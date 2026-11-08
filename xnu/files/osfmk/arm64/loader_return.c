@@ -229,7 +229,7 @@ static_kvtophys(const void *va)
  * Returns only if no loader is listening.
  */
 static void
-loader_jump(uint64_t reason, uint64_t code)
+loader_jump(uint64_t reason, uint64_t code, bool lean)
 {
 #if ARM_PGSHIFT == 12
 	uint64_t stub = loader_stub_slot[1];
@@ -247,7 +247,13 @@ loader_jump(uint64_t reason, uint64_t code)
 		return;
 	}
 	loader_return_entered = true;
+	/*
+	 * A "lean" jump is for the earliest checkpoints, before PE_init_platform(): the interrupt
+	 * controller has not been set up and the boot arguments cannot be parsed yet, so touching
+	 * either here could itself be what stops the run (and say nothing).
+	 */
 #if defined(GENERIC_GIC_V3_IRQ)
+	if (!lean) {
 	gic_v3_irq_quiesce();
 	/*
 	 * With a core of its own (bootcpu=) the kernel does not go back into the loader's code on
@@ -258,6 +264,7 @@ loader_jump(uint64_t reason, uint64_t code)
 	if (PE_parse_boot_argn("bootcpu", &own_core, sizeof(own_core))) {
 		__builtin_arm_wsr64("CNTV_CTL_EL0", CNTV_CTL_EL0_IMASKED);
 		gic_v3_irq_cpu_shutdown();
+	}
 	}
 #endif
 
@@ -311,7 +318,7 @@ loader_jump(uint64_t reason, uint64_t code)
                 : : "r" (r_ttbr0), "r" (r_log), "r" (r_len), "r" (r_tcr), "r" (r_stub), "r" (r_reason), "r" (r_code));
 	__builtin_unreachable();
 #else
-	(void)reason; (void)code;
+	(void)reason; (void)code; (void)lean;
 #endif /* ARM_PGSHIFT == 12 */
 }
 
@@ -397,15 +404,18 @@ loader_return(void)
 			loader_log_putc(*c);
 		}
 	}
-	loader_jump(0, 0);
+	loader_jump(0, 0, false);
 }
 
-/* Bring-up aid: stop here if the loader asked for checkpoint n. */
+/*
+ * Bring-up aid: stop here if the loader asked for checkpoint n. Numbers below 11 are before
+ * the platform expert exists (arm_init() up to PE_init_platform()), so they use the lean jump.
+ */
 void
 loader_checkpoint(uint64_t n)
 {
 	if (loader_stub_slot[2] == n) {
-		loader_jump(2, n);
+		loader_jump(2, n, n < 11);
 	}
 }
 

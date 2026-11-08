@@ -13,6 +13,7 @@ or, when there is none, from devices/redwood/prebuilt/.
 usage: mkxnuimg.py [-p payload.bin] [-o out.img]
 """
 import argparse, gzip, os, subprocess, sys
+from tools.boot_config import load as load_boot_config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MU = os.path.join(HERE, 'Mu-Silicium')
@@ -22,11 +23,26 @@ PAYLOAD_BASE, PAYLOAD_MAX = 0xF0000000, 0x04000000
 
 ap = argparse.ArgumentParser()
 ap.add_argument('-p', '--payload')
-ap.add_argument('-o', '--output', default=os.path.join(HERE, 'xnu-redwood.img'))
+ap.add_argument('-o', '--output')
 ap.add_argument('--mode', default='RELEASE')
+ap.add_argument('--device', default=os.environ.get('DEVICE','redwood'))
+ap.add_argument('--vendor-boot', help='matching stock vendor_boot image (negroni)')
 args = ap.parse_args()
+args.output = args.output or os.path.join(HERE,f'xnu-{args.device}.img')
+conf = load_boot_config(args.device)
+UEFI_TARGET = conf['UEFI_TARGET']
+FD_BASE, FD_SIZE = conf['FD_BASE'], conf['FD_SIZE']
+PAYLOAD_BASE, PAYLOAD_MAX = conf['PAYLOAD_BASE'], conf['PAYLOAD_MAX']
+PREBUILT = os.path.join(HERE,'devices',args.device,'prebuilt')
+if args.device == 'negroni':
+    packer = os.path.join(HERE,'devices','negroni','uefi','pack-probe.py')
+    vendor = args.vendor_boot or os.environ.get('STOCK_VENDOR_BOOT') or os.path.join(HERE,'..','downloads','stock-images','vendor_boot.img')
+    cmd = [sys.executable,packer,'--mu',MU,'--vendor-boot',vendor,
+           '--output-dir',os.path.join(HERE,'boot-negroni'),'--output',args.output,'--mode',args.mode]
+    if args.payload: cmd += ['--payload',args.payload]
+    sys.exit(subprocess.call(cmd))
 
-fd_path = os.path.join(MU, f'Build/redwoodPkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
+fd_path = os.path.join(MU, f'Build/{UEFI_TARGET}Pkg/{args.mode}_CLANGPDB/FV/SILICIUM_UEFI.fd')
 if os.path.isfile(fd_path):
     shim_dir = os.path.join(MU, 'BootShim')
     for f in ('BootShim.elf', 'BootShim.bin'):
@@ -36,7 +52,7 @@ if os.path.isfile(fd_path):
                            f'CFLAGS=--target=aarch64-linux-gnu -DPAYLOAD_BASE={PAYLOAD_BASE:#x}'],
                           cwd=shim_dir, stdout=subprocess.DEVNULL)
     parts = {'shim': os.path.join(shim_dir, 'BootShim.bin'), 'fd': fd_path,
-             'dtb': os.path.join(MU, 'Resources/DTBs/redwood.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
+             'dtb': os.path.join(MU, f'Resources/DTBs/{UEFI_TARGET}.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
              'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
 else:
     parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'SILICIUM_UEFI.fd'),

@@ -15,7 +15,15 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
+#ifndef PAYLOAD_BASE
 #define PAYLOAD_BASE        0xF0000000ULL
+#endif
+#ifndef LOADER_READ_ONLY
+#define LOADER_READ_ONLY 0
+#endif
+#ifndef LOADER_SESSION_SECONDS
+#define LOADER_SESSION_SECONDS 0
+#endif
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
@@ -24,7 +32,9 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define KERNEL_VIRT_BASE    0xFFFFFFF004000000ULL /* boot_args.virtBase */
 #define KERNEL_LINK_OFFSET  0x03000000ULL         /* kernel text sits 48 MB above the base */
 #define BASE_ALIGN          0x02000000ULL         /* 32 MB: L2 block size with 16K pages */
+#ifndef MAX_MEM_SIZE
 #define MAX_MEM_SIZE        0x180000000ULL        /* 6 GB; the kernel's bootstrap page tables cover 8 */
+#endif
 /*
  * A root image too big for the payload area is placed here, at a fixed
  * offset inside the kernel's memory window, once; it then survives any
@@ -39,7 +49,9 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define PANIC_LOG_SIZE      0x80000u
 #define NVRAM_BANK_SIZE     0x2000u
 #define PANIC_LOG_BASE      (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x100000ULL)
+#ifndef PAYLOAD_MAX_SIZE
 #define PAYLOAD_MAX_SIZE    0x04000000ULL         /* RAM reserved for the payload in the UEFI memory map */
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* XNU structures (pexpert/pexpert/arm64/boot.h, mach-o/loader.h)           */
@@ -264,6 +276,9 @@ clean_dcache(uint64_t start, uint64_t end)
 static efi_block_io *
 find_log_partition(void)
 {
+#if LOADER_READ_ONLY
+	return NULL;
+#endif
 	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
 	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
 	static const char16 want[] = LOG_PARTITION;
@@ -554,6 +569,8 @@ struct platform {
 	const char *name;
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
 	uint64_t gic_dist, gic_redist;   /* GICv3 */
+	uint64_t gic_redist_size;
+	int hypervisor_wdt;
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
@@ -578,6 +595,7 @@ static const struct platform platform_qemu_virt = {
 static const struct platform platform_redwood = {
 	/* io_base must be non-zero: XNU treats a zero SoC base as "no SoC" and skips clock setup. */
 	.name = "redwood", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.hypervisor_wdt = 1,
 	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
 	.cores = 8, .core_shift = 8,
 	/*
@@ -587,6 +605,24 @@ static const struct platform platform_redwood = {
 	 */
 	.small_cores = 0x0f,
 };
+
+static const struct platform platform_negroni = {
+	.name = "negroni", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17100000, .gic_redist = 0x17180000,
+	.gic_redist_size = 0x200000, .hypervisor_wdt = 1,
+	.cores = 8, .core_shift = 8, .small_cores = 0x0f,
+};
+
+static const struct platform *
+platform_by_name(const char *name, uint32_t len)
+{
+	static const struct platform *const all[] = { &platform_redwood, &platform_negroni, &platform_qemu_virt };
+	if (len && name[len - 1] == 0) len--;
+	for (unsigned i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+		if (str_len(all[i]->name) == len && memcmp(all[i]->name, name, len) == 0) return all[i];
+	}
+	return NULL;
+}
 
 /* ------------------------------------------------------------------------ */
 
@@ -1981,7 +2017,7 @@ block_start(void)
 			}
 		}
 		if (block_write_requested && block_is_darwin(info, bio, bp)) {
-			block_write_part = (int)block_shared.parts;
+			if (!LOADER_READ_ONLY) block_write_part = (int)block_shared.parts;
 		}
 		block_bios[block_shared.parts++] = bio;
 		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
@@ -2503,7 +2539,7 @@ wdt_arm(void)
 {
 	uint64_t ctl = 0, since = 0;
 
-	if (PLAT != &platform_redwood) {
+	if (!PLAT->hypervisor_wdt) {
 		return; /* SMC is not routed anywhere useful on QEMU virt */
 	}
 	uint64_t st = smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since);
@@ -2512,7 +2548,7 @@ wdt_arm(void)
 	uint64_t r_pet = smc_call(VIRT_WDT_PET, 0, 0, NULL, NULL);
 	print("watchdog: status ret=%x ctl=%x since_pet=%x; set_time=%x enable=%x pet=%x\n", st, ctl, since, r_time,
 	    r_ctl, r_pet);
-	wdt_armed = (r_pet == 0);
+	wdt_armed = (r_time == 0 && r_ctl == 0 && r_pet == 0);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2555,6 +2591,7 @@ install_exception_hook(void)
 /* Payload                                                                  */
 
 struct payload_info {
+	const struct platform *platform;
 	const uint8_t *kernel;
 	uint32_t kernel_size;           /* the kernel entry's size: what its Mach-O header may point into */
 	const uint8_t *ramdisk;
@@ -2625,7 +2662,10 @@ parse_payload(struct payload_info *pi, int verbose)
 			print("payload entry is larger than the payload (size %x): not used\n", (uint64_t)e->size);
 			return 0;
 		}
-		if (str_eq(e->name, "ramdisk")) {
+		if (str_eq(e->name, "platform")) {
+			pi->platform = platform_by_name(text, e->size);
+			if (pi->platform == NULL) return 0;
+		} else if (str_eq(e->name, "ramdisk")) {
 			pi->ramdisk = p + sizeof(*e);             /* becomes /dev/md0, the root device */
 			pi->ramdisk_size = e->size;
 		} else if (str_eq(e->name, "kernel")) {
@@ -3428,7 +3468,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_begin(&w, "gic");
 	dt_prop_str(&w, "device_type", "interrupt-controller");
 	dt_prop_str(&w, "compatible", "arm,gic-v3");
-	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
+	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base,
+	    plat->gic_redist_size ? plat->gic_redist_size : 0x100000 };
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
 	dt_end(&w);
 	if (plat->uart != 0) {
@@ -3703,6 +3744,7 @@ usb_start(void)
  * after it was taken for data, and only the power button brought the phone back.
  */
 static uint64_t usb_data_timeout;
+static uint64_t loader_session_start;
 
 static int64_t
 usb_wait(uint8_t endpoint)
@@ -3715,6 +3757,8 @@ usb_wait(uint8_t endpoint)
 		uint32_t msg = UsbDeviceEventNoEvent;
 		uint64_t size = 0;
 		usb_device_event_data data;
+		if (LOADER_SESSION_SECONDS && READ_SYSREG(CNTVCT_EL0) - loader_session_start >=
+		    (uint64_t)LOADER_SESSION_SECONDS * freq) reboot();
 
 		USB->handle_event(&msg, &size, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
@@ -3964,6 +4008,10 @@ fb_command(char *cmd)
 			}
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem run") || starts_with(cmd, "oem selftest")) {
+			if (PLAT == &platform_negroni && !wdt_armed) {
+				fb_reply("FAIL", "hardware watchdog not armed");
+				return;
+			}
 			int selftest = starts_with(cmd, "oem selftest");
 			const char *arg = cmd + 7;
 			while (*arg == ' ') {
@@ -3981,7 +4029,12 @@ fb_command(char *cmd)
 				compose_logs(NULL, 0);
 			}
 		} else if (starts_with(cmd, "oem hang")) {
+			if (PLAT == &platform_negroni && !wdt_armed) {
+				fb_reply("FAIL", "hardware watchdog not armed");
+				return;
+			}
 			fb_reply("OKAY", "watchdog test: not petting any more");
+			if (PLAT == &platform_negroni) __asm__ volatile ("msr daifset, #0xf");
 			for (;;) {
 			}
 		} else if (starts_with(cmd, "oem memmap")) {
@@ -4318,7 +4371,8 @@ efi_main(efi_handle image, efi_system_table *st)
 	BS = st->bs;
 	IMAGE = image;
 
-	BS->set_watchdog_timer(0, 0, 0, NULL);
+	loader_session_start = READ_SYSREG(CNTVCT_EL0);
+	BS->set_watchdog_timer(LOADER_SESSION_SECONDS, LOADER_SESSION_SECONDS ? 0x10000 : 0, 0, NULL);
 	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
 	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
 		load_payload_from_volume();
@@ -4335,6 +4389,11 @@ efi_main(efi_handle image, efi_system_table *st)
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
 	PLAT = &platform_qemu_virt;
+#ifdef LOADER_DEFAULT_NEGRONI
+	PLAT = &platform_negroni;
+#endif
+	int have_payload = parse_payload(&pi, 0);
+	if (have_payload && pi.platform) PLAT = pi.platform;
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
@@ -4345,7 +4404,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
-		} else {
+		} else if (PLAT == &platform_qemu_virt) {
 			ramfb_phone_screen();
 		}
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
@@ -4355,7 +4414,6 @@ efi_main(efi_handle image, efi_system_table *st)
 	install_exception_hook();
 	wdt_arm();
 
-	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && pi.usb_mode && usb_start()) {
 		flush_log();
 		usb_command_loop();

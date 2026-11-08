@@ -6,6 +6,7 @@
 HB="$(cd "$(dirname "$0")" && pwd)"
 case "$(basename "$0")" in *++) drv=clang++; extra=(-fno-use-cxa-atexit);; *) drv=clang; extra=();; esac
 args=()
+major=$(/usr/bin/$drv -dumpversion 2>/dev/null); major=${major%%.*}
 for a in "$@"; do
   case "$a" in
     -enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang) ;;
@@ -14,5 +15,11 @@ for a in "$@"; do
     *) args+=("$a");;
   esac
 done
+# Clang 16 promoted these diagnostics to errors; preserve the older compiler's
+# behavior for the kernel sources and the device drivers carried by this port.
+if [ "${major:-14}" -ge 16 ]; then
+  extra+=(-Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion
+          -Wno-error=incompatible-function-pointer-types)
+fi
 exec /usr/bin/$drv -include "$HB/../../hostinc/xnu_clang_compat.h" -target arm64-apple-ios${XNU_SDK_VERSION:-16.5} --ld-path="$HB/ld64" \
   -w "${extra[@]}" "${args[@]}"

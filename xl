@@ -53,6 +53,8 @@
 # when the last upload was not from this copy. The record starts empty -- an upload by a copy without
 # this change leaves none -- and `run` says so rather than assuming.
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
+UEFI_TARGET=$(python3 tools/boot_config.py --value UEFI_TARGET) || exit 1
+UEFI_MODE=$(python3 tools/boot_config.py --value UEFI_MODE) || exit 1
 # On a Mac: flock, GNU timeout and stat, and Android's platform-tools, from tools/macos-bin (see its README)
 [ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin:$PWD/tools/macos-bin/platform-tools:$PATH
 # the kernel and the loader built here, or else the ones that come with the repository
@@ -128,7 +130,7 @@ firmware() {
 	case "${XL_FIRMWARE:-}" in
 	u-boot|silicium) echo "$XL_FIRMWARE"; return ;;
 	esac
-	if [ -f Mu-Silicium/Build/redwoodPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd ] || [ -f devices/redwood/prebuilt/SILICIUM_UEFI.fd ]; then
+	if [ -f "Mu-Silicium/Build/${UEFI_TARGET}Pkg/${UEFI_MODE}_CLANGPDB/FV/SILICIUM_UEFI.fd" ] || [ -f "devices/${DEVICE:-redwood}/prebuilt/SILICIUM_UEFI.fd" ]; then
 		echo silicium
 	else
 		echo u-boot
@@ -136,6 +138,11 @@ firmware() {
 }
 
 enter() {
+	if [ "${DEVICE:-redwood}" = negroni ]; then
+		python3 tools/boot_config.py | cmp -s - xnuloader/boot-config.h || {
+			echo 'xl: rebuild the loader with DEVICE=negroni before entering this phone'; return 1;
+		}
+	fi
 	case "$(state)" in
 	loader) return 0 ;;
 	android) adb reboot bootloader; wait_for fastboot 60 || { echo "xl: phone did not reach fastboot"; return 1; } ;;
@@ -145,10 +152,10 @@ enter() {
 		[ "$(state)" = absent ] && { echo "xl: phone not reachable"; return 1; }
 		enter; return ;;
 	esac
-	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb >/dev/null || { echo "xl: payload build failed"; return 1; }
+	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb --platform "${DEVICE:-redwood}" >/dev/null || { echo "xl: payload build failed"; return 1; }
 	case "$(firmware)" in
 	u-boot) tools/mkubootimg.py -d "${DEVICE:-redwood}" -l $L -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
-	*) ./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
+	*) ./mkxnuimg.py --mode "$UEFI_MODE" -p usb-payload.bin -o xnu-usb.img >/dev/null ;;
 	esac || { echo "xl: image build failed ($(firmware))"; return 1; }
 	# Right after the phone enters fastboot the first "boot" is sometimes not taken: try twice.
 	local try

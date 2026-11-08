@@ -119,10 +119,10 @@ index 4b83160780c3..8997af1f0e1b 100644
  include $(MakeInc_rule)
  include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..27cccab98c8e 100644
+index 44274016a4cf..245d81f857d6 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,51 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,52 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -150,6 +150,7 @@ index 44274016a4cf..27cccab98c8e 100644
 +bsd/dev/hakios.haptic.c                  optional hakios_haptic
 +bsd/dev/hakios.virtio_input.c            optional hakios_virtio_input
 +bsd/dev/hakios.goodix.c                  optional hakios_goodix
++bsd/dev/hakios.s3908.c                   optional hakios_s3908
 +bsd/dev/hakios.buttons.c                 optional hakios_buttons
 +bsd/dev/hakios.qmi.c                     optional hakios_qmi
 +bsd/dev/hakios.mpss.c                    optional hakios_modem
@@ -174,7 +175,7 @@ index 44274016a4cf..27cccab98c8e 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +200,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +201,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -227,7 +228,7 @@ index 44274016a4cf..27cccab98c8e 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +452,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +453,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -235,7 +236,7 @@ index 44274016a4cf..27cccab98c8e 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +475,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +476,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -977,6 +978,27 @@ index 003cfb074a99..c597065f24f1 100644
  
  	if (sock == NULL) {
  		return EINVAL;
+diff --git a/bsd/kern/makesyscalls.sh b/bsd/kern/makesyscalls.sh
+index 52992d4cd0af..140fed3bcb71 100755
+--- a/bsd/kern/makesyscalls.sh
++++ b/bsd/kern/makesyscalls.sh
+@@ -671,14 +671,14 @@ s/\$//g
+ 		}
+ 
+ 		printf("#if CONFIG_REQUIRES_U32_MUNGING\n") > sysent
+-		printf("\t{ \(sy_call_t *\)(void (*)(void))%s, %s, %s, %s, %s},",
++		printf("\t{ (sy_call_t *)(void (*)(void))%s, %s, %s, %s, %s},",
+ 				tempname, munge32, munge_ret, argssize, size32) > sysent
+ 		linesize = length(tempname) + length(munge32) + \
+ 			length(munge_ret) + length(argssize) + length(size32) + 28
+ 		align_comment(linesize, 88, sysent)
+ 		printf("/* %d = %s%s*/\n", syscall_num, funcname, additional_comments) > sysent
+ 		printf("#else\n") > sysent
+-		printf("\t{ \(sy_call_t *\)(void (*)(void))%s, %s, %s, %s},\n",
++		printf("\t{ (sy_call_t *)(void (*)(void))%s, %s, %s, %s},\n",
+ 				tempname, munge_ret, argssize, size32) > sysent
+ 		printf("#endif\n") > sysent
+ 		
 diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
 index 4ca22ee4371a..e95e618b4cb6 100644
 --- a/bsd/kern/sys_generic.c
@@ -2091,7 +2113,7 @@ index 0316792a3f42..b9c195b09cd1 100644
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..f91095c98d26 100644
+index e26a1d70f470..ceecfcfea936 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
 @@ -73,6 +73,9 @@
@@ -2116,7 +2138,18 @@ index e26a1d70f470..f91095c98d26 100644
  arm_init(
  	boot_args       *args)
  {
-@@ -354,6 +361,7 @@ arm_init(
+@@ -346,14 +353,18 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++	loader_checkpoint(7);
+ 	arm_setup_pre_sign();
++	loader_checkpoint(8);
+ 
+ 	arm_slide_rebase_and_sign_image();
++	loader_checkpoint(9);
+ 
+ 	/* If kernel integrity is supported, use a constant copy of the boot args. */
  	const_boot_args = *args;
  	BootArgs = args = &const_boot_args;
  
@@ -2124,7 +2157,7 @@ index e26a1d70f470..f91095c98d26 100644
  	cpu_data_init(&BootCpuData);
  #if defined(HAS_APPLE_PAC)
  	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
-@@ -362,14 +370,19 @@ arm_init(
+@@ -362,14 +373,19 @@ arm_init(
  #endif /* defined(HAS_APPLE_PAC) */
  
  	PE_init_platform(FALSE, args); /* Get platform expert set up */
@@ -2144,7 +2177,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  #if (DEVELOPMENT || DEBUG)
  	unsigned long const *platform_stall_ptr = NULL;
-@@ -385,6 +398,7 @@ arm_init(
+@@ -385,6 +401,7 @@ arm_init(
  	}
  
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
@@ -2152,7 +2185,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
  	dt_entry_size = 0;
-@@ -422,10 +436,13 @@ arm_init(
+@@ -422,10 +439,13 @@ arm_init(
  	}
  #endif
  
@@ -2166,7 +2199,7 @@ index e26a1d70f470..f91095c98d26 100644
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
  
  	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +456,14 @@ arm_init(
+@@ -439,11 +459,14 @@ arm_init(
  	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
  	    + ((uintptr_t)&BootCpuData
  	    - (uintptr_t)(args->virtBase)));
@@ -2181,7 +2214,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +472,16 @@ arm_init(
+@@ -452,12 +475,16 @@ arm_init(
  	 * preemption level is not really meaningful for the bootstrap thread.
  	 */
  	thread->machine.preemption_count = 0;
@@ -2198,7 +2231,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/*
  	 * Initialize the timer callout world
-@@ -465,6 +489,7 @@ arm_init(
+@@ -465,6 +492,7 @@ arm_init(
  	timer_call_init();
  
  	cpu_init();
@@ -2206,7 +2239,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	processor_bootstrap();
  
-@@ -514,6 +539,7 @@ arm_init(
+@@ -514,6 +542,7 @@ arm_init(
  #endif  /* __ARM_PAN_AVAILABLE__ */
  
  	arm_vm_init(xmaxmem, args);
@@ -2214,7 +2247,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	if (debug_boot_arg) {
  		patch_low_glo();
-@@ -527,7 +553,9 @@ arm_init(
+@@ -527,7 +556,9 @@ arm_init(
  
  	/* Setup debugging output. */
  	const unsigned int serial_exists = serial_init();
@@ -2224,7 +2257,7 @@ index e26a1d70f470..f91095c98d26 100644
  	kprintf("kprintf initialized\n");
  
  	serialmode = 0;
-@@ -569,6 +597,7 @@ arm_init(
+@@ -569,6 +600,7 @@ arm_init(
  		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
  	}
  	PE_create_console();
@@ -2232,7 +2265,7 @@ index e26a1d70f470..f91095c98d26 100644
  
  	/* setup console output */
  	PE_init_printf(FALSE);
-@@ -647,6 +676,7 @@ arm_init(
+@@ -647,6 +679,7 @@ arm_init(
  	 * against string vulnerabilities
  	 */
  	__stack_chk_guard &= ~(0xFFULL << 8);
@@ -2240,7 +2273,7 @@ index e26a1d70f470..f91095c98d26 100644
  	machine_startup(args);
  }
  
-@@ -673,6 +703,9 @@ arm_init_cpu(
+@@ -673,6 +706,9 @@ arm_init_cpu(
  
  
  	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
@@ -2360,6 +2393,52 @@ index df672c65b144..d7e1da7c5db2 100644
  #endif /* HAS_APPLE_PAC */
  
  	bool reserved11;
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index d89b0f19cff7..09e6b8cc8202 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1812,6 +1812,18 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define ARM64_PHYSMAP_SLIDE_RANGE (1ULL << 30) // 1 GB
+ #define ARM64_PHYSMAP_SLIDE_MASK  (ARM64_PHYSMAP_SLIDE_RANGE - 1)
+ 
++#if XNU_MONITOR
++#define ARM64_PHYSMAP_ALIGNMENT_PADDING 0ULL
++#else
++/*
++ * arm_vm_physmap_slide() preserves each PA's block offset. Each PTOV entry
++ * can therefore consume up to one extra twig of VA space. Reserve that
++ * space in both the aperture bound and its L1 allocation, including the
++ * ARM_LARGE_MEMORY configuration used by NEGRONI's non-PPL kernel.
++ */
++#define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
++#endif
++
+ void
+ arm_vm_init(uint64_t memory_size, boot_args * args)
+ {
+@@ -1859,7 +1871,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	}
+ 
+ #if defined(ARM_LARGE_MEMORY)
+-	unsigned long physmap_l1_entries = ((real_phys_size + ARM64_PHYSMAP_SLIDE_RANGE) >> ARM_TT_L1_SHIFT) + 1;
++	unsigned long physmap_l1_entries = ((real_phys_size + ARM64_PHYSMAP_SLIDE_RANGE + ARM64_PHYSMAP_ALIGNMENT_PADDING) >> ARM_TT_L1_SHIFT) + 1;
+ 	physmap_base = VM_MIN_KERNEL_ADDRESS - (physmap_l1_entries << ARM_TT_L1_SHIFT);
+ #else
+ 	physmap_base = phystokv(args->topOfKernelData);
+@@ -1883,10 +1895,10 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #if defined(ARM_LARGE_MEMORY)
+ 	/* For large memory systems with no PPL such as virtual machines */
+ 	static_memory_end = phystokv(args->topOfKernelData);
+-	physmap_end = physmap_base + real_phys_size;
++	physmap_end = physmap_base + real_phys_size + ARM64_PHYSMAP_ALIGNMENT_PADDING;
+ #else
+-	static_memory_end = physmap_base + mem_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE); // worst possible case for block alignment
+-	physmap_end = physmap_base + real_phys_size + (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE);
++	static_memory_end = physmap_base + mem_size + ARM64_PHYSMAP_ALIGNMENT_PADDING; // worst possible case for block alignment
++	physmap_end = physmap_base + real_phys_size + ARM64_PHYSMAP_ALIGNMENT_PADDING;
+ #endif // ARM_LARGE_MEMORY
+ #endif
+ 
 diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
 index b9549da357b4..cca31ea32502 100644
 --- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
@@ -2596,7 +2675,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  
  void
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index e5336e5a1cce..a54e35035cde 100644
+index e5336e5a1cce..0f403bda40b7 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -126,6 +126,27 @@ LEXT(LowResetVectorBase)
@@ -2931,6 +3010,15 @@ index e5336e5a1cce..a54e35035cde 100644
  
  #if !VMAPPLE
  	MOV64   x1, SCTLR_EL1_DEFAULT
+@@ -790,6 +989,8 @@ common_start:
+ 	// If x21 != 0, we're doing a warm reset, so we need to trampoline to the kernel pmap.
+ 	cbnz	x21, Ltrampoline
+ 
++	LOADER_CHECKPOINT 6
++
+ 	// Set KVA of boot args as first arg
+ 	add		x0, x20, x22
+ 	sub		x0, x0, x23
 diff --git a/osfmk/conf/Makefile b/osfmk/conf/Makefile
 index 050f34a53c49..c58ff62cd419 100644
 --- a/osfmk/conf/Makefile

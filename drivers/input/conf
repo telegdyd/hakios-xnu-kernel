@@ -14,6 +14,11 @@ driver GOODIX
 	help    the touch screen: a Goodix GT9916 ("Berlin-D") or a FocalTech FT3680 on SPI (touchscreen=1). The bus,
 	help    pins and supplies are the POCO X5 Pro's; another phone with one of these controllers changes those
 
+driver S3908
+	file    bsd/dev/hakios.s3908.c
+	help    the OnePlus 10 Pro's touch screen: a Synaptics S3908 (TouchComm) at I2C 0x4b, its two wires driven by hand
+	help    (touchscreen=1). The pins and addresses are the NE2213's
+
 driver BUTTONS
 	file    bsd/dev/hakios.buttons.c
 	help    the power and volume keys, read from the PMIC through the SPMI arbiter (buttons=1)

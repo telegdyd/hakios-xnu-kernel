@@ -251,7 +251,7 @@ THERMAL_TM1	arg	thermal_tm1	Chip, thermal and PMIC	k	hakios.thermal.c
 TORCH	arg	torch	Haptics and torch	kl	hakios.torch.c,loader.c	a look, reading only: the arbiter's channel for the module and who may write through it, the module's type, its registers, the PMIC's temperature
 TORCH_MAX_S	arg	torch_max_s	Haptics and torch	k	hakios.torch.c	
 TORCH_SECS	arg	torch_secs	Haptics and torch	k	hakios.torch.c	
-TOUCH_FLIP	arg	touch_flip	Touch and buttons	k	hakios.goodix.c	
+TOUCH_FLIP	arg	touch_flip	Touch and buttons	k	hakios.goodix.c,hakios.s3908.c	
 TOUCH_LAT	arg	touch_lat	GPU and display	ku	HakiosMetalCA.m,MiniIOMobileFramebuffer.cpp,eagl.c,hakios.goodix.c,hakios.gpu.cpp,hakios.input.c,inject.c,inject_sb.c	a line for every wait of a program's for the GPU that took a millisecond or more ("tl: f KIND US at US"), for telling apart what holds a frame up
 TOUCH_POLL_US	arg	touch_poll_us	Touch and buttons	k	hakios.goodix.c	
 TOUCH_RATE	arg	touch_rate	Touch and buttons	k	hakios.goodix.c	the chip reports twice as often (Xiaomi's game mode; 240 otherwise)

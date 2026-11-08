@@ -147,6 +147,10 @@ stage1() {
 		printf '#!/bin/sh\nexec python3 "$@"\n' | update host/bin/python
 		chmod +x host/bin/python
 	fi
+	# Debian ships python3 without the unversioned name used by XNU's scripts.
+	if [ "$XNU_HOST_OS" != Darwin ]; then
+		link "$(command -v python3)" host/bin/python
+	fi
 	# mig: Apple's own does not build on glibc; this is a port that does
 	if [ ! -x host/bin/migcom ] || [ ! -x host/bin/mig ]; then
 		log "building mig"
