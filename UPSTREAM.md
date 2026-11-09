@@ -77,3 +77,11 @@
   polls it, and the loader restarts USB after the run (returned, hung or not
   started). Before, both drove DWC3 and the live log and sweetd were unusable
   on flash boots. Runs without usb_net unchanged.
+- `tools/boot_config.py`, `xnuloader/loader.c`: boot setting `DARWIN_WRITE`
+  (default: the opposite of `READ_ONLY`, so existing ports are unchanged). A
+  loader built `READ_ONLY=1 DARWIN_WRITE=1` writes no log to logdump but still
+  serves the kernel's `ufs_write=1` writes to darwin past the cryptexes, so
+  `/private/var` can be kept on a phone whose loader is otherwise read only.
+- `tools/mkdatavol.py`: `--blocks N` for a darwin of another size than the
+  first phone's (the volume must end where darwin does), and `--runs DIR` for
+  the written stretches as raw files, for writing darwin from Android.

@@ -21,6 +21,11 @@
 #ifndef LOADER_READ_ONLY
 #define LOADER_READ_ONLY 0
 #endif
+/* the kernel's writes to darwin (ufs_write=1): their own switch, so that a loader that writes nothing else
+ * (READ_ONLY=1: no log in logdump) can still keep Darwin's data volume (tools/boot_config.py, DARWIN_WRITE) */
+#ifndef LOADER_DARWIN_WRITE
+#define LOADER_DARWIN_WRITE (!LOADER_READ_ONLY)
+#endif
 #ifndef LOADER_SESSION_SECONDS
 #define LOADER_SESSION_SECONDS 0
 #endif
@@ -2033,7 +2038,7 @@ block_start(void)
 			}
 		}
 		if (block_write_requested && block_is_darwin(info, bio, bp)) {
-			if (!LOADER_READ_ONLY) block_write_part = (int)block_shared.parts;
+			if (LOADER_DARWIN_WRITE) block_write_part = (int)block_shared.parts;
 		}
 		block_bios[block_shared.parts++] = bio;
 		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&

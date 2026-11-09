@@ -11,7 +11,7 @@ def load(device=None):
         raise ValueError('invalid device name')
     conf = dict(UEFI_TARGET='redwood', UEFI_MODE='RELEASE', PLATFORM='redwood', FD_BASE=0x9fd00000,
                 FD_SIZE=0x200000, PAYLOAD_BASE=0xf0000000, PAYLOAD_MAX=0x4000000,
-                MAX_MEM_SIZE=0x180000000, READ_ONLY=0, SESSION_SECONDS=0,
+                MAX_MEM_SIZE=0x180000000, READ_ONLY=0, DARWIN_WRITE=-1, SESSION_SECONDS=0,
                 HEADER_VERSION=1, LOADER_IMAGE_BASE=0xa1000000)
     path = ROOT/'devices'/device/'boot.conf'
     if path.exists():
@@ -30,6 +30,11 @@ def load(device=None):
     assert conf['PAYLOAD_BASE'] % 0x10000 == 0
     assert conf['PAYLOAD_MAX'] > 0x100000
     assert conf['UEFI_MODE'] in ('DEBUG','RELEASE')
+    # DARWIN_WRITE: the loader may serve the kernel's writes to darwin (ufs_write=1). Unset, it follows READ_ONLY; set,
+    # READ_ONLY=1 DARWIN_WRITE=1 keeps every other write (the loader's log in logdump) off and darwin's data volume on.
+    if conf['DARWIN_WRITE'] < 0:
+        conf['DARWIN_WRITE'] = 0 if conf['READ_ONLY'] else 1
+    assert conf['DARWIN_WRITE'] in (0, 1)
     conf['DEVICE'] = device
     return conf
 
@@ -46,6 +51,7 @@ if __name__ == '__main__':
     print(f"#define PAYLOAD_MAX_SIZE {c['PAYLOAD_MAX']:#x}ULL")
     print(f"#define MAX_MEM_SIZE {c['MAX_MEM_SIZE']:#x}ULL")
     print(f"#define LOADER_READ_ONLY {c['READ_ONLY']}")
+    print(f"#define LOADER_DARWIN_WRITE {c['DARWIN_WRITE']}")
     print(f"#define LOADER_SESSION_SECONDS {c['SESSION_SECONDS']}")
     # QEMU still selects its platform from the virtual display, as before.
     if c['DEVICE'] == 'negroni':

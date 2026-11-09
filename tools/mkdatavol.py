@@ -2,9 +2,13 @@
 """The data volume of Darwin for the phone: an empty HFS Plus volume in darwin past the Darwin volume and the cryptexes,
 as an Android sparse image of the whole of darwin that writes that volume and nothing else.
 
-usage: mkdatavol.py OUT.simg [MKFS]      (MKFS: mkfs.hfsplus, default the one in $PATH)
+usage: mkdatavol.py [--blocks N] [--runs DIR] OUT.simg [MKFS]      (MKFS: mkfs.hfsplus, default the one in $PATH)
 
     fastboot flash darwin OUT.simg
+
+--blocks N: darwin's size in blocks of 4096 on this phone (default 5242875, the first phone's: the volume has to end
+where darwin does). --runs DIR: also each stretch the image writes, as a raw file DIR/BLOCK-COUNT.img (BLOCK counted
+from darwin's start), for a phone whose darwin is written from Android instead (devices/negroni/tools/darwin-write.py).
 
 The kernel gives that stretch of darwin out as /dev/ufs_darwin_data (drivers/storage/hakios.ufs.c, ufs_write=1) and
 init mounts it on /private/var (userland/src/init.c, var_hfs=ufs_darwin_data). Flashing this again empties it.
@@ -56,11 +60,18 @@ def used_blocks(img):
 
 
 def main():
-    if len(sys.argv) not in (2, 3):
+    args, darwin_blocks, runs_dir = sys.argv[1:], DARWIN_BLOCKS, None
+    while args[:1] in (['--blocks'], ['--runs']) and len(args) > 1:
+        if args[0] == '--blocks':
+            darwin_blocks = int(args[1], 0)
+        else:
+            runs_dir = args[1]
+        args = args[2:]
+    if len(args) not in (1, 2) or darwin_blocks <= DATA_FIRST:
         sys.exit(__doc__)
-    out = sys.argv[1]
-    mkfs = sys.argv[2] if len(sys.argv) > 2 else 'mkfs.hfsplus'
-    blocks = DARWIN_BLOCKS - DATA_FIRST
+    out = args[0]
+    mkfs = args[1] if len(args) > 1 else 'mkfs.hfsplus'
+    blocks = darwin_blocks - DATA_FIRST
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, 'data.hfs')
         with open(path, 'wb') as f:
@@ -86,6 +97,10 @@ def main():
                     continue
                 img.seek(first * BS)
                 data = img.read(count * BS)
+                if runs_dir is not None:
+                    os.makedirs(runs_dir, exist_ok=True)
+                    with open(os.path.join(runs_dir, f'{DATA_FIRST + first}-{count}.img'), 'wb') as r:
+                        r.write(data)
                 # zeros in a used stretch go as FILL, which costs nothing to send; everything else as RAW
                 at = 0
                 while at < count:
@@ -100,7 +115,7 @@ def main():
                     written += end - at
                     at = end
     with open(out, 'wb') as f:
-        f.write(struct.pack('<IHHHHIIII', MAGIC, 1, 0, 28, 12, BS, DARWIN_BLOCKS, len(chunks), 0))
+        f.write(struct.pack('<IHHHHIIII', MAGIC, 1, 0, 28, 12, BS, darwin_blocks, len(chunks), 0))
         for c in chunks:
             f.write(c)
     print(f'{out}: {os.path.getsize(out)} bytes; the volume: {blocks} blocks ({blocks * BS >> 20} MB) from darwin '
