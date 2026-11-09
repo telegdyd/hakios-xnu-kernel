@@ -1412,13 +1412,29 @@ dsp_shutdown(const char *why)
 		link_stop();
 	}
 	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
+	/*
+	 * The rails at 384 again for TrustZone's shutdown, as Android's PIL does (subsys-pil-tz.c pil_shutdown_trusted: the
+	 * proxy votes around the call): a DSP that has been up for minutes has let LCX and LMX down to retention, and on the
+	 * 10 Pro the shutdown then failed and the phone reset on its way back to the loader (2026-11-10, runs adsp-3 and
+	 * adsp-5; returns after 90 and 120 s, with the votes of the start still standing, were clean). Not on a panic's
+	 * way out (no lock may be taken there).
+	 */
+	bool voted = false;
+
+	if (!leaving && !rails_asked) {
+		voted = rails(384);
+	}
 	result = scm("to shut the audio DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_ADSP, 0, 0, &answer);
+	if (voted) {
+		rails(0);
+	}
 	if (result != 0 || answer != 0) {
-		printf("adsp: %u: TRUSTZONE DOES NOT SHUT THE AUDIO DSP DOWN: the call returns %d, its answer is %#llx\n", step, result,
-		    answer);
+		tell("adsp: %u: TRUSTZONE DOES NOT SHUT THE AUDIO DSP DOWN: the call returns %d, its answer is %#llx (rails %s)\n", step,
+		    result, answer, voted ? "asked for it" : rails_asked ? "still asked" : "NOT asked");
 		return false;
 	}
-	printf("adsp: %u: THE AUDIO DSP IS SHUT DOWN\n", step);
+	tell("adsp: %u: THE AUDIO DSP IS SHUT DOWN (rails %s)\n", step, voted ? "asked for it" : rails_asked ? "still asked" :
+	    "not asked");
 	need(&ipcc);
 	wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
 	doorbells();

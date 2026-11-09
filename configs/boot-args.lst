@@ -234,6 +234,7 @@ press_power	k
 press_power_ms	k
 privs	k
 rd	kl
+reboot_fastboot	k
 rec_mb	k
 rec_ring	k
 rec_secs	k

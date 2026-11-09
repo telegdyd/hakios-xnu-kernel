@@ -2,7 +2,7 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **365 arguments**: 294 read by the kernel, 15 by the loader, 68 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **366 arguments**: 295 read by the kernel, 15 by the loader, 68 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
@@ -406,7 +406,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 | `usb_net` | KL | `hakios.usb_net.c`, `loader.c` | `CONFIG_USB_NET` |  |
 
-## User space (37)
+## User space (38)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -436,6 +436,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `metal_skip` | U | `HakiosMetalCA.m` | `CONFIG_METAL_SKIP` |  |
 | `metal_trace` | U | `HakiosMetalCA.m` | `CONFIG_METAL_TRACE` |  |
 | `metal_watch` | U | `inject.c` | `CONFIG_METAL_WATCH` |  |
+| `reboot_fastboot` | K | `hakios.platform.c` | `CONFIG_REBOOT_FASTBOOT` |  |
 | `root_apfs` | U | `init.c` | `CONFIG_ROOT_APFS` |  |
 | `sb_delay` | U | `inject_sb.c` |  | xl (XL_SB_DELAY) |
 | `switcher_wallpaper` | U | `inject_sb.c` | `CONFIG_SWITCHER_WALLPAPER` |  |

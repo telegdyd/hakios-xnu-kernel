@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 389 symbols in 18 groups; 36 are set, 27 of them drivers built in.
+# 390 symbols in 18 groups; 36 are set, 27 of them drivers built in.
 #
 
 #
@@ -1129,7 +1129,7 @@ CONFIG_MODEM_AGAIN=y
 # CONFIG_UFS_PROBE is not set
 
 #
-# User space (35)
+# User space (36)
 #
 
 # read by inject_sb.c (user space)
@@ -1209,6 +1209,9 @@ CONFIG_MODEM_AGAIN=y
 
 # read by inject.c (user space)
 # CONFIG_METAL_WATCH is not set
+
+# read by hakios.platform.c (kernel)
+# CONFIG_REBOOT_FASTBOOT is not set
 
 # the root is to be the Darwin root volume on /dev/DEV -- the phone's flash, read only
 # CONFIG_ROOT_APFS is not set

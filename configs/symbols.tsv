@@ -213,6 +213,7 @@ PRESS_POWER	arg	press_power	Touch and buttons	k	hakios.buttons.c	a short press o
 PRESS_POWER_MS	arg	press_power_ms	Touch and buttons	k	hakios.buttons.c	
 PRIVS	arg	privs	Security stand-ins	k	kern_minimac.c	
 RD	arg	rd	CPU, memory and boot	kl	(patch),loader.c	
+REBOOT_FASTBOOT	arg	reboot_fastboot	User space	k	hakios.platform.c	
 REC_MB	arg	rec_mb	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 REC_RING	arg	rec_ring	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 REC_SECS	arg	rec_secs	GPU and display	k	MiniIOMobileFramebuffer.cpp	
