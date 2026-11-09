@@ -1,5 +1,7 @@
 /*
- * The phone's UFS host controller, driven from this kernel -- read only, next to UEFI's driver.
+ * The phone's UFS host controller, driven from this kernel, next to UEFI's driver.
+ * Reads only unless hakios.ufs.c explicitly authorizes the verified data window
+ * with ufs_native_write=1. That mode adds WRITE(10) and SYNCHRONIZE CACHE(10).
  *
  * Reading the storage through the loader (hakios.ufs.c) is one request at a time: Qualcomm's
  * UFSDxe reads synchronously on core 0, and its transfer request list has room for one request
@@ -19,7 +21,8 @@
  * touched; IS and UTRLCNR are only read. UTRLCLR is written only to clear this kernel's own
  * slots when they do not finish at the end.
  *
- * Read only by construction: a command is made in a buffer of its own, and only one that passes
+ * Reads are checked as follows (writes have a separate, disabled-by-default window):
+ * a command is made in a buffer of its own, and only one that passes
  * ufshc_permitted() is ever written into a slot; what the slot then holds is read back and must
  * be the same and pass again before the doorbell is rung. The whitelist checks three things of
  * every command: the SCSI operation (READ(10)/READ(16), TEST UNIT READY, REQUEST SENSE, INQUIRY,
@@ -29,7 +32,7 @@
  * the device), and only those reads are allowed to go to now (ufshc_set_luns: LUN 0, where the
  * Darwin volume is, unless a comparison with the loader's reads asks for more). A read's length in
  * the CDB must be what the UPIU expects. It is tried at the probe on made-up commands that must
- * pass or be refused. This file builds READ(10) and TEST UNIT READY only.
+ * pass or be refused. The read path builds READ(10) and TEST UNIT READY only.
  *
  * Every slot of this list holds a whitelisted command at all times: TEST UNIT READY until it is
  * used for a read. Slot 0 is kept for the proof that the controller does read this list: after
@@ -64,6 +67,7 @@
 #include <vm/vm_kern.h>
 #include <vm/memory_types.h>
 #include "hakios.ufshc.h"
+#include "hakios.ufshc-write.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
@@ -167,6 +171,9 @@ static uint64_t hc_polls, hc_slot_waits, hc_slot_wait_ticks, hc_lock_ticks, hc_f
 
 static LCK_GRP_DECLARE(hc_lck_grp, "hakios-ufshc");
 static LCK_MTX_DECLARE(hc_lock, &hc_lck_grp);
+/* Disabled until native read/write initialization verifies and sets the data window. */
+static struct ufshc_write_window hc_write_window;
+static LCK_MTX_DECLARE(hc_write_lock, &hc_lck_grp);
 
 SYSCTL_DECL(_kern_hakios);
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_native_requests, CTLFLAG_RD | CTLFLAG_LOCKED, &hc_requests,
@@ -313,7 +320,14 @@ hc_refusal(const uint8_t *upiu, uint32_t dw0, uint32_t lun_mask, bool any_comman
 static bool
 ufshc_permitted(const uint8_t *upiu, uint32_t dw0)
 {
-	const char *why = hc_refusal(upiu, dw0, hc_lun_mask, false);
+	const char *why;
+
+	if (upiu[16] == 0x2a || upiu[16] == 0x35) {
+		why = ufshc_write_permitted(&hc_write_window, upiu, dw0) ? NULL :
+		    "native writes disabled, out of the data region, or unsupported encoding";
+	} else {
+		why = hc_refusal(upiu, dw0, hc_lun_mask, false);
+	}
 
 	if (why == NULL) {
 		return true;
@@ -840,6 +854,109 @@ ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len)
 			head++;
 		}
 	}
+	return error;
+}
+
+/*
+ * The caller must have verified darwin's identity and converted ONLY its data
+ * region to absolute LUN-0 LBAs. Initialization only, before device publication;
+ * the window cannot subsequently be widened or replaced. hakios.ufs.c calls
+ * this only for ufs_native_write=1 after checking darwin and mapping its LUN.
+ */
+int
+ufshc_allow_writes(uint64_t first, uint64_t end)
+{
+	struct ufshc_write_window window = { .first = first, .end = end, .enabled = true };
+
+	if (!hc_usable || !hc_in || hc_dead || hc_closed || hc_write_window.enabled || first == 0 ||
+	    !ufshc_write_range(&window, 0, first, 1)) {
+		return EINVAL;
+	}
+	hc_write_window = window;
+	return 0;
+}
+
+/* hc_write_lock orders every WRITE against SYNCHRONIZE CACHE. Reads may overlap. */
+static int
+hc_write_submit(struct hc_slot *s, const struct hc_cmd *c, uint32_t bytes, const char *what)
+{
+	int error = hc_place(s, c, bytes);
+	bool rung = false;
+
+	if (error == 0) {
+		error = hc_ring(s);
+		rung = error == 0;
+	}
+	if (error == 0) {
+		error = hc_complete(s, what, false);
+		if (error == 0) {
+			volatile const uint8_t *r = (volatile const uint8_t *)s->ucd + UCD_RESPONSE;
+
+			/* An under/overrun is not a successful full write, even with GOOD status. */
+			if ((r[1] & 0x60) != 0 || r[12] || r[13] || r[14] || r[15]) {
+				error = EIO;
+			}
+		}
+	}
+	if (error != 0 && rung) {
+		/* Completion/durability is uncertain. Never replay through UEFI. */
+		hc_off();
+	}
+	if (error != ETIMEDOUT) {
+		hc_give(s);
+	}
+	return error;
+}
+
+int
+ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len)
+{
+	int error = 0;
+	uint64_t first = offset / BLOCK, blocks = len / BLOCK;
+
+	/* Validate the complete request before submitting even its first chunk. */
+	if (offset % BLOCK || len % BLOCK || !hc_write_window.enabled || lun != 0 || len == 0 ||
+	    first < hc_write_window.first || first >= hc_write_window.end ||
+	    blocks > hc_write_window.end - first) {
+		return EROFS;
+	}
+	lck_mtx_lock(&hc_write_lock);
+	while (len != 0 && error == 0) {
+		struct hc_slot *s;
+		struct hc_cmd c;
+		uint32_t bytes = (uint32_t)(len < hc_slot_buffer ? len : hc_slot_buffer);
+
+		if (!hc_usable || !hc_in || hc_dead || hc_closed || (s = hc_take(true)) == NULL) {
+			error = EIO;
+			break;
+		}
+		ufshc_write_command(c.upiu, (uint8_t)s->number, (uint32_t)(offset / BLOCK), (uint16_t)(bytes / BLOCK));
+		c.dw0 = UTRD_CT_UFS | UTRD_DD_OUT;
+		memcpy(s->data, src, bytes);
+		FlushPoC_DcacheRegion((vm_offset_t)s->data, bytes);
+		error = hc_write_submit(s, &c, bytes, "native WRITE(10)");
+		offset += bytes;
+		src += bytes;
+		len -= bytes;
+	}
+	lck_mtx_unlock(&hc_write_lock);
+	return error;
+}
+
+int
+ufshc_flush(void)
+{
+	struct hc_slot *s;
+	struct hc_cmd c;
+	int error = EIO;
+
+	lck_mtx_lock(&hc_write_lock);
+	if (hc_write_window.enabled && hc_usable && hc_in && !hc_dead && !hc_closed && (s = hc_take(true)) != NULL) {
+		ufshc_flush_command(c.upiu, (uint8_t)s->number);
+		c.dw0 = UTRD_CT_UFS | UTRD_DD_NONE;
+		error = hc_write_submit(s, &c, 0, "native SYNCHRONIZE CACHE(10)");
+	}
+	lck_mtx_unlock(&hc_write_lock);
 	return error;
 }
 

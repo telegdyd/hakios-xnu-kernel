@@ -300,11 +300,12 @@ ufs_native_hang	k
 ufs_native_leave	k
 ufs_native_slots	k
 ufs_native_spin	k
+ufs_native_write	k
 ufs_probe	l
 ufs_shared_pa	k
 ufs_write	kl
 ui_lite	u
-usb_net	k
+usb_net	kl
 usb_net_ip	k
 ustacks	k
 ustacks_at	k

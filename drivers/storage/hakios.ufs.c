@@ -3,14 +3,18 @@
  * UFS (/dev/ufs_NAME and /dev/rufs_NAME, NAME as the partition table has it). Read only, but for
  * the one place the data of Darwin lives (ufs_write=1, below).
  *
- * There is no UFS driver here, and none is needed. UEFI never exits on this port: Qualcomm's own
+ * With ufs=2 alone, storage is served through the loader. UEFI never exits: Qualcomm's own
  * UFS driver (UFSDxe) has brought up the controller, its PHY, its clocks and power, and stays
  * resident, and xnuloader keeps serving the kernel from core 0 while the kernel runs on another
  * core (it already does for the battery). So with ufs=2 on its command line the loader publishes a
  * page (ufs_shared_pa=) with the table of partitions, a request and an answer, and a buffer; this
  * driver writes a request -- which partition, which blocks -- and core 0 reads them with that
  * driver's ReadBlocks into the buffer (xnuloader/loader.c, block_poll). Nothing in this kernel
- * touches the storage controller.
+ * touches the storage controller on that path. ufs_native=1 uses hakios.ufshc.c
+ * for reads; ufs_native_write=1 additionally enables native writes and cache
+ * flushes and prohibits ALL runtime loader mailbox requests and fallback. The
+ * loader prepares immutable GPT snapshots before entry, which native startup
+ * compares with direct reads. With no bootcpu argument XNU can then own core 0.
  *
  * Read only wherever a write could do harm, by construction. The block devices never write: the
  * strategy routine refuses, so no filesystem mounted from one can write, and opening one for
@@ -66,6 +70,7 @@ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, u
 extern void IOSleep(unsigned int milliseconds);
 extern void loader_return(void);        /* osfmk/arm64/loader_return.c */
 extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm64/caches_asm.s */
+extern boolean_t pmap_valid_address(uint64_t addr);
 
 /* the page the loader publishes: the same layout as struct loader_block in xnuloader/loader.c */
 #define BLOCK_MAGIC        0x4b434f4c42574452ULL       /* "RDWBLOCK" */
@@ -136,6 +141,8 @@ struct loader_block {
 		uint64_t area_pa;
 		uint32_t area_size, ucd_offset, ucd_size, slots;
 		uint32_t uefi_utrlba, uefi_utrlbau;
+		uint64_t gpt_pa;
+		uint32_t gpt_version, gpt_mask;
 	} native __attribute__((aligned(128)));
 	struct {
 		volatile uint32_t take_back;   /* the loader's: it takes the controller back, send nothing more */
@@ -176,6 +183,8 @@ static uint64_t ufs_lun_offset[BLOCK_MAX_PARTS];
 static bool ufs_native_mapped;
 static uint32_t ufs_native_luns;                /* how many units are mapped (LUN 0..n-1) */
 static volatile bool ufs_native_on;
+/* ufs_native_write=1: Native reads, writes and flushes without a loader storage service. */
+static bool ufs_native_required, ufs_native_writes;
 static uint64_t ufs_native_fallbacks, ufs_mailbox_refused;
 
 static LCK_GRP_DECLARE(ufs_lck_grp, "hakios-ufs");
@@ -218,6 +227,7 @@ static int ufs_write_part = -1;
 static volatile bool ufs_write_busy;            /* a write of ours has this kernel's list out: not a failure */
 static bool ufs_write_out, ufs_write_was_native;        /* the list is out for writing, and was in before */
 static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
+static uint64_t ufs_native_flushes;
 
 /* /dev/ufs_darwin_data: the minor number past every partition's, and the block size it is counted in */
 #define UFS_DATA_MINOR     BLOCK_MAX_PARTS
@@ -237,7 +247,11 @@ SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_wait_us, CTLFLAG_RD | CTLFLAG_LOCKED, &u
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_copy_us, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_copy_us,
     "microseconds spent copying out of the loader's buffer");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_writes,
-    "requests written into darwin and read back by the loader");
+    "successful writes into darwin");
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_native_flushes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_native_flushes,
+    "successful synchronous native cache flushes");
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_mailbox_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_mailbox_refused,
+    "loader mailbox operations refused while native storage owns the controller");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_write_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_bytes,
     "bytes written into darwin");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_write_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_write_errors,
@@ -325,6 +339,10 @@ ufs_request(uint32_t op, uint32_t part, uint64_t lba, uint64_t count, uint8_t *d
 
 	if (ufs_dead) {
 		return EIO;
+	}
+	if (ufs_native_required) {
+		ufs_mailbox_refused++;
+		return ENXIO; /* No resident loader service may be required by this mode. */
 	}
 	if (op == BLOCK_OP_READ) {
 		if (part == ufs_last_part && lba == ufs_last_end) {
@@ -449,9 +467,9 @@ hakios_ufs_report(const char *when)
 	    "copying %llu ms\n", when, ufs_requests, ufs_small, ufs_medium, ufs_large, ufs_sequential,
 	    ufs_errors, ufs_bytes, ufs_wait_us / 1000, loader_ns / 1000000, ufs_copy_us / 1000);
 	if (ufs_write_part >= 0 || ufs_writes != 0 || ufs_write_refused != 0) {
-		printf("ufs: %s: %llu writes into darwin, %llu bytes, read back by the loader; %llu did not "
-		    "finish, %llu refused here\n", when, ufs_writes, ufs_write_bytes, ufs_write_errors,
-		    ufs_write_refused);
+		printf("ufs: %s: %llu writes into darwin, %llu bytes (%s); %llu did not "
+		    "finish, %llu refused here; %llu native flushes\n", when, ufs_writes, ufs_write_bytes,
+		    ufs_native_writes ? "native" : "loader", ufs_write_errors, ufs_write_refused, ufs_native_flushes);
 	}
 }
 
@@ -564,6 +582,7 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 	 * a short partition would otherwise be read together with the one that follows it. Written
 	 * without a sum that can wrap.
 	 */
+	if (part >= ufs_parts) return EINVAL;
 	uint64_t part_size = ufs_part_bytes(part);
 
 	if (offset > part_size || len > part_size - offset) {
@@ -574,6 +593,9 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 
 		if (error == 0) {
 			return 0;
+		}
+		if (ufs_native_required) {
+			return error; /* Never transfer controller ownership after a native error. */
 		}
 		if (ufs_write_busy) {
 			/* the list is out for a write of ours, not broken: this read goes the other way */
@@ -587,16 +609,14 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 		}
 		ufs_native_out("a read failed");
 	}
-	return ufs_read_mailbox(part, offset, dst, len);
+	return ufs_native_required ? EIO : ufs_read_mailbox(part, offset, dst, len);
 }
 
 /*
- * Whole blocks [offset, offset + len) of the one partition that takes writes, from src, through
- * the loader. This kernel's own driver never writes -- its whitelist of commands has no write in
- * it -- so for the length of a write its transfer list goes out and UEFI's driver, which the
- * loader calls, has the controller again; reads meanwhile go through the loader too (ufs_read),
- * which is slower and right. Nothing of Darwin waits on this but the writer itself: the data volume
- * is in memory (ramfs) and only its copy for the next boot is written here.
+ * Whole blocks [offset, offset + len) of the writable darwin data region. Native
+ * read/write mode retains the kernel's list and orders flushes with writes;
+ * raw writes additionally flush and compare read-back before returning. The
+ * legacy path temporarily restores UEFI's list and uses the loader mailbox.
  */
 static int
 ufs_write(uint32_t op, uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
@@ -604,6 +624,7 @@ ufs_write(uint32_t op, uint32_t part, uint64_t offset, const uint8_t *src, uint6
 	uint64_t nbs, per;
 	int error = 0;
 
+	if (op != BLOCK_OP_WRITE && op != BLOCK_OP_WRITE_FAST) return EINVAL;
 	if (!ufs_ready || ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
 		ufs_write_refused++;
 		return EROFS;
@@ -620,6 +641,41 @@ ufs_write(uint32_t op, uint32_t part, uint64_t offset, const uint8_t *src, uint6
 	}
 	per = ufs_buffer_size / nbs;
 	lck_mtx_lock(&ufs_write_mtx);
+	if (ufs_native_required) {
+		/* Keep the native list in place for both root reads and data writes.
+		 * Raw writes retain the old durable write-and-read-back contract. */
+		uint64_t at = offset, left = len;
+		const uint8_t *from = src;
+		uint8_t *verify = NULL;
+
+		if (!ufs_native_writes || !ufs_native_on || ufs_lun[part] != 0) {
+			error = EIO;
+		} else if (op == BLOCK_OP_WRITE && (verify = kalloc_data(ufs_buffer_size, Z_WAITOK)) == NULL) {
+			error = ENOMEM;
+		}
+		while (left != 0 && error == 0) {
+			uint64_t bytes = MIN(left, (uint64_t)ufs_buffer_size);
+
+			error = ufshc_write(0, ufs_lun_offset[part] + at, from, bytes);
+			if (error == 0 && op == BLOCK_OP_WRITE) {
+				error = ufshc_flush();
+				if (error == 0) ufs_native_flushes++;
+				if (error == 0) error = ufs_read_native(part, at, verify, bytes);
+				if (error == 0 && memcmp(verify, from, (size_t)bytes) != 0) error = EIO;
+			}
+			if (error == 0) {
+				ufs_writes++;
+				ufs_write_bytes += bytes;
+			}
+			at += bytes;
+			from += bytes;
+			left -= bytes;
+		}
+		if (verify != NULL) kfree_data(verify, ufs_buffer_size);
+		if (error != 0) ufs_write_errors++;
+		lck_mtx_unlock(&ufs_write_mtx);
+		return error;
+	}
 	/*
 	 * The list goes out once, at the first write, and comes back when the device is closed: a
 	 * whole data volume is written a bufferful at a time, and switching the controller's list
@@ -699,13 +755,26 @@ ufs_data_bytes(void)
 static uint32_t
 ufs_data_op(void)
 {
-	return (ufs_page->write_caps & BLOCK_CAN_FAST) ? BLOCK_OP_WRITE_FAST : BLOCK_OP_WRITE;
+	return (ufs_native_writes || (ufs_page->write_caps & BLOCK_CAN_FAST)) ? BLOCK_OP_WRITE_FAST : BLOCK_OP_WRITE;
 }
 
 static int
 ufs_data_flush(void)
 {
 	int error;
+
+	if (ufs_native_required) {
+		/* A sub-block write holds data_mtx while reading its boundary blocks.
+		 * Do not let a journal flush overtake that already-started write. */
+		lck_mtx_lock(&ufs_data_mtx);
+		lck_mtx_lock(&ufs_write_mtx);
+		error = ufs_native_writes && ufs_native_on ? ufshc_flush() : EIO;
+		if (error == 0) ufs_native_flushes++;
+		if (error != 0) ufs_write_errors++;
+		lck_mtx_unlock(&ufs_write_mtx);
+		lck_mtx_unlock(&ufs_data_mtx);
+		return error;
+	}
 
 	if (ufs_data_op() != BLOCK_OP_WRITE_FAST) {
 		return 0;               /* every write was flushed already */
@@ -1120,6 +1189,12 @@ hakios_var_save_on_return(void)
 	uint32_t ms = VAR_SAVE_MS;
 	uint64_t waited = 0;
 
+	/* Still on a schedulable thread: flush acknowledged native writes before
+	 * the other CPUs stop. Panic quiesce cannot take these sleeping locks. */
+	if (ufs_ready && ufs_native_writes && ufs_data_used) {
+		int error = ufs_data_flush();
+		printf("ufs: orderly return: native cache flush %s (%d)\n", error ? "FAILED" : "done", error);
+	}
 	if (!ufs_ready || ufs_write_part < 0 || ufs_var_save != VAR_SAVE_IDLE) {
 		return;
 	}
@@ -1320,11 +1395,42 @@ hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, uint6
  * is the same as block 1 of that LUN read here; no other LUN is read. The loader's reads are made
  * first, with UEFI's list in; then this kernel's list goes in (with its proof) and stays in.
  */
+static int
+ufs_gpt_snapshot(uint32_t unit, uint8_t *dst)
+{
+	uint64_t pa = ufs_page->native.gpt_pa;
+	static vm_offset_t map;
+	uint32_t bytes, wanted, got;
+
+	if (ufs_page->native.gpt_version != 1 || unit >= 8 ||
+	    (ufs_page->native.gpt_mask & (1u << unit)) == 0 || pa == 0 || (pa & 0x1fff) != 0 ||
+	    pa > UINT64_MAX - 8 * 4096 || pmap_valid_address(pa) || pmap_valid_address(pa + 8 * 4096 - 1)) {
+		return ENXIO;
+	}
+	if (map == 0) {
+		vm_offset_t base = ml_io_map_unmappable((vm_offset_t)(pa & ~(UFS_PAGE - 1)),
+		    ((pa & (UFS_PAGE - 1)) + 8 * 4096 + UFS_PAGE - 1) & ~(UFS_PAGE - 1), VM_WIMG_WCOMB);
+		if (base != 0) map = base + (pa & (UFS_PAGE - 1));
+	}
+	if (map == 0) return ENOMEM;
+	memcpy(dst, (const void *)(map + unit * 4096), 4096);
+	/* The immutable loader allocation stays mapped for this run, as does its mailbox page. */
+	if (memcmp(dst, "EFI PART", 8) != 0) return EINVAL;
+	memcpy(&bytes, dst + 12, sizeof(bytes));
+	memcpy(&wanted, dst + 16, sizeof(wanted));
+	if (bytes < 92 || bytes > 4096) return EINVAL;
+	memset(dst + 16, 0, 4);
+	got = crc32(0, dst, bytes);
+	memcpy(dst + 16, &wanted, sizeof(wanted));
+	return got == wanted ? 0 : EINVAL;
+}
+
 static bool
 ufs_native_map(bool all_units)
 {
 	uint8_t *mine = kalloc_data(4096, Z_WAITOK), *theirs = kalloc_data(BLOCK_MAX_UNITS * 4096, Z_WAITOK);
 	uint32_t units[BLOCK_MAX_UNITS], n = 0, mask = 0, darwin = ufs_entry("darwin");
+	uint64_t unit_blocks[8] = { 0 };
 	bool good = mine != NULL && theirs != NULL;
 
 	memset(ufs_lun, 0xff, sizeof(ufs_lun));
@@ -1337,17 +1443,22 @@ ufs_native_map(bool all_units)
 		if (!all_units && (darwin == BLOCK_MAX_PARTS || ufs_page->part[darwin].unit != e->unit)) {
 			continue;
 		}
-		if (e->block_size != 4096 || ufs_read_mailbox(i, 4096, theirs + n * 4096, 4096) != 0 ||
+		int snapshot = ufs_gpt_snapshot(e->unit, theirs + n * 4096);
+		if (snapshot != 0 && !ufs_native_required) {
+			snapshot = ufs_read_mailbox(i, 4096, theirs + n * 4096, 4096);
+		}
+		if (e->block_size != 4096 || snapshot != 0 ||
 		    memcmp(theirs + n * 4096, "EFI PART", 8) != 0) {
 			printf("ufs: native: %s: no GPT header to know it by (block size %u)\n", e->name, e->block_size);
 			good = false;
 			break;
 		}
 		units[n++] = i;
+		unit_blocks[e->unit] = e->blocks;
 		mask |= 1u << e->unit;
 		ufs_native_luns = n;
 	}
-	if (good && !all_units && (n != 1 || ufs_page->part[units[0]].unit != 0)) {
+	if (good && (n == 0 || (!all_units && (n != 1 || ufs_page->part[units[0]].unit != 0)))) {
 		printf("ufs: native: darwin is not on the first unit the loader lists: not LUN 0, not read here\n");
 		good = false;
 	}
@@ -1373,10 +1484,19 @@ ufs_native_map(bool all_units)
 			volatile struct loader_block_part *e = &ufs_page->part[i];
 
 			if (e->unit < 8 && (mask & (1u << e->unit)) && e->block_size == 4096) {
+				if (e->start_lba > unit_blocks[e->unit] || e->blocks > unit_blocks[e->unit] - e->start_lba ||
+				    e->start_lba > UINT64_MAX / 4096 || e->blocks > UINT64_MAX / 4096) {
+					good = false;
+					break;
+				}
 				ufs_lun[i] = (uint8_t)e->unit;
 				ufs_lun_offset[i] = e->start_lba * 4096;
 			}
 		}
+	}
+	if (!good) {
+		ufs_native_out("invalid native partition bounds");
+		memset(ufs_lun, 0xff, sizeof(ufs_lun));
 	}
 	if (mine != NULL) {
 		kfree_data(mine, 4096);
@@ -1688,6 +1808,10 @@ ufs_sysctl_native(__unused struct sysctl_oid *oidp, __unused void *arg1, __unuse
 	if (error != 0 || !changed) {
 		return error;
 	}
+	if (ufs_native_required) {
+		/* This run has no loader storage service to switch to. No ownership changes. */
+		return value == 1 && ufs_native_on ? 0 : EBUSY;
+	}
 	if (value != 0) {
 		if (!(ufs_native_mapped && ufshc_available()) || ufs_native_in(true) != 0) {
 			return ENXIO;
@@ -1712,6 +1836,10 @@ hakios_ufs_init(void)
 	uint64_t pa = 0, buffer_pa;
 	uint32_t check = 0, made = 0;
 	vm_offset_t base;
+
+	PE_parse_boot_argn("ufs_native_write", &check, sizeof(check));
+	ufs_native_required = check == 1;
+	check = 0;
 
 	if (!PE_parse_boot_argn("ufs_shared_pa", &pa, sizeof(pa)) || pa == 0) {
 		return;                 /* the loader was not asked for ufs=2: there is nothing to read through */
@@ -1834,6 +1962,9 @@ hakios_ufs_init(void)
 		uint32_t mode = check, compare = 0;
 
 		PE_parse_boot_argn("ufs_native_check", &compare, sizeof(compare));
+		if (ufs_native_required && (mode != 1 || compare != 0)) {
+			panic("ufs_native_write requires ufs_native=1 and no mailbox comparison");
+		}
 		if (!ufshc_probe(&offer, mode == 2)) {
 			if (mode != 2) {
 				printf("ufs: this kernel's own UFS driver is not used: through the loader\n");
@@ -1856,6 +1987,23 @@ hakios_ufs_init(void)
 				loader_return();
 			}
 			ufs_native_on = true;
+			if (ufs_native_required) {
+				uint32_t part = (uint32_t)ufs_write_part;
+				uint64_t first, blocks;
+
+				if (ufs_write_part < 0 || part >= ufs_parts || ufs_lun[part] != 0) {
+					panic("native UFS writes: no verified writable darwin on LUN 0");
+				}
+				first = ufs_page->part[part].start_lba;
+				blocks = ufs_page->part[part].blocks;
+				if (first > 0xffffffffULL || blocks > 0x100000000ULL - first ||
+				    ufshc_allow_writes(first + UFS_WRITE_FIRST, first + blocks) != 0) {
+					panic("native UFS writes: invalid data window");
+				}
+				ufs_native_writes = true;
+				printf("ufs: native reads, writes and flushes; NO loader mailbox/fallback; data LBA %llu..%llu\n",
+				    first + UFS_WRITE_FIRST, first + blocks - 1);
+			}
 			compare = 0;
 			if (PE_parse_boot_argn("ufs_native_bench", &compare, sizeof(compare)) && compare != 0) {
 				ufs_native_bench();
@@ -1869,6 +2017,9 @@ hakios_ufs_init(void)
 		}
 	}
 
+	if (ufs_native_required && !ufs_native_writes) {
+		panic("native UFS read/write mode requested but initialization failed");
+	}
 	if (PE_parse_boot_argn("ufs_bench", &check, sizeof(check)) && check != 0) {
 		/* right here, in bsd_init's thread, and then back to the loader: nothing else is wanted */
 		ufs_bench(NULL, THREAD_AWAKENED);

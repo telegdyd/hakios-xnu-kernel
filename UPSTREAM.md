@@ -85,3 +85,14 @@
 - `tools/mkdatavol.py`: `--blocks N` for a darwin of another size than the
   first phone's (the volume must end where darwin does), and `--runs DIR` for
   the written stretches as raw files, for writing darwin from Android.
+- Native UFS read/write mode (`ufs_native=1 ufs_native_write=1 ufs_write=1`):
+  WRITE(10) is bounded to the loader-verified LUN-0 darwin data region, and
+  SYNCHRONIZE CACHE(10) is ordered with writes. Raw writes flush/read back;
+  HFS journal flushes go directly to the controller. Errors never replay
+  through the loader in this mode. It is opt-in for other device configs.
+- `xnuloader/loader.c`: immutable, versioned GPT-header snapshots occupy a
+  compatible extension of the native storage offer. Startup compares native
+  reads with these snapshots instead of asking a resident loader core. XNU
+  can boot on core 0 (no bootcpu argument), bringing all eight negroni cores
+  online. The loader remains in memory for return, but runs on no core while
+  XNU owns the device. See `docs/negroni-native-ufs.md` for validation.

@@ -18,6 +18,7 @@ input    bsd/dev/hakios.virtio_input.c
 storage  bsd/dev/hakios.ufs.c
 storage  bsd/dev/hakios.ufshc.c
 storage  bsd/dev/hakios.ufshc.h
+storage  bsd/dev/hakios.ufshc-write.h
 storage  bsd/dev/hakios.sparse.c
 storage  bsd/dev/hakios.image.c
 storage  bsd/dev/hakios.apfs_check.c

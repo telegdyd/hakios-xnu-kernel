@@ -1655,6 +1655,9 @@ struct loader_block {
 		uint64_t area_pa;              /* the list (1 KB, at the start) and command descriptors */
 		uint32_t area_size, ucd_offset, ucd_size, slots;
 		uint32_t uefi_utrlba, uefi_utrlbau;
+		/* Versioned GPT snapshots: avoid runtime mailbox reads during native startup. */
+		uint64_t gpt_pa;
+		uint32_t gpt_version, gpt_mask;
 	} native __attribute__((aligned(128)));
 	/* written by the loader during a run: it takes the controller back (a hung kernel); send nothing more */
 	struct {
@@ -1680,6 +1683,7 @@ static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
+static uint8_t block_gpt[8][4096] __attribute__((aligned(0x2000)));
 
 /* the bytes of a device path before its end node */
 static uint64_t
@@ -2064,6 +2068,24 @@ block_start(void)
 		block_bios[block_shared.parts++] = units[u].bio;
 	}
 	/* the kernel's own transfer list: this loader's area, if the controller is as UEFI keeps it */
+	/* Read these BEFORE XNU owns the controller, including when XNU will run on core 0.
+	 * The last UEFI command remains a read, as the native list proof requires. */
+	if (hc_requested) {
+		memset(block_gpt, 0, sizeof(block_gpt));
+		for (uint64_t u = 0; u < nunits && u < 8; u++) {
+			efi_block_io *bio = units[u].bio;
+
+			if (bio->media->block_size == 4096 && bio->media->last_block >= 1 &&
+			    !EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, 4096, block_buffer)) &&
+			    memcmp(block_buffer, "EFI PART", 8) == 0) {
+				memcpy(block_gpt[u], block_buffer, 4096);
+				block_shared.native.gpt_mask |= 1u << u;
+			}
+		}
+		clean_dcache((uint64_t)(uintptr_t)block_gpt, (uint64_t)(uintptr_t)block_gpt + sizeof(block_gpt));
+		block_shared.native.gpt_pa = (uint64_t)(uintptr_t)block_gpt;
+		block_shared.native.gpt_version = 1;
+	}
 	if (hc_known && hc_list_is_uefis() && hc_rd(HC_UTRLDBR) == 0 && (hc_rd(HC_HCE) & 1)) {
 		memset(hc_area, 0, sizeof(hc_area));
 		flush_dcache((uint64_t)(uintptr_t)hc_area, (uint64_t)(uintptr_t)hc_area + sizeof(hc_area));

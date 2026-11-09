@@ -26,6 +26,10 @@ int ufshc_switch_in(bool prove);
 int ufshc_switch_out(const char *why);
 bool ufshc_list_in(void);
 int ufshc_read(uint8_t lun, uint64_t offset, uint8_t *dst, uint64_t len);
+/* ufs_native_write=1: caller verifies darwin before authorizing its data window. */
+int ufshc_allow_writes(uint64_t first, uint64_t end);
+int ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len);
+int ufshc_flush(void);
 void ufshc_report(const char *when);
 void hakios_ufs_quiesce(void);
 

@@ -271,6 +271,7 @@ UFS_NATIVE_HANG	arg	ufs_native_hang	Storage and APFS	k	hakios.ufshc.c
 UFS_NATIVE_LEAVE	arg	ufs_native_leave	Storage and APFS	k	hakios.ufshc.c	
 UFS_NATIVE_SLOTS	arg	ufs_native_slots	Storage and APFS	k	hakios.ufshc.c	
 UFS_NATIVE_SPIN	arg	ufs_native_spin	Storage and APFS	k	hakios.ufshc.c	
+UFS_NATIVE_WRITE	arg	ufs_native_write	Storage and APFS	k	hakios.ufs.c	Native reads, writes and flushes without a loader storage service
 UFS_PROBE	arg	ufs_probe	Loader	l	loader.c	
 UI_LITE	arg	ui_lite	User space	u	inject_sb.c	the system's own "Reduce Transparency" and "Reduce Motion" (Settings, Accessibility), for this
 USB_NET_IP	arg	usb_net_ip	User space	k	hakios.usb_net.c	
