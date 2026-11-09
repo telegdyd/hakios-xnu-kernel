@@ -59,6 +59,7 @@ extern void hakios_torch_quiesce(void);
 extern void hakios_camera_quiesce(void);
 extern void hakios_mic_quiesce(void);
 extern void hakios_ufs_quiesce(void);
+extern void hakios_usb_net_quiesce(void);      /* drivers/net/hakios.usb_net.c: the USB controller, if the kernel took it */
 extern void hakios_var_save_on_return(void);   /* drivers/storage/hakios.ufs.c: the data volume into the flash */
 void loader_checkpoint(uint64_t n);
 
@@ -71,6 +72,7 @@ static bool     loader_return_entered;
 static uint64_t loader_l1[512] __attribute__((aligned(4096)));
 static uint64_t loader_l2[512] __attribute__((aligned(4096)));
 
+static uint64_t loader_log_total;        /* characters ever put in: the live log's positions (loader_log_copy) */
 static uint32_t loader_log_ring_at;      /* where the next character goes in the ring */
 static bool     loader_log_wrapped;
 static bool     loader_log_linear;       /* the pieces have been put in order: only appending from now on */
@@ -138,6 +140,7 @@ loader_log_line(const char *line)
 static void
 loader_log_put_locked(char c)
 {
+	loader_log_total++;
 	if (loader_log_linear || loader_log_len < LOADER_LOG_HEAD) {
 		if (loader_log_len < LOADER_LOG_SIZE) {
 			loader_log[loader_log_len++] = c;
@@ -152,6 +155,35 @@ loader_log_put_locked(char c)
 			loader_log_len = LOADER_LOG_HEAD + loader_log_ring_at;
 		}
 	}
+}
+
+/*
+ * The live log (drivers/net/hakios.usb_net.c, TCP 5140): characters from *pos on, at most max, *pos moved on.
+ * Positions count every character ever put in: the head (the first LOADER_LOG_HEAD) stays as it is, the ring
+ * keeps the last LOADER_LOG_RING of the rest; a reader that fell further behind than the ring (less a margin
+ * for the writer) skips ahead. No lock: a character torn by a writer on another processor is the worst that
+ * can happen, and the reader must never wait for one.
+ */
+uint32_t loader_log_copy(uint64_t *pos, char *out, uint32_t max);
+
+uint32_t
+loader_log_copy(uint64_t *pos, char *out, uint32_t max)
+{
+	uint64_t total = os_atomic_load(&loader_log_total, relaxed);
+	uint32_t n = 0;
+
+	if (loader_log_linear) {
+		return 0;               /* (the run is ending: the pieces are being put in order) */
+	}
+	if (*pos >= LOADER_LOG_HEAD && total > *pos && total - *pos > LOADER_LOG_RING - 65536) {
+		*pos = total - (LOADER_LOG_RING - 65536);
+	}
+	while (n < max && *pos < total) {
+		out[n++] = *pos < LOADER_LOG_HEAD ? loader_log[*pos] :
+		    loader_log[LOADER_LOG_HEAD + (*pos - LOADER_LOG_HEAD) % LOADER_LOG_RING];
+		(*pos)++;
+	}
+	return n;
 }
 
 /* Oldest first: the head, a note about what was dropped, then the ring from its oldest character. */
@@ -378,6 +410,7 @@ loader_return(void)
 	 */
 	psci_smp_stop_others();
 #endif
+	hakios_usb_net_quiesce();       /* the USB controller stopped, if usb_net=1 took it from the loader's UEFI */
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */

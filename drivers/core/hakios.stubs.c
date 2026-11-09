@@ -100,6 +100,11 @@ void hakios_mpss_stop(void) {}
 void hakios_mpss_quiesce(void) {}
 #endif
 
+#ifndef HAKIOS_USB_NET
+void hakios_usb_net_init(void) {}
+void hakios_usb_net_quiesce(void) {}
+#endif
+
 #ifndef HAKIOS_VIRTIO_NET
 void hakios_virtio_net_init(void) {}
 #endif

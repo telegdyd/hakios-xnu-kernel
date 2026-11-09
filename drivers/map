@@ -57,6 +57,7 @@ modem    bsd/dev/hakios.nas.c
 modem    bsd/dev/hakios.ipa.c
 
 net      bsd/dev/hakios.net.c
+net      bsd/dev/hakios.usb_net.c
 net      bsd/dev/hakios.virtio_net.c
 
 core     bsd/dev/hakios.version.c

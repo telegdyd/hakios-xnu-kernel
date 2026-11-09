@@ -71,6 +71,7 @@ SYMBOLS = [
     ("NET_TRACE", "int", "net_trace", "a log line for each of the first N frames on the network interfaces", None, None),
     ("NET_NAMES", "bool", "net_names", "a log line for every name asked of a DNS server and every TCP connection begun "
                                         "(the names go to the log: for debugging only)", None, None),
+    ("USB_NET", "bool", "usb_net", "the phone's USB cable as a network adapter (en2) and the kernel log on TCP 5140", None, None),
     ("VIRTIO_NET", "bool", "virtio_net", "QEMU's virtio network device as en0 (QEMU only; its bus address means nothing on a phone)", None, None),
     ("SOCINFO", "bool", "socinfo", "read the chip's identity from the firmware's shared memory: kern.hakios.soc_* (SoC number, revision, board)", None, None),
     ("THERMAL", "bool", "thermal", "read the SoC's 27 temperature sensors: kern.hakios.thermal_* and a line in the log; read only", None, None),
@@ -95,7 +96,7 @@ GROUP_OF = {
     "ADSP": "Audio and battery", "SOUND": "Audio and battery", "MIC": "Audio and battery",
     "WIFI": "Wi-Fi", "HAPTIC": "Haptics and torch", "CAM": "Cameras",
     "MODEM": "Cellular", "MODEM_AGAIN": "Cellular", "MODEM_BUFFER": "Cellular",
-    "NET_TRACE": "Network", "NET_NAMES": "Network", "VIRTIO_NET": "Network",
+    "NET_TRACE": "Network", "NET_NAMES": "Network", "VIRTIO_NET": "Network", "USB_NET": "Network",
     "BATTERY_STOP": "Audio and battery", "BATTERY_STOP_POLL": "Audio and battery", "SOCINFO": "Chip, thermal and PMIC", "THERMAL": "Chip, thermal and PMIC", "THERMAL_POLL": "Chip, thermal and PMIC",
     "THERMAL_STOP": "Chip, thermal and PMIC", "PMIC": "Chip, thermal and PMIC", "BOOTARGS": "Extra arguments",
 }

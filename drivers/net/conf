@@ -5,6 +5,10 @@
 standard bsd/dev/hakios.net.c
 	help    en0, an interface that is Ethernet to the rest of the kernel, for whatever link carries its frames
 
+driver USB_NET
+	file    bsd/dev/hakios.usb_net.c
+	help    the phone's USB cable as en2 (a CDC-NCM function on the DWC3 controller) and the kernel log on TCP 5140 (usb_net=1)
+
 driver VIRTIO_NET
 	file    bsd/dev/hakios.virtio_net.c
 	help    QEMU's virtio network device as the link behind en0 (virtio_net=1). QEMU only
