@@ -44,6 +44,8 @@
  *   thermal_poll=<ms>  how often (200 to 60000; 2000)
  *   thermal_log=<s>    a summary line this often (0: only on a rise; 60)
  *   thermal_stop=<C>   stop the run at this temperature (0: never; 105)
+ *   thermal_slow=<C>   lower the CPU cap at this temperature (with cpufreq=1; 0: never; 85)
+ *   thermal_soc=8450   the OnePlus 10 Pro's (SM8450) sensor table instead of the reference phone's
  *   thermal_tm0=<pa>, thermal_tm1=<pa>  the two blocks' readings, when this is not the reference phone
  *                      (0xc263000 and 0xc265000)
  */
@@ -91,13 +93,14 @@ say(const char *format, ...)
 #define TEMP_MAX_TENTHS         1600
 
 /* made by tools/dt-thermal.py from the phone's device tree: name, block, sensor, slow down at, gives up at (millidegrees) */
-static const struct sensor_info {
+struct sensor_info {
 	const char *    name;
 	uint32_t        tm;
 	uint32_t        number;
 	int32_t         slow_mc;
 	int32_t         limit_mc;
-} sensors[] = {
+};
+static const struct sensor_info sensors_sc7280[] = {
 	{ "aoss-0", 0xc263000, 0, 115000, 125000 },
 	{ "cpu-0-0", 0xc263000, 1, 110000, 125000 },
 	{ "cpu-0-1", 0xc263000, 2, 110000, 125000 },
@@ -126,13 +129,66 @@ static const struct sensor_info {
 	{ "mdmss-3", 0xc265000, 10, 95000, 125000 },
 	{ "camera-0", 0xc265000, 11, 100000, 125000 },
 };
-#define NSENSORS        ((unsigned)(sizeof(sensors) / sizeof(sensors[0])))
+/* boot-arg thermal_soc=8450: the OnePlus 10 Pro's (SM8450) own tree, the same way (16 sensors in each block) */
+static const struct sensor_info sensors_sm8450[] = {
+	{ "aoss-0", 0xc263000, 0, 115000, 125000 },
+	{ "cpuss-0", 0xc263000, 1, 115000, 125000 },
+	{ "cpuss-1", 0xc263000, 2, 115000, 125000 },
+	{ "cpuss-2", 0xc263000, 3, 115000, 125000 },
+	{ "cpuss-3", 0xc263000, 4, 115000, 125000 },
+	{ "cpu-1-0", 0xc263000, 5, 110000, 125000 },
+	{ "cpu-1-1", 0xc263000, 6, 110000, 125000 },
+	{ "cpu-1-2", 0xc263000, 7, 110000, 125000 },
+	{ "cpu-1-3", 0xc263000, 8, 110000, 125000 },
+	{ "cpu-1-4", 0xc263000, 9, 110000, 125000 },
+	{ "cpu-1-5", 0xc263000, 10, 110000, 125000 },
+	{ "cpu-1-6", 0xc263000, 11, 110000, 125000 },
+	{ "cpu-1-7", 0xc263000, 12, 110000, 125000 },
+	{ "cpu-1-8", 0xc263000, 13, 110000, 125000 },
+	{ "gpuss-0", 0xc263000, 14, 95000, 125000 },
+	{ "gpuss-1", 0xc263000, 15, 95000, 125000 },
+	{ "aoss-1", 0xc265000, 0, 115000, 125000 },
+	{ "cpu-0-0", 0xc265000, 1, 110000, 125000 },
+	{ "cpu-0-1", 0xc265000, 2, 110000, 125000 },
+	{ "cpu-0-2", 0xc265000, 3, 110000, 125000 },
+	{ "cpu-0-3", 0xc265000, 4, 110000, 125000 },
+	{ "nspss-0", 0xc265000, 5, 95000, 125000 },
+	{ "nspss-1", 0xc265000, 6, 95000, 125000 },
+	{ "nspss-2", 0xc265000, 7, 95000, 125000 },
+	{ "video", 0xc265000, 8, 115000, 125000 },
+	{ "ddr", 0xc265000, 9, 90000, 125000 },
+	{ "mdmss-0", 0xc265000, 10, 102000, 125000 },
+	{ "mdmss-1", 0xc265000, 11, 102000, 125000 },
+	{ "mdmss-2", 0xc265000, 12, 102000, 125000 },
+	{ "mdmss-3", 0xc265000, 13, 102000, 125000 },
+	{ "camera-0", 0xc265000, 14, 115000, 125000 },
+	{ "camera-1", 0xc265000, 15, 115000, 125000 },
+};
+#define MAX_SENSORS     32
+_Static_assert(sizeof(sensors_sc7280) / sizeof(sensors_sc7280[0]) <= MAX_SENSORS, "sensor table");
+_Static_assert(sizeof(sensors_sm8450) / sizeof(sensors_sm8450[0]) <= MAX_SENSORS, "sensor table");
+static const struct sensor_info *sensors = sensors_sc7280;
+static unsigned nsensors = sizeof(sensors_sc7280) / sizeof(sensors_sc7280[0]);
+#define NSENSORS        nsensors
 #define REFERENCE_TM0   0xc263000u
 #define REFERENCE_TM1   0xc265000u
 
+/*
+ * The CPU cap (with hakios.cpufreq.c's cpufreq=1): when the hottest sensor reaches thermal_slow degrees (default 85,
+ * well below the vendor's 110), every 10 s one step down this ladder; once it is 10 degrees below that, one step up
+ * again every 10 s. thermal_slow=0: no cap. (iOSPlus10 0280 does the same at 70/60 C with 2400/1800/1400.)
+ */
+static const uint32_t cap_ladder_mhz[] = { 0, 2400, 1800, 1400, 1000 };
+#define CAP_STEPS       ((unsigned)(sizeof(cap_ladder_mhz) / sizeof(cap_ladder_mhz[0])))
+extern void hakios_cpufreq_cap(uint32_t mhz);
+extern const char *hakios_cpufreq_line(void);
+static uint32_t slow_celsius = 85;
+static unsigned cap_step;
+static uint64_t cap_changed;
+
 static vm_offset_t tm_va[2];
 static uint32_t tm_pa[2] = { REFERENCE_TM0, REFERENCE_TM1 };
-static int32_t tenths[NSENSORS];                /* the last good reading; INT32_MIN: none yet */
+static int32_t tenths[MAX_SENSORS];             /* the last good reading; INT32_MIN: none yet */
 static uint32_t poll_ms = 2000, log_seconds = 60, stop_celsius = 105;
 static uint64_t last_log, reads;
 static int strikes, last_step;
@@ -140,7 +196,7 @@ static bool stopping;
 
 static int thermal_max_mc = -273000;
 static char thermal_hottest[16] = "";
-static char thermal_list[NSENSORS * 16 + 8];
+static char thermal_list[MAX_SENSORS * 16 + 8];
 static int thermal_reads_value;
 
 SYSCTL_INT(_kern_hakios, OID_AUTO, thermal_max_mc, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_max_mc, 0,
@@ -212,10 +268,33 @@ look(void)
 	seconds /= NSEC_PER_SEC;
 	if (step > last_step || last_log == 0 || (log_seconds != 0 && seconds >= log_seconds)) {
 		text_of(one, sizeof(one), hottest);
-		say("thermal: %u of %u sensors read; hottest %s at %s C; %s\n", good, NSENSORS, sensors[hot].name, one, thermal_list);
+		say("thermal: %u of %u sensors read; hottest %s at %s C; cpu %s; %s\n", good, NSENSORS, sensors[hot].name, one,
+		    hakios_cpufreq_line(), thermal_list);
 		last_log = now;
 	}
 	last_step = step;
+
+	if (slow_celsius != 0) {
+		uint64_t since;
+
+		absolutetime_to_nanoseconds(now - cap_changed, &since);
+		if (cap_changed == 0 || since >= 10 * NSEC_PER_SEC) {
+			unsigned want = cap_step;
+
+			if (hottest >= (int32_t)slow_celsius * 10 && cap_step + 1 < CAP_STEPS) {
+				want = cap_step + 1;
+			} else if (hottest < ((int32_t)slow_celsius - 10) * 10 && cap_step > 0) {
+				want = cap_step - 1;
+			}
+			if (want != cap_step) {
+				cap_step = want;
+				cap_changed = now;
+				text_of(one, sizeof(one), hottest);
+				say("thermal: %s at %s C: CPU cap %u MHz (0: none)\n", sensors[hot].name, one, cap_ladder_mhz[cap_step]);
+				hakios_cpufreq_cap(cap_ladder_mhz[cap_step]);
+			}
+		}
+	}
 
 	if (stop_celsius != 0 && hottest >= (int32_t)stop_celsius * 10) {
 		strikes++;
@@ -254,6 +333,13 @@ thermal_init(void)
 	if (!PE_parse_boot_argn("thermal", &enabled, sizeof(enabled)) || !enabled) {
 		return;
 	}
+	if (PE_parse_boot_argn("thermal_soc", &value, sizeof(value)) && value == 8450) {
+		sensors = sensors_sm8450;
+		nsensors = sizeof(sensors_sm8450) / sizeof(sensors_sm8450[0]);
+	}
+	if (PE_parse_boot_argn("thermal_slow", &value, sizeof(value)) && value <= 160) {
+		slow_celsius = value;
+	}
 	for (unsigned i = 0; i < NSENSORS; i++) {
 		tenths[i] = INT32_MIN;
 	}
@@ -275,8 +361,8 @@ thermal_init(void)
 			return;
 		}
 	}
-	say("thermal: %u sensors in two blocks (%#x, %#x), every %u ms; stop at %u C%s\n", NSENSORS, tm_pa[0], tm_pa[1], poll_ms,
-	    stop_celsius, stop_celsius ? "" : " (off)");
+	say("thermal: %u sensors in two blocks (%#x, %#x), every %u ms; CPU cap from %u C; stop at %u C%s\n", NSENSORS, tm_pa[0],
+	    tm_pa[1], poll_ms, slow_celsius, stop_celsius, stop_celsius ? "" : " (off)");
 	call = thread_call_allocate(tick, NULL);
 	tick(NULL, NULL);
 }

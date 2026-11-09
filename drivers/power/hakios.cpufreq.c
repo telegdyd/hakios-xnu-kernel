@@ -10,6 +10,11 @@
  * says more).
  *
  * Register layout: Linux drivers/cpufreq/qcom-cpufreq-hw.c ("epss" variant).
+ *
+ * Elsewhere (boot-arg cpufreq_epss=<pa>, the OnePlus 10 Pro's 0x17d91000): the same, and a cap the thermal
+ * driver lowers when the phone gets hot (hakios_cpufreq_cap(); never below the row the firmware left), and
+ * sysctl kern.hakios.cpufreq ("d0 1785/1785 d1 2496/2496 d2 2995/2995 cap 0": asked / allowed by the hardware).
+ * The firmware's own limits (LMh) act in the hardware whatever is asked; the second number shows them.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -19,6 +24,7 @@
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 
@@ -57,11 +63,62 @@ tell(const char *format, ...)
 #define EPSS_PHYS               0x18591000UL    /* three groups ("domains") of 0x1000: small cores, big, biggest */
 #define EPSS_DOMAIN_SIZE        0x1000UL
 #define EPSS_DOMAINS            3
+#define EPSS_DOMAIN_STATE       0x20            /* [7:0]: the multiple of 19.2 MHz the hardware allows now (LMh's limit) */
 #define EPSS_FREQ_TABLE         0x100           /* a word per row: [31:30] clock source, [7:0] multiple of 19.2 MHz */
 #define EPSS_TABLE_ROWS         40
 #define EPSS_PERF_STATE         0x320           /* the row that is wanted */
 #define XO_KHZ                  19200
 #define ALTERNATE_KHZ           300000          /* source 0: a fixed 300 MHz */
+
+/*
+ * Boot-arg cpufreq_epss=<pa>: the first domain's registers, when this is not the reference phone (the OnePlus 10 Pro,
+ * SM8450: 0x17d91000, dt qcom,cpufreq-hw). The memory vote below (ddr=) has the reference phone's addresses and is
+ * only made there unless ddr= asks for it.
+ */
+static vm_offset_t epss_phys = EPSS_PHYS;
+
+/* What was found and done per domain: its table, the row the firmware left, the top row, the row asked for now. */
+static struct {
+	vm_offset_t     base;
+	uint32_t        rows, khz[EPSS_TABLE_ROWS];
+	uint32_t        firmware_row, top_row, row;
+	bool            ours;
+} dom[EPSS_DOMAINS];
+static uint32_t cap_khz;                        /* 0: none; hakios_cpufreq_cap() */
+static char cpufreq_line[160];
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cpufreq, CTLFLAG_RD | CTLFLAG_LOCKED, cpufreq_line, 0,
+    "per domain of cores: the MHz asked for, and the MHz the hardware allows (lmh): \"d0 1785/1785 d1 ...\"; cap");
+
+static uint32_t
+row_khz(uint32_t entry)
+{
+	return (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
+}
+
+/* The sysctl's line, read from the hardware: what was asked, what LMh allows now. */
+static void
+cpufreq_describe(void)
+{
+	int at = 0;
+
+	cpufreq_line[0] = 0;
+	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		if (!dom[d].ours) {
+			continue;
+		}
+		uint32_t asked = *(volatile uint32_t *)(dom[d].base + EPSS_PERF_STATE);
+		uint32_t lmh = (*(volatile uint32_t *)(dom[d].base + EPSS_DOMAIN_STATE) & 0xff) * XO_KHZ;
+
+		at += snprintf(cpufreq_line + at, sizeof(cpufreq_line) - at, "d%u %u/%u ", d,
+		    asked < dom[d].rows ? dom[d].khz[asked] / 1000 : 0, lmh / 1000);
+		if (at >= (int)sizeof(cpufreq_line) - 1) {
+			return;
+		}
+	}
+	snprintf(cpufreq_line + at, sizeof(cpufreq_line) - at, "cap %u", cap_khz / 1000);
+}
 
 /* How fast a simple loop runs, in thousands of iterations per millisecond. */
 static uint32_t
@@ -86,28 +143,89 @@ domain_of(uint32_t phys_id)
 	return core < 4 ? 0 : core < 7 ? 1 : 2;
 }
 
+/* The highest row not above the cap, and never below the row the firmware left (a known-good one). */
+static uint32_t
+row_for_cap(uint32_t d)
+{
+	uint32_t row = dom[d].top_row;
+
+	while (cap_khz != 0 && row > dom[d].firmware_row && dom[d].khz[row] > cap_khz) {
+		row--;
+	}
+	return row;
+}
+
 static void
 raise_domain(uint32_t domain, uint32_t cores)
 {
-	uint32_t top = 0, top_khz = 0, was;
+	uint32_t top = 0, top_khz = 0, was, at = 0;
+	char table[200];
 	vm_offset_t base;
 
-	base = ml_io_map(EPSS_PHYS + domain * EPSS_DOMAIN_SIZE, EPSS_DOMAIN_SIZE);
+	base = ml_io_map(epss_phys + domain * EPSS_DOMAIN_SIZE, EPSS_DOMAIN_SIZE);
+	table[0] = 0;
 	for (uint32_t row = 0; row < EPSS_TABLE_ROWS; row++) {
-		uint32_t entry = *(volatile uint32_t *)(base + EPSS_FREQ_TABLE + 4 * row);
-		uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
+		uint32_t khz = row_khz(*(volatile uint32_t *)(base + EPSS_FREQ_TABLE + 4 * row));
 
 		if (row > 0 && khz <= top_khz) {
 			break;                  /* the table ends by repeating its last row */
 		}
+		dom[domain].khz[row] = khz;
 		top = row;
 		top_khz = khz;
+		if (at < sizeof(table) - 8) {
+			at += snprintf(table + at, sizeof(table) - at, " %u", khz / 1000);
+		}
 	}
 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
-	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
+	dom[domain].base = base;
+	dom[domain].rows = top + 1;
+	dom[domain].top_row = top;
+	dom[domain].firmware_row = was <= top ? was : top;
+	dom[domain].ours = true;
+	dom[domain].row = row_for_cap(domain);
+	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = dom[domain].row;
 	delay_for_interval(20, NSEC_PER_MSEC);
-	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz\n", domain, cores, was, top,
-	    top_khz / 1000);
+	tell("cpufreq: group %u (%u of our cores): table (MHz):%s\n", domain, cores, table);
+	tell("cpufreq: group %u: row %u (%u MHz, the firmware's) -> %u, %u MHz; the hardware allows %u MHz\n", domain, was,
+	    was <= top ? dom[domain].khz[was] / 1000 : 0, dom[domain].row, dom[domain].khz[dom[domain].row] / 1000,
+	    (*(volatile uint32_t *)(base + EPSS_DOMAIN_STATE) & 0xff) * XO_KHZ / 1000);
+}
+
+/*
+ * For the thermal driver (hakios.thermal.c): no domain above mhz (0: no cap), never below the row the firmware left.
+ * Called from one thread only (the thermal one), after hakios_cpufreq_init().
+ */
+void hakios_cpufreq_cap(uint32_t mhz);
+
+void
+hakios_cpufreq_cap(uint32_t mhz)
+{
+	cap_khz = mhz * 1000;
+	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		uint32_t row;
+
+		if (!dom[d].ours) {
+			continue;
+		}
+		row = row_for_cap(d);
+		if (row != dom[d].row) {
+			dom[d].row = row;
+			*(volatile uint32_t *)(dom[d].base + EPSS_PERF_STATE) = row;
+		}
+	}
+	cpufreq_describe();
+	tell("cpufreq: cap %u MHz: %s\n", mhz, cpufreq_line);
+}
+
+/* The line of kern.hakios.cpufreq, fresh (the thermal driver logs it with its own). */
+const char *hakios_cpufreq_line(void);
+
+const char *
+hakios_cpufreq_line(void)
+{
+	cpufreq_describe();
+	return cpufreq_line;
 }
 
 /*
@@ -563,7 +681,9 @@ hakios_cpufreq_init(void)
 	uint32_t enabled = 0, membench = 0, cores[EPSS_DOMAINS] = { 0 }, before, here;
 
 	load_start();
-	enabled = 2;
+	(void)PE_parse_boot_argn("cpufreq_epss", &epss_phys, sizeof(epss_phys));
+	/* the vote's addresses are the reference phone's: elsewhere only when ddr= asks */
+	enabled = epss_phys == EPSS_PHYS ? 2 : 0;
 	PE_parse_boot_argn("ddr", &enabled, sizeof(enabled));
 	if (enabled == 1) {
 		ddr_look();
@@ -587,6 +707,7 @@ hakios_cpufreq_init(void)
 		}
 	}
 	printf("cpufreq: on core %u a loop ran at %u, now at %u\n", here, before, loop_speed());
+	cpufreq_describe();
 	/* membench has its own variable: when the boot-arg is absent, the cpufreq value (2 means on) must not start the benchmark */
 	PE_parse_boot_argn("membench", &membench, sizeof(membench));
 	if (membench == 1) {

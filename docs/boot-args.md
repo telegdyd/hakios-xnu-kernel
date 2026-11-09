@@ -2,7 +2,7 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **350 arguments**: 279 read by the kernel, 14 by the loader, 68 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **355 arguments**: 284 read by the kernel, 14 by the loader, 68 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
@@ -328,7 +328,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `torch_max_s` | K | `hakios.torch.c` | `CONFIG_TORCH_MAX_S` |  |
 | `torch_secs` | K | `hakios.torch.c` | `CONFIG_TORCH_SECS` |  |
 
-## Chip, thermal and PMIC (10)
+## Chip, thermal and PMIC (12)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -339,11 +339,13 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `thermal` | K | `hakios.thermal.c` | `CONFIG_THERMAL` |  |
 | `thermal_log` | K | `hakios.thermal.c` | `CONFIG_THERMAL_LOG` |  |
 | `thermal_poll` | K | `hakios.thermal.c` | `CONFIG_THERMAL_POLL` |  |
+| `thermal_slow` | K | `hakios.thermal.c` | `CONFIG_THERMAL_SLOW` |  |
+| `thermal_soc` | K | `hakios.thermal.c` | `CONFIG_THERMAL_SOC` |  |
 | `thermal_stop` | K | `hakios.thermal.c` | `CONFIG_THERMAL_STOP` |  |
 | `thermal_tm0` | K | `hakios.thermal.c` | `CONFIG_THERMAL_TM0` |  |
 | `thermal_tm1` | K | `hakios.thermal.c` | `CONFIG_THERMAL_TM1` |  |
 
-## CPU, memory and boot (23)
+## CPU, memory and boot (24)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -351,6 +353,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `applog_name` | K | `(patch)` | `CONFIG_APPLOG_NAME` |  |
 | `bootcpu` | KL | `loader.c`, `loader_return.c` | `CONFIG_BOOTCPU` |  |
 | `cpufreq` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ` |  |
+| `cpufreq_epss` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ_EPSS` |  |
 | `cpuload` | K | `hakios.cpufreq.c` | `CONFIG_CPULOAD` |  |
 | `ddr` | K | `hakios.cpufreq.c` | `CONFIG_DDR` |  |
 | `ddr_rest` | K | `hakios.cpufreq.c` | `CONFIG_DDR_REST` |  |
@@ -393,7 +396,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs` | L | `loader.c` | `CONFIG_UFS` |  |
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 
-## User space (35)
+## User space (37)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -428,6 +431,8 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `switcher_wallpaper` | U | `inject_sb.c` | `CONFIG_SWITCHER_WALLPAPER` |  |
 | `tu_debug` | U | `HakiosMetalCA.m` | `CONFIG_TU_DEBUG` |  |
 | `ui_lite` | U | `inject_sb.c` | `CONFIG_UI_LITE` |  |
+| `usb_net` | K | `hakios.usb_net.c` | `CONFIG_USB_NET` |  |
+| `usb_net_ip` | K | `hakios.usb_net.c` | `CONFIG_USB_NET_IP` |  |
 | `var_hfs` | U | `init.c` | `CONFIG_VAR_HFS` |  |
 | `var_store` | U | `init.c` | `CONFIG_VAR_STORE` |  |
 | `wallpaper_cache` | U | `inject_sb.c` | `CONFIG_WALLPAPER_CACHE` |  |

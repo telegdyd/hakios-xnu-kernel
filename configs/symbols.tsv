@@ -74,6 +74,7 @@ CAM_SETTLE	arg	cam_settle	Cameras	k	hakios.camera.c
 CAM_SHUTTER	arg	cam_shutter	Cameras	k	hakios.camera.c	
 CAM_VBLANK	arg	cam_vblank	Cameras	k	hakios.camera.c	
 CC_FADE	arg	cc_fade	User space	u	inject_sb.c	
+CPUFREQ_EPSS	arg	cpufreq_epss	CPU, memory and boot	k	hakios.cpufreq.c	the first domain's registers, when this is not the reference phone (the OnePlus 10 Pro, SM8450: 0x17d91000, dt qcom,cpufreq-hw)
 CPULOAD	arg	cpuload	CPU, memory and boot	k	hakios.cpufreq.c	every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py shows it per gesture)
 CPUMASK	arg	cpumask	Loader	l	loader.c	
 DDR	arg	ddr	CPU, memory and boot	k	hakios.cpufreq.c	the memory's bus clock managers ("BCM") in the command database the boot loader left, with what is needed to vote for bandwidth on them -- only read
@@ -246,6 +247,8 @@ SYSSLEEP	arg	syssleep	CPU, memory and boot	k	(patch)
 SYSTRACE	arg	systrace	CPU, memory and boot	k	(patch),user_exception_trace.c	
 SYSTRACE_NAME	arg	systrace_name	CPU, memory and boot	k	(patch)	
 THERMAL_LOG	arg	thermal_log	Chip, thermal and PMIC	k	hakios.thermal.c	a summary line this often (0: only on a rise; 60)
+THERMAL_SLOW	arg	thermal_slow	Chip, thermal and PMIC	k	hakios.thermal.c	lower the CPU cap at this temperature (with cpufreq=1; 0: never; 85)
+THERMAL_SOC	arg	thermal_soc	Chip, thermal and PMIC	k	hakios.thermal.c	the OnePlus 10 Pro's (SM8450) sensor table instead of the reference phone's
 THERMAL_TM0	arg	thermal_tm0	Chip, thermal and PMIC	k	hakios.thermal.c	
 THERMAL_TM1	arg	thermal_tm1	Chip, thermal and PMIC	k	hakios.thermal.c	
 TORCH	arg	torch	Haptics and torch	kl	hakios.torch.c,loader.c	a look, reading only: the arbiter's channel for the module and who may write through it, the module's type, its registers, the PMIC's temperature
@@ -269,6 +272,7 @@ UFS_NATIVE_SLOTS	arg	ufs_native_slots	Storage and APFS	k	hakios.ufshc.c
 UFS_NATIVE_SPIN	arg	ufs_native_spin	Storage and APFS	k	hakios.ufshc.c	
 UFS_PROBE	arg	ufs_probe	Loader	l	loader.c	
 UI_LITE	arg	ui_lite	User space	u	inject_sb.c	the system's own "Reduce Transparency" and "Reduce Motion" (Settings, Accessibility), for this
+USB_NET_IP	arg	usb_net_ip	User space	k	hakios.usb_net.c	
 USTACKS	arg	ustacks	Debugging	k	user_exception_trace.c	
 USTACKS_AT	arg	ustacks_at	Debugging	k	user_exception_trace.c	
 USTACKS_COUNT	arg	ustacks_count	Debugging	k	user_exception_trace.c	

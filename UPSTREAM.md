@@ -34,3 +34,17 @@
   negroni's controller does not answer the host again otherwise after a run of
   a minute with userland. The console echo of a returned kernel log is limited
   to its last 3000 bytes; the whole log is still fetched over USB.
+- `xnu/files/osfmk/arm64/gic_v3_irq.c`: redistributor frames are found with
+  the right stride: the loader's `redistributor-stride` in `/arm-io/gic` if
+  given, else four 64 KB pages when `GICR_TYPER.VLPIS` is set, else two; a
+  core's own frame (by Aff1, then Aff0) is tried before the walk. SM8450's
+  frames are 0x40000 apart while VLPIS reads 0 under Gunyah; with 0x20000 the
+  second core read a hole (external abort). `xnuloader/loader.c` passes the
+  stride for negroni. QEMU reaches launchd with 1 and 4 cores.
+- `drivers/power/hakios.cpufreq.c`: `cpufreq_epss=<pa>` for a phone other
+  than redwood (the RPMh memory vote stays redwood-only by default), the
+  frequency table and LMh limit in the log and in `kern.hakios.cpufreq`, and
+  `hakios_cpufreq_cap()` for the thermal driver. `drivers/power/hakios.thermal.c`:
+  `thermal_soc=8450` (SM8450 sensor table from the stock tree) and a stepped
+  CPU cap from `thermal_slow=` degrees (default 85). Redwood's behaviour is
+  unchanged without the new arguments.

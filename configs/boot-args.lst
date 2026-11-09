@@ -81,6 +81,7 @@ cam_shutter	k
 cam_vblank	k
 cc_fade	u
 cpufreq	k
+cpufreq_epss	k
 cpuload	k
 cpumask	l
 cpus	l
@@ -272,6 +273,8 @@ systrace_name	k
 thermal	k
 thermal_log	k
 thermal_poll	k
+thermal_slow	k
+thermal_soc	k
 thermal_stop	k
 thermal_tm0	k
 thermal_tm1	k
@@ -300,6 +303,8 @@ ufs_probe	l
 ufs_shared_pa	k
 ufs_write	kl
 ui_lite	u
+usb_net	k
+usb_net_ip	k
 ustacks	k
 ustacks_at	k
 ustacks_count	k

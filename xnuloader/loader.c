@@ -577,6 +577,7 @@ struct platform {
 	uint64_t io_base, io_size;       /* one window covering the SoC peripherals */
 	uint64_t gic_dist, gic_redist;   /* GICv3 */
 	uint64_t gic_redist_size;
+	uint64_t gic_redist_stride;      /* one core's frame and the next (dt redistributor-stride); 0: the kernel reads GICR_TYPER */
 	int hypervisor_wdt;
 	uint64_t uart;                   /* PL011, 0 if none */
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
@@ -617,7 +618,7 @@ static const struct platform platform_redwood = {
 static const struct platform platform_negroni = {
 	.name = "negroni", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x17100000, .gic_redist = 0x17180000,
-	.gic_redist_size = 0x200000, .hypervisor_wdt = 1,
+	.gic_redist_size = 0x200000, .gic_redist_stride = 0x40000, .hypervisor_wdt = 1,
 	.cores = 8, .core_shift = 8, .small_cores = 0x0f, .usb_restart_after_run = 1,
 };
 
@@ -3480,6 +3481,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base,
 	    plat->gic_redist_size ? plat->gic_redist_size : 0x100000 };
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
+	if (plat->gic_redist_stride != 0) {
+		dt_prop_u64(&w, "redistributor-stride", plat->gic_redist_stride);
+	}
 	dt_end(&w);
 	if (plat->uart != 0) {
 		dt_begin(&w, "uart0");

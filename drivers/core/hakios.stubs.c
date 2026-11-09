@@ -71,6 +71,10 @@ void hakios_battery_report(__unused const struct hakios_battery_state *state) {}
 #ifndef HAKIOS_CPUFREQ
 void hakios_cpufreq_init(void) {}
 void hakios_ddr_quiesce(void) {}
+void hakios_cpufreq_cap(uint32_t mhz);
+void hakios_cpufreq_cap(__unused uint32_t mhz) {}
+const char *hakios_cpufreq_line(void);
+const char *hakios_cpufreq_line(void) { return "-"; }
 #endif
 
 #ifndef HAKIOS_ADRENO

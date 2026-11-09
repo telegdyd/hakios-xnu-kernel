@@ -58,6 +58,7 @@
 #define GICR_FRAME_SIZE         0x20000     /* RD_base + SGI_base per CPU */
 #define GICR_TYPER              0x0008
 #define GICR_TYPER_LAST         (1u << 4)
+#define GICR_TYPER_VLPIS        (1u << 1)   /* four 64 KB pages a frame, not two */
 #define GICR_WAKER              0x0014
 #define GICR_WAKER_PROCSLEEP    (1u << 1)
 #define GICR_WAKER_CHILDASLEEP  (1u << 2)
@@ -80,6 +81,7 @@
 
 static vm_offset_t gicd_base, gicr_base;
 static vm_size_t   gicr_size;
+static vm_size_t   gicr_stride;            /* the loader's redistributor-stride; 0: from GICR_TYPER */
 static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor frame */
 
 /*
@@ -398,8 +400,32 @@ gic_find_redistributor(void)
 	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
 	/* GICR_TYPER[63:32] packs Aff3.Aff2.Aff1.Aff0 */
 	uint32_t affinity = (uint32_t)(((mpidr >> 32) & 0xff) << 24 | (mpidr & 0xffffff));
+	/*
+	 * How far apart the frames are: two 64 KB pages each (RD_base, SGI_base), or four where the GIC has
+	 * virtual LPIs (GICR_TYPER.VLPIS, bit 1: VLPI_base and a reserved page follow), as Linux's
+	 * gic_iterate_rdists() reads it. The OnePlus 10 Pro's are 0x40000 apart (Linux there: "CPU1: found
+	 * redistributor 100 region 0:0x171c0000"); taking 0x20000 read a hole between two frames, an external
+	 * abort (core 4 starting: esr 0x96000010 at +0x20008). There VLPIS reads 0 all the same (Gunyah's GIC), so the
+	 * loader's redistributor-stride (from the stock tree) comes first. The first frame is the boot core's, so it is on.
+	 */
+	vm_offset_t stride = gicr_stride != 0 ? gicr_stride :
+	    (*(volatile uint64_t *)(gicr_base + GICR_TYPER) & GICR_TYPER_VLPIS) ? 2 * GICR_FRAME_SIZE : GICR_FRAME_SIZE;
+	/*
+	 * Then this core's own frame first, where its number puts it (Aff1 on phones whose cores are 0x000..0x700,
+	 * Aff0 elsewhere): a core's own frame is powered, those of cores not started yet may not be. The walk from
+	 * the first frame is for a layout this guess does not fit.
+	 */
+	const uint64_t guesses[2] = { (mpidr >> 8) & 0xff, mpidr & 0xff };
 
-	for (vm_offset_t frame = gicr_base; frame + GICR_FRAME_SIZE <= gicr_base + gicr_size; frame += GICR_FRAME_SIZE) {
+	for (int g = 0; g < 2; g++) {
+		vm_offset_t frame = gicr_base + guesses[g] * stride;
+
+		if (frame + stride <= gicr_base + gicr_size &&
+		    (uint32_t)(*(volatile uint64_t *)(frame + GICR_TYPER) >> 32) == affinity) {
+			return frame;
+		}
+	}
+	for (vm_offset_t frame = gicr_base; frame + stride <= gicr_base + gicr_size; frame += stride) {
 		uint64_t typer = *(volatile uint64_t *)(frame + GICR_TYPER);
 
 		if ((uint32_t)(typer >> 32) == affinity) {
@@ -437,6 +463,9 @@ gic_v3_irq_cpu_init(void)
 		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
 		gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
 		gicr_size = reg[3];
+		if (SecureDTGetProperty(entry, "redistributor-stride", &prop, &prop_size) == kSuccess && prop_size == sizeof(uint64_t)) {
+			gicr_stride = (vm_size_t)*(uint64_t const *)prop;
+		}
 		if (gicd_base == 0 || gicr_base == 0) {
 			panic("gic: cannot map the distributor/redistributor");
 		}
