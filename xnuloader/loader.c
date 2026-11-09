@@ -1035,6 +1035,9 @@ static const struct kernel_live *running_live;
  */
 static int run_active;
 static int usb_restart_wanted;      /* the kernel has been on the core that serves USB: usb_restart() before the next command */
+/* the run asked for usb_net=1: the kernel drives the USB controller itself, so run_on_other_cpu() does not
+ * poll it (the two would fight over DWC3), and the loader brings it up again afterwards (usb_restart) */
+static int usb_kernel_owned;
 static uint64_t running_slide;
 static void usb_poll_command(void);
 
@@ -2464,7 +2467,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		if (block_enabled) {
 			block_poll();
 		}
-		usb_poll_command();
+		if (!usb_kernel_owned) {
+			usb_poll_command();
+		}
 		if (block_enabled) {
 			/*
 			 * The pause is spent looking at the kernel's mailbox: with one look a pass, a
@@ -3065,7 +3070,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	hc_requested = 0;
 	block_probe_requested = 0;
 	block_enabled = 0;
+	usb_kernel_owned = 0;
 	for (const char *c = pi.cmdline; *c; c++) {
+		usb_kernel_owned |= starts_with(c, "usb_net=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[9] == 0 || c[9] == ' ');
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
 		}
@@ -3553,6 +3561,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		if (kernel_mpidr != this_mpidr) {
 			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
 
+			/* (also when it hung or never started: whatever the kernel did to the controller, bring it up again) */
+			usb_restart_wanted = PLAT->usb_restart_after_run && usb_kernel_owned;
+
 			screen_quiet = screen_quiet_before_run;
 			wdt_set_ms(WDT_BITE_MS);
 			if (status != 0) {
@@ -3583,7 +3594,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 
 	/* --- the kernel came back ------------------------------------------- */
-	usb_restart_wanted = PLAT->usb_restart_after_run && kernel_mpidr == this_mpidr && checkpoint != CHECKPOINT_SELFTEST;
+	usb_restart_wanted = PLAT->usb_restart_after_run && (kernel_mpidr == this_mpidr || usb_kernel_owned) &&
+	    checkpoint != CHECKPOINT_SELFTEST;
 	screen_quiet = screen_quiet_before_run;
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */

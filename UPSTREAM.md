@@ -72,3 +72,8 @@
 - `drivers/input/hakios.s3908.c`: a stray continuation packet is read past
   instead of failing the command, and the report config is asked for up to
   five times. Seen on the first boot with the root on flash.
+- `xnuloader/loader.c`: a run with `usb_net=1` on another core (`bootcpu=N`)
+  leaves the USB controller to the kernel: `run_on_other_cpu()` no longer
+  polls it, and the loader restarts USB after the run (returned, hung or not
+  started). Before, both drove DWC3 and the live log and sweetd were unusable
+  on flash boots. Runs without usb_net unchanged.
