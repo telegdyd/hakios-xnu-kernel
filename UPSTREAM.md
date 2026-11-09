@@ -29,3 +29,8 @@
   kernels. Adapted from slop `negroni-ios/xnu/patches/0011` at
   `aeb9d51b527955f204c2fc0f208feaee149f57e3`. The rebuilt kernel reaches launchd
   under QEMU; hardware bring-up is tracked separately in the device facts.
+- `xnuloader/loader.c`: per-platform `usb_restart_after_run` (negroni only)
+  restarts the USB controller after a kernel has had the core that serves it;
+  negroni's controller does not answer the host again otherwise after a run of
+  a minute with userland. The console echo of a returned kernel log is limited
+  to its last 3000 bytes; the whole log is still fetched over USB.

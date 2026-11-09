@@ -368,8 +368,15 @@ write_logs(const char *klog, uint64_t klog_len)
 	if (bio == NULL) {
 		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
 		if (klog != NULL) {
-			print("\n== KERNEL LOG ==\n");
-			for (uint64_t i = 0; i < klog_len; i++) {
+			/*
+			 * Drawing every character is slow (a long session's log is megabytes: minutes with the
+			 * loader looking hung, no USB served). The whole log is in the staged buffer for the host
+			 * (fastboot get_staged); the screen gets only the end of it.
+			 */
+			uint64_t from = klog_len > 3000 ? klog_len - 3000 : 0;
+
+			print("\n== KERNEL LOG (the last %d of %d bytes; all of it over USB) ==\n", klog_len - from, klog_len);
+			for (uint64_t i = from; i < klog_len; i++) {
 				put_char(klog[i]);
 			}
 			print("\n== END OF LOG ==\n");
@@ -578,6 +585,7 @@ struct platform {
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
+	int usb_restart_after_run;       /* the USB controller is dead after the kernel has had this core: see usb_restart() */
 };
 
 static const struct platform platform_qemu_virt = {
@@ -610,7 +618,7 @@ static const struct platform platform_negroni = {
 	.name = "negroni", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x17100000, .gic_redist = 0x17180000,
 	.gic_redist_size = 0x200000, .hypervisor_wdt = 1,
-	.cores = 8, .core_shift = 8, .small_cores = 0x0f,
+	.cores = 8, .core_shift = 8, .small_cores = 0x0f, .usb_restart_after_run = 1,
 };
 
 static const struct platform *
@@ -1022,6 +1030,7 @@ static const struct kernel_live *running_live;
  * running_live is NULL for a kernel without one, so it cannot say that a kernel is running.
  */
 static int run_active;
+static int usb_restart_wanted;      /* the kernel has been on the core that serves USB: usb_restart() before the next command */
 static uint64_t running_slide;
 static void usb_poll_command(void);
 
@@ -3567,6 +3576,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 
 	/* --- the kernel came back ------------------------------------------- */
+	usb_restart_wanted = PLAT->usb_restart_after_run && kernel_mpidr == this_mpidr && checkpoint != CHECKPOINT_SELFTEST;
 	screen_quiet = screen_quiet_before_run;
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */
@@ -3724,8 +3734,9 @@ usb_start(void)
 		print("usb: start failed %x\n", s);
 		return 0;
 	}
-	if (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
-	    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf))) {
+	/* (a restart of the controller keeps the buffers it has) */
+	if (usb_rx_buf == NULL && (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
+	    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf)))) {
 		print("usb: no transfer buffers\n");
 		return 0;
 	}
@@ -4096,6 +4107,28 @@ usb_poll_command(void)
 	fb_command(cmd);
 }
 
+/*
+ * Nobody serves the controller while the kernel has this core, and on the OnePlus 10 Pro it does not answer the host
+ * afterwards when the kernel has run for a minute with userland on it (why is not known; with a run of 8 seconds it
+ * does). Taking it down and bringing it up again brings it back; the host sees the device leave and return.
+ */
+static void
+usb_restart(void)
+{
+	efi_status s;
+
+	usb_restart_wanted = 0;
+	s = USB->stop();
+	if (EFI_ERROR(s)) {
+		print("usb: stop failed %x\n", s);
+	}
+	usb_connected = 0;
+	usb_rx_queued = 0;
+	if (!usb_start()) {
+		reboot();       /* without USB nobody can reach this loader */
+	}
+}
+
 static void
 usb_command_loop(void)
 {
@@ -4104,6 +4137,10 @@ usb_command_loop(void)
 		char cmd[128];
 		int64_t n;
 
+		if (usb_restart_wanted) {
+			usb_restart();
+			continue;
+		}
 		if (!usb_connected) {
 			usb_wait(0xff); /* returns on the next cable state change */
 			continue;
