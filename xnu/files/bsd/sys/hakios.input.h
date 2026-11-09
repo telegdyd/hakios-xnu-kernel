@@ -72,8 +72,14 @@ struct hakios_battery_state {
 	int32_t charge_uah, full_uah, design_uah, cycles;      /* 0 when not known (yet) */
 	int32_t usb_type;               /* Linux's POWER_SUPPLY_USB_TYPE_*: 1 a computer's port, 2 a charger, ... */
 	int32_t usb_voltage_uv, usb_current_ua;                 /* what the port gives */
+	int32_t estimated;              /* HAKIOS_BATTERY_*: 0 for a fuel gauge's values (the DSP's) */
 };
+#define HAKIOS_BATTERY_ESTIMATED        0x1     /* the charge is estimated from the voltage, not a gauge's */
+#define HAKIOS_BATTERY_NO_TEMPERATURE   0x2     /* temperature_hundredths means nothing */
 void hakios_battery_report(const struct hakios_battery_state *state);
+/* the charge (0..100, -1 unknown), whether a battery and a charger are there, as last reported; false before the first report */
+bool hakios_battery_get(int *soc, int *present, int *charger);
+bool hakios_battery_bcl_init(void);    /* boot-arg battery_soc=8450: the OnePlus 10 Pro's estimate (hakios.battery_bcl.c) */
 void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
 void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
 void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */

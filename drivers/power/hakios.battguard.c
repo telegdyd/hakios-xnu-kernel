@@ -7,7 +7,7 @@
  * protection that costs nothing: at 15 percent the run ends, the loader has the log, and (xl with XL_REBOOT_AFTER=1) the phone
  * goes back to Android, which charges it.
  *
- * What it believes. It asks the battery driver's own numbers (sysctl kern.hakios.battery_soc, ..._present, ..._charger_present;
+ * What it believes. It asks the battery driver's own numbers (hakios_battery_get(): what kern.hakios.battery_soc, ..._present, ..._charger_present show;
  * they come from the loader's charger page or, with adsp=1, from the audio DSP's battery service) and acts only on a reading that is
  * between 0 and 100 with a battery present and NO charger attached. An unknown charge (-1), no battery, or a charger on the cable
  * is never a reason to stop. It does not read any hardware itself.
@@ -27,6 +27,7 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/sysctl.h>
+#include <sys/hakios.input.h>
 #include <sys/systm.h>
 
 extern void loader_log_putc(char c);
@@ -35,7 +36,6 @@ extern void hakios_var_save_on_return(void);
 extern void hakios_adreno_stop(void);
 extern void hakios_wifi_stop(void);
 extern void hakios_adsp_stop(void);
-extern int kernel_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -58,21 +58,14 @@ static thread_call_t call;
 static uint32_t stop_percent, poll_seconds = 20, looks, strikes, last_said_minute = ~0u;
 static bool stopping;
 
-static bool
-read_int(const char *name, int *value)
-{
-	size_t size = sizeof(*value);
-
-	return kernel_sysctlbyname(name, value, &size, NULL, 0) == 0 && size == sizeof(*value);
-}
-
 static void
 tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	int soc = -1, present = 0, charger = 0;
 	uint64_t deadline;
-	bool known = read_int("kern.hakios.battery_soc", &soc) && read_int("kern.hakios.battery_present", &present) &&
-	    read_int("kern.hakios.battery_charger_present", &charger) && soc >= 0 && soc <= 100 && present && !charger;
+	/* (straight from the battery driver: a kernel_sysctlbyname() of kern.hakios.battery_soc read -1 on the 10 Pro while the
+	 * sysctl itself, from user space, said 88 -- 2026-11-09, cause not found; this way has no lookup to fail) */
+	bool known = hakios_battery_get(&soc, &present, &charger) && soc >= 0 && soc <= 100 && present && !charger;
 	uint32_t minute = (uint32_t)(++looks * poll_seconds / 300);       /* a line every five minutes, and the first */
 
 	if (minute != last_said_minute || looks == 1) {

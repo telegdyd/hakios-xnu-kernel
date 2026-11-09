@@ -41,6 +41,7 @@ audio    bsd/dev/hakios.virtio_sound.c
 audio    bsd/dev/hakios.guard.c
 
 power    bsd/dev/hakios.battery.c
+power    bsd/dev/hakios.battery_bcl.c
 power    iokit/Kernel/hakios.battery.cpp
 power    bsd/dev/hakios.cpufreq.c
 

@@ -4,9 +4,10 @@
 
 driver BATTERY
 	file    bsd/dev/hakios.battery.c
+	file    bsd/dev/hakios.battery_bcl.c
 	file    iokit/Kernel/hakios.battery.cpp iokitcpp
 	help    the battery: kern.hakios.battery_*, and HakiosBattery, the IOPMPowerSource Darwin reads the charge from
-	help    (the state comes from the audio DSP's battery manager, with adsp=1)
+	help    (the state comes from the audio DSP's battery manager, with adsp=1; on the OnePlus 10 Pro, battery_soc=8450, an estimate from its PMIC)
 
 driver CPUFREQ
 	file    bsd/dev/hakios.cpufreq.c

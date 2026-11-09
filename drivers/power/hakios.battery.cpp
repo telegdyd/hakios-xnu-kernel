@@ -39,7 +39,10 @@ struct hakios_battery_state {
 	int32_t charge_uah, full_uah, design_uah, cycles;
 	int32_t usb_type;
 	int32_t usb_voltage_uv, usb_current_ua;
+	int32_t estimated;              /* HAKIOS_BATTERY_* below */
 };
+#define HAKIOS_BATTERY_ESTIMATED        0x1
+#define HAKIOS_BATTERY_NO_TEMPERATURE   0x2
 
 extern "C" void HakiosBatteryReport(const void * state, unsigned size);
 
@@ -132,7 +135,11 @@ HakiosBattery::report(const struct hakios_battery_state * b)
 	setVoltage(b->voltage_uv > 0 ? (unsigned) (b->voltage_uv / 1000) : 0);
 	setAmperage(b->current_ua / 1000);
 	number("InstantAmperage", b->current_ua / 1000);
-	number("Temperature", b->temperature_hundredths);
+	/* (no temperature at all rather than a made-up one, when the source has none) */
+	if (!(b->estimated & HAKIOS_BATTERY_NO_TEMPERATURE)) {
+		number("Temperature", b->temperature_hundredths);
+	}
+	flag("CapacityEstimated", (b->estimated & HAKIOS_BATTERY_ESTIMATED) != 0);
 	if (b->charge_uah > 0) {
 		number("AppleRawCurrentCapacity", b->charge_uah / 1000);
 	}

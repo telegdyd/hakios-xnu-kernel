@@ -43,6 +43,16 @@ static int battery_temperature_c = -273, battery_present, battery_charger_presen
 static int battery_charging, battery_soc_estimated, battery_charger_action = -1;
 static uint64_t battery_updates, battery_failures;
 
+/* for others in the kernel (the battery guard): no sysctl lookup in between */
+bool
+hakios_battery_get(int *soc, int *present, int *charger)
+{
+	*soc = battery_soc_percent;
+	*present = battery_present;
+	*charger = battery_charger_present;
+	return battery_updates != 0;
+}
+
 /* for others in the kernel (the flashlight's thermal guard): -273 while it is not known */
 int
 hakios_battery_temperature(void)
@@ -138,11 +148,12 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	battery_voltage_mv = b->voltage_uv / 1000;
 	battery_current_ma = b->current_ua / 1000;
 	/* (in 64 bits for the same reason: an overflow here would make a hot battery read as cold) */
-	battery_temperature_c = (int)(((int64_t)b->temperature_hundredths + 50) / 100);
+	battery_temperature_c = (b->estimated & HAKIOS_BATTERY_NO_TEMPERATURE) ? -273 :
+	    (int)(((int64_t)b->temperature_hundredths + 50) / 100);
 	battery_present = b->present != 0;
 	battery_charger_present = b->external != 0;
 	battery_charging = b->status == 1;      /* POWER_SUPPLY_STATUS_CHARGING */
-	battery_soc_estimated = 0;
+	battery_soc_estimated = (b->estimated & HAKIOS_BATTERY_ESTIMATED) != 0;
 	battery_charger_action = b->status;
 	if (b->full_uah > 0) {
 		battery_full_uah = b->full_uah;
@@ -153,7 +164,7 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	if (b->cycles > 0) {
 		battery_cycles = b->cycles;
 	}
-	battery_source_dsp = 1;
+	battery_source_dsp = !(b->estimated & HAKIOS_BATTERY_ESTIMATED);
 	battery_updates++;
 	HakiosBatteryReport(b, sizeof(*b));
 }
@@ -182,6 +193,8 @@ hakios_battery_init(void)
 	vm_offset_t page;
 	thread_t thread;
 
+	/* the OnePlus 10 Pro (battery_soc=8450): its own estimate, read from a PMIC; no loader cache there */
+	if (hakios_battery_bcl_init()) return;
 	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) return;
 	if (!PE_parse_boot_argn("battery_shared_pa", &shared_pa, sizeof(shared_pa)) || shared_pa == 0) {
 		printf("battery: xnuloader did not provide battery_shared_pa\n");

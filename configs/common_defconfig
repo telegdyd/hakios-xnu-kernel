@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 380 symbols in 18 groups; 36 are set, 27 of them drivers built in.
+# 385 symbols in 18 groups; 36 are set, 27 of them drivers built in.
 #
 
 #
@@ -79,7 +79,7 @@ CONFIG_HAKIOS_USB_NET=y
 # QEMU's virtio network device as the link behind en0 (virtio_net=1). QEMU only [hakios.virtio_net.c]
 CONFIG_HAKIOS_VIRTIO_NET=y
 
-# the battery: kern.hakios.battery_*, and HakiosBattery, the IOPMPowerSource Darwin reads the charge from (the state ... [hakios.battery.c, hakios.battery.cpp]
+# the battery: kern.hakios.battery_*, and HakiosBattery, the IOPMPowerSource Darwin reads the charge from (the state ... [hakios.battery.c, hakios.battery_bcl.c, hakios.battery.cpp]
 CONFIG_HAKIOS_BATTERY=y
 
 # the clock of the cores the kernel runs on (cpufreq=1), and the memory bus's votes (ddr=) [hakios.cpufreq.c]
@@ -174,7 +174,7 @@ CONFIG_HAKIOS_WIFI=y
 # CONFIG_XPCPROXY_IDVERSION is not set
 
 #
-# Storage and APFS (44)
+# Storage and APFS (45)
 #
 
 # the phone's storage: 1 a survey, read only; 2 the loader's block service, through which the kernel reads it (the ...
@@ -302,6 +302,9 @@ CONFIG_UFS=2
 
 # read by hakios.ufshc.c (kernel)
 # CONFIG_UFS_NATIVE_SPIN is not set
+
+# Native reads, writes and flushes without a loader storage service
+# CONFIG_UFS_NATIVE_WRITE is not set
 
 # read by hakios.ufs.c (kernel)
 # CONFIG_VAR_SAVE_MS is not set
@@ -582,7 +585,7 @@ CONFIG_GPU=y
 # CONFIG_VBLUR is not set
 
 #
-# Audio and battery (32)
+# Audio and battery (36)
 #
 
 # the audio DSP; the battery level in the UI and charging state come through it [needs fw-audio/ from the phone]
@@ -629,6 +632,18 @@ CONFIG_SOUND=4
 
 # read by hakios.adsp.c, hakios.battery.c, loader.c (kernel and loader)
 # CONFIG_BATTERY is not set
+
+# a line with every reading, not only when something changes
+# CONFIG_BATTERY_LOG is not set
+
+# how often (2 to 120; 10)
+# CONFIG_BATTERY_POLL is not set
+
+# read by hakios.battery_bcl.c (kernel)
+# CONFIG_BATTERY_SOC is not set
+
+# neither read nor write the file
+# CONFIG_BATTERY_STORE is not set
 
 # every property once, for the log (which number is which on this phone's firmware)
 # CONFIG_BATTMGR is not set

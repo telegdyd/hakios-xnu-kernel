@@ -96,3 +96,9 @@
   can boot on core 0 (no bootcpu argument), bringing all eight negroni cores
   online. The loader remains in memory for return, but runs on no core while
   XNU owns the device. See `docs/negroni-native-ufs.md` for validation.
+- Battery without the audio DSP (`drivers/power/hakios.battery_bcl.c`, `battery_soc=8450`):
+  the OnePlus 10 Pro's percentage estimated from the PM8350B BCL's voltage and
+  current (observer reads only), kept in `/private/var/db/hakios_battery`.
+  `struct hakios_battery_state` gains `estimated` (CapacityEstimated, no made-up
+  Temperature); `hakios_battery_get()` lets battguard read the driver directly
+  instead of through `kernel_sysctlbyname()`, which read -1 there.

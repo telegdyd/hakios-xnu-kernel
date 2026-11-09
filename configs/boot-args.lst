@@ -53,9 +53,13 @@ applog	k
 applog_name	k
 autounlock	u
 battery	kl
+battery_log	k
+battery_poll	k
 battery_shared_pa	k
+battery_soc	k
 battery_stop	k
 battery_stop_poll	k
+battery_store	k
 battmgr	k
 bootcpu	kl
 bt	k
