@@ -3641,11 +3641,17 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			print("  (pa-va slide %x: subtract it from physical addresses to symbolicate)\n", slide);
 			set_result("early-exception", 0, loader_ctx[CTX_ELR]);
 			klog_len = klog_len > (1u << 20) ? 0 : klog_len;
+		} else if (reason == 3) {
+			print("the kernel asked for a reset (sweet-sh.py reboot)\n");
+			set_result("returned", klog_len, 0);
 		} else {
 			set_result("returned", klog_len, 0);
 		}
 	}
 	write_logs(klog, klog_len);
+	if (reason == 3 && checkpoint != CHECKPOINT_SELFTEST) {
+		reboot();       /* Android again; the log was in the kernel's own hands, as for any run */
+	}
 	return 1;
 }
 

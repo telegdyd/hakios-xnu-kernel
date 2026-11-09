@@ -399,8 +399,12 @@ loader_log_append_msgbuf(void)
 	}
 }
 
-void
-loader_return(void)
+/*
+ * reason 0: back to the loader, which waits for the host's next command. reason 3: the same, and the
+ * loader then resets the phone (Android again): what "sweet-sh.py reboot" asks for.
+ */
+static void
+loader_return_reason(uint64_t reason)
 {
 #if defined(GENERIC_PSCI_SMP)
 	/*
@@ -437,7 +441,13 @@ loader_return(void)
 			loader_log_putc(*c);
 		}
 	}
-	loader_jump(0, 0, false);
+	loader_jump(reason, 0, false);
+}
+
+void
+loader_return(void)
+{
+	loader_return_reason(0);
 }
 
 /*
@@ -519,13 +529,31 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
  */
 static thread_call_t loader_stop_call;
 
+/*
+ * kern.hakios.loader_request (hakios.platform.c), written by sweetd for "sweet-sh.py loader|reboot":
+ * 1 = back to the loader and stay there, 2 = back to the loader, which then resets the phone.
+ * The poll below, once a second, does the work: a system call must not be the thread that stops the system.
+ */
+static volatile int loader_request;
+
+void
+loader_request_return(int mode)
+{
+	if (mode == 1 || mode == 2) {
+		loader_request = mode;
+	}
+}
+
 static void
 loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	uint64_t deadline;
+	int request = loader_request;
 
-	if (loader_live.stop) {
-		static const char banner[] = "\n--- the host asked for the end of the run: back to the loader ---\n";
+	if (loader_live.stop || request) {
+		const char *banner = request == 2 ? "\n--- the system asked for a reset: back to the loader, then Android ---\n" :
+		    request == 1 ? "\n--- the system asked for the loader ---\n" :
+		    "\n--- the host asked for the end of the run: back to the loader ---\n";
 		for (const char *c = banner; *c; c++) {
 			loader_log_putc(*c);
 		}
@@ -533,7 +561,8 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		hakios_adreno_stop();
 		hakios_wifi_stop();
 		hakios_adsp_stop();
-		loader_return();
+		hakios_mpss_stop();
+		loader_return_reason(request == 2 ? 3 : 0);
 	}
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
 	thread_call_enter_delayed(loader_stop_call, deadline);

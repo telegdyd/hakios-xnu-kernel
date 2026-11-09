@@ -25,6 +25,32 @@ SYSCTL_NODE(_kern, OID_AUTO, hakios, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "redwood ph
 static LCK_GRP_DECLARE(hakios_platform_lock_group, "hakios-platform");
 
 /*
+ * kern.hakios.loader_request: 1 = hand the phone back to the loader and stay there, 2 = hand it back and let the
+ * loader reset it (Android again). Root only; the return happens within a second (osfmk/arm64/loader_return.c).
+ * Written by sweetd for "sweet-sh.py loader" and "sweet-sh.py reboot". Reads as 0.
+ */
+extern void loader_request_return(int mode) __attribute__((weak));
+
+static int
+hakios_loader_request_sysctl(struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
+    struct sysctl_req *req)
+{
+	int mode = 0, error;
+
+	error = sysctl_handle_int(oidp, &mode, 0, req);
+	if (error || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if ((mode != 1 && mode != 2) || loader_request_return == NULL) {
+		return EINVAL;
+	}
+	loader_request_return(mode);
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, loader_request, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, hakios_loader_request_sysctl, "I", "1: back to the loader, 2: back to the loader and reset (Android)");
+
+/*
  * One transfer at a time through the PMIC arbiter for this system, whoever asks: with two at once the arbiter drops
  * one ("the transfer was dropped"), as Linux never lets happen (one lock for the bus). A spin lock: it is taken
  * around a transfer of some tens of microseconds.

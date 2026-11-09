@@ -15,22 +15,32 @@
  *
  * argv[0] without a slash is one of the built-in commands below instead (iOS has no ls or cat, and
  * the image has no package prefix yet): ls, cat, sysctl, put (a file from the client: "put PATH MODE
- * SIZE", then SIZE bytes after the argument lines), rm, mkdir, kill.
+ * SIZE", then SIZE bytes after the argument lines), rm, mkdir, kill, and two that end the run:
+ * "loader" (back to the loader, which waits for fastboot commands) and "reboot" (back to the loader, which
+ * resets the phone: Android). Both go through kern.hakios.loader_request and take about a second.
+ *
+ * It also answers DHCP on the link (a child process): the PC is given 192.168.7.1/24, no router, no DNS, so
+ * that nobody has to set the address by hand. Windows, Linux and macOS ask on their own once the adapter
+ * appears. The address is fixed; only the one client on the cable is served.
  *
  * The client is devices/negroni/tools/sweet-sh.py. Only peers on the USB Ethernet link (192.168.7.0/24)
  * are served, and only with the token: TOKEN_IMAGE (build.sh copies userland/sweetd.token, made on the PC
  * and never in git, into the image), else TOKEN_PATH. Without either nothing runs. Clients are served
  * one at a time.
  */
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -295,6 +305,18 @@ builtin(int cs, int argc, char **argv)
 		}
 		return status;
 	}
+	if (strcmp(argv[0], "loader") == 0 || strcmp(argv[0], "reboot") == 0) {
+		int mode = argv[0][0] == 'r' ? 2 : 1;
+
+		sync();
+		if (sysctlbyname("kern.hakios.loader_request", NULL, NULL, &mode, sizeof(mode)) != 0) {
+			dprintf(cs, "%s: kern.hakios.loader_request: %s\n", argv[0], strerror(errno));
+			return 1;
+		}
+		dprintf(cs, "%s: asked; the phone goes %s within a few seconds\n", argv[0],
+		    mode == 2 ? "back to Android" : "back to the loader");
+		return 0;
+	}
 	if (strcmp(argv[0], "kill") == 0) {
 		int sig = SIGTERM, i = 1;
 
@@ -342,7 +364,7 @@ serve(int cs)
 		int status = builtin(cs, argc, argv);
 
 		if (status == -2) {
-			dprintf(cs, "sweetd: no built-in %s (ls cat sysctl put rm mkdir kill); a program wants its path\n", argv[0]);
+			dprintf(cs, "sweetd: no built-in %s (ls cat sysctl put rm mkdir kill loader reboot); a program wants its path\n", argv[0]);
 			status = -1000;
 		}
 		dprintf(cs, "\n%s %d\n", SWEETD_END, status);
@@ -405,10 +427,121 @@ serve(int cs)
 	}
 }
 
+/* ---- DHCP: the PC's address on the cable ------------------------------------------------------------ */
+
+#define PC_ADDR         0xc0a80701u     /* 192.168.7.1 */
+#define PHONE_ADDR      0xc0a80702u     /* 192.168.7.2 */
+#define DHCP_LEASE      86400
+
+struct dhcp_msg {
+	uint8_t op, htype, hlen, hops;
+	uint32_t xid;
+	uint16_t secs, flags;
+	uint32_t ciaddr, yiaddr, siaddr, giaddr;
+	uint8_t chaddr[16], sname[64], file[128];
+	uint32_t cookie;
+	uint8_t options[308];
+} __attribute__((packed));
+
+static size_t
+dhcp_opt(uint8_t *p, uint8_t code, const void *data, uint8_t len)
+{
+	p[0] = code;
+	p[1] = len;
+	memcpy(p + 2, data, len);
+	return 2u + len;
+}
+
+/* Answers DISCOVER with OFFER and REQUEST with ACK (always the same address), broadcast, as a client without an address expects. */
+static void
+dhcp_serve(void)
+{
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	int on = 1;
+	struct sockaddr_in a = { .sin_len = sizeof(a), .sin_family = AF_INET, .sin_port = htons(67), .sin_addr.s_addr = htonl(INADDR_ANY) };
+
+	if (s < 0) {
+		return;
+	}
+	setsockopt(s, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+	while (bind(s, (struct sockaddr *)&a, sizeof(a)) != 0) {
+		sleep(2);
+	}
+	for (;;) {
+		struct dhcp_msg m, r;
+		struct sockaddr_in from;
+		socklen_t fl = sizeof(from);
+		ssize_t n = recvfrom(s, &m, sizeof(m), 0, (struct sockaddr *)&from, &fl);
+		uint8_t type = 0;
+
+		if (n < (ssize_t)offsetof(struct dhcp_msg, options) || m.op != 1 || m.hlen != 6 || m.cookie != htonl(0x63825363)) {
+			continue;
+		}
+		for (size_t i = 0; i + 1 < sizeof(m.options) && m.options[i] != 255;) {
+			if (m.options[i] == 0) {
+				i++;
+				continue;
+			}
+			if (i + 2 + m.options[i + 1] > sizeof(m.options)) {
+				break;
+			}
+			if (m.options[i] == 53 && m.options[i + 1] == 1) {
+				type = m.options[i + 2];
+			}
+			i += 2u + m.options[i + 1];
+		}
+		if (type != 1 && type != 3) {
+			continue;
+		}
+		/* a REQUEST for somebody else's server, or for another address, is not ours (a DISCOVER is always) */
+		memset(&r, 0, sizeof(r));
+		r.op = 2;
+		r.htype = m.htype;
+		r.hlen = 6;
+		r.xid = m.xid;
+		r.flags = m.flags;
+		r.yiaddr = htonl(PC_ADDR);
+		r.siaddr = htonl(PHONE_ADDR);
+		memcpy(r.chaddr, m.chaddr, 16);
+		r.cookie = htonl(0x63825363);
+
+		uint8_t *o = r.options;
+		uint8_t t = type == 1 ? 2 : 5, mask[4] = { 255, 255, 255, 0 };
+		uint32_t id = htonl(PHONE_ADDR), lease = htonl(DHCP_LEASE), half = htonl(DHCP_LEASE / 2), seven = htonl(DHCP_LEASE * 7 / 8);
+
+		o += dhcp_opt(o, 53, &t, 1);
+		o += dhcp_opt(o, 54, &id, 4);
+		o += dhcp_opt(o, 51, &lease, 4);
+		o += dhcp_opt(o, 58, &half, 4);
+		o += dhcp_opt(o, 59, &seven, 4);
+		o += dhcp_opt(o, 1, mask, 4);
+		*o++ = 255;
+
+		struct sockaddr_in to = { .sin_len = sizeof(to), .sin_family = AF_INET, .sin_port = htons(68),
+			                  .sin_addr.s_addr = htonl(INADDR_BROADCAST) };
+		size_t len = (size_t)(o - (uint8_t *)&r);
+		if (len < 300) {
+			len = 300;
+		}
+		unsigned idx = if_nametoindex("en2");
+
+		if (idx != 0) {
+			setsockopt(s, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx));
+		}
+		sendto(s, &r, len, 0, (struct sockaddr *)&to, sizeof(to));
+		fprintf(stderr, "sweetd: dhcp %s -> 192.168.7.1\n", type == 1 ? "offer" : "ack");
+	}
+}
+
 int
 main(void)
 {
 	signal(SIGPIPE, SIG_IGN);
+	if (fork() == 0) {
+		dhcp_serve();
+		_exit(0);
+	}
 	int ls = socket(AF_INET, SOCK_STREAM, 0);
 	int on = 1;
 	setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
