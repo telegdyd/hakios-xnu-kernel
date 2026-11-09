@@ -403,9 +403,20 @@ loader_log_append_msgbuf(void)
  * reason 0: back to the loader, which waits for the host's next command. reason 3: the same, and the
  * loader then resets the phone (Android again): what "sweet-sh.py reboot" asks for.
  */
+/*
+ * The reason asked for, kept where the boot processor finds it: when another processor asks,
+ * the boot processor makes the return with loader_return(), which knows no reason of its own.
+ * The highest asked for wins (a reset asked for is not lost to a plain return after it).
+ * Before this, sweet-sh.py reboot with cpus=8 left the phone in the loader (2026-11-09).
+ */
+static uint64_t loader_reason_wanted;
+
 static void
 loader_return_reason(uint64_t reason)
 {
+	if (reason > __atomic_load_n(&loader_reason_wanted, __ATOMIC_ACQUIRE)) {
+		__atomic_store_n(&loader_reason_wanted, reason, __ATOMIC_RELEASE);
+	}
 #if defined(GENERIC_PSCI_SMP)
 	/*
 	 * With more than one processor: the others switch themselves off first, and the rest of
@@ -414,6 +425,7 @@ loader_return_reason(uint64_t reason)
 	 */
 	psci_smp_stop_others();
 #endif
+	reason = __atomic_load_n(&loader_reason_wanted, __ATOMIC_ACQUIRE);
 	hakios_usb_net_quiesce();       /* the USB controller stopped, if usb_net=1 took it from the loader's UEFI */
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */

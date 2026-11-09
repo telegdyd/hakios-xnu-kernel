@@ -8,6 +8,8 @@ savedefconfig`), for a kernel whose options are not compiled in but given on its
   tools/hakios-config.py defconfig redwood open       ... and the fragment configs/open.config on top
   tools/hakios-config.py merge virt                   put a fragment over the .config there is
   tools/hakios-config.py args                         the kernel's boot-arguments for the .config
+  tools/hakios-config.py args --set thermal=0         ... with one changed for a run (name= leaves it out); replaced
+                                                      where it stands, since the first occurrence of a name is the one read
   tools/hakios-config.py check | show | needs         validate it; say what it is; which firmware it wants
   tools/hakios-config.py savedefconfig                the .config as a minimal defconfig (its differences from configs/defconfig)
   tools/hakios-config.py list | help SYMBOL           what configs/ holds; what a symbol means
@@ -680,8 +682,40 @@ def cmd_args(a):
         for p in problems:
             print("hakios-config: PROBLEM: " + p, file=sys.stderr)
         return 1
+    try:
+        args = override_args(args, a.set, a.root)
+    except ConfigError as e:
+        print("hakios-config: PROBLEM: %s" % e, file=sys.stderr)
+        return 1
     print(" ".join(args))
     return 0
+
+
+def override_args(args, sets, root=None):
+    """--set name=value over the configuration's arguments: the word of that name replaced where it stands, or added at the
+    end. Replaced, not added in front of: XNU and the loader take the first occurrence of a name, so an added
+    `thermal=0` after `thermal=1` would not be seen. `--set name=` (nothing after =) takes the word out."""
+    known = known_args(root)
+    out = list(args)
+    for word in sets:
+        name, eq, value = word.partition("=")
+        if not eq or not re.fullmatch(r"[a-z0-9_.-]+", name):
+            raise ConfigError("--set %s: give name=value (or name= to leave the argument out)" % word)
+        if known is not None and name not in known:
+            raise ConfigError("--set %s: nothing reads the argument %s (docs/boot-args.md lists them)" % (word, name))
+        if value and not RELAXED.fullmatch(value):
+            raise ConfigError("--set %s: a value of letters, digits and . , : / + @ = -" % word)
+        at = [i for i, w in enumerate(out) if w.partition("=")[0] == name]
+        for i in reversed(at[1:]):
+            del out[i]
+        if not value:
+            if at:
+                del out[at[0]]
+        elif at:
+            out[at[0]] = "%s=%s" % (name, value)
+        else:
+            out.append("%s=%s" % (name, value))
+    return out
 
 
 def cmd_check(a):
@@ -1058,6 +1092,8 @@ def main():
     p.add_argument("--force", action="store_true", help="print them even if the check finds a problem")
     p.add_argument("--defconfig", help="the arguments of this defconfig (and --fragment) instead of the .config's")
     p.add_argument("--fragment", action="append", default=[], help="a fragment over it; more than one is allowed")
+    p.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                   help="for this run: replace the argument NAME (or add it); NAME= leaves it out. More than one is allowed")
     p.set_defaults(fn=cmd_args)
     for name, fn, text in (("check", cmd_check, "validate the .config"), ("show", cmd_show, "say what the .config is"),
                            ("needs", cmd_needs, "which firmware the .config wants, and whether it is there"),

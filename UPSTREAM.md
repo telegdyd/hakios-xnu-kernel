@@ -55,3 +55,12 @@
   down, as the stock tree's key codes say). Run on the phone: all three keys.
   Redwood's layout and mapping are unchanged without the argument.
   `configs/common_defconfig` regenerated (it lacked earlier negroni symbols).
+- `xnu/files/osfmk/arm64/loader_return.c`: the return reason (3, "reset the
+  phone") is kept where the boot processor finds it. With more than one core,
+  a request handled on another core was handed to the boot processor, which
+  returned with reason 0, so `sweet-sh.py reboot` left the phone in the loader.
+- `tools/hakios-config.py args --set name=value`: one argument changed for a
+  run, replaced where it stands (XNU and the loader read the first occurrence),
+  `name=` leaves it out; the name is checked against `configs/boot-args.lst`.
+  Negroni's payload command line now comes from its configuration
+  (`devices/negroni/tools/make-payload.sh`) instead of being typed per build.
