@@ -10,6 +10,8 @@
 #                                   after init's checks; rc.darwin runs a few Darwin programs and halts
 #                      JOBS="..."   labels of the stock Darwin launchd jobs to load (default: DARWIN_JOBS)
 #                      REST=1       ... and the rest of them, started only when asked for (see mkjobs.py)
+#                      SWEETD=0     without com.hakios.sweetd (the command runner on TCP 5143 of the USB
+#                                   Ethernet link; its token is userland/sweetd.token, made here once)
 #                      WIFID=0      without wifid, Darwin's Wi-Fi daemon, which is in by default (see below)
 #                      OSLOG="..."  labels of the jobs whose os_log output goes to the console ("all": every
 #                                   one of JOBS; default: only the window server, which says little)
@@ -237,6 +239,9 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework Security -o obj/wifipw_test src/wifipw_test.c &&
 			{ ${LDID:-ldid} -Ssrc/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
+		# the command runner on the USB Ethernet link (TCP 5143; com.hakios.sweetd.plist; client: devices/negroni/tools/sweet-sh.py)
+		$DYN -o obj/sweetd src/sweetd.c
+		${LDID:-ldid} -S obj/sweetd 2>/dev/null || echo "build.sh: no ldid: sweetd is unsigned"
 		# our library for inside stock Darwin programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc \
 			-o obj/libhakios.dylib src/inject.c
@@ -345,6 +350,16 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		fi
 	fi
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
+	if [ -f obj/sweetd ] && [ "${SWEETD-1}" != 0 ]; then
+		cp obj/sweetd root/bin/
+		# its token: made once on this machine, beside this script and out of git, and the same file
+		# the PC's sweet-sh.py reads
+		if [ ! -s sweetd.token ]; then
+			(umask 077; od -An -N24 -tx1 /dev/urandom | tr -d ' \n' > sweetd.token)
+			echo "build.sh: made userland/sweetd.token (for sweetd and sweet-sh.py)"
+		fi
+		install -m 600 sweetd.token root/etc/sweetd.token
+	fi
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/cputop ] && cp obj/cputop root/bin/
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
@@ -463,6 +478,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
 	# fairplayd among them).
 	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
+	[ -f root/bin/sweetd ] && cp com.hakios.sweetd.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $DARWIN/rootfs.slt ] && VOLUME="--root-volume $DARWIN/rootfs.slt"
 	[ -n "$DARWIN_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $DARWIN/rootfs root/LaunchDaemons $DARWIN_JOBS

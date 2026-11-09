@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.hakios.sweetd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/redwood/bin/sweetd</string>
+	</array>
+	<!-- The command runner on TCP 5143 of the USB Ethernet link (src/sweetd.c; the client is
+	     devices/negroni/tools/sweet-sh.py). It waits for the network by itself, and runs
+	     nothing without the token in the image (userland/sweetd.token). Root, as oslogfwd. -->
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>LimitLoadToSessionType</key>
+	<string>System</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+</dict>
+</plist>
