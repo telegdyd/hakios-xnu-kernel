@@ -498,6 +498,15 @@ publish(const struct reading *r)
 	b.charge_uah = (int32_t)((int64_t)DESIGN_UAH * est.soc / 10000);
 	b.design_uah = DESIGN_UAH;
 	b.estimated = HAKIOS_BATTERY_ESTIMATED | HAKIOS_BATTERY_NO_TEMPERATURE;
+	if (hakios_battery_gauge_live()) {
+		/* the DSP's fuel gauge is reporting (adsp_soc=8450, hakios.adsp.c): the estimate follows it and says nothing */
+		int soc = -1, present = 0, charger = 0;
+
+		if (hakios_battery_get(&soc, &present, &charger) && soc >= 0 && soc <= 100) {
+			est.soc = soc * 100;
+		}
+		return;
+	}
 	hakios_battery_report(&b);
 }
 

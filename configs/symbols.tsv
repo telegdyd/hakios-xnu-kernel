@@ -17,6 +17,8 @@ ADSP_LISTEN	arg	adsp_listen	Audio and battery	k	hakios.adsp.c
 ADSP_NEW	arg	adsp_new	Audio and battery	k	hakios.adsp.c	
 ADSP_PAUSE	arg	adsp_pause	Audio and battery	k	hakios.adsp.c	
 ADSP_RETURN	arg	adsp_return	Audio and battery	k	hakios.adsp.c	
+ADSP_RETURN_S	arg	adsp_return_s	Audio and battery	k	hakios.adsp.c	S seconds after this, the DSP is stopped and the run goes back to the loader
+ADSP_SOC	arg	adsp_soc	Audio and battery	k	hakios.adsp.c	
 ADSP_STEP	arg	adsp_step	Audio and battery	k	hakios.adsp.c	
 ADSP_WAIT	arg	adsp_wait	Audio and battery	k	hakios.adsp.c	
 APFS_CHEAP	arg	apfs_cheap	Storage and APFS	k	apfs_vfsops.c	
@@ -57,6 +59,7 @@ BATTERY_POLL	arg	battery_poll	Audio and battery	k	hakios.battery_bcl.c	how often
 BATTERY_SOC	arg	battery_soc	Audio and battery	k	hakios.battery_bcl.c	
 BATTERY_STORE	arg	battery_store	Audio and battery	k	hakios.battery_bcl.c	neither read nor write the file
 BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c	every property once, for the log (which number is which on this phone's firmware)
+BATTMGR_SINK	arg	battmgr_sink	Audio and battery	k	hakios.adsp.c	
 BT	arg	bt	User space	k	hakios.bt.c	
 BT_AGAIN	arg	bt_again	User space	k	hakios.bt.c	the second look this many seconds later (0: no second look; 30)
 BUTTONS	arg	buttons	Touch and buttons	k	hakios.buttons.c	
@@ -279,6 +282,7 @@ UFS_NATIVE_WRITE	arg	ufs_native_write	Storage and APFS	k	hakios.ufs.c	Native rea
 UFS_PROBE	arg	ufs_probe	Loader	l	loader.c	
 UI_LITE	arg	ui_lite	User space	u	inject_sb.c	the system's own "Reduce Transparency" and "Reduce Motion" (Settings, Accessibility), for this
 USB_NET_IP	arg	usb_net_ip	User space	k	hakios.usb_net.c	
+USB_PHYGUARD	arg	usb_phyguard	User space	k	hakios.usb_net.c	
 USTACKS	arg	ustacks	Debugging	k	user_exception_trace.c	
 USTACKS_AT	arg	ustacks_at	Debugging	k	user_exception_trace.c	
 USTACKS_COUNT	arg	ustacks_count	Debugging	k	user_exception_trace.c	

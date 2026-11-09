@@ -138,6 +138,21 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_from_dsp, CTLFLAG_RD | CTLFLAG_LOCKED
 
 extern void HakiosBatteryReport(const void *state, unsigned size);     /* drivers/power/hakios.battery.cpp */
 
+static uint64_t gauge_at;               /* when the fuel gauge (the DSP's battery manager) last reported */
+
+/* The gauge has reported in the last minute: an estimate (hakios.battery_bcl.c) gives way to it. */
+bool
+hakios_battery_gauge_live(void)
+{
+	uint64_t at = gauge_at, ns;
+
+	if (at == 0) {
+		return false;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - at, &ns);
+	return ns < 60ull * NSEC_PER_SEC;
+}
+
 void
 hakios_battery_report(const struct hakios_battery_state *b)
 {
@@ -165,6 +180,9 @@ hakios_battery_report(const struct hakios_battery_state *b)
 		battery_cycles = b->cycles;
 	}
 	battery_source_dsp = !(b->estimated & HAKIOS_BATTERY_ESTIMATED);
+	if (battery_source_dsp) {
+		gauge_at = mach_absolute_time();
+	}
 	battery_updates++;
 	HakiosBatteryReport(b, sizeof(*b));
 }

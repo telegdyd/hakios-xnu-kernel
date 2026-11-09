@@ -688,6 +688,125 @@ event_one(uint32_t raw)
 }
 
 /*
+ * The PHY's guard (boot-arg usb_phyguard=1; the OnePlus 10 Pro's addresses). On the 10 Pro the audio DSP's charger_pd
+ * does its own port detection (BC1.2, PD) on D+/D- a few seconds after the DSP starts: it writes the high-speed PHY's
+ * UTMI overrides and leaves them so -- SLEEPM and OPMODE "non-driving" with the datapath override on, which takes the
+ * pull-up away -- and may switch the PHY's reference clock off (iOSPlus10's notes 48, 70: utmi0 9, cfg0 1, clkref
+ * 1 -> 80000000). Android's USB driver sets the PHY up again at each role change; nothing does here, so the computer
+ * loses the phone for good. The guard notes the five words as the loader left them (the link working), looks at them
+ * every 10 ms, and once something has changed them and they have stayed so for 300 ms, writes them back (the clock's
+ * enable first, the overrides' enables last), at most 20 times a boot. The controller's own state is not touched: its
+ * RUN_STOP is still on, so the host sees the pull-up again, resets the port, and the loop's reset and connect events
+ * take it from there.
+ */
+#define HSPHY_PHYS              0x088e3000UL    /* hsphy@88e3000, "qcom,usb-hsphy-snps-femto" (the stock DT) */
+#define HSPHY_UTMI_CTRL0        0x3c            /* SLEEPM 0, OPMODE 4:3 (1: non-driving), TERMSEL 5 */
+#define HSPHY_UTMI_CTRL1        0x40            /* XCVRSEL */
+#define HSPHY_CTRL2             0x64            /* USB2_SUSPEND_N 2, USB2_SUSPEND_N_SEL 3 */
+#define HSPHY_CFG0              0x94            /* UTMI_PHY_DATAPATH_CTRL_OVERRIDE_EN 0, UTMI_PHY_CMN_CTRL_OVERRIDE_EN 1 */
+#define GCC_CLKREF_PHYS         0x0019c000UL    /* clock-controller@100000 + 0x9c000: GCC_EUSB3_0_CLKREF_EN at + 0xc */
+#define GCC_CLKREF_EN           0x00c           /* bit 0 enable, bit 31 CLK_OFF */
+#define PHYGUARD_WORDS          5
+
+static const char *const phyguard_name[PHYGUARD_WORDS] = { "utmi0", "utmi1", "ctrl2", "cfg0", "clkref" };
+static struct {
+	bool on;
+	vm_offset_t phy, gcc;
+	uint32_t base[PHYGUARD_WORDS], last[PHYGUARD_WORDS];
+	uint32_t stable_ms, since_ms, restores, lines;
+} phyguard;
+
+static void
+phyguard_read(uint32_t *w)
+{
+	w[0] = rd(phyguard.phy, HSPHY_UTMI_CTRL0);
+	w[1] = rd(phyguard.phy, HSPHY_UTMI_CTRL1);
+	w[2] = rd(phyguard.phy, HSPHY_CTRL2);
+	w[3] = rd(phyguard.phy, HSPHY_CFG0);
+	w[4] = rd(phyguard.gcc, GCC_CLKREF_EN);
+}
+
+static void
+phyguard_start(void)
+{
+	uint32_t on = 0;
+
+	if (!PE_parse_boot_argn("usb_phyguard", &on, sizeof(on)) || on == 0) {
+		return;
+	}
+	phyguard.phy = ml_io_map(HSPHY_PHYS, 0x1000);
+	phyguard.gcc = ml_io_map(GCC_CLKREF_PHYS, 0x1000);
+	if (phyguard.phy == 0 || phyguard.gcc == 0) {
+		printf("usb_net: phyguard: the PHY or the clock controller cannot be mapped: no guard\n");
+		return;
+	}
+	phyguard_read(phyguard.base);
+	memcpy(phyguard.last, phyguard.base, sizeof(phyguard.last));
+	phyguard.on = true;
+	printf("usb_net: phyguard: on; the PHY as the loader left it: utmi0 %x utmi1 %x ctrl2 %x cfg0 %x, clkref %x\n",
+	    phyguard.base[0], phyguard.base[1], phyguard.base[2], phyguard.base[3], phyguard.base[4]);
+}
+
+static void
+phyguard_write(vm_offset_t base, vm_offset_t offset, uint32_t value)
+{
+	*(volatile uint32_t *)(base + offset) = value;
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* Called from the loop every 10 ms or so (elapsed_ms since the last call). */
+static void
+phyguard_look(uint32_t elapsed_ms)
+{
+	uint32_t now[PHYGUARD_WORDS], after[PHYGUARD_WORDS];
+
+	if (!phyguard.on) {
+		return;
+	}
+	phyguard_read(now);
+	if (memcmp(now, phyguard.last, sizeof(now)) != 0) {
+		if (phyguard.lines < 60) {
+			phyguard.lines++;
+			printf("usb_net: phyguard: the PHY changed: utmi0 %x utmi1 %x ctrl2 %x cfg0 %x clkref %x (was %x %x %x %x %x)\n",
+			    now[0], now[1], now[2], now[3], now[4], phyguard.last[0], phyguard.last[1], phyguard.last[2],
+			    phyguard.last[3], phyguard.last[4]);
+		}
+		memcpy(phyguard.last, now, sizeof(now));
+		phyguard.stable_ms = 0;
+		return;
+	}
+	if (memcmp(now, phyguard.base, sizeof(now)) == 0) {
+		phyguard.stable_ms = 0;
+		return;
+	}
+	phyguard.stable_ms += elapsed_ms;
+	if (phyguard.stable_ms < 300 || phyguard.restores >= 20) {
+		return;
+	}
+	phyguard.restores++;
+	if ((now[4] & 1) == 0 && (phyguard.base[4] & 1) != 0) {
+		phyguard_write(phyguard.gcc, GCC_CLKREF_EN, now[4] | 1);
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	phyguard_write(phyguard.phy, HSPHY_UTMI_CTRL0, phyguard.base[0]);
+	phyguard_write(phyguard.phy, HSPHY_UTMI_CTRL1, phyguard.base[1]);
+	phyguard_write(phyguard.phy, HSPHY_CTRL2, phyguard.base[2]);
+	phyguard_write(phyguard.phy, HSPHY_CFG0, phyguard.base[3]);
+	delay_for_interval(1, NSEC_PER_MSEC);
+	phyguard_read(after);
+	printf("usb_net: phyguard: put back (%u): utmi0 %x->%x utmi1 %x->%x ctrl2 %x->%x cfg0 %x->%x clkref %x->%x: %s\n",
+	    phyguard.restores, now[0], after[0], now[1], after[1], now[2], after[2], now[3], after[3], now[4], after[4],
+	    memcmp(after, phyguard.base, 4 * sizeof(uint32_t)) == 0 ? "as the loader left it" : "NOT as the loader left it");
+	for (unsigned i = 0; i < PHYGUARD_WORDS; i++) {
+		if (after[i] != phyguard.base[i]) {
+			printf("usb_net: phyguard: %s is %x, the loader's %x\n", phyguard_name[i], after[i], phyguard.base[i]);
+		}
+	}
+	memcpy(phyguard.last, after, sizeof(after));
+	phyguard.stable_ms = 0;
+}
+
+/*
  * The loop: every millisecond while anything has happened in the last second, every five when it
  * has been quiet (a quiet controller costs one read of GEVNTCOUNT). No interrupt is attached, as in
  * hakios.ufshc.c and hakios.net.c.
@@ -722,6 +841,11 @@ event_loop(void)
 			quiet++;
 		}
 		interval = (count != 0 || quiet < 1000) ? 1 : 5;
+		phyguard.since_ms += interval;
+		if (phyguard.since_ms >= 10) {
+			phyguard_look(phyguard.since_ms);
+			phyguard.since_ms = 0;
+		}
 		said += interval;
 		if (said >= 30000) {
 			said = 0;
@@ -2093,6 +2217,7 @@ usbnet_thread(__unused void *parameter, __unused wait_result_t result)
 		printf("usb_net: the controller is not ours; nothing more is done\n");
 		thread_terminate(current_thread());
 	}
+	phyguard_start();
 	event_loop();
 }
 

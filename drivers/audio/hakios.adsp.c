@@ -114,6 +114,8 @@ extern lck_mtx_t hakios_rsc_lock;            /* RPMh's sequencer, shared with th
 static LCK_GRP_DECLARE(adsp_lock_group, "hakios-adsp");
 
 #define STEPS                   11
+static uint32_t adsp_soc;               /* boot-arg adsp_soc: 0 the X5 Pro (SM7325), 8450 the OnePlus 10 Pro (adsp_soc_8450()) */
+static uint32_t steps_all = STEPS;      /* the steps there are: STEPS, or 10 on SM8450 (no APR there) */
 #define HAKIOS_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin */
 
 static uint32_t last_step, pause_ms = 2200, listen_seconds = 3;
@@ -983,8 +985,13 @@ step_survey(void)
 
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
-#define ADSP_MEMORY             0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
-#define ADSP_MEMORY_SIZE        0x04000000u
+/*
+ * The DSP's memory: the X5 Pro's (dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000), or with
+ * adsp_soc=8450 the OnePlus 10 Pro's (dt: adsp_region@85e00000, reg 0x85700000 + 0x2800000; see adsp_soc_8450()).
+ */
+static uint32_t adsp_memory = 0x86700000u, adsp_memory_size = 0x04000000u;
+#define ADSP_MEMORY             adsp_memory
+#define ADSP_MEMORY_SIZE        adsp_memory_size
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
 
 
@@ -1007,9 +1014,13 @@ root_file(const char *name, uint64_t *size)
 	if (rootvnode == NULLVP) {
 		return NULL;
 	}
+	/* (/fw on the system image; /private/var/fw on the writable volume, where sweet-sh.py --put can put it) */
 	snprintf(path, sizeof(path), "/fw/%s", name);
 	if (vnode_lookup(path, 0, &vnode, context) != 0) {
-		return NULL;
+		snprintf(path, sizeof(path), "/private/var/fw/%s", name);
+		if (vnode_lookup(path, 0, &vnode, context) != 0) {
+			return NULL;
+		}
 	}
 	VATTR_INIT(&attributes);
 	VATTR_WANTED(&attributes, va_data_size);
@@ -1079,6 +1090,7 @@ image_file(const char *name, uint64_t *size)
 
 
 #define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)
+#define MDT_RELOCATABLE         (1u << 27)
 #define MAX_SEGMENTS            48
 
 struct elf_segment {
@@ -1147,6 +1159,25 @@ step_firmware(void)
 		    first[1], first[2], first[3], count, size);
 		goto fail;
 	}
+	/*
+	 * A relocatable image (bit 27 of a segment's flags, Linux mdt_loader.c) is loaded wherever its memory is: each
+	 * segment at its p_paddr less the lowest p_paddr. The 10 Pro's is (its addresses begin at 0x86300000, its memory
+	 * at 0x85700000); the X5 Pro's addresses are its memory's own.
+	 */
+	uint32_t base = ADSP_MEMORY;
+	bool relocatable = false;
+
+	for (uint32_t i = 0; i < count; i++) {
+		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
+		if (segment.type == 1 && !MDT_HASH(segment.flags) && segment.memory_size != 0) {
+			relocatable |= (segment.flags & MDT_RELOCATABLE) != 0;
+			lowest = segment.paddr < lowest ? segment.paddr : lowest;
+		}
+	}
+	if (relocatable && lowest != ~0u) {
+		base = lowest;
+	}
+	lowest = ~0u;
 	for (uint32_t i = 0; i < count; i++) {
 		char name[16];
 
@@ -1157,13 +1188,13 @@ step_firmware(void)
 		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
 			continue;
 		}
-		if (segment.paddr < ADSP_MEMORY || segment.file_size > segment.memory_size ||
-		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)ADSP_MEMORY + ADSP_MEMORY_SIZE) {
+		if (segment.paddr < base || segment.file_size > segment.memory_size ||
+		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)base + ADSP_MEMORY_SIZE) {
 			printf("adsp: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
 			    segment.memory_size);
 			goto fail;
 		}
-		image.segment[image.segments].at = segment.paddr - ADSP_MEMORY;
+		image.segment[image.segments].at = segment.paddr - base;
 		image.segment[image.segments].file_size = segment.file_size;
 		image.segment[image.segments].memory_size = segment.memory_size;
 		image.segment[image.segments].file = NULL;
@@ -1188,17 +1219,17 @@ step_firmware(void)
 		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
 		image.segments++;
 	}
-	if (image.segments == 0 || lowest != ADSP_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
+	if (image.segments == 0 || lowest != base || 52 + 32 * count + (uint64_t)hashes != size) {
 		printf("adsp: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
 		goto fail;
 	}
 	image.header = header;
 	image.header_size = size;
-	image.size = ((highest + 0xfff) & ~0xfffu) - ADSP_MEMORY;
+	image.size = ((highest + 0xfff) & ~0xfffu) - base;
 	printf("adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
-	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
-	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
+	    "bytes of the DSP's %#x from %#x%s\n", step, from_root ? "from the root" : "from the small image", size, hashes,
+	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY, relocatable ? " (relocatable: moved there)" : "");
 	return true;
 fail:
 	image_forget();
@@ -1479,15 +1510,23 @@ step_image(void)
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the audio DSP's memory (0x86700000, 64 MB: memory of nobody's until TrustZone "
-	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
+	announce("put the image's segments into the audio DSP's memory (memory of nobody's until TrustZone starts the DSP), "
+	    "with zeroes where a segment is longer than its file, and read them back");
 	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEMORY, ADSP_MEMORY_SIZE, VM_WIMG_WCOMB);
 	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, ADSP_MEMORY);
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
 
-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
+		/*
+		 * (a segment's end need not be a multiple of eight -- the 10 Pro's are not, e.g. 0x3135a4 bytes -- and its last
+		 * word is then written with zeroes past the end: those bytes are in the DSP's memory, before the next segment,
+		 * which begins on a page)
+		 */
+		uint64_t end = (uint64_t)image.segment[s].at + ((image.segment[s].memory_size + 7) & ~7ull);
+
+		if ((image.segment[s].at & 7) != 0 || end > ADSP_MEMORY_SIZE) {
+			printf("adsp: %u: segment %u (at %#x, %#x bytes) does not begin at a multiple of eight bytes or does not fit: "
+			    "not written\n", step, s, image.segment[s].at, image.segment[s].memory_size);
 			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
 			return false;
 		}
@@ -2686,21 +2725,30 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 #define BATTMGR_NOTICE          2
 #define BATTMGR_BATTERY_GET     0x30
 #define BATTMGR_USB_GET         0x32
+#define BATTMGR_USB_SET         0x33
 #define BATT_STATUS             0               /* Linux's POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
 #define BATT_HEALTH             1
 #define BATT_PRESENT            2
 #define BATT_CAPACITY           4
 #define BATT_VOLT_NOW           7
 #define BATT_CURR_NOW           9
-#define BATT_TEMP               13              /* hundredths of a degree: 3900 when Android says 39.0 */
-#define BATT_CHG_COUNTER        15              /* the charge in the battery now, uAh */
-#define BATT_CYCLE_COUNT        16
-#define BATT_CHG_FULL_DESIGN    17              /* 5000000 uAh */
-#define BATT_CHG_FULL           18              /* the full charge as the fuel gauge has learnt it, uAh */
+/*
+ * From the temperature on, the X5 Pro's firmware has one property more than Linux's list; the 10 Pro's (adsp_soc=8450)
+ * has Linux's own numbers (qcom_battmgr.c sm8350: 12 TEMP, 13 TECHNOLOGY, 14 CHG_COUNTER, 15 CYCLE_COUNT,
+ * 16 CHG_FULL_DESIGN, 17 CHG_FULL), read with battmgr=2 on 2026-11-09: 12 = 3520 (35.2 C), 13 = 2 (Li-ion).
+ */
+static uint32_t batt_shift = 1;         /* 0 on SM8450 (adsp_soc_8450()) */
+#define BATT_TEMP               (12 + batt_shift)       /* hundredths of a degree: 3900 when Android says 39.0 */
+#define BATT_CHG_COUNTER        (14 + batt_shift)       /* the charge in the battery now, uAh */
+#define BATT_CYCLE_COUNT        (15 + batt_shift)
+#define BATT_CHG_FULL_DESIGN    (16 + batt_shift)       /* 5000000 uAh on the X5 Pro */
+#define BATT_CHG_FULL           (17 + batt_shift)       /* the full charge as the fuel gauge has learnt it, uAh */
 #define USB_VOLT_NOW            1               /* uV */
 #define USB_CURR_NOW            3               /* uA, what the port gives */
 #define USB_TYPE                6               /* Linux's POWER_SUPPLY_USB_TYPE_*: 1 here, a computer's port */
 #define USB_ONLINE              0
+#define USB_OTG_SWITCH          15              /* the 10 Pro's firmware (OPLUS): 0 OTG off */
+#define USB_TYPEC_MODE          19              /* the 10 Pro's firmware (OPLUS): set 0 DRP, 1 sink only; read 0 sink */
 #define BATTMGR_SECONDS         10
 
 struct battmgr_message {
@@ -2742,11 +2790,15 @@ battmgr_input(const uint8_t *data, uint32_t length)
 	os_atomic_inc(&battmgr.answers, release);
 }
 
-/* One property asked for and its answer waited for (a second at most); one thread asks at a time (battmgr_thread). */
+/*
+ * One property asked for (or set, with BATTMGR_USB_SET and *value the value) and its answer waited for (a second at
+ * most); one thread asks at a time (battmgr_thread).
+ */
 static bool
 battmgr_get(uint32_t opcode, uint32_t property, uint32_t *value)
 {
-	struct battmgr_message q = { BATTMGR_OWNER, BATTMGR_REQUEST, opcode, { 0, property, 0 } };
+	struct battmgr_message q = { BATTMGR_OWNER, BATTMGR_REQUEST, opcode,
+		                     { 0, property, opcode == BATTMGR_USB_SET ? *value : 0 } };
 	uint32_t before = os_atomic_load(&battmgr.answers, acquire);
 
 	if (glink_send(&glink.channel[CHANNEL_PMIC], &q, sizeof(q)) != 0) {
@@ -2781,6 +2833,26 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 		battmgr.runs = false;
 		thread_terminate(current_thread());
 	}
+	if (adsp_soc == 8450) {
+		/*
+		 * The 10 Pro's charger_pd starts its Type-C port as dual-role and, with no Android to say otherwise, makes the
+		 * phone the source a few seconds after the DSP is up: the computer then sees no device (iOSPlus10's notes 58,
+		 * t19). Android's oplus charger code sets the port to sink only; so is it here, and OTG off, unless
+		 * battmgr_sink=0. (What the port's PHY was left in is put back by hakios.usb_net.c, usb_phyguard.)
+		 */
+		uint32_t sink = 1;
+
+		PE_parse_boot_argn("battmgr_sink", &sink, sizeof(sink));
+		if (sink != 0) {
+			uint32_t mode = 1, otg = 0, role = ~0u;
+			bool set_mode = battmgr_get(BATTMGR_USB_SET, USB_TYPEC_MODE, &mode);
+			bool set_otg = battmgr_get(BATTMGR_USB_SET, USB_OTG_SWITCH, &otg);
+			bool got = battmgr_get(BATTMGR_USB_GET, USB_TYPEC_MODE, &role);
+
+			tell("adsp: battmgr: the USB port set to sink only: %s, OTG off: %s; it reads %d (0: sink)\n",
+			    set_mode ? "done" : "NO ANSWER", set_otg ? "done" : "NO ANSWER", got ? (int)role : -1);
+		}
+	}
 	{
 		/* boot-arg battmgr=2: every property once, for the log (which number is which on this phone's firmware) */
 		uint32_t mode = 1;
@@ -2812,6 +2884,16 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 		    battmgr_get(BATTMGR_BATTERY_GET, BATT_TEMP, &temp) &&
 		    battmgr_get(BATTMGR_USB_GET, USB_ONLINE, &usb);
 
+		if (good && adsp_soc == 8450) {
+			static unsigned again;
+			uint32_t role = 0, mode = 1;
+
+			if (battmgr_get(BATTMGR_USB_GET, USB_TYPEC_MODE, &role) && role != 0 && again < 6) {
+				again++;
+				tell("adsp: battmgr: the USB port reads %u (a source): set to sink only again (%u): %s\n", role, again,
+				    battmgr_get(BATTMGR_USB_SET, USB_TYPEC_MODE, &mode) ? "done" : "NO ANSWER");
+			}
+		}
 		if (good) {
 			/* (what may be missing without harm, and the capacities and the cycles only now and then: they hardly change) */
 			(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_COUNTER, &charge);
@@ -2835,6 +2917,18 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 			b.charge_uah = (int32_t)charge;
 			b.full_uah = (int32_t)full;
 			b.design_uah = (int32_t)design;
+			if (adsp_soc == 8450) {
+				/*
+				 * The 10 Pro's gauge says the current more than 0 while the battery gives charge (2026-11-09: +110 mA
+				 * while its charge counter fell 18 mAh in 10 minutes), the other way round from ours. Its charges
+				 * are not in the pack's units (learnt 1859000 against a design of 4000000, for a pack of 5000 mAh):
+				 * the charge is the percentage of the pack's 5000 mAh, and the full and design charges are not given.
+				 */
+				b.current_ua = -(int32_t)curr;
+				b.charge_uah = (int32_t)((int64_t)5000000 * (int32_t)capacity / 10000);
+				b.full_uah = 0;
+				b.design_uah = 5000000;
+			}
 			b.cycles = (int32_t)cycles;
 			b.usb_type = (int32_t)usb_type;
 			b.usb_voltage_uv = (int32_t)usb_volt;
@@ -3240,21 +3334,78 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	for (unsigned waited = 0; waited < 300 && rootvnode == NULLVP; waited++) {
 		sleep_ms(200);
 	}
+	if (adsp_soc == 8450) {
+		/* (its firmware is in /private/var/fw, mounted after the root: ten minutes at most) */
+		for (unsigned waited = 0; waited < 3000; waited++) {
+			vnode_t vnode = NULLVP;
+
+			if (vnode_lookup("/fw/adsp.mdt", 0, &vnode, vfs_context_kernel()) == 0 ||
+			    vnode_lookup("/private/var/fw/adsp.mdt", 0, &vnode, vfs_context_kernel()) == 0) {
+				vnode_put(vnode);
+				break;
+			}
+			sleep_ms(200);
+		}
+	}
 	run_steps();
 	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
 		services += qrtr_servers[i].there;
 	}
-	if (step == STEPS && dsp_started) {
-		tell("adsp: THE AUDIO DSP IS UP AND LINKED, its audio services up (APR), %llu ms after the kernel began on it (the "
-		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
-		hakios_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, hakios.sound.c) */
-		hakios_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, hakios.mic.c) */
+	if (step == steps_all && dsp_started) {
+		tell("adsp: THE AUDIO DSP IS UP AND LINKED%s, %llu ms after the kernel began on it (the root's waited for "
+		    "included): node %u, %u services; it stays on\n", steps_all == STEPS ? ", its audio services up (APR)" : "",
+		    (now_us() - began) / 1000, qrtr_peer, services);
+		if (steps_all == STEPS) {
+			hakios_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, hakios.sound.c) */
+			hakios_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, hakios.mic.c) */
+		}
 		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);
 	}
+	{
+		/* boot-arg adsp_return_s=S: S seconds after this, the DSP is stopped and the run goes back to the loader */
+		uint32_t seconds = 0;
+
+		if (PE_parse_boot_argn("adsp_return_s", &seconds, sizeof(seconds)) && seconds != 0) {
+			tell("adsp: back to the loader in %u s (adsp_return_s)\n", seconds);
+			for (uint32_t ms = 0; ms < seconds * 1000; ms += 100) {
+				sleep_ms(100);
+			}
+			tell("adsp: adsp_return_s: the DSP is stopped, and back to the loader\n");
+			hakios_adsp_stop();
+			loader_return();
+		}
+	}
 	thread_terminate(current_thread());
+}
+
+/*
+ * The OnePlus 10 Pro (SM8450, negroni), boot-arg adsp_soc=8450: what differs from the X5 Pro, from its own device
+ * tree (device-info/2026-11-08-initial/rooted/device-tree.dtb). The same there: the shared memory (0x80900000, 2 MB)
+ * and its lock (TCSR mutex 3, 0x01f43000), processor 2, the SMP2P items 443/429 and entries, the GLINK items, IPCC
+ * client 3 (LPASS: signal 0 GLINK, signal 2 SMP2P) and client 0 (the AOP), the AOP's mailbox (0x0c300000), image 1,
+ * the rails lcx.lvl and lmx.lvl at 384 (cx-uV-uA 0x180), the command database (0x80860000), the sequencer's TCS
+ * layout (0xd00; the active TCSs first). Different:
+ *   - its memory: adsp_region 0x85700000 + 0x2800000, and the image is relocatable (step_firmware())
+ *   - IPCC at 0x0ed18000 (qcom,ipcc@ed18000), not 0x00408000
+ *   - the sequencer: rsc@17a00000, drv-id 2, so DRV 2's block at 0x17a20000
+ *   - its audio is AudioReach's GPR, not APR: steps 1 to 10 only. The battery manager's channel (PMIC_RTR_ADSP_APPS,
+ *     opened by the DSP's charger_pd) needs only the link, so it is asked once QRTR is up
+ * The loader's window for the kernel (0x842000000 on) is nowhere near the DSP's memory.
+ */
+static void
+adsp_soc_8450(void)
+{
+	adsp_memory = 0x85700000u;
+	adsp_memory_size = 0x02800000u;
+	ipcc.phys = 0x0ed18000u;
+	rsc.phys = 0x17a20000u;
+	steps_all = 10;
+	batt_shift = 0;
+	printf("adsp: the OnePlus 10 Pro's (SM8450) audio DSP: memory %#x + %#x, IPCC %#x, RPMh DRV 2 %#x, steps 1 to %u\n",
+	    adsp_memory, adsp_memory_size, ipcc.phys, rsc.phys, steps_all);
 }
 
 /* Called while the system starts (drivers/input/hakios.input.c), after the Wi-Fi's start has been set going. */
@@ -3268,13 +3419,16 @@ hakios_adsp_init(void)
 	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
 		return;
 	}
-	if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
+	PE_parse_boot_argn("adsp_soc", &adsp_soc, sizeof(adsp_soc));
+	if (adsp_soc == 8450) {
+		adsp_soc_8450();
+	} else if (pe_arm_get_soc_base_phys() != HAKIOS_SOC_BASE) {
 		printf("adsp: adsp=1 and adsp_step=N are for the phone's audio DSP, and this is not the phone\n");
 		return;
 	}
 	if (last_step == 0) {
 		/* all of it, on a thread of its own, and left up */
-		last_step = STEPS;
+		last_step = steps_all;
 		keep = true;
 		quiet = true;
 		pause_ms = 0;
@@ -3288,8 +3442,8 @@ hakios_adsp_init(void)
 		tell("adsp: the audio DSP is being brought up beside the system's start (adsp=1)\n");
 		return;
 	}
-	if (last_step > STEPS) {
-		last_step = STEPS;
+	if (last_step > steps_all) {
+		last_step = steps_all;
 	}
 	keep = option("adsp_keep");
 	new_from = last_step;

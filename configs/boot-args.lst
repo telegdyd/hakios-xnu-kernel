@@ -18,6 +18,8 @@ adsp_listen	k
 adsp_new	k
 adsp_pause	k
 adsp_return	k
+adsp_return_s	k
+adsp_soc	k
 adsp_step	k
 adsp_wait	k
 apfs_cheap	k
@@ -61,6 +63,7 @@ battery_stop	k
 battery_stop_poll	k
 battery_store	k
 battmgr	k
+battmgr_sink	k
 bootcpu	kl
 bt	k
 bt_again	k
@@ -311,6 +314,7 @@ ufs_write	kl
 ui_lite	u
 usb_net	kl
 usb_net_ip	k
+usb_phyguard	k
 ustacks	k
 ustacks_at	k
 ustacks_count	k

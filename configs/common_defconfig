@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 385 symbols in 18 groups; 36 are set, 27 of them drivers built in.
+# 389 symbols in 18 groups; 36 are set, 27 of them drivers built in.
 #
 
 #
@@ -585,7 +585,7 @@ CONFIG_GPU=y
 # CONFIG_VBLUR is not set
 
 #
-# Audio and battery (36)
+# Audio and battery (39)
 #
 
 # the audio DSP; the battery level in the UI and charging state come through it [needs fw-audio/ from the phone]
@@ -624,6 +624,12 @@ CONFIG_SOUND=4
 # read by hakios.adsp.c (kernel)
 # CONFIG_ADSP_RETURN is not set
 
+# S seconds after this, the DSP is stopped and the run goes back to the loader
+# CONFIG_ADSP_RETURN_S is not set
+
+# read by hakios.adsp.c (kernel)
+# CONFIG_ADSP_SOC is not set
+
 # read by hakios.adsp.c (kernel)
 # CONFIG_ADSP_STEP is not set
 
@@ -647,6 +653,9 @@ CONFIG_SOUND=4
 
 # every property once, for the log (which number is which on this phone's firmware)
 # CONFIG_BATTMGR is not set
+
+# read by hakios.adsp.c (kernel)
+# CONFIG_BATTMGR_SINK is not set
 
 # read by hakios.mic.c (kernel)
 # CONFIG_MIC_ADC is not set
@@ -1120,7 +1129,7 @@ CONFIG_MODEM_AGAIN=y
 # CONFIG_UFS_PROBE is not set
 
 #
-# User space (34)
+# User space (35)
 #
 
 # read by inject_sb.c (user space)
@@ -1215,6 +1224,9 @@ CONFIG_MODEM_AGAIN=y
 
 # read by hakios.usb_net.c (kernel)
 # CONFIG_USB_NET_IP is not set
+
+# read by hakios.usb_net.c (kernel)
+# CONFIG_USB_PHYGUARD is not set
 
 # read by init.c (user space)
 # CONFIG_VAR_HFS is not set

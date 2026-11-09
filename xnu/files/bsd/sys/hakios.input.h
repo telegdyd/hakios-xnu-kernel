@@ -79,6 +79,7 @@ struct hakios_battery_state {
 void hakios_battery_report(const struct hakios_battery_state *state);
 /* the charge (0..100, -1 unknown), whether a battery and a charger are there, as last reported; false before the first report */
 bool hakios_battery_get(int *soc, int *present, int *charger);
+bool hakios_battery_gauge_live(void);   /* the DSP's fuel gauge reported in the last minute (hakios.battery.c) */
 bool hakios_battery_bcl_init(void);    /* boot-arg battery_soc=8450: the OnePlus 10 Pro's estimate (hakios.battery_bcl.c) */
 void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
 void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
