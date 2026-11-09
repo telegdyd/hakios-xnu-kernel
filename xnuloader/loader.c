@@ -587,6 +587,9 @@ struct platform {
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 	int usb_restart_after_run;       /* the USB controller is dead after the kernel has had this core: see usb_restart() */
+	int firmware_quiet_at_once;      /* kernel on another core: no UEFI interrupts on this one from the start, not after
+	                                  * NOTE_SECONDS -- the firmware's own touch and key drivers poll the hardware the
+	                                  * kernel drives (negroni: NegroniTouchDxe, NegroniKeyInputDxe) */
 };
 
 static const struct platform platform_qemu_virt = {
@@ -619,7 +622,7 @@ static const struct platform platform_negroni = {
 	.name = "negroni", .io_base = 0x00400000, .io_size = 0x3FC00000,
 	.gic_dist = 0x17100000, .gic_redist = 0x17180000,
 	.gic_redist_size = 0x200000, .gic_redist_stride = 0x40000, .hypervisor_wdt = 1,
-	.cores = 8, .core_shift = 8, .small_cores = 0x0f, .usb_restart_after_run = 1,
+	.cores = 8, .core_shift = 8, .small_cores = 0x0f, .usb_restart_after_run = 1, .firmware_quiet_at_once = 1,
 };
 
 static const struct platform *
@@ -2413,7 +2416,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * After that this core only watches: no interrupts (the kernel reprograms the interrupt
 		 * controller's shared half; UEFI's handlers had better not run on top of that for long).
 		 */
-		if (!watching_only && seconds_since(started) >= NOTE_SECONDS) {
+		if (!watching_only && (PLAT->firmware_quiet_at_once || seconds_since(started) >= NOTE_SECONDS)) {
 			watching_only = 1;
 			daif = READ_SYSREG(DAIF);
 			__asm__ volatile ("msr daifset, #0xf");

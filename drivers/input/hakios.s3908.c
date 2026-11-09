@@ -273,7 +273,7 @@ tcm_read_message(void)
 		return 1;
 	}
 	if (tcm.code == TCM_STATUS_CONTINUED) {
-		return -3;
+		return -6;      /* the rest of an answer we did not take whole: read on (tcm_command) */
 	}
 	length = tcm.header[2] | (uint32_t)tcm.header[3] << 8;
 	if (length == 0) {
@@ -307,6 +307,11 @@ tcm_command(uint8_t command)
 	for (unsigned tries = 0; tries < 200; tries++) {
 		int rc = tcm_read_message();
 
+		if (rc == -6) {
+			/* a stray continuation (seen 2026-11-09: the chip answered late, after an earlier read had given up) */
+			sleep_ms(1);
+			continue;
+		}
 		if (rc < 0) {
 			return rc;
 		}
@@ -509,8 +514,21 @@ chip_setup(void)
 	}
 	printf("s3908: drain rc=%d code=%#x header %02x %02x %02x %02x bus=%d attention=%d\n", rc, tcm.code,
 	    tcm.header[0], tcm.header[1], tcm.header[2], tcm.header[3], tcm.bus_error, attention());
-	rc = tcm_get_report_config();
-	printf("s3908: report config rc=%d length=%u bus=%d\n", rc, tcm.config_length, tcm.bus_error);
+	/* a few tries: an answer can come late and leave a stray piece behind (2026-11-09, first boot from darwin) */
+	for (unsigned tries = 0; tries < 5; tries++) {
+		rc = tcm_get_report_config();
+		printf("s3908: report config rc=%d length=%u bus=%d (try %u)\n", rc, tcm.config_length, tcm.bus_error,
+		    tries + 1);
+		if (rc == 0) {
+			break;
+		}
+		sleep_ms(50);
+		for (unsigned i = 0; i < 50 && !attention(); i++) {
+			if (tcm_read_message() < 0 && tcm.bus_error) {
+				break;
+			}
+		}
+	}
 	return rc;
 }
 

@@ -64,3 +64,11 @@
   `name=` leaves it out; the name is checked against `configs/boot-args.lst`.
   Negroni's payload command line now comes from its configuration
   (`devices/negroni/tools/make-payload.sh`) instead of being typed per build.
+- `xnuloader/loader.c`: platform flag `firmware_quiet_at_once` (negroni): when
+  the kernel runs on another core (`bootcpu=N`, needed for `ufs=2`), core 0's
+  interrupts are masked from the kernel's start instead of after NOTE_SECONDS.
+  Mu's NegroniTouchDxe and NegroniKeyInputDxe otherwise poll the touch chip
+  and keys under the kernel (I2C bus errors, no touch). Redwood unchanged.
+- `drivers/input/hakios.s3908.c`: a stray continuation packet is read past
+  instead of failing the command, and the report config is asked for up to
+  five times. Seen on the first boot with the root on flash.
