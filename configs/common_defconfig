@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 371 symbols in 18 groups; 34 are set, 25 of them drivers built in.
+# 380 symbols in 18 groups; 36 are set, 27 of them drivers built in.
 #
 
 #
@@ -19,7 +19,7 @@
 CONFIG_FIRMWARE="device"
 
 #
-# Drivers built in (25)
+# Drivers built in (27)
 #
 
 # the audio DSP started and linked (adsp=1, adsp_step=N); the battery's state comes through it too. Needs the DSP's ... [hakios.adsp.c]
@@ -61,6 +61,9 @@ CONFIG_HAKIOS_VIRTIO_INPUT=y
 # the touch screen: a Goodix GT9916 ("Berlin-D") or a FocalTech FT3680 on SPI (touchscreen=1). The bus, pins and ... [hakios.goodix.c]
 CONFIG_HAKIOS_GOODIX=y
 
+# the OnePlus 10 Pro's touch screen: a Synaptics S3908 (TouchComm) at I2C 0x4b, its two wires driven by hand ... [hakios.s3908.c]
+CONFIG_HAKIOS_S3908=y
+
 # the power and volume keys, read from the PMIC through the SPMI arbiter (buttons=1) [hakios.buttons.c]
 CONFIG_HAKIOS_BUTTONS=y
 
@@ -69,6 +72,9 @@ CONFIG_HAKIOS_QMI=y
 
 # the modem (modem=1): started, its file systems served from the flash, the IPA's data path as en1, the SIM and the ... [hakios.mpss.c, hakios.cell.c, hakios.nas.c, hakios.ipa.c; requires CONFIG_HAKIOS_QMI, CONFIG_HAKIOS_UFS]
 CONFIG_HAKIOS_MODEM=y
+
+# the phone's USB cable as en2 (a CDC-NCM function on the DWC3 controller) and the kernel log on TCP 5140 (usb_net=1) [hakios.usb_net.c]
+CONFIG_HAKIOS_USB_NET=y
 
 # QEMU's virtio network device as the link behind en0 (virtio_net=1). QEMU only [hakios.virtio_net.c]
 CONFIG_HAKIOS_VIRTIO_NET=y
@@ -98,7 +104,7 @@ CONFIG_HAKIOS_VIRTIO_BLK=y
 CONFIG_HAKIOS_WIFI=y
 
 #
-# CPU, memory and boot (21)
+# CPU, memory and boot (22)
 #
 
 # CPU cores the kernel uses, 1 to 8; one if not set
@@ -115,6 +121,9 @@ CONFIG_HAKIOS_WIFI=y
 
 # read by the patch to Apple's files (kernel)
 # CONFIG_APPLOG_NAME is not set
+
+# the first domain's registers, when this is not the reference phone (the OnePlus 10 Pro, SM8450: 0x17d91000, dt ...
+# CONFIG_CPUFREQ_EPSS is not set
 
 # every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py ...
 # CONFIG_CPULOAD is not set
@@ -301,7 +310,7 @@ CONFIG_UFS=2
 # CONFIG_VIRTIO_BLK is not set
 
 #
-# Touch and buttons (10)
+# Touch and buttons (11)
 #
 
 # the touch screen, and the power and volume buttons
@@ -309,6 +318,9 @@ CONFIG_TOUCHSCREEN=y
 
 # read by hakios.buttons.c (kernel)
 # CONFIG_BUTTONS is not set
+
+# the OnePlus 10 Pro's (SM8450) PMIC arbiter instead of the X5 Pro's
+# CONFIG_BUTTONS_SOC is not set
 
 # read by hakios.buttons.c (kernel)
 # CONFIG_BUTTONS_STEPS is not set
@@ -319,7 +331,7 @@ CONFIG_TOUCHSCREEN=y
 # read by hakios.buttons.c (kernel)
 # CONFIG_PRESS_POWER_MS is not set
 
-# read by hakios.goodix.c (kernel)
+# read by hakios.goodix.c, hakios.s3908.c (kernel)
 # CONFIG_TOUCH_FLIP is not set
 
 # read by hakios.goodix.c (kernel)
@@ -335,7 +347,7 @@ CONFIG_TOUCHSCREEN=y
 # CONFIG_VIRTIO_INPUT is not set
 
 #
-# GPU and display (76)
+# GPU and display (77)
 #
 
 # rendering on Adreno (an image built with GL=1; the GPU's firmware from your phone) [needs fw-gpu/ from the phone]
@@ -398,6 +410,9 @@ CONFIG_GPU=y
 # read by MiniIOMobileFramebuffer.cpp (kernel)
 # CONFIG_FB_HZ is not set
 
+# the registers of the display interface the panel is on, for a port
+# CONFIG_FB_INTF is not set
+
 # how often the panel is really refreshed
 # CONFIG_FB_MEASURE is not set
 
@@ -422,7 +437,7 @@ CONFIG_GPU=y
 # log the first N calls of every selector (default 3)
 # CONFIG_FBTRACE is not set
 
-# read by MiniIOMobileFramebuffer.cpp (kernel)
+# read by MiniIOMobileFramebuffer.cpp, inject_sb.c (kernel and user space)
 # CONFIG_FBWIDTH is not set
 
 # the surface's memory, as before
@@ -989,7 +1004,7 @@ CONFIG_MODEM_AGAIN=y
 # CONFIG_TORCH_SECS is not set
 
 #
-# Chip, thermal and PMIC (10)
+# Chip, thermal and PMIC (12)
 #
 
 # read the chip's identity from the firmware's shared memory: kern.hakios.soc_* (SoC number, revision, board)
@@ -1016,6 +1031,12 @@ CONFIG_MODEM_AGAIN=y
 # a summary line this often (0: only on a rise; 60)
 # CONFIG_THERMAL_LOG is not set
 
+# lower the CPU cap at this temperature (with cpufreq=1; 0: never; 85)
+# CONFIG_THERMAL_SLOW is not set
+
+# the OnePlus 10 Pro's (SM8450) sensor table instead of the reference phone's
+# CONFIG_THERMAL_SOC is not set
+
 # read by hakios.thermal.c (kernel)
 # CONFIG_THERMAL_TM0 is not set
 
@@ -1023,7 +1044,7 @@ CONFIG_MODEM_AGAIN=y
 # CONFIG_THERMAL_TM1 is not set
 
 #
-# Network (3)
+# Network (4)
 #
 
 # a log line for each of the first N frames on the network interfaces
@@ -1031,6 +1052,9 @@ CONFIG_MODEM_AGAIN=y
 
 # a log line for every name asked of a DNS server and every TCP connection begun (the names go to the log: for ...
 # CONFIG_NET_NAMES is not set
+
+# the phone's USB cable as a network adapter (en2) and the kernel log on TCP 5140
+# CONFIG_USB_NET is not set
 
 # QEMU's virtio network device as en0 (QEMU only; its bus address means nothing on a phone)
 # CONFIG_VIRTIO_NET is not set
@@ -1081,7 +1105,7 @@ CONFIG_MODEM_AGAIN=y
 # CONFIG_UFS_PROBE is not set
 
 #
-# User space (33)
+# User space (34)
 #
 
 # read by inject_sb.c (user space)
@@ -1173,6 +1197,9 @@ CONFIG_MODEM_AGAIN=y
 
 # the system's own "Reduce Transparency" and "Reduce Motion" (Settings, Accessibility), for this
 # CONFIG_UI_LITE is not set
+
+# read by hakios.usb_net.c (kernel)
+# CONFIG_USB_NET_IP is not set
 
 # read by init.c (user space)
 # CONFIG_VAR_HFS is not set

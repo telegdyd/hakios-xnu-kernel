@@ -48,3 +48,10 @@
   `thermal_soc=8450` (SM8450 sensor table from the stock tree) and a stepped
   CPU cap from `thermal_slow=` degrees (default 85). Redwood's behaviour is
   unchanged without the new arguments.
+- `drivers/input/hakios.buttons.c`: `buttons_soc=8450` selects SM8450's PMIC
+  arbiter (version 7: core 0xc400000, cnfg 0xc42d000, observer 0xc440000;
+  channel table at core + 0x2000, observer channels 0x20 apart, bus 0's count
+  only) and the 10 Pro's key wiring (RESIN is volume up, PM8350 GPIO6 volume
+  down, as the stock tree's key codes say). Run on the phone: all three keys.
+  Redwood's layout and mapping are unchanged without the argument.
+  `configs/common_defconfig` regenerated (it lacked earlier negroni symbols).

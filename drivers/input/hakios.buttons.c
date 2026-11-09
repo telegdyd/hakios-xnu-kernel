@@ -1,12 +1,17 @@
 /*
- * The buttons of the POCO X5 Pro (redwood) -- power, volume up, volume down -- as a source of
- * button records for /dev/hakios-touch (sys/hakios.input.h). Only with boot-arg buttons=1:
- * every address below belongs to this phone.
+ * The buttons of the POCO X5 Pro (redwood) and of the OnePlus 10 Pro (negroni) -- power, volume up,
+ * volume down -- as a source of button records for /dev/hakios-touch (sys/hakios.input.h). Only with
+ * boot-arg buttons=1 (or touchscreen=1). The addresses are the X5 Pro's (SM7325) unless boot-arg
+ * buttons_soc=8450 says the OnePlus 10 Pro's (SM8450): see "the PMIC arbiter" below.
  *
- * None of the three is a pin of the SoC. They are inputs of two of the power management chips:
+ * None of the three is a pin of the SoC. They are inputs of two of the power management chips, the
+ * same on both phones but for the second chip's name:
  *   power        KPDPWR_N of the power-on block ("PON") of the PMK8350
- *   volume down  RESIN_N of the same block
- *   volume up    GPIO6 of the PM7325, pulled up; the key pulls it low
+ *   RESIN_N of the same block            volume down on the X5 Pro, volume UP on the 10 Pro
+ *   GPIO6 of the PM7325 / of the PM8350  volume up on the X5 Pro, volume DOWN on the 10 Pro;
+ *                                        pulled up, the key pulls it low
+ * (The 10 Pro's stock tree labels gpio6 "volume_up" but gives it KEY_VOLUMEDOWN, 0x72, and RESIN
+ * KEY_VOLUMEUP, 0x73; a hand on the phone confirmed the codes, not the label, 2026-11-09.)
  * Both chips sit on the SPMI bus (slaves 0 and 1), and the way to that bus is the SoC's "PMIC
  * arbiter": it owns the bus and gives each of the systems on the chip (this one, the modem, the
  * always-on processor, TrustZone...) a set of registers per PMIC peripheral -- a "channel" -- to
@@ -38,9 +43,15 @@
  *   4  read how the keys' inputs are set up, and what they say now
  *   5  watch them                                       (the default)
  *
- * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter version 5),
+ * The other boot-arg:
+ *   buttons_soc=8450   the OnePlus 10 Pro's (SM8450) PMIC arbiter instead of the X5 Pro's
+ *
+ * Register layouts: Linux drivers/spmi/spmi-pmic-arb.c (arbiter versions 5 and 7; v6.12 read for 7),
  * drivers/input/misc/pm8941-pwrkey.c (the "pmk8350" kind), drivers/pinctrl/qcom/pinctrl-spmi-gpio.c,
- * and the phone's own device tree (qcom,spmi@c440000, pon_hlos@1300, gpio_keys).
+ * and each phone's own device tree (X5 Pro: qcom,spmi@c440000; 10 Pro: qcom,spmi@c42d000, its bus 0;
+ * both: pon_hlos@1300 of slave 0, gpio_keys -> gpio6 of pinctrl@8800 of slave 1).
+ *
+ * Status: X5 Pro, run on the phone (all three keys). 10 Pro: see the head of "the PMIC arbiter".
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -94,22 +105,64 @@ wr(vm_offset_t address, uint32_t value)
 
 /* ---- the PMIC arbiter ---------------------------------------------------------------------------- */
 
-#define ARB_CORE_PHYS           0x0c440000UL    /* "core": the version, and which peripheral each channel is */
-#define ARB_CORE_SIZE           0x1100UL
-#define ARB_CNFG_PHYS           0x0c40a000UL    /* "cnfg": which system owns each channel */
-#define ARB_CNFG_SIZE           0x1000UL
-#define ARB_OBSERVER_PHYS       0x0e600000UL    /* "obsrvr": 0x10000 per system, 0x80 per channel in it */
-#define ARB_OBSERVER_SIZE       0x10000UL       /* ours is the first */
-#define ARB_SYSTEM              0               /* who we are to the arbiter: the device tree's "qcom,ee" */
+/*
+ * Two layouts of it. What stays the same: the version at "core" + 0, the number of channels in "core" + 4
+ * ([10:0]), one word per channel in "core" saying which peripheral it is ([19:8] slave and peripheral,
+ * [24] interrupts go to the owner), one per channel in "cnfg" saying who may write through it ([2:0]),
+ * and the observer channel's own registers (command, status, data: below).
+ *
+ *   version 5, SM7325 (X5 Pro): the table at core + 0x900, owners at cnfg + 0x700, observer channels
+ *       0x80 apart, 0x10000 per system.
+ *   version 7, SM8450 (10 Pro): the table at core + 0x2000, owners at cnfg + 0, observer channels 0x20
+ *       apart, 0x8000 per system. Version 7 has two SPMI buses behind one arbiter; the first "features"
+ *       count is bus 0's channels and they come first in the table, so looking at that many looks at
+ *       bus 0 only. Both PMICs of the keys are on bus 0 (the stock tree's qcom,spmi@c42d000, qcom,bus-id 0:
+ *       pmk8350@0, pm8350@1). Bus 1's channels follow, with peripheral numbers of their own that could
+ *       match ours, which is why the count matters. The SM8450 addresses are the stock tree's reg/reg-names
+ *       of that node (cnfg 0xc42d000, core 0xc400000, obsrvr 0xc440000).
+ *       Status: written from Linux v6.12's spmi-pmic-arb.c and the phone's stock tree (2026-11-09);
+ *       QEMU has no arbiter, so the first run on the phone is the first test of this layout.
+ */
+struct arbiter_layout {
+	const char *    soc;
+	const char *    pin_name;       /* the GPIO key's pin, as the log says it */
+	bool            resin_is_up;    /* RESIN is volume up and the GPIO volume down (the 10 Pro) */
+	vm_offset_t     core_phys, cnfg_phys, observer_phys;
+	vm_size_t       core_size, cnfg_size, observer_size;    /* the observer: our system's part only */
+	uint32_t        version_from, version_to;               /* [from, to) */
+	uint32_t        table, owners;                          /* where channel 0's words are in core and cnfg */
+	uint32_t        observer_system, observer_channel;      /* the strides */
+	uint32_t        max_channels;
+};
 
-#define ARB_VERSION             0x000
-#define ARB_VERSION_5           0x50000000u     /* what follows is version 5's; 7 moved things again */
+#define ARB_VERSION_5           0x50000000u
 #define ARB_VERSION_7           0x70000000u
-#define ARB_FEATURES            0x004           /* [10:0] the number of channels */
-#define ARB_CHANNEL(n)          (0x900 + 4 * (n))       /* core: [19:8] slave and peripheral, [24] interrupts go to the owner */
+#define ARB_VERSION_8           0x80000000u
+
+static const struct arbiter_layout arb_sm7325 = {
+	.soc = "SM7325 (POCO X5 Pro)", .pin_name = "GPIO6 of the PM7325",
+	.core_phys = 0x0c440000UL, .core_size = 0x1100UL,
+	.cnfg_phys = 0x0c40a000UL, .cnfg_size = 0x1000UL,
+	.observer_phys = 0x0e600000UL, .observer_size = 0x10000UL,
+	.version_from = ARB_VERSION_5, .version_to = ARB_VERSION_7,
+	.table = 0x900, .owners = 0x700, .observer_system = 0x10000, .observer_channel = 0x80, .max_channels = 512,
+};
+static const struct arbiter_layout arb_sm8450 = {
+	.soc = "SM8450 (OnePlus 10 Pro)", .pin_name = "GPIO6 of the PM8350", .resin_is_up = true,
+	.core_phys = 0x0c400000UL, .core_size = 0x3000UL,
+	.cnfg_phys = 0x0c42d000UL, .cnfg_size = 0x1000UL,
+	.observer_phys = 0x0c440000UL, .observer_size = 0x8000UL,
+	.version_from = ARB_VERSION_7, .version_to = ARB_VERSION_8,
+	.table = 0x2000, .owners = 0x000, .observer_system = 0x8000, .observer_channel = 0x20, .max_channels = 1024,
+};
+static const struct arbiter_layout *arb = &arb_sm7325;
+
+#define ARB_SYSTEM              0               /* who we are to the arbiter: the device tree's "qcom,ee" (0 on both) */
+#define ARB_VERSION             0x000
+#define ARB_FEATURES            0x004           /* [10:0] the number of channels (version 7: of bus 0) */
+#define ARB_CHANNEL(n)          (arb->table + 4 * (n))
 #define ARB_CHANNEL_INTERRUPTS  (1u << 24)
-#define ARB_OWNER(n)            (0x700 + 4 * (n))       /* cnfg: [2:0] the system that may write through channel n */
-#define ARB_MAX_CHANNELS        512
+#define ARB_OWNER(n)            (arb->owners + 4 * (n))
 
 #define OBSERVER_COMMAND        0x00
 #define OBSERVER_STATUS         0x08
@@ -133,7 +186,7 @@ struct peripheral {
 	bool            found;
 };
 static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
-static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
+static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1; named by the layout */
 
 /* How the reads have gone: said once a minute. */
 static struct {
@@ -147,7 +200,8 @@ static struct {
 static const char *
 spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t count)
 {
-	vm_offset_t channel = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * p->channel;
+	/* arb_observer is our system's part already (ARB_SYSTEM's: see buttons_thread) */
+	vm_offset_t channel = arb_observer + (vm_offset_t)arb->observer_channel * p->channel;
 	uint64_t start = mach_absolute_time(), now, interval, taken;
 	uint32_t status, data[2];
 	const char *problem = NULL;
@@ -260,6 +314,9 @@ static struct button {
     volume_up = { .name = "volume up", .record = HAKIOS_BUTTON_VOLUME_UP },
     volume_down = { .name = "volume down", .record = HAKIOS_BUTTON_VOLUME_DOWN };
 
+/* which volume key each input is: the X5 Pro's way unless the layout says resin_is_up (buttons_thread) */
+static struct button *resin_key = &volume_down, *pin_key = &volume_up;
+
 /* "12.345 s (08:13:05.918 UTC)": since boot as in the log's own stamps, and as the daemons' lines have it */
 static void
 now_text(char *text, size_t size, uint64_t now)
@@ -316,20 +373,20 @@ buttons_poll(void)
 	const char *problem;
 	uint8_t status;
 
-	if (power.usable || volume_down.usable) {
+	if (power.usable || resin_key->usable) {
 		problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
 			button_look(&power, status & PON_KPDPWR);
-			button_look(&volume_down, status & PON_RESIN);
+			button_look(resin_key, status & PON_RESIN);
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pon.name, problem);
 		}
 	}
-	if (volume_up.usable) {
+	if (pin_key->usable) {
 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
-			button_look(&volume_up, !(status & GPIO_LEVEL));
+			button_look(pin_key, !(status & GPIO_LEVEL));
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pin.name, problem);
@@ -378,16 +435,16 @@ pon_inputs(void)
 		printf("buttons: %s: %s\n", pon.name, problem);
 		return;
 	}
-	printf("buttons: power-on block: status %#x (power %s, volume down %s); interrupts: edge %#x, high %#x, low %#x, "
-	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
+	printf("buttons: power-on block: status %#x (power %s, %s %s); interrupts: edge %#x, high %#x, low %#x, "
+	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released", resin_key->name,
 	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
 	    r[REG_INT_POLARITY_LOW - REG_RT_STATUS], r[REG_INT_ENABLED - REG_RT_STATUS], more[0], more[1]);
-	power.usable = volume_down.usable = true;
+	power.usable = resin_key->usable = true;
 	power.last = r[0] & PON_KPDPWR;
-	volume_down.last = r[0] & PON_RESIN;
+	resin_key->last = r[0] & PON_RESIN;
 }
 
-/* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
+/* Step 4 for the pin: it is a key only if it is an input with a pull-up, and switched on. */
 static void
 pin_input(void)
 {
@@ -406,18 +463,18 @@ pin_input(void)
 	}
 	mode = c[0] & 3;
 	pull = c[GPIO_REG_PULL - GPIO_REG_MODE] & 7;
-	printf("buttons: volume up's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
-	    "%02x %02x; level %s\n", mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
+	printf("buttons: %s's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
+	    "%02x %02x; level %s\n", pin_key->name, mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
 	    c[GPIO_REG_SUPPLY - GPIO_REG_MODE] & 7, pull, pull < 4 ? "up" : pull == 4 ? "down" : "none",
 	    (c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80) ? "enabled" : "DISABLED", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
 	    (status & GPIO_LEVEL) ? "high (released)" : "LOW (held)");
 	if (mode != 0 || pull >= 4 || !(c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80)) {
-		printf("buttons: volume up's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
-		    "which this driver does not do: volume up is left alone\n");
+		printf("buttons: %s's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
+		    "which this driver does not do: %s is left alone\n", pin_key->name, pin_key->name);
 		return;
 	}
-	volume_up.usable = true;
-	volume_up.last = !(status & GPIO_LEVEL);
+	pin_key->usable = true;
+	pin_key->last = !(status & GPIO_LEVEL);
 }
 
 static void
@@ -436,20 +493,28 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	uint32_t steps = (uint32_t)(uintptr_t)parameter, version, channels;
 	bool pon_known, pin_known;
 
-	printf("buttons: step 1: map the PMIC arbiter (%#lx, %#lx, %#lx) and read its version\n", ARB_CORE_PHYS, ARB_CNFG_PHYS,
-	    ARB_OBSERVER_PHYS);
-	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
-	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
-	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	pin.name = arb->pin_name;
+	if (arb->resin_is_up) {
+		resin_key = &volume_up;
+		pin_key = &volume_down;
+	}
+	printf("buttons: step 1: map the PMIC arbiter of the %s (core %#lx, cnfg %#lx, observer %#lx) and read its version\n",
+	    arb->soc, (unsigned long)arb->core_phys, (unsigned long)arb->cnfg_phys,
+	    (unsigned long)(arb->observer_phys + (vm_offset_t)arb->observer_system * ARB_SYSTEM));
+	arb_core = ml_io_map(arb->core_phys, arb->core_size);
+	arb_cnfg = ml_io_map(arb->cnfg_phys, arb->cnfg_size);
+	arb_observer = ml_io_map(arb->observer_phys + (vm_offset_t)arb->observer_system * ARB_SYSTEM, arb->observer_size);
 	version = rd(arb_core + ARB_VERSION);
 	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
 	printf("buttons: PMIC arbiter version %#x, %u channels\n", version, channels);
-	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {
-		printf("buttons: this driver knows version 5 of the arbiter only: no buttons\n");
+	if (version < arb->version_from || version >= arb->version_to) {
+		printf("buttons: the %s's layout is that of arbiter version %u (%#x to %#x): no buttons (wrong buttons_soc=?)\n",
+		    arb->soc, arb->version_from >> 28, arb->version_from, arb->version_to - 1);
 		goto out;
 	}
-	if (channels == 0 || channels > ARB_MAX_CHANNELS) {
-		channels = ARB_MAX_CHANNELS;
+	if (channels == 0 || channels > arb->max_channels) {
+		printf("buttons: ... which is not a channel count this layout has room for: looking at all %u\n", arb->max_channels);
+		channels = arb->max_channels;
 	}
 	if (steps < 2) {
 		goto out;
@@ -476,7 +541,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	if (pin_known) {
 		pin_input();
 	}
-	if (!power.usable && !volume_up.usable) {
+	if (!power.usable && !pin_key->usable) {
 		printf("buttons: nothing that can be read: no buttons\n");
 		goto out;
 	}
@@ -585,6 +650,11 @@ hakios_buttons_init(void)
 	if (steps == 0) {
 		return;
 	}
+	/* boot-arg buttons_soc=8450: the OnePlus 10 Pro's arbiter (version 7) instead of the X5 Pro's */
+	uint32_t soc = 0;
+	if (PE_parse_boot_argn("buttons_soc", &soc, sizeof(soc)) && soc == 8450) {
+		arb = &arb_sm8450;
+	}
 	if (kernel_thread_start(buttons_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
@@ -603,8 +673,8 @@ hakios_buttons_init(void)
  *     summary of which channels have something. Those are writes to the arbiter, not to a PMIC.
  *   - But the peripheral must be told to raise them as well: for each key a bit in "interrupt
  *     type" (edge), "polarity high" and "polarity low" (both edges), and "enable set". Those are
- *     WRITES TO THE PMIC -- to the power-on block for power and volume down, to the GPIO for
- *     volume up -- unless the firmware has left them set; step 4 prints what it finds there.
+ *     WRITES TO THE PMIC -- to the power-on block for power and RESIN, to the GPIO for the
+ *     other volume key -- unless the firmware has left them set; step 4 prints what it finds there.
  *     After an interrupt the peripheral's latched status is cleared by another write to it.
  *   - Only the system that owns a peripheral's channel gets its interrupts (step 2 prints the
  *     owners).
