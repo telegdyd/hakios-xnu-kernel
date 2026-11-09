@@ -2450,7 +2450,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * the kernel does it too, but whether that counts from another core is not known.
 		 * After that a kernel that neither returns nor hangs visibly meets the watchdog.
 		 */
-		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(started) < budget + 60) {
+		if (wdt_armed && seconds_since(last_pet) >= 5 && (budget == 0 || seconds_since(started) < budget + 60)) {
 			wdt_pet();
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 		}
@@ -4460,6 +4460,9 @@ efi_main(efi_handle image, efi_system_table *st)
 	PLAT = &platform_negroni;
 #endif
 	int have_payload = parse_payload(&pi, 0);
+	/* An installed one-shot boot has no host session deadline. The hardware
+	 * watchdog and the kernel-heartbeat monitor still protect a hung kernel. */
+	if (have_payload && !pi.usb_mode) BS->set_watchdog_timer(0, 0, 0, NULL);
 	if (have_payload && pi.platform) PLAT = pi.platform;
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
@@ -4488,6 +4491,19 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
+		/* Qualcomm's USB firmware also prepares the PHY. A hostless boot has
+		 * not visited the USB command loop, but the kernel's NCM driver still
+		 * needs that preparation before taking ownership of the controller. */
+		if (PLAT == &platform_negroni && !pi.usb_mode && usb_start()) {
+			/* StartEx is asynchronous: let the DXE finish cable/controller
+			 * setup before XNU takes ownership. This bounded delay also works
+			 * with no cable, and never waits for a host command. */
+			uint64_t began = READ_SYSREG(CNTVCT_EL0);
+			while (seconds_since(began) < 2) {
+				usb_poll_command();
+				BS->stall(1000);
+			}
+		}
 		run_kernel(0, 0);
 	}
 	reboot();
