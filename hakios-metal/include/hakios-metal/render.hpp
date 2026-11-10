@@ -480,10 +480,6 @@ struct Options {
     bool gmemLoad = true;        // each tile's load from memory (off: the fake's twin, whose stores then show GMEM's own contents)
     uint8_t rotate2d = 0;        // encodeBlit's RB_2D_BLIT_CNTL.ROTATE (a6xx_rotation: 0, 90, 180, 270, hflip, vflip as 0..5);
                                  // a quarter turn takes a destination rectangle of the source's sides swapped
-    // A730 draw-ladder diagnostics (GPU-PLAN.md section 7), each what freedreno does for FD730 and the A730 path does
-    // not by default; off, they change nothing, and they are refused on the A6XX
-    bool a730Fs128 = false;          // the FS at THREAD128 (SP_FS_CTRL_REG0, HLSQ_FS_CNTL_0), as freedreno runs it
-    bool a730BindlessBases = false;  // SP_BINDLESS_BASE[0..4] at a zeroed 64-byte descriptor, each after HLSQ_INVALIDATE_CMD GFX_BINDLESS
 };
 // A draw joins the open pass only with options equal to the pass's, compared as bytes (CommandBuffer::draw): with a
 // member wider than a byte the struct had padding, which a stack-made Options leaves as garbage, and draws that should

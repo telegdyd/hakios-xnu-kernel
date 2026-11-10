@@ -1297,8 +1297,6 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         if (draw.indirect != nullptr) return refuse(why, "A730 indirect draws wait for their ladder step");
         if (draw.visibilityMode != 0) return refuse(why, "A730 visibility results wait for their ladder step");
         if (program.fs.numSamplerPrefetch != 0) return refuse(why, "A730 FS texture prefetch (its A7XX command form) waits for its ladder step");
-    } else if (o.a730Fs128 || o.a730BindlessBases) {
-        return refuse(why, "the a730* render::Options are A730 diagnostics");
     }
     const Stage& vs = program.vs;
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
@@ -1628,7 +1626,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     for (uint32_t i = 0; gmem != nullptr && i < numRt; i++) {
         if (attachmentOf(pass, i).texture != nullptr) mrts[i].baseGmem = gmem->base[i];
     }
-    const a6xx_threadsize fsThreads = fs.k.doubleThreadsize || (g7 && o.a730Fs128) ? THREAD128 : THREAD64;
+    const a6xx_threadsize fsThreads = fs.k.doubleThreadsize ? THREAD128 : THREAD64;
     const uint32_t* ij = fs.ijRegid;
 
     if (whole) {
@@ -1787,17 +1785,6 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
                              CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(uint32_t((table + kGfxIboAt) >> 32))};
             stream.packet(CP_LOAD_STATE6, w, 3);
             reg64(stream, REG_A6XX_SP_IBO, table + kGfxIboAt);
-        }
-    }
-    // (the A730 diagnostic: freedreno's five graphics bindless bases, each after an invalidate of the graphics bindless
-    // state, here all at the table's zeroed hole as 64-byte descriptors; no stage of this path reads them)
-    if (g7 && o.a730BindlessBases) {
-        memset(tableCpu + kTableHoleAt, 0, 64);
-        const uint64_t hole = table + kTableHoleAt;
-        for (uint32_t i = 0; i < 5; i++) {
-            gen7::raw(stream, 0xab1f, 0x01fe0000);   // HLSQ_INVALIDATE_CMD: GFX_BINDLESS 0xff
-            const uint32_t base[2] = {uint32_t(hole) | 3u, uint32_t(hole >> 32)};
-            stream.registers(0xab0a + 2 * i, base, 2);   // SP_BINDLESS_BASE[i].DESCRIPTOR, BINDLESS_DESCRIPTOR_64B
         }
     }
     // 10. the two programs (tu6_emit_xs, tu_shader.cc:1238-1356; fd6_emit_shader, fd6_program.cc:100-245): CTRL_REG0 (the

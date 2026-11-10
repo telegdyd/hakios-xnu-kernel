@@ -1481,9 +1481,8 @@ static void metallibSuite(Gpu& gpu, CommandQueue* queue, uint64_t chip, const co
 //   pair  T1 and T2 (vertices 0..6): all 4096 pixels the colour
 //   clear the pass's Clear to (0.25, 0.5, 0.75, 1), then T1: the lower-left the colour, the rest one other word
 // Every byte of the target's memory past its 64 x 4 x 64 pixels must stay canary. A case stops on its first failure.
-// (the A730 draw diagnostics: --fs128, --bindless-bases, --vis-use into the draw's render::Options; --scissor-out draws T1 with a
+// (--scissor-out draws T1 with a
 // one-pixel scissor at (63, 0), outside it, so that no fragment is shaded: every pixel must stay canary)
-static render::Options gDrawOptions;
 static bool gScissorOut = false;
 static bool gTrace = false;   // --trace: render::setA730Trace into row 0, columns 48..63 of the target (pixels T1 never covers)
 static int drawCase(Gpu& gpu, uint64_t chip, const std::string& name) {
@@ -1529,7 +1528,7 @@ static int drawCase(Gpu& gpu, uint64_t chip, const std::string& name) {
             auto cb = queue->commandBuffer();
             if (gScissorOut) d.scissor = Scissor{W - 1, 0, 1, 1};
             if (gTrace) render::setA730Trace(t->gpuAddress() + 48 * 4);
-            if (!cb->draw(flat, pass, d, Bindings{}, Bindings{}, gDrawOptions)) {
+            if (!cb->draw(flat, pass, d, Bindings{}, Bindings{}, render::Options{})) {
                 report(false, std::string(shape) + " recording: " + cb->error());
                 return 1;
             }
@@ -1741,9 +1740,6 @@ int main(int argc, char** argv) {
         }
         recover = recover || strcmp(argv[i], "--recover") == 0;
         noEarly = noEarly || strcmp(argv[i], "--noearly") == 0;
-        if (strcmp(argv[i], "--fs128") == 0) gDrawOptions.a730Fs128 = true;
-        if (strcmp(argv[i], "--bindless-bases") == 0) gDrawOptions.a730BindlessBases = true;
-        if (strcmp(argv[i], "--vis-use") == 0) gDrawOptions.visCullUse = true;
         if (strcmp(argv[i], "--scissor-out") == 0) gScissorOut = true;
         if (strcmp(argv[i], "--trace") == 0) gTrace = true;
         bisect = bisect || strcmp(argv[i], "--bisect") == 0;
