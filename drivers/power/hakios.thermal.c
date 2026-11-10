@@ -37,6 +37,9 @@
  * values move between runs; kern.hakios.thermal_* are read from user space (userland/src/hello.c with hello_wait=). NOT yet
  * seen: the stop (thermal_stop) firing, a phone under load, a reading above 40 degrees. The sensors are the device tree's; whether
  * the phone's own tree is the reference one (devices/redwood/prebuilt/device-tree.dtb) was not compared sensor by sensor.
+ * OnePlus 10 Pro (thermal_soc=8450, 2026-11-10): 32 of 32 sensors; 67-75 C at rest with every cluster at its top row; under
+ * full load on all 8 cores for 4 minutes the hottest core went to 80.0 C and stayed there: the firmware's own limiter (LMh)
+ * lowered what the hardware allows (d2 2995 asked, 2515-2841 allowed), so the cap here (85 C) never had to act.
  * Not run in QEMU, and thermal=1 must not be given there: it has no such blocks, and a load from an address it does not map faults.
  *
  * Boot-args:
@@ -272,7 +275,14 @@ look(void)
 		    hakios_cpufreq_line(), thermal_list);
 		last_log = now;
 	}
-	last_step = step;
+	/*
+	 * A rise is logged once: the step is forgotten only when the reading has fallen two steps below it. Held at a
+	 * step's edge (the 10 Pro's own limiter keeps its cores at 80.0 C under load), it went 79.x / 80.0 every
+	 * reading and logged every 2 s.
+	 */
+	if (step > last_step || step <= last_step - 2) {
+		last_step = step;
+	}
 
 	if (slow_celsius != 0) {
 		uint64_t since;
