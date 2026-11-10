@@ -152,3 +152,11 @@
   the broad suite an A730 runs. On the OnePlus 10 Pro (10 November) all 47 texture checks pass
   twice in one boot, and eight PortraitFilters kernels compile on the phone and complete, the
   same words in two runs. No behaviour change for the A635.
+- `hakios-metal/src/render.cpp`, `gen7.cpp`: the A730's first sysmem draw (colour targets, no depth,
+  no GMEM), its batch start and pass begin taken from freedreno's own FD730 stream. Every stream of a
+  pass (`CommandBuffer::draw`'s head and body, `closePass`'s tiles and tail, OpenPass's) is now built
+  with the command buffer's chip: they took `pm4::Stream`'s default A6XX id, so the A730 got the A6XX
+  path and hung. `a730_probe_submissions_as_rd` checks the whole submission (and with
+  `HAKIOS_A730_SUBMIT_RD` writes it as `.rd` for cffdump). On the OnePlus 10 Pro (10 November)
+  `tri_flat` passes all three shapes exactly, three rounds each; compute and textures still pass
+  after it. Depth, GMEM, indirect draws and 3D IBOs stay refused on the A730; the A6xx path is unchanged.

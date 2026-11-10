@@ -38,6 +38,8 @@
 #include "../tests/fixtures/a730/tex_fill_3d_air.hpp"
 #include "../tests/fixtures/a730/tex_sample_gid_air.hpp"
 #include "../tests/fixtures/a730/tex_sample_wide_air.hpp"
+#include "../tests/fixtures/a730/tri_flat_fs_air.hpp"
+#include "../tests/fixtures/a730/tri_flat_vs_air.hpp"
 #include "../tests/fixtures/fill_id_air.hpp"
 #include "../tests/fixtures/chain160_air.hpp"
 #include "../tests/fixtures/chain220_air.hpp"
@@ -1472,8 +1474,150 @@ static void metallibSuite(Gpu& gpu, CommandQueue* queue, uint64_t chip, const co
     }
 }
 
+// The A730's first draws (GPU-PLAN.md section 6 step 4): tri_flat through the A730 fixtures into a 64x64 RGBA8Unorm
+// target filled with a canary, in sysmem. Three shapes, each three times with the queue reopened:
+//   one   T1 alone (vertices 0..3): the lower-left half (j > i) the colour, the upper-right (j < i) canary, the
+//         diagonal's 64 centres all one way or the other (a consistent fill rule)
+//   pair  T1 and T2 (vertices 0..6): all 4096 pixels the colour
+//   clear the pass's Clear to (0.25, 0.5, 0.75, 1), then T1: the lower-left the colour, the rest one other word
+// Every byte of the target's memory past its 64 x 4 x 64 pixels must stay canary. A case stops on its first failure.
+// (the A730 draw diagnostics: --fs128, --bindless-bases, --vis-use into the draw's render::Options; --scissor-out draws T1 with a
+// one-pixel scissor at (63, 0), outside it, so that no fragment is shaded: every pixel must stay canary)
+static render::Options gDrawOptions;
+static bool gScissorOut = false;
+static bool gTrace = false;   // --trace: render::setA730Trace into row 0, columns 48..63 of the target (pixels T1 never covers)
+static int drawCase(Gpu& gpu, uint64_t chip, const std::string& name) {
+    if (chip != kChipA730.id) {
+        report(false, "--case " + name + " is the A730 draw ladder (the A635 runs the broad suite's 9a)");
+        return 2;
+    }
+    const uint64_t faults = gpu.faults();
+    const uint32_t W = 64, H = 64;
+    const uint32_t colour = 0xff804020u;   // tri_flat_fs's literal as RGBA8Unorm bytes: R 0x20, G 0x40, B 0x80, A 0xff
+    const Program flat{kernels::a730_tri_flat_vs_air, kernels::a730_tri_flat_fs_air, Linkage{}, "a730_tri_flat"};
+    const uint32_t canary = texCanary([&](uint32_t v) { return v == colour; });
+    std::string why;
+    const std::vector<const char*> shapes = gScissorOut ? std::vector<const char*>{"one"} : std::vector<const char*>{"one", "pair", "clear"};
+    for (const char* shape : shapes) {
+        for (unsigned round = 0; round < 3; ++round) {
+            auto queue = CommandQueue::make(gpu, &why);
+            TextureDesc desc;
+            desc.format = PixelFormat::kRGBA8Unorm;
+            desc.width = W;
+            desc.height = H;
+            desc.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+            auto t = queue ? Texture::make(gpu, desc, &why) : nullptr;
+            if (!queue || !t || t->contents() == nullptr) {
+                report(false, std::string(shape) + ": a queue and a 64x64 RGBA8Unorm target with rows this processor can read: " + why);
+                return 1;
+            }
+            fillBo(*t, canary);
+            RenderPass pass;
+            pass.color0 = t.get();
+            const bool clear = strcmp(shape, "clear") == 0;
+            if (clear) {
+                pass.load = LoadAction::kClear;
+                pass.clearColor[0] = 0.25;
+                pass.clearColor[1] = 0.5;
+                pass.clearColor[2] = 0.75;
+                pass.clearColor[3] = 1.0;
+            }
+            Draw d;
+            d.vertexStart = 0;
+            d.vertexCount = strcmp(shape, "pair") == 0 ? 6 : 3;
+            d.viewport = Viewport{0, 0, double(W), double(H), 0, 1};
+            auto cb = queue->commandBuffer();
+            if (gScissorOut) d.scissor = Scissor{W - 1, 0, 1, 1};
+            if (gTrace) render::setA730Trace(t->gpuAddress() + 48 * 4);
+            if (!cb->draw(flat, pass, d, Bindings{}, Bindings{}, gDrawOptions)) {
+                report(false, std::string(shape) + " recording: " + cb->error());
+                return 1;
+            }
+            cb->commit();
+            cb->waitUntilCompleted();
+            std::vector<uint8_t> bo = textureBo(*t);
+            if (gTrace) {
+                // the steps the command processor got to (render.hpp kTrace*), then those 16 pixels back to canary for the checks
+                std::string steps;
+                for (uint32_t k = 1; k < render::kTraceWords; k++) {
+                    uint32_t word;
+                    memcpy(&word, bo.data() + 48 * 4 + 4 * k, 4);
+                    steps += " " + std::to_string(k) + (word == k ? "+" : "-");
+                }
+                std::printf("probe: trace %s round %u: steps%s (+ reached, - not)\n", shape, round + 1, steps.c_str());
+                for (uint32_t k = 0; k < 16; k++) memcpy(bo.data() + 48 * 4 + 4 * k, &canary, 4);
+                render::setA730Trace(0);
+            }
+            uint32_t inColour = 0, inside = 0, outOk = 0, outside = 0, edgeColour = 0, edge = 0, other = 0, firstX = 0, firstY = 0, firstGot = 0;
+            uint32_t outWord = 0;   // (the clear colour as the first outside pixel, the top-right corner, holds it)
+            memcpy(&outWord, bo.data() + uint64_t(W - 1) * 4, 4);
+            bool outSame = true;
+            for (uint32_t j = 0; j < H; j++) {
+                for (uint32_t i = 0; i < W; i++) {
+                    uint32_t px;
+                    memcpy(&px, bo.data() + j * t->bytesPerRow() + uint64_t(i) * 4, 4);
+                    const int side = gScissorOut ? -1 : strcmp(shape, "pair") == 0 ? 1 : j > i ? 1 : j < i ? -1 : 0;
+                    bool expected = false;
+                    if (side > 0) {
+                        inside++;
+                        inColour += px == colour;
+                        expected = px == colour;
+                    } else if (side < 0) {
+                        outside++;
+                        outSame = outSame && px == outWord;
+                        const bool ok = clear ? px != canary && px != colour : px == canary;
+                        outOk += ok;
+                        expected = ok;
+                    } else {
+                        edge++;
+                        edgeColour += px == colour;
+                        expected = px == colour || (clear ? px == outWord : px == canary);
+                    }
+                    if (!expected && other++ == 0) {
+                        firstX = i;
+                        firstY = j;
+                        firstGot = px;
+                    }
+                }
+            }
+            // the memory past the pixels: the row padding and the rows past the height, to the Bo's end
+            uint64_t padding = 0, paddingBad = 0;
+            for (uint64_t at = 0; at + 4 <= bo.size(); at += 4) {
+                const uint64_t row = at / t->bytesPerRow(), col = at % t->bytesPerRow();
+                if (row < H && col < uint64_t(W) * 4) continue;
+                uint32_t word;
+                memcpy(&word, bo.data() + at, 4);
+                padding++;
+                paddingBad += word != canary;
+            }
+            const bool edgeOk = edge == 0 || edgeColour == 0 || edgeColour == edge;
+            const bool ok = cb->status() == CommandBuffer::kCompleted && inColour == inside && outOk == outside && (!clear || outSame) && edgeOk && other == 0 &&
+                            paddingBad == 0 && gpu.faults() == faults;
+            std::string text = std::string(shape) + " round " + std::to_string(round + 1) + ": " + std::to_string(inColour) + " of " + std::to_string(inside) +
+                               " inside the colour";
+            if (outside != 0) {
+                text += ", " + std::to_string(outOk) + " of " + std::to_string(outside) + (clear ? " outside the clear colour " + hex8(outWord) + (outSame ? "" : " (NOT all one word)") : " outside canary");
+            }
+            if (edge != 0) {
+                text += ", diagonal " + std::to_string(edgeColour) + " of " + std::to_string(edge) + " the colour" +
+                        (edgeColour == 0 ? " (top-left rule)" : edgeColour == edge ? " (bottom-right rule)" : " (NEITHER rule)");
+            }
+            if (other != 0) text += ", " + std::to_string(other) + " pixels wrong (first " + std::to_string(firstX) + "," + std::to_string(firstY) + ": " + hex8(firstGot) + ")";
+            text += ", " + std::to_string(paddingBad) + " of " + std::to_string(padding) + " padding words changed";
+            report(ok, text + status(*cb, gpu));
+            if (!ok) {
+                std::printf("probe: 1 failure\n");
+                return 1;
+            }
+        }
+    }
+    std::printf("probe: 0 failures\n");
+    return 0;
+}
+
 static int singleCase(Gpu& gpu, uint64_t chip, const std::string& name, const compute::Options& options, bool noEarly) {
     if (name == "img_store") return imageStoreCase(gpu, chip, name, options);
+    if (name == "tri_flat") return drawCase(gpu, chip, name);
     if (name == "textures") {
         // the suite's texture section on its own: half stores, arrays and 3D, views, sampling, the integer formats,
         // the address modes and border colours (section 7 below, every kernel the chip's own)
@@ -1491,7 +1635,7 @@ static int singleCase(Gpu& gpu, uint64_t chip, const std::string& name, const co
     }
     if (name != "end_only" && name != "fill_id" && name != "fill_id_air" && name != "copy" && name != "fill" &&
         name != "tex_fill" && name != "tex_copy") {
-        std::printf("probe: unknown --case %s (end_only, fill_id, copy, fill, fill_id_air, img_store, tex_fill, tex_copy, textures)\n", name.c_str());
+        std::printf("probe: unknown --case %s (end_only, fill_id, copy, fill, fill_id_air, img_store, tex_fill, tex_copy, textures, tri_flat)\n", name.c_str());
         return 2;
     }
     if (noEarly && name != "fill_id_air") {
@@ -1597,6 +1741,11 @@ int main(int argc, char** argv) {
         }
         recover = recover || strcmp(argv[i], "--recover") == 0;
         noEarly = noEarly || strcmp(argv[i], "--noearly") == 0;
+        if (strcmp(argv[i], "--fs128") == 0) gDrawOptions.a730Fs128 = true;
+        if (strcmp(argv[i], "--bindless-bases") == 0) gDrawOptions.a730BindlessBases = true;
+        if (strcmp(argv[i], "--vis-use") == 0) gDrawOptions.visCullUse = true;
+        if (strcmp(argv[i], "--scissor-out") == 0) gScissorOut = true;
+        if (strcmp(argv[i], "--trace") == 0) gTrace = true;
         bisect = bisect || strcmp(argv[i], "--bisect") == 0;
         binTrace = binTrace || strcmp(argv[i], "--bin-trace") == 0;
         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the

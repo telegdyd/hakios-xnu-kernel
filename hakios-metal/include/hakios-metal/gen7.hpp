@@ -60,10 +60,37 @@ inline constexpr MagicWrite kMagic[] = {
 
 // Shared encoders still name A6xx registers. Multiword blocks used here stay
 // contiguous on both generations; the structurally different CS block does not.
+// Register arrays a6xx.xml defines once, with no A6XX/A7XX variants (Mesa 25.0.7): every element is at the same
+// offset on both generations. The table above names only their bases; an element past the base is one of these.
+struct SharedArray { uint32_t first, last; };
+inline constexpr SharedArray kSharedArrays[] = {
+    {0x8010, 0x806f},   // GRAS_CL_VPORT[16], stride 6       a6xx.xml:3084
+    {0x8070, 0x808f},   // GRAS_CL_Z_CLAMP[16], stride 2     a6xx.xml:3092
+    {0x80b0, 0x80cf},   // GRAS_SC_SCREEN_SCISSOR[16]        a6xx.xml:3296
+    {0x80d0, 0x80ef},   // GRAS_SC_VIEWPORT_SCISSOR[16]      a6xx.xml:3300
+    {0x8820, 0x885f},   // RB_MRT[8], stride 8               a6xx.xml:3668
+    {0x8903, 0x891a},   // RB_MRT_FLAG_BUFFER[8], stride 3   a6xx.xml:3966
+    {0x9200, 0x9207},   // VPC_VARYING_INTERP[8]             a6xx.xml:4230
+    {0x9208, 0x920f},   // VPC_VARYING_PS_REPL[8]            a6xx.xml:4234
+    {0x9212, 0x9215},   // VPC_VAR[4]                        a6xx.xml:4243
+    {0xa010, 0xa08f},   // VFD_FETCH[32], stride 4           a6xx.xml:4617
+    {0xa090, 0xa0cf},   // VFD_DECODE[32], stride 2          a6xx.xml:4622
+    {0xa0d0, 0xa0ef},   // VFD_DEST_CNTL[32]                 a6xx.xml:4635
+    {0xa803, 0xa812},   // SP_VS_OUT[16]                     a6xx.xml:4739
+    {0xa813, 0xa81a},   // SP_VS_VPC_DST[8]                  a6xx.xml:4754
+    {0xa98e, 0xa995},   // SP_FS_OUTPUT[8]                   a6xx.xml:5039
+    {0xa996, 0xa99d},   // SP_FS_MRT[8]                      a6xx.xml:5047
+};
 inline uint32_t offset(const pm4::Stream& stream, uint32_t legacy) {
     if (!stream.gen7()) return legacy;
-    const uint32_t result = legacyRegisterOffset(kChipA730, legacy);
-    assert(result != kRegisterAbsent);
+    uint32_t result = legacyRegisterOffset(kChipA730, legacy);
+    if (result == kRegisterAbsent) {
+        for (const auto& a : kSharedArrays) {
+            if (legacy >= a.first && legacy <= a.last) result = legacy;
+        }
+    }
+    // never emitted as an address: a register the A7XX does not have is the emitter's bug
+    if (result == kRegisterAbsent) __builtin_trap();
     return result;
 }
 inline void registers(pm4::Stream& stream, uint32_t legacy, const uint32_t* words, uint32_t count) {
@@ -76,5 +103,13 @@ inline uint32_t hlsqCsControl(uint32_t threadsize, uint32_t y) {
            (4u << A7XX_HLSQ_CS_CNTL_1_WGTILEWIDTH__SHIFT) | (height << A7XX_HLSQ_CS_CNTL_1_WGTILEHEIGHT__SHIFT);
 }
 void batchStart(pm4::Stream& stream);
+// An A7XX-only register by its A7XX offset (no A6XX name to translate)
+void raw(pm4::Stream& stream, uint32_t a7xxOffset, uint32_t value);
+// What a 3D pass needs after batchStart: fd6_emit_static_regs(A7XX)'s non-magic part, the VFD fetch sizes zeroed,
+// the border colour bases, the A7XX-only tables
+// (TRACE: render::setA730Trace's address, for its steps 13-15; 0 for none)
+void drawStatic(pm4::Stream& stream, uint64_t borderColors, uint64_t trace = 0);
+// A sysmem pass's begin over a W x H window (fd6_emit_sysmem_prep, A7XX)
+void sysmemPassBegin(pm4::Stream& stream, uint32_t W, uint32_t H);
 void event(pm4::Stream& stream, a6xx::vgt_event_type event, uint64_t address = 0, uint32_t value = 0, bool write = false);
 }
