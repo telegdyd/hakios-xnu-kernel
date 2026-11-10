@@ -108,3 +108,10 @@
 - `xnuloader/loader.c`: boot-arg `loader_stay=1` for a one-shot boot (a payload from
   the boot partition, no host): a kernel that returns is followed by the loader's USB
   commands instead of a reset, so the host can fetch the log (`fastboot get_staged`).
+- `tools/mesa/freedreno-darwin.patch` (`fd6_draw.cc`): on the A7xx, every draw whose
+  fragment shader reads the framebuffer (EXT_shader_framebuffer_fetch) gets a CCU colour
+  clean, a UCHE invalidate and a CP_WAIT_FOR_IDLE before it. The A6xx rule (only the first
+  such draw after one that does not read, no wait) left CoreAnimation's blur and vibrancy on
+  the a730 as half-drawn quads, black or in stale colours, with GMEM and sysmem, with UBWC and
+  without. FD_MESA_DEBUG=flush and glfetch=0 both hid it; this does, at full speed
+  (OnePlus 10 Pro, 10 November). The A6xx path is unchanged.
