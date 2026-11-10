@@ -7,6 +7,7 @@ adreno_only	k
 adreno_pause	k
 adreno_return	k
 adreno_skip	k
+adreno_soc	k
 adreno_speed	k
 adreno_stream1	k
 adreno_watch	k

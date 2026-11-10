@@ -7,6 +7,7 @@ ADRENO_ONLY	arg	adreno_only	GPU and display	k	hakios.adreno.c	step K alone (what
 ADRENO_PAUSE	arg	adreno_pause	GPU and display	k	hakios.adreno.c	how long the newest step waits after announcing a group of accesses (default 2200)
 ADRENO_RETURN	arg	adreno_return	GPU and display	k	hakios.adreno.c	when all is over, go back to the loader instead of starting the system
 ADRENO_SKIP	arg	adreno_skip	GPU and display	k	hakios.adreno.c	leave out the steps whose bits are set (bit 2 = step 2)
+ADRENO_SOC	arg	adreno_soc	GPU and display	k	hakios.adreno.c	the OnePlus 10 Pro's (SM8450) Adreno 730 instead of the X5 Pro's GPU; all 22 steps
 ADRENO_SPEED	arg	adreno_speed	GPU and display	k	hakios.adreno.c	step 17 asks the GMU for the 3D core's Nth speed: 1 315 MHz, 2 450 MHz, 3 550 MHz (the default: the most this phone's GPU is rated for)
 ADRENO_STREAM1	arg	adreno_stream1	GPU and display	k	hakios.adreno.c	step 18 leaves the core's second stream out (0) or gives it an empty context of its own (2): what the SMMU then records shows what the core
 ADRENO_WATCH	arg	adreno_watch	GPU and display	k	hakios.adreno.c	after the last step, say once a second for S seconds (default 20) that the machine is still alive, and what was written last

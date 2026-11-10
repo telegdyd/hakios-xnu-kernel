@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 392 symbols in 18 groups; 36 are set, 27 of them drivers built in.
+# 393 symbols in 18 groups; 36 are set, 27 of them drivers built in.
 #
 
 #
@@ -49,7 +49,7 @@ CONFIG_HAKIOS_TORCH=y
 # the chip's identity from the firmware's shared memory: kern.hakios.soc_* (socinfo=1). Any Qualcomm SoC that keeps ... [hakios.socinfo.c]
 CONFIG_HAKIOS_SOCINFO=y
 
-# the Adreno 642L of the SC7280 woken step by step (adreno=N), and HakiosGPU, the IOKit service Mesa, Metal and the ... [hakios.adreno.c, hakios.gpu.cpp]
+# the Adreno 642L of the SC7280 (with adreno_soc=8450 the SM8450's Adreno 730, all 22 steps) woken step by step ... [hakios.adreno.c, hakios.gpu.cpp]
 CONFIG_HAKIOS_ADRENO=y
 
 # the vibration motor: an Awinic AW86927 driving a linear resonant actuator (haptic=N), its waveforms from fw-haptic/ [hakios.haptic.c]
@@ -356,7 +356,7 @@ CONFIG_TOUCHSCREEN=y
 # CONFIG_VIRTIO_INPUT is not set
 
 #
-# GPU and display (77)
+# GPU and display (78)
 #
 
 # rendering on Adreno (an image built with GL=1; the GPU's firmware from your phone) [needs fw-gpu/ from the phone]
@@ -388,6 +388,9 @@ CONFIG_GPU=y
 
 # leave out the steps whose bits are set (bit 2 = step 2)
 # CONFIG_ADRENO_SKIP is not set
+
+# the OnePlus 10 Pro's (SM8450) Adreno 730 instead of the X5 Pro's GPU; all 22 steps
+# CONFIG_ADRENO_SOC is not set
 
 # step 17 asks the GMU for the 3D core's Nth speed: 1 315 MHz, 2 450 MHz, 3 550 MHz (the default: the most this ...
 # CONFIG_ADRENO_SPEED is not set

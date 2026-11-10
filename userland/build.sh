@@ -210,6 +210,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			{ ${LDID:-ldid} -Ssrc/record_test.entitlements obj/record_test 2>/dev/null ||
 			  echo "build.sh: no ldid: record_test is unsigned, and the system may not let it record"; }
 		$DYN -o obj/cpu_test src/cpu_test.c
+		# the GPU kept on (gpu=1), through HakiosGPU without Mesa: submissions and their fences in a loop (src/gpu_test.c)
+		$DYN -framework CoreFoundation -framework IOKit -o obj/gpu_test src/gpu_test.c
 		# which processes take the processors, every few seconds (src/cputop.c; rc.jobs.cputop)
 		$DYN -o obj/cputop src/cputop.c
 		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/cow_test.c
@@ -361,6 +363,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		install -m 600 sweetd.token root/etc/sweetd.token
 	fi
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
+	[ -f obj/gpu_test ] && cp obj/gpu_test root/bin/
 	[ -f obj/cputop ] && cp obj/cputop root/bin/
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
@@ -569,8 +572,10 @@ done
 # Programs and libraries of more than 4 MB (Turnip, UniXNU's Metal on Vulkan: TURNIP=1, M2V=1) live in the system
 # image, in /usr/local/redwood, with a link in their place here: the small image is loaded with the kernel, in the
 # 64 MB the loader takes for both (with them it grew from 6.6 to 26 MB).
+# Not for a flash boot (FLASHBOOT=1): it has no system image, and /usr/local/redwood is not on the flash's Darwin
+# volume, so they stay here. GL=1's Mesa does fit: 15 MB that zlib makes 2 MB of (the 10 Pro's payload: 19.4 -> 21.5 MB).
 rm -rf big
-for f in $(cd root && find lib bin -type f -size +4M 2>/dev/null); do
+for f in $([ -z "${FLASHBOOT:-}" ] && cd root && find lib bin -type f -size +4M 2>/dev/null); do
 	mkdir -p big/$(dirname $f)
 	mv root/$f big/$f
 	ln -s /usr/local/redwood/$f root/$f

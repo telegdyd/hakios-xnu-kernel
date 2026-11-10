@@ -58,6 +58,7 @@
  * itself, and the GMU's version is a property of its firmware.
  *
  * More boot-args:
+ *   adreno_soc=8450    the OnePlus 10 Pro's (SM8450) Adreno 730 instead of the X5 Pro's GPU; all 22 steps
  *   adreno_only=K      step K alone (what steps 6 to 10 need, they check for themselves: within
  *                      one session of the loader, power and clocks stay as an earlier run left them)
  *   adreno_skip=MASK   leave out the steps whose bits are set (bit 2 = step 2)
@@ -109,6 +110,10 @@ static uint32_t last_step, skip_steps, pause_ms = 2200, fine, watch_seconds = 20
 static uint32_t step;                   /* the one being performed */
 static uint32_t speed_bin;              /* which of the GPUs of this kind the fuses say this is (step 2) */
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
+static uint32_t adreno_soc;             /* boot-arg adreno_soc: 0 the X5 Pro (SM7325), 8450 the OnePlus 10 Pro (adreno_soc_8450()) */
+static uint32_t steps_ported;           /* on SM8450: the steps that have its numbers so far; the rest are refused */
+/* the GPU's firmware in fw/ of the small image, by its names in the phone's /vendor/firmware (adreno_soc_8450(): the A730's) */
+static const char *fw_gmu = "a660_gmu.bin", *fw_sqe = "a660_sqe.fw", *fw_zap_mdt = "a660_zap.mdt", *fw_zap_image = "a660_zap.b02";
 static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
 
@@ -283,12 +288,15 @@ wait_for(struct block *b, uint32_t offset, uint32_t mask, uint32_t value, uint32
  * gcc-sc7280.c. The touch screen driver uses this controller too.
  */
 static struct block gcc = { "gcc", 0x00100000, 0x80000 };
-#define GCC_PLL_VOTE            0x52000         /* bit 15: gcc_gpu_gpll0_clk_src (600 MHz), bit 16: ..._div_clk_src (300 MHz) */
+/* the X5 Pro's offsets; adreno_soc=8450 puts the OnePlus 10 Pro's in their place (adreno_soc_8450()) */
+static uint32_t gcc_pll_vote = 0x52000, gcc_gpu_cfg_ahb = 0x71004, gcc_gpu_memnoc_gfx = 0x7100c,
+    gcc_gpu_snoc_dvm_gfx = 0x71018, gcc_ddrss_gpu_axi = 0x71154;
+#define GCC_PLL_VOTE            gcc_pll_vote    /* bit 15: gcc_gpu_gpll0_clk_src (600 MHz), bit 16: ..._div_clk_src (300 MHz) */
 #define GCC_PLL_VOTE_GPU_DIV    (1u << 16)
-#define GCC_GPU_CFG_AHB_CBCR    0x71004
-#define GCC_GPU_MEMNOC_GFX_CBCR 0x7100c
-#define GCC_GPU_SNOC_DVM_GFX_CBCR 0x71018
-#define GCC_DDRSS_GPU_AXI_CBCR  0x71154
+#define GCC_GPU_CFG_AHB_CBCR    gcc_gpu_cfg_ahb
+#define GCC_GPU_MEMNOC_GFX_CBCR gcc_gpu_memnoc_gfx
+#define GCC_GPU_SNOC_DVM_GFX_CBCR gcc_gpu_snoc_dvm_gfx
+#define GCC_DDRSS_GPU_AXI_CBCR  gcc_ddrss_gpu_axi
 #define CBCR_ENABLE             (1u << 0)       /* a clock's control register: on */
 #define CBCR_OFF                (1u << 31)      /* ... and whether it is in fact off */
 
@@ -435,6 +443,12 @@ step_fuses(void)
 {
 	uint32_t bin, gaming;
 
+	if (adreno_soc == 8450) {
+		/* dt: qcom,kgsl-3d0@3d00000 has no nvmem cell and one set of power levels: there is no bin to tell apart */
+		printf("adreno: %u: the OnePlus 10 Pro's GPU (Adreno 730v2, dt: qcom,gpu-model) has no speed-bin fuse to read\n",
+		    step);
+		return true;
+	}
 	announce("read the GPU's fuses in the error-corrected copy (0x784000), which Linux reads");
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
@@ -460,24 +474,37 @@ step_fuses(void)
  * starts (gcc-sc7280.c, the end of the probe function).
  */
 static struct block gpucc = { "gpucc", 0x03d90000, 0x9000 };
-#define GPUCC_PLL0_MODE         0x0000          /* the 3D core's PLL: bit 31 locked, bit 0 output on; +4: times 19.2 MHz */
-#define GPUCC_PLL1_MODE         0x0100          /* a 500 MHz PLL, an alternative source for the GMU's clock */
-#define GPUCC_CXO_AON_CBCR      0x1004
-#define GPUCC_GX_SW_RESET       0x1008          /* dt: gpu_gx_sw_reset */
-#define GPUCC_GX_GDSCR          0x100c          /* dt: gpu_gx_gdsc, the 3D core's power switch: the GMU's to operate */
-#define GPUCC_GX_GMU_CBCR       0x1064
-#define GPUCC_CX_GDSCR          0x106c          /* dt: gpu_cx_gdsc */
-#define GPUCC_AHB_CBCR          0x1078          /* gpu_cc_ahb_clk: the register bus inside the GPU block */
-#define GPUCC_CX_GMU_CBCR       0x1098          /* gpu_cc_cx_gmu_clk: the GMU */
-#define GPUCC_CXO_CBCR          0x109c          /* gpu_cc_cxo_clk: the crystal, for the GMU's timers */
-#define GPUCC_GMU_RCGR          0x1120          /* gpu_cc_gmu_clk_src: +0 command, +4 source and divider */
-#define GPUCC_CB_CBCR           0x1170          /* gpu_cc_cb_clk: Linux keeps it on always */
-#define GPUCC_HUB_AON_CBCR      0x1178          /* gpu_cc_hub_aon_clk */
-#define GPUCC_HUB_RCGR          0x117c          /* gpu_cc_hub_clk_src */
-#define GPUCC_HUB_CX_INT_CBCR   0x1204          /* gpu_cc_hub_cx_int_clk */
-#define GPUCC_CX_HW_CTRL        0x1540          /* dt: gpu_cx_hw_ctrl: bit 31 is where the vendor's driver sees CX come on */
-#define GPUCC_GX_DOMAIN_MISC    0x158c          /* dt: gpu_gx_domain_addr */
-#define GPUCC_SMMU_VOTE_CBCR    0x5000          /* gpu_cc_hlos1_vote_gpu_smmu_clk: our vote for the SMMU's clock */
+/* The X5 Pro's offsets, as variables: adreno_soc=8450 puts the OnePlus 10 Pro's in their place (adreno_soc_8450()). */
+static struct {
+	uint32_t pll0, pll1, cxo_aon, gx_sw_reset, gx_gdscr, gx_gmu, cx_gdscr, ahb, cx_gmu, cxo, gmu_rcgr, cb, hub_aon,
+	    hub_rcgr, hub_cx_int, cx_hw_ctrl, gx_domain_misc, smmu_vote, memnoc_gfx, cx_snoc_dvm;
+} gpucc_at = {
+	.pll0 = 0x0000, .pll1 = 0x0100, .cxo_aon = 0x1004, .gx_sw_reset = 0x1008, .gx_gdscr = 0x100c, .gx_gmu = 0x1064,
+	.cx_gdscr = 0x106c, .ahb = 0x1078, .cx_gmu = 0x1098, .cxo = 0x109c, .gmu_rcgr = 0x1120, .cb = 0x1170,
+	.hub_aon = 0x1178, .hub_rcgr = 0x117c, .hub_cx_int = 0x1204, .cx_hw_ctrl = 0x1540, .gx_domain_misc = 0x158c,
+	.smmu_vote = 0x5000,
+	/* (two the SC7280's controller has not got: 0 here) */
+};
+#define GPUCC_PLL0_MODE         gpucc_at.pll0   /* the 3D core's PLL: bit 31 locked, bit 0 output on; +4: times 19.2 MHz */
+#define GPUCC_PLL1_MODE         gpucc_at.pll1   /* a 500 MHz PLL, an alternative source for the GMU's clock */
+#define GPUCC_CXO_AON_CBCR      gpucc_at.cxo_aon
+#define GPUCC_GX_SW_RESET       gpucc_at.gx_sw_reset    /* dt: gpu_gx_sw_reset */
+#define GPUCC_GX_GDSCR          gpucc_at.gx_gdscr       /* dt: gpu_gx_gdsc, the 3D core's power switch: the GMU's to operate */
+#define GPUCC_GX_GMU_CBCR       gpucc_at.gx_gmu
+#define GPUCC_CX_GDSCR          gpucc_at.cx_gdscr       /* dt: gpu_cx_gdsc */
+#define GPUCC_AHB_CBCR          gpucc_at.ahb    /* gpu_cc_ahb_clk: the register bus inside the GPU block */
+#define GPUCC_CX_GMU_CBCR       gpucc_at.cx_gmu /* gpu_cc_cx_gmu_clk: the GMU */
+#define GPUCC_CXO_CBCR          gpucc_at.cxo    /* gpu_cc_cxo_clk: the crystal, for the GMU's timers */
+#define GPUCC_GMU_RCGR          gpucc_at.gmu_rcgr       /* gpu_cc_gmu_clk_src: +0 command, +4 source and divider */
+#define GPUCC_CB_CBCR           gpucc_at.cb     /* gpu_cc_cb_clk: Linux keeps it on always (SM8450: none, 0) */
+#define GPUCC_HUB_AON_CBCR      gpucc_at.hub_aon        /* gpu_cc_hub_aon_clk */
+#define GPUCC_HUB_RCGR          gpucc_at.hub_rcgr       /* gpu_cc_hub_clk_src */
+#define GPUCC_HUB_CX_INT_CBCR   gpucc_at.hub_cx_int     /* gpu_cc_hub_cx_int_clk */
+#define GPUCC_CX_HW_CTRL        gpucc_at.cx_hw_ctrl     /* dt: gpu_cx_hw_ctrl: bit 31 is where the vendor's driver sees CX come on */
+#define GPUCC_GX_DOMAIN_MISC    gpucc_at.gx_domain_misc /* dt: gpu_gx_domain_addr */
+#define GPUCC_SMMU_VOTE_CBCR    gpucc_at.smmu_vote      /* gpu_cc_hlos1_vote_gpu_smmu_clk: our vote for the SMMU's clock */
+#define GPUCC_MEMNOC_GFX_CBCR   gpucc_at.memnoc_gfx     /* SM8450 only: gpu_cc_memnoc_gfx_clk */
+#define GPUCC_CX_SNOC_DVM_CBCR  gpucc_at.cx_snoc_dvm    /* SM8450 only: gpu_cc_cx_snoc_dvm_clk */
 
 #define GDSC_SW_COLLAPSE        (1u << 0)       /* a power switch's control register (gdsc.c): off, by software */
 #define GDSC_HW_CONTROL         (1u << 1)       /* something else than software operates it */
@@ -513,10 +540,16 @@ step_gpucc(void)
 	get(&gpucc, "ahb", GPUCC_AHB_CBCR);
 	get(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR);
 	get(&gpucc, "cxo", GPUCC_CXO_CBCR);
-	get(&gpucc, "cb", GPUCC_CB_CBCR);
+	if (GPUCC_CB_CBCR != 0) {
+		get(&gpucc, "cb", GPUCC_CB_CBCR);
+	}
 	get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
 	get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
 	get(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR);
+	if (GPUCC_MEMNOC_GFX_CBCR != 0) {
+		get(&gpucc, "memnoc_gfx", GPUCC_MEMNOC_GFX_CBCR);
+		get(&gpucc, "cx_snoc_dvm", GPUCC_CX_SNOC_DVM_CBCR);
+	}
 	return true;
 }
 
@@ -674,7 +707,7 @@ step_clocks(void)
 	}
 
 	announce("in the GPU's clock controller: the clocks of the GMU and of the SMMU on");
-	if (!clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false) ||
+	if ((gpucc_at.cb && !clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false)) ||      /* none on SM8450 */
 	    !clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) ||
 	    !clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false) ||
 	    !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true) ||
@@ -747,12 +780,20 @@ count_clock(uint32_t ticks)
 static uint32_t
 measure(uint32_t select)
 {
-	uint32_t gpu_mux = get(&gpucc, "debug mux", GPUCC_DEBUG_MUX), gpu_div = get(&gpucc, "debug divider", GPUCC_DEBUG_DIV);
-	uint32_t gpu_cbcr = get(&gpucc, "debug output", GPUCC_DEBUG_CBCR), mux = get(&gcc, "debug mux", GCC_DEBUG_MUX);
-	uint32_t div = get(&gcc, "debug divider", GCC_DEBUG_DIV), cbcr = get(&gcc, "debug input", GCC_DEBUG_CBCR);
-	uint32_t base = get(&gcc, "crystal/4", GCC_XO_DIV4_CBCR), control = get(&gcc, "measure control", GCC_MEASURE_CTL);
-	uint32_t brief, full;
+	uint32_t gpu_mux, gpu_div, gpu_cbcr, mux, div, cbcr, base, control, brief, full;
 
+	if (adreno_soc == 8450) {
+		/* the X5 Pro's counter registers: on SM8450 gcc 0x62000 is the PLL votes, and the rest is not known */
+		return MEASURE_FAILED;
+	}
+	gpu_mux = get(&gpucc, "debug mux", GPUCC_DEBUG_MUX);
+	gpu_div = get(&gpucc, "debug divider", GPUCC_DEBUG_DIV);
+	gpu_cbcr = get(&gpucc, "debug output", GPUCC_DEBUG_CBCR);
+	mux = get(&gcc, "debug mux", GCC_DEBUG_MUX);
+	div = get(&gcc, "debug divider", GCC_DEBUG_DIV);
+	cbcr = get(&gcc, "debug input", GCC_DEBUG_CBCR);
+	base = get(&gcc, "crystal/4", GCC_XO_DIV4_CBCR);
+	control = get(&gcc, "measure control", GCC_MEASURE_CTL);
 	put(&gpucc, "debug mux", GPUCC_DEBUG_MUX, (gpu_mux & ~0xffu) | select);
 	put(&gpucc, "debug divider", GPUCC_DEBUG_DIV, (gpu_div & ~0xfu) | 1);
 	put(&gpucc, "debug output", GPUCC_DEBUG_CBCR, gpu_cbcr | CBCR_ENABLE);
@@ -810,6 +851,22 @@ measure_clocks(void)
 	};
 	uint32_t hz, ahb_hz = MEASURE_FAILED;
 
+	if (adreno_soc == 8450) {
+		/*
+		 * No counter numbers for SM8450 yet: what the control registers say instead. Its ahb reads 0 before
+		 * and after the enable bit is written, as the X5 Pro's does (seen: adreno-6.log), so only a bit 31 that
+		 * is set says anything; that the GMU's registers answer in step 6 is what shows the bus has its clock.
+		 */
+		printf("adreno: %u: SM8450: no frequency counter; by their control registers: ahb %#x cxo %#x hub_aon %#x "
+		    "hub_cx_int %#x cx_gmu %#x gx_gmu %#x (bit 31: off)\n", step, rd(gpucc.base + GPUCC_AHB_CBCR),
+		    rd(gpucc.base + GPUCC_CXO_CBCR), rd(gpucc.base + GPUCC_HUB_AON_CBCR), rd(gpucc.base + GPUCC_HUB_CX_INT_CBCR),
+		    rd(gpucc.base + GPUCC_CX_GMU_CBCR), rd(gpucc.base + GPUCC_GX_GMU_CBCR));
+		if (rd(gpucc.base + GPUCC_AHB_CBCR) & CBCR_OFF) {
+			printf("adreno: %u: the register bus of the GPU block has no clock\n", step);
+			return false;
+		}
+		return true;
+	}
 	announce("measure the GPU block's clocks with the SoC's frequency counter (debug registers at gcc 0x162000.., "
 	    "gpucc 0x3d910fc, 0x3d91100, 0x3d91568)");
 	hz = measure(GPUCC_DEBUG_CXO);
@@ -869,6 +926,15 @@ cx_ready(void)
 		    cx_is_on() ? "on" : "off", gmu_clock);
 		return false;
 	}
+	if (adreno_soc == 8450) {
+		/* no counter: only ahb's bit 31 can say no (measure_clocks()); step 6's reads have answered with it so */
+		if (rd(gpucc.base + GPUCC_AHB_CBCR) & CBCR_OFF) {
+			printf("adreno: %u: the GPU block's register bus clock is off (ahb %#x): not touching it\n", step,
+			    rd(gpucc.base + GPUCC_AHB_CBCR));
+			return false;
+		}
+		return true;
+	}
 	ahb_hz = measure_quietly(GPUCC_DEBUG_AHB);
 	if (ahb_hz == MEASURE_FAILED) {
 		printf("adreno: %u: the frequency counter did not finish (step 5 shows whether it works)\n", step);
@@ -917,9 +983,11 @@ static struct block gbif = { "gbif", 0x03d00000 + 4 * 0x3c00, 0x1000 };
 #define GBIF_SCACHE_CNTL0       (4 * 0x01)
 #define GBIF_HALT               (4 * 0x45)
 #define GBIF_HALT_ACK           (4 * 0x46)
+#define GBIF_QSB_SIDE0          (4 * 0x03)
 static struct block cx_misc = { "cx_misc", 0x03d9e000, 0x1000 };
 #define CX_MISC_SYSTEM_CACHE_CNTL_0 (4 * 1)
 #define CX_MISC_SYSTEM_CACHE_CNTL_1 (4 * 2)
+#define CX_MISC_TCM_RET_CNTL    (4 * 0x39)      /* the A7xx's: its GMU's memories kept while it sleeps */
 
 static bool
 step_first_words(void)
@@ -969,7 +1037,7 @@ step_first_words(void)
 /* ---- step 7: the GMU's channel to RPMh ----------------------------------------------------------------- */
 
 /*
- * dt: qcom,kgsl-3d0 "rscc" at 0x3de0000: the same kind of command slots through which this
+ * dt: qcom,kgsl-3d0 "rscc" at 0x3de0000 (SM8450: 0x3d50000): the same kind of command slots through which this
  * kernel asks RPMh for the touch screen's supply, but the GMU's own; through them its firmware
  * raises the 3D core's rail. Offsets in words: a6xx_gmu.xml, domain A6XX_RSCC.
  */
@@ -1015,7 +1083,7 @@ step_rscc(void)
 	if (!cx_ready()) {
 		return false;
 	}
-	announce("read the GMU's RPMh channel (0x3de0000)");
+	announce("read the GMU's RPMh channel (rscc: 0x3de0000, on SM8450 0x3d50000)");
 	get(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0);
 	get(&rscc, "pdc_slave_id_drv0", RSCC_PDC_SLAVE_ID_DRV0);
 	get(&rscc, "seq_busy_drv0", RSCC_SEQ_BUSY_DRV0);
@@ -1028,7 +1096,7 @@ step_rscc(void)
 /* ---- steps 8 and 9: the SMMU --------------------------------------------------------------------------- */
 
 /*
- * dt: kgsl-smmu@3da0000 (qcom,qsmmu-v500: an Arm MMU-500), 0x20000 long, with "qcom,skip-init":
+ * dt: kgsl-smmu@3da0000 (qcom,qsmmu-v500: an Arm MMU-500), 0x20000 long (SM8450: 0x40000), with "qcom,skip-init":
  * the vendor's driver leaves its stream table as it finds it. Its streams (dt: qcom,kgsl-iommu
  * and qcom,gmu, "iommus"): 0 the GPU, 1 its low-priority twin, 2 secure content, 5 the GMU.
  * The global registers here are the ones the hypervisor imitates; offsets: arm-smmu.h.
@@ -1646,9 +1714,9 @@ zap_header(uint64_t *phys)
 	const uint8_t *header;
 	vm_offset_t page = 0;
 	uint64_t size = 0;
-	uint32_t segments, hashes;
+	uint32_t segments, hashes = 0;
 
-	header = image_file("fw", "a660_zap.mdt", &size);
+	header = image_file("fw", fw_zap_mdt, &size);
 	if (header == NULL) {
 		return false;
 	}
@@ -1659,7 +1727,20 @@ zap_header(uint64_t *phys)
 		    header[2], header[3], segments);
 		return false;
 	}
-	memcpy(&hashes, header + 52 + 32 + 16, sizeof(hashes));
+	/*
+	 * The segment of hashes is the one whose flags say so (mdt_loader.c: QCOM_MDT_TYPE_HASH, bits 26:24 = 2): the
+	 * A660's is the second segment, the A730's the third (its second is the code).
+	 */
+	for (uint32_t i = 0; i < segments && 52 + 32 * (i + 1) <= size; i++) {
+		uint32_t flags, file_size;
+
+		memcpy(&flags, header + 52 + 32 * i + 24, sizeof(flags));
+		memcpy(&file_size, header + 52 + 32 * i + 16, sizeof(file_size));
+		if ((flags >> 24 & 7) == 2) {
+			hashes = file_size;
+			break;
+		}
+	}
 	printf("adreno: %u: an ELF header of %u segments, %u bytes with its table, then %llu bytes; by the table, %u of hashes\n",
 	    step, segments, 52 + 32 * segments, size - (52 + 32 * segments), hashes);
 	if (52 + 32 * segments + (uint64_t)hashes != size) {
@@ -1682,7 +1763,8 @@ step_zap_signature(void)
 	uint64_t header = 0, answer = ~0ull;
 	int32_t result;
 
-	announce("find the zap shader's header, fw/a660_zap.mdt, in the small image that came with the kernel");
+	printf("adreno: %u: the zap shader's header is fw/%s\n", step, fw_zap_mdt);
+	announce("find the zap shader's header in the small image that came with the kernel");
 	if (!zap_header(&header)) {
 		return false;
 	}
@@ -1743,8 +1825,9 @@ step_gmu_space(void)
 	if (!cx_ready()) {
 		return false;
 	}
-	announce("find the GMU's firmware, fw/a660_gmu.bin, in the small image, and make the memory it asks for");
-	gmu_firmware = image_file("fw", "a660_gmu.bin", &gmu_firmware_size);
+	printf("adreno: %u: the GMU's firmware is fw/%s\n", step, fw_gmu);
+	announce("find the GMU's firmware in the small image, and make the memory it asks for");
+	gmu_firmware = image_file("fw", fw_gmu, &gmu_firmware_size);
 	if (gmu_firmware == NULL) {
 		return false;
 	}
@@ -1872,6 +1955,10 @@ step_gmu_firmware(void)
 #define GMU_HFI_QTBL_INFO       GMU_WORD(0x5184)
 #define GMU_HFI_QTBL_ADDR       GMU_WORD(0x5185)
 #define GMU_HFI_CTRL_INIT       GMU_WORD(0x5186)
+#define GMU_GENERAL_8           GMU_WORD(0x51cd)        /* the A7xx's: at start, where the log is, and its pages - 1 */
+#define GMU_GENERAL_9           GMU_WORD(0x51ce)        /* ... and how far it was written before */
+#define GMU_GENERAL_10          GMU_WORD(0x51cf)        /* ... and which GPU this is */
+#define GMU_CHIP_A730           0x07030100      /* dt qcom,chipid 0x07030001 the way the A7xx's firmware wants it */
 #define GMU_GMU2HOST_INTR_CLR   GMU_WORD(0x5191)
 #define GMU_GMU2HOST_INTR_INFO  GMU_WORD(0x5192)        /* bit 0: a message for us; bit 31: the 3D core is ours */
 #define GMU_HOST2GMU_INTR_SET   GMU_WORD(0x5194)        /* bit 0: a message for the GMU; bit 30, 31: see step 17 */
@@ -1896,6 +1983,7 @@ struct hfi_table {
 #define HFI_QUEUE_AT(n)         (((uint32_t)sizeof(struct hfi_table) + 15) / 16 * 16 + 4096 * (n))
 
 static volatile struct hfi_table *hfi;  /* the uncached view */
+static void gmu_rpmh_program(void);     /* step 16's; on SM8450 step 15's */
 
 /*
  * Everything the vendor's driver writes before it lets the processor go (a6xx_gmu_register_config,
@@ -1949,24 +2037,53 @@ step_gmu_start(void)
 		get(&rscc, "seq_busy_drv0", RSCC_SEQ_BUSY_DRV0);
 	}
 	rsc_awake = true;
+	if (adreno_soc == 8450) {
+		gmu_rpmh_program();
+	}
 	put(&gmu, "cx_falnext_intf", GMU_CX_FALNEXT_INTF, 1);
 	put(&gmu, "cx_fal_intf", GMU_CX_FAL_INTF, 1);
-	put(&gmu, "general_7", GMU_GENERAL_7, 1);
-	put(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT, 0);
-	put(&gmu, "cm3_boot_config", GMU_CM3_BOOT_CONFIG, 2);
-	put(&gmu, "hfi_qtbl_addr", GMU_HFI_QTBL_ADDR, GMU_HFI_ADDRESS);
-	put(&gmu, "hfi_qtbl_info", GMU_HFI_QTBL_INFO, 1);
-	put(&gmu, "ahb_fence_range_0", GMU_AHB_FENCE_RANGE_0, 1u << 31 | (0xa << 2) << 18 | 0x8a0);
-	put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
-	put(&gbif, "halt", GBIF_HALT, 0);
-	put(&gmu, "pwr_col_cp_resp", GMU_PWR_COL_CP_RESP, 0);
-	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, GMU_CHIP);
-	put(&gmu, "pwr_col_cp_msg", GMU_PWR_COL_CP_MSG, GMU_LOG_ADDRESS | (GMU_LOG_SIZE / 4096 - 1));
-	put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
-	put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
-	put(&gmu, "dcache_config", GMU_DCACHE_CONFIG, 1);
-	put(&gmu, "pwr_col_inter_frame_ctrl", GMU_PWR_COL_INTER_FRAME_CTRL, 0x9c40400);
-	set(&gmu, "rpmh_ctrl", GMU_RPMH_CTRL, GMU_RPMH_CTRL_ALL);
+	if (adreno_soc == 8450) {
+		/*
+		 * The A7xx (Linux a6xx_gmu_fw_start, a6xx_gmu_power_config for it; slop's negroni ladder):
+		 * its memories' retention in cx_misc rather than general_7, a wider fenced range, which GPU
+		 * and where the log is in general_10 and general_8, the CX half's bus QoS; and no
+		 * inter-frame power collapse or RPMh control words ("A7xx knows better by default").
+		 */
+		put(&cx_misc, "tcm_ret_cntl", CX_MISC_TCM_RET_CNTL, 1);
+		put(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT, 0);
+		put(&gmu, "cm3_boot_config", GMU_CM3_BOOT_CONFIG, 2);
+		put(&gmu, "hfi_qtbl_addr", GMU_HFI_QTBL_ADDR, GMU_HFI_ADDRESS);
+		put(&gmu, "hfi_qtbl_info", GMU_HFI_QTBL_INFO, 1);
+		put(&gmu, "ahb_fence_range_0", GMU_AHB_FENCE_RANGE_0, 1u << 31 | 0x32u << 18 | 0x8a0);
+		put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
+		put(&gbif, "halt", GBIF_HALT, 0);
+		put(&gmu, "general_9", GMU_GENERAL_9, 0);
+		put(&gmu, "general_10", GMU_GENERAL_10, GMU_CHIP_A730);
+		put(&gmu, "general_8", GMU_GENERAL_8, GMU_LOG_ADDRESS | (GMU_LOG_SIZE / 4096 - 1));
+		for (unsigned i = 0; i < 4; i++) {
+			put(&gbif, "qsb_side", GBIF_QSB_SIDE0 + 4 * i, 0x00071620);
+		}
+		put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
+		put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
+		put(&gmu, "dcache_config", GMU_DCACHE_CONFIG, 1);
+	} else {
+		put(&gmu, "general_7", GMU_GENERAL_7, 1);
+		put(&gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT, 0);
+		put(&gmu, "cm3_boot_config", GMU_CM3_BOOT_CONFIG, 2);
+		put(&gmu, "hfi_qtbl_addr", GMU_HFI_QTBL_ADDR, GMU_HFI_ADDRESS);
+		put(&gmu, "hfi_qtbl_info", GMU_HFI_QTBL_INFO, 1);
+		put(&gmu, "ahb_fence_range_0", GMU_AHB_FENCE_RANGE_0, 1u << 31 | (0xa << 2) << 18 | 0x8a0);
+		put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
+		put(&gbif, "halt", GBIF_HALT, 0);
+		put(&gmu, "pwr_col_cp_resp", GMU_PWR_COL_CP_RESP, 0);
+		put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, GMU_CHIP);
+		put(&gmu, "pwr_col_cp_msg", GMU_PWR_COL_CP_MSG, GMU_LOG_ADDRESS | (GMU_LOG_SIZE / 4096 - 1));
+		put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
+		put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
+		put(&gmu, "dcache_config", GMU_DCACHE_CONFIG, 1);
+		put(&gmu, "pwr_col_inter_frame_ctrl", GMU_PWR_COL_INTER_FRAME_CTRL, 0x9c40400);
+		set(&gmu, "rpmh_ctrl", GMU_RPMH_CTRL, GMU_RPMH_CTRL_ALL);
+	}
 	put(&gmu, "gmu2host_intr_clr", GMU_GMU2HOST_INTR_CLR, 0xffffffff);
 
 	gmu_runs = true;
@@ -2010,42 +2127,12 @@ static struct block pdc = { "pdc", 0x0b290000, 0x10000 };       /* dt: qcom,gmu 
 static bool
 step_gmu_queues(void)
 {
-	static const uint32_t program[5] = { 0xeaaae5a0, 0xe1a1ebab, 0xa2e0a581, 0xecac82e2, 0x0020edad };
-
 	if (!cx_ready() || !gmu_runs) {
 		return false;
 	}
-	announce("enable the GPU's part of the always-on sequencer (pdc, 0xb294500 and 0xb294520: a part of the SoC not "
-	    "touched before)");
-	get(&pdc, "gpu_enable", PDC_GPU_ENABLE);
-	get(&pdc, "gpu_seq_start_addr", PDC_GPU_SEQ_START_ADDR);
-	put(&pdc, "gpu_seq_start_addr", PDC_GPU_SEQ_START_ADDR, 0);
-	put(&pdc, "gpu_enable", PDC_GPU_ENABLE, 0x80000001);
-	get(&pdc, "gpu_enable", PDC_GPU_ENABLE);
-
-	announce("give the GMU's RPMh channel its sleep and wake program (rscc, 0x3de0000), unless it has it");
-	if (get(&rscc, "seq_mem_0_drv0", RSCC_SEQ_MEM_0_DRV0) == program[0] &&
-	    get(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4) == 0x80000021) {
-		goto programmed;
+	if (adreno_soc != 8450) {
+		gmu_rpmh_program();
 	}
-	put(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0, 1u << 24);
-	put(&rscc, "pdc_slave_id_drv0", RSCC_PDC_SLAVE_ID_DRV0, 1);
-	put(&rscc, "hidden_tcs_cmd0_data", RSCC_HIDDEN_TCS_CMD0_DATA, 0);
-	put(&rscc, "hidden_tcs_cmd0_addr", RSCC_HIDDEN_TCS_CMD0_ADDR, 0);
-	put(&rscc, "hidden_tcs_cmd1_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 2, 0);
-	put(&rscc, "hidden_tcs_cmd1_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 2, 0);
-	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, 0x80000021);    /* a650 and later */
-	put(&rscc, "hidden_tcs_cmd2_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 4, 0);
-	put(&rscc, "override_start_addr", RSCC_OVERRIDE_START_ADDR, 0);
-	put(&rscc, "pdc_seq_start_addr", RSCC_PDC_SEQ_START_ADDR, 0x4520);
-	put(&rscc, "pdc_match_value_lo", RSCC_PDC_MATCH_VALUE_LO, 0x4510);
-	put(&rscc, "pdc_match_value_hi", RSCC_PDC_MATCH_VALUE_HI, 0x4514);
-	for (unsigned i = 0; i < 5; i++) {
-		put(&rscc, "seq_mem_drv0", RSCC_SEQ_MEM_0_DRV0 + 4 * i, program[i]);
-	}
-	get(&rscc, "seq_mem_0_drv0", RSCC_SEQ_MEM_0_DRV0);
-
-programmed:
 	announce("ask the GMU to start its message queues");
 	put(&gmu, "hfi_ctrl_init", GMU_HFI_CTRL_INIT, 1);
 	if (!wait_for(&gmu, GMU_HFI_CTRL_STATUS, 1, 1, 500)) {
@@ -2060,6 +2147,49 @@ programmed:
 	gmu_talks = true;
 	printf("adreno: %u: THE GMU'S MESSAGE QUEUES ARE UP\n", step);
 	return !space_faulted(&gmu_space);
+}
+
+/*
+ * The PDC's enabling and the RSC's program. The A6xx's vendor driver has them after the firmware
+ * has started (step 16); for the A7xx Linux (a6xx_gmu_fw_start: a6xx_gmu_rpmh_init) and slop's
+ * negroni ladder have them before it is let out of reset, so on SM8450 step 15 calls this first.
+ */
+static void
+gmu_rpmh_program(void)
+{
+	static const uint32_t program[5] = { 0xeaaae5a0, 0xe1a1ebab, 0xa2e0a581, 0xecac82e2, 0x0020edad };
+	/* the third hidden command's data: the A660's, and the A730's (Linux: 0x80000021 only from the A740 on) */
+	const uint32_t tcs_cmd2_data = adreno_soc == 8450 ? 0x80000000 : 0x80000021;
+
+	announce("enable the GPU's part of the always-on sequencer (pdc, 0xb294500 and 0xb294520: a part of the SoC not "
+	    "touched before)");
+	get(&pdc, "gpu_enable", PDC_GPU_ENABLE);
+	get(&pdc, "gpu_seq_start_addr", PDC_GPU_SEQ_START_ADDR);
+	put(&pdc, "gpu_seq_start_addr", PDC_GPU_SEQ_START_ADDR, 0);
+	put(&pdc, "gpu_enable", PDC_GPU_ENABLE, 0x80000001);
+	get(&pdc, "gpu_enable", PDC_GPU_ENABLE);
+
+	announce("give the GMU's RPMh channel its sleep and wake program (rscc, 0x3de0000; on SM8450 0x3d50000), unless it has it");
+	if (get(&rscc, "seq_mem_0_drv0", RSCC_SEQ_MEM_0_DRV0) == program[0] &&
+	    get(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4) == tcs_cmd2_data) {
+		return;
+	}
+	put(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0, 1u << 24);
+	put(&rscc, "pdc_slave_id_drv0", RSCC_PDC_SLAVE_ID_DRV0, 1);
+	put(&rscc, "hidden_tcs_cmd0_data", RSCC_HIDDEN_TCS_CMD0_DATA, 0);
+	put(&rscc, "hidden_tcs_cmd0_addr", RSCC_HIDDEN_TCS_CMD0_ADDR, 0);
+	put(&rscc, "hidden_tcs_cmd1_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 2, 0);
+	put(&rscc, "hidden_tcs_cmd1_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 2, 0);
+	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, tcs_cmd2_data);
+	put(&rscc, "hidden_tcs_cmd2_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 4, 0);
+	put(&rscc, "override_start_addr", RSCC_OVERRIDE_START_ADDR, 0);
+	put(&rscc, "pdc_seq_start_addr", RSCC_PDC_SEQ_START_ADDR, 0x4520);
+	put(&rscc, "pdc_match_value_lo", RSCC_PDC_MATCH_VALUE_LO, 0x4510);
+	put(&rscc, "pdc_match_value_hi", RSCC_PDC_MATCH_VALUE_HI, 0x4514);
+	for (unsigned i = 0; i < 5; i++) {
+		put(&rscc, "seq_mem_drv0", RSCC_SEQ_MEM_0_DRV0 + 4 * i, program[i]);
+	}
+	get(&rscc, "seq_mem_0_drv0", RSCC_SEQ_MEM_0_DRV0);
 }
 
 /* ---- step 17: talk to the GMU; the 3D core powered ---------------------------------------------------------- */
@@ -2161,7 +2291,8 @@ gmu_data(uint32_t address)
 static void
 gmu_post_mortem(void)
 {
-	uint32_t next = rd(gmu.base + GMU_PWR_COL_CP_RESP) & 0xffff, entries = GMU_LOG_SIZE / 16;
+	uint32_t next = rd(gmu.base + (adreno_soc == 8450 ? GMU_GENERAL_9 : GMU_PWR_COL_CP_RESP)) & 0xffff;
+	uint32_t entries = GMU_LOG_SIZE / 16;
 	const volatile uint32_t *log = (const volatile uint32_t *)gmu_log.memory;
 
 	to_memory(gmu_log.memory, GMU_LOG_SIZE);
@@ -2285,14 +2416,31 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 static bool
 step_core_power(void)
 {
-	static const struct {
+	struct speed {
 		uint32_t khz, level;
-	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+	};
+	static const struct speed speeds_7325[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
+	/* SM8450: the phone's dt (qcom,gpu-pwrlevels: 220, 317, 492 MHz at levels 56, 64, 128) */
+	static const struct speed speeds_8450[] = { { 0, 0 }, { 220000, 56 }, { 317000, 64 }, { 492000, 128 } };
+	/*
+	 * SM8450: Linux's a730_build_bw_table (slop's negroni ladder sends the same): twelve levels of
+	 * DDR votes (SH0, MC0, ACV), none for the config bus
+	 */
+	static const uint32_t ddr_8450[12][3] = {
+		{ 0x40000000, 0x40000000, 0x40000000 }, { 0x600002e8, 0x600003d0, 0x60000008 },
+		{ 0x6000068d, 0x6000089a, 0x60000008 }, { 0x600007f2, 0x60000a6e, 0x60000008 },
+		{ 0x600009e5, 0x60000cfd, 0x60000008 }, { 0x60000b29, 0x60000ea6, 0x60000008 },
+		{ 0x60001698, 0x60001da8, 0x60000008 }, { 0x600018d2, 0x60002093, 0x60000008 },
+		{ 0x60001e66, 0x600027e6, 0x60000008 }, { 0x600027c2, 0x6000342f, 0x60000008 },
+		{ 0x60002e71, 0x60003cf5, 0x60000008 }, { 0x600030ae, 0x60003fe5, 0x60000008 },
+	};
+	const struct speed *speeds = adreno_soc == 8450 ? speeds_8450 : speeds_7325;
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
 	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 3, HFI_NO_INDEX }, granted = 0, speed = 0;
 	uint16_t gfx[16], cx[16], mx[16];
 	unsigned gfx_levels, cx_levels, mx_levels;
+	bool powered;
 
 	if (!cx_ready() || !gmu_talks) {
 		return false;
@@ -2302,7 +2450,7 @@ step_core_power(void)
 		printf("adreno: %u: RPMh's list lacks one of the rails\n", step);
 		return false;
 	}
-	perf.gpu_levels = sizeof(speeds) / sizeof(speeds[0]);
+	perf.gpu_levels = sizeof(speeds_7325) / sizeof(speeds_7325[0]);
 	for (unsigned i = 0; i < perf.gpu_levels; i++) {
 		perf.gpu[i].khz = speeds[i].khz;
 		perf.gpu[i].acd = 0xffffffff;           /* no adaptive clocking */
@@ -2314,7 +2462,8 @@ step_core_power(void)
 	perf.gmu_levels = 2;
 	perf.gmu[1].khz = 200000;
 	if (!rail_vote(0, cx, cx_levels, mx, mx_levels, &perf.gmu[0].vote) ||
-	    !rail_vote(48, cx, cx_levels, mx, mx_levels, &perf.gmu[1].vote)) {  /* "minimum SVS", the vendor's choice */
+	    !rail_vote(adreno_soc == 8450 ? 64 : 48, cx, cx_levels, mx, mx_levels, &perf.gmu[1].vote)) {
+		/* "minimum SVS", the vendor's choice; on SM8450 "low SVS", Linux's sm8450.dtsi for the GMU's 200 MHz */
 		return false;
 	}
 	printf("adreno: %u: votes: 3D core %#x %#x %#x %#x, GMU %#x %#x\n", step, perf.gpu[0].vote, perf.gpu[1].vote,
@@ -2327,14 +2476,24 @@ step_core_power(void)
 	bw.ddr_address[1] = rpmh_resource("MC0", NULL, NULL);
 	bw.ddr_address[2] = rpmh_resource("ACV", NULL, NULL);
 	bw.ddr_data[0][0] = bw.ddr_data[0][1] = bw.ddr_data[0][2] = 0x40000000;
-	bw.cnoc_commands = 1;
-	bw.cnoc_wait = 1;
-	bw.cnoc_address[0] = rpmh_resource("CN0", NULL, NULL);
-	bw.cnoc_data[0][0] = 0x40000000;
-	bw.cnoc_data[1][0] = 0x60000001;
+	if (adreno_soc == 8450) {
+		bw.levels = 12;
+		for (unsigned i = 0; i < 12; i++) {
+			for (unsigned j = 0; j < 3; j++) {
+				bw.ddr_data[i][j] = ddr_8450[i][j];
+			}
+		}
+	} else {
+		bw.cnoc_commands = 1;
+		bw.cnoc_wait = 1;
+		bw.cnoc_address[0] = rpmh_resource("CN0", NULL, NULL);
+		bw.cnoc_data[0][0] = 0x40000000;
+		bw.cnoc_data[1][0] = 0x60000001;
+	}
 	printf("adreno: %u: RPMh's bus resources: SH0 %#x, MC0 %#x, ACV %#x, CN0 %#x (Linux has 0x50004, 0x50000, 0x50088, "
 	    "0x5006c)\n", step, bw.ddr_address[0], bw.ddr_address[1], bw.ddr_address[2], bw.cnoc_address[0]);
-	if (bw.ddr_address[0] == 0 || bw.ddr_address[1] == 0 || bw.ddr_address[2] == 0 || bw.cnoc_address[0] == 0) {
+	if (bw.ddr_address[0] == 0 || bw.ddr_address[1] == 0 || bw.ddr_address[2] == 0 ||
+	    (bw.cnoc_commands != 0 && bw.cnoc_address[0] == 0)) {
 		return false;
 	}
 
@@ -2348,6 +2507,8 @@ step_core_power(void)
 	if (!hfi_send("the table of speeds", HFI_PERF_TABLE, &perf.header, sizeof(perf) / 4) ||
 	    !hfi_send("the table of bus votes", HFI_BW_TABLE, &bw.header, sizeof(bw) / 4) ||
 	    !hfi_send("\"start the core firmware\"", HFI_CORE_FW_START, core_start, 2) ||
+	    /* SM8450: "start" before the vote and the 3D core's power, as Linux (a6xx_hfi_start) and slop have it */
+	    (adreno_soc == 8450 && !hfi_send("\"start\"", HFI_START, start, 1)) ||
 	    !hfi_send("the speed wanted", HFI_GX_BW_PERF_VOTE, vote, 4)) {
 		return false;
 	}
@@ -2365,13 +2526,22 @@ step_core_power(void)
 	get(&gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK_STATUS);
 	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
 	get(&gmu, "rpmh_power_state", GMU_RPMH_POWER_STATE);
-	if (!(granted & GMU_CORE_GRANTED) || (rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS) & 0xc0) != 0) {
+	/*
+	 * Powered: the A6xx's GMU says so in sptprac_pwr_clk_status (bits 6 and 7 clear); the A7xx's
+	 * has other bits there, so on SM8450 it is the 3D core's switch itself, as slop checks it.
+	 */
+	if (adreno_soc == 8450) {
+		powered = (rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON) != 0;
+	} else {
+		powered = (rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS) & 0xc0) == 0;
+	}
+	if (!(granted & GMU_CORE_GRANTED) || !powered) {
 		printf("adreno: %u: the GMU does not power the 3D core (gmu2host_intr_info %#x, fw_init_result %#x)\n", step,
 		    granted, rd(gmu.base + GMU_CM3_FW_INIT_RESULT));
 		space_faulted(&gmu_space);
 		return false;
 	}
-	if (!hfi_send("\"start\"", HFI_START, start, 1)) {
+	if (adreno_soc != 8450 && !hfi_send("\"start\"", HFI_START, start, 1)) {
 		return false;
 	}
 	printf("adreno: %u: measured: the 3D core's clock runs at %u Hz (%u MHz was asked for), the GMU's in it at %u Hz\n", step,
@@ -2408,7 +2578,6 @@ step_core_power(void)
 #define CORE_TARGET_ADDRESS     0x10000000u
 #define CORE_NOWHERE            0x7f000000u     /* never given anything */
 
-#define GBIF_QSB_SIDE0          (4 * 0x03)      /* of the bus interface (step 6) */
 #define RBBM_GBIF_CLIENT_QOS_CNTL GPU_WORD(0x0011)
 #define RBBM_GBIF_HALT          GPU_WORD(0x0016)
 #define RBBM_GBIF_HALT_ACK      GPU_WORD(0x0017)
@@ -2444,6 +2613,15 @@ step_core_power(void)
 #define RBBM_SECVID_TSB_CNTL    GPU_WORD(0xf803)
 #define RBBM_SECVID_TSB_ADDR_MODE_CNTL GPU_WORD(0xf810)
 #define CP_RB_CNTL_VALUE        (12u | 2u << 8 | 1u << 27)      /* 2^12 pairs of words; do not copy the read position to memory */
+/* the A7xx's own (Linux a6xx_gpu.c hw_init, a7xx paths; a7xx.xml) */
+#define CP_RB_RPTR_ADDR         GPU_WORD(0x0804)
+#define CP_BV_RB_RPTR_ADDR      GPU_WORD(0x0a98)
+#define CP_BV_APRIV_CNTL        GPU_WORD(0x0ad0)
+#define CP_LPAC_APRIV_CNTL      GPU_WORD(0x0b31)
+#define UCHE_GBIF_GX_CONFIG     GPU_WORD(0x0e3a)
+#define UCHE_CMDQ_CONFIG        GPU_WORD(0x0e3c)
+#define RB_CMP_DBG_ECO_CNTL     GPU_WORD(0x8e28)
+#define CP_THREAD_CONTROL       0x17            /* a command: which of the A7xx's two command threads (BR, BV) the next are for */
 
 /* commands (Mesa's adreno_pm4.xml); a packet is a header word and so many more */
 #define CP_NOP                  0x10
@@ -2566,8 +2744,9 @@ step_core_space(void)
 		return false;
 	}
 	PE_parse_boot_argn("adreno_stream1", &stream1, sizeof(stream1));
-	announce("make the 3D core's memory: its ring, its microcode (fw/a660_sqe.fw), a page to try writing to");
-	microcode = image_file("fw", "a660_sqe.fw", &size);
+	printf("adreno: %u: the microcode: fw/%s\n", step, fw_sqe);
+	announce("make the 3D core's memory: its ring, its microcode, a page to try writing to");
+	microcode = image_file("fw", fw_sqe, &size);
 	if (microcode == NULL || size < 8 || size > 0x40000 ||
 	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
 	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, PTE_CORE | PTE_READ_ONLY) ||
@@ -2623,7 +2802,7 @@ step_core_space(void)
  * (Step 21 is what tells whether the 3D core gets out of secure mode with it.) There was a
  * boot-arg adreno_zap=0 for the second and later runs of a started phone; nothing reads it now.
  */
-#define ZAP_MEMORY              0x8b71a000ull
+static uint64_t zap_memory = 0x8b71a000ull;     /* on SM8450 0x8b91a000 (dt gpu_micro_code_region) */
 #define ZAP_MEMORY_SIZE         0x2000u
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_THREE_VALUES        3
@@ -2651,7 +2830,7 @@ step_zap_load(void)
 	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
 	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
 	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
-	segment = image_file("fw", "a660_zap.b02", &size);
+	segment = image_file("fw", fw_zap_image, &size);
 	if (segment == NULL || size == 0 || size > 0x1000) {
 		return false;
 	}
@@ -2667,7 +2846,7 @@ step_zap_load(void)
 		zap_is_loaded = true;
 		return true;
 	}
-	if (scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY, 0x1000,
+	if (scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, zap_memory, 0x1000,
 	    &answer) != 0 || answer != 0) {
 		printf("adreno: %u: TrustZone does not take the place (%#llx): TAKEN TO MEAN THAT IT KEEPS A ZAP SHADER FROM "
 		    "BEFORE, which is used as it is\n", step, answer);
@@ -2675,11 +2854,11 @@ step_zap_load(void)
 		return true;
 	}
 	/* (the memory is looked at only now: TrustZone has just said that it is not its own) */
-	memory = (volatile uint8_t *)ml_io_map_wcomb(ZAP_MEMORY, ZAP_MEMORY_SIZE);
+	memory = (volatile uint8_t *)ml_io_map_wcomb(zap_memory, ZAP_MEMORY_SIZE);
 	printf("adreno: %u: the reserved memory begins %02x %02x %02x %02x, the zap shader %02x %02x %02x %02x\n", step,
 	    memory[0], memory[1], memory[2], memory[3], segment[0], segment[1], segment[2], segment[3]);
-	printf("adreno: %u: about to write %llu bytes at %#llx\n", step, size, ZAP_MEMORY);
-	snprintf(last_write, sizeof(last_write), "step %u wrote the zap shader into memory at %#llx", step, ZAP_MEMORY);
+	printf("adreno: %u: about to write %llu bytes at %#llx\n", step, size, zap_memory);
+	snprintf(last_write, sizeof(last_write), "step %u wrote the zap shader into memory at %#llx", step, zap_memory);
 	hold(true);
 	for (uint64_t i = 0; i < 0x1000; i++) {
 		memory[i] = i < size ? segment[i] : 0;
@@ -2696,6 +2875,10 @@ step_zap_load(void)
 }
 
 /* ---- step 20: the 3D core's registers, its command processor started, its first command ------------------- */
+
+static void core_registers_a6xx(const uint32_t *address_modes, unsigned modes);
+static void core_registers_a730(void);
+static bool core_start_after(uint32_t blind);
 
 static bool
 step_core_start(void)
@@ -2714,7 +2897,33 @@ step_core_start(void)
 	put(&gpu, "rbbm_secvid_tsb_cntl", RBBM_SECVID_TSB_CNTL, 0);
 	put64(&gpu, "rbbm_secvid_tsb_trusted_base", RBBM_SECVID_TSB_TRUSTED_BASE, 0);
 	put(&gpu, "rbbm_secvid_tsb_trusted_size", RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
-	for (unsigned i = 0; i < sizeof(address_modes) / sizeof(address_modes[0]); i++) {
+	if (adreno_soc == 8450) {
+		core_registers_a730();
+	} else {
+		core_registers_a6xx(address_modes, sizeof(address_modes) / sizeof(address_modes[0]));
+	}
+	/*
+	 * adreno_blind=1: the command processor is started with its microcode at an address where
+	 * nothing is. All it can do then is ask the SMMU for it, and the SMMU's record of the refusal
+	 * shows that its requests come through context 0 as meant, and what they look like.
+	 */
+	PE_parse_boot_argn("adreno_blind", &blind, sizeof(blind));
+	put64(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE, blind ? CORE_NOWHERE : CORE_SQE_ADDRESS);
+	put64(&gpu, "cp_rb_base", CP_RB_BASE, CORE_RING_ADDRESS);
+	put(&gpu, "cp_rb_cntl", CP_RB_CNTL, CP_RB_CNTL_VALUE);
+	if (adreno_soc == 8450) {
+		/* (not written to while CP_RB_CNTL says not to, but the A7xx's two threads are given a place, as slop did) */
+		put64(&gpu, "cp_rb_rptr_addr", CP_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x80);
+		put64(&gpu, "cp_bv_rb_rptr_addr", CP_BV_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x100);
+	}
+	return core_start_after(blind);
+}
+
+/* Linux's hw_init for the A6xx (A660 family; the SC7280's A642L) */
+static void
+core_registers_a6xx(const uint32_t *address_modes, unsigned modes)
+{
+	for (unsigned i = 0; i < modes; i++) {
 		put(&gpu, "address mode: 64 bits", GPU_WORD(address_modes[i]), 1);
 	}
 	for (unsigned i = 0; i < 4; i++) {
@@ -2750,15 +2959,52 @@ step_core_start(void)
 	put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0);
 	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2 | 1u << 1);
 	put(&gpu, "rb_dbg_eco_cntl", RB_DBG_ECO_CNTL, 0x04100000);     /* Mesa's value for this GPU */
+}
+
+/*
+ * Linux's hw_init for the A730 (a6xx_gpu.c, its a7xx paths), as slop ran it on this phone: no
+ * 64-bit address modes (the A7xx has only those), no GMEM range, ROQ, memory pool or primitive
+ * FIFO numbers, no CP_CHICKEN_DBG (those are the A6xx's); the three command processors' (BR, BV,
+ * LPAC) privileged accesses; no clock gating or register protection yet (as on the A6xx here).
+ */
+static void
+core_registers_a730(void)
+{
+	for (unsigned i = 0; i < 4; i++) {
+		put(&gbif, "qsb_side", GBIF_QSB_SIDE0 + 4 * i, 0x00071620);
+	}
+	put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0x2120212);
+	put(&gpu, "uche_gbif_gx_config", UCHE_GBIF_GX_CONFIG, 0x10240e0);
+	put(&gpu, "rbbm_perfctr_gpu_busy_masked", RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+	put64(&gpu, "uche_trap_base", UCHE_TRAP_BASE, 0x0001fffffffff000ull);
+	put64(&gpu, "uche_write_thru_base", UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
+	put(&gpu, "uche_cache_ways", UCHE_CACHE_WAYS, 1u << 23);
+	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
+	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
 	/*
-	 * adreno_blind=1: the command processor is started with its microcode at an address where
-	 * nothing is. All it can do then is ask the SMMU for it, and the SMMU's record of the refusal
-	 * shows that its requests come through context 0 as meant, and what they look like.
+	 * The tiled and compressed layouts (a6xx_calc_ubwc_config for the A730): highest bank bit 16
+	 * (hbb_lo 3), UBWC 4.0. (Mesa will have to be told 16 here, not the A642L's 14.)
 	 */
-	PE_parse_boot_argn("adreno_blind", &blind, sizeof(blind));
-	put64(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE, blind ? CORE_NOWHERE : CORE_SQE_ADDRESS);
-	put64(&gpu, "cp_rb_base", CP_RB_BASE, CORE_RING_ADDRESS);
-	put(&gpu, "cp_rb_cntl", CP_RB_CNTL, CP_RB_CNTL_VALUE);
+	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | 3u << 1);
+	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), 3u << 1);
+	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | 3u << 1);
+	put(&gpu, "gras_nc_mode_cntl", GPU_WORD(0x8602), 3u << 5);
+	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), 3u << 21);
+	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 1);
+	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0xcfffff);
+	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1u << 7 | 1);
+	put(&gpu, "uche_cmdq_config", UCHE_CMDQ_CONFIG, 6u << 16 | 6u << 12 | 9u << 8 | 1u << 3 | 1u << 2 | 2u);
+	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 0x6f);        /* BR: as the BV and LPAC, and the crash dumper's */
+	put(&gpu, "cp_bv_apriv_cntl", CP_BV_APRIV_CNTL, 0xf);   /* microcode, ring, ring's commands, read position */
+	put(&gpu, "cp_lpac_apriv_cntl", CP_LPAC_APRIV_CNTL, 0xf);
+	/* non-UBWC reads may not pass writes */
+	put(&gpu, "rb_cmp_dbg_eco_cntl", RB_CMP_DBG_ECO_CNTL, rd(gpu.base + RB_CMP_DBG_ECO_CNTL) | 1u << 11);
+}
+
+/* What step 20 does once the registers are written: the command processor started and "initialize". */
+static bool
+core_start_after(uint32_t blind)
+{
 	get(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE);
 	get(&gpu, "cp_rb_base", CP_RB_BASE);
 	get(&gpu, "cp_rb_cntl", CP_RB_CNTL);
@@ -2789,6 +3035,24 @@ step_core_start(void)
 	}
 
 	announce("give the 3D core its first command, \"initialize\"");
+	if (adreno_soc == 8450) {
+		/* a7xx_cp_init, without the power-up register list (as slop): the BV thread kept out of it first */
+		ring_command(CP_THREAD_CONTROL, 1);
+		ring(1u << 27);                         /* the BR thread only */
+		ring_command(CP_ME_INIT, 7);
+		ring(1u << 0 | 1u << 1 | 1u << 3 | 1u << 6);    /* hardware contexts, error detection, default reset state, no counters' save */
+		ring(0x00000003);                       /* several hardware contexts */
+		ring(0x20000000);                       /* error detection */
+		ring(0x00000002);                       /* operation mode */
+		ring(0);
+		ring(0);
+		ring(0);
+		if (!ring_run("initialize its command processor")) {
+			return false;
+		}
+		printf("adreno: %u: THE 3D CORE TAKES COMMANDS\n", step);
+		return true;
+	}
 	ring_command(CP_ME_INIT, 8);            /* a6xx_cp_init */
 	ring(0x0000002f);
 	ring(0x00000003);                       /* several hardware contexts */
@@ -2858,9 +3122,12 @@ step_core_commands(void)
 #define DST_BGRA_LINEAR         (FORMAT_8888 | 1u << 10)        /* rows of pixels, blue first in memory */
 #define EVENT_FLUSH_COLOR       0x1d
 #define EVENT_CACHE_FLUSH       0x04
+#define EVENT_CACHE_CLEAN       0x31            /* the A7xx's: its caches written back to memory (Linux's a7xx_submit) */
+#define EVENT_WRITE_ENABLED     (1u << 27)      /* the A7xx's CP_EVENT_WRITE7: an address and a word follow */
 #define TARGET_WIDTH            1080
-#define TARGET_HEIGHT           2400
 #define TARGET_ROW              4352            /* 1088 pixels: the next multiple of 64 bytes */
+
+static uint32_t target_height = 2400;           /* the panel's rows: 2412 on the 10 Pro (adreno_soc_8450) */
 
 extern void MiniIOMobileFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t row_bytes);
 
@@ -2886,28 +3153,60 @@ ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t 
 	ring(3);                                /* "scale": the 2D engine's one operation */
 }
 
+static bool frame_check(void);
+
+/*
+ * The A730's frame (what slop drew on this phone; Linux's a7xx_submit for the events): the same
+ * three fills, without the A6xx's marker and cache-mode word (the A7xx's RB_CCU_CNTL is laid out
+ * differently, and step 20 has set what it needs). Its events are CP_EVENT_WRITE7's: the colour
+ * cache flushed, then everything cleaned to memory, with a word written when it is.
+ */
+static bool
+step_frame_a730(void)
+{
+	ring_fill(0, 800, 255, 128, 0);         /* orange */
+	ring_fill(800, 1600, 255, 255, 255);
+	ring_fill(1600, target_height, 0, 128, 255);
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_FLUSH_COLOR);
+	ring_command(CP_EVENT_WRITE, 4);
+	ring(EVENT_CACHE_CLEAN | EVENT_WRITE_ENABLED);
+	ring(CORE_SCRATCH_ADDRESS + 16);
+	ring(0);
+	ring(0x0d0e0d0e);
+	ring_command(CP_WAIT_FOR_IDLE, 0);
+	if (!ring_run("fill a picture")) {
+		return false;
+	}
+	to_memory(core_scratch.memory, 64);
+	printf("adreno: %u: the word it writes when its caches are in memory: %#x (told: 0xd0e0d0e)\n", step,
+	    ((volatile uint32_t *)core_scratch.memory)[4]);
+	return frame_check();
+}
+
 static bool
 step_frame(void)
 {
-	const volatile uint8_t *pixel;
-
 	if (!cx_ready() || !core_runs) {
 		return false;
 	}
 	announce("make a picture's worth of memory for the 3D core (10 MB) and have it fill three bands of colour");
-	if (!block_new(&core_space, &core_target, CORE_TARGET_ADDRESS, TARGET_ROW * TARGET_HEIGHT, PTE_CORE)) {
+	if (!block_new(&core_space, &core_target, CORE_TARGET_ADDRESS, TARGET_ROW * target_height, PTE_CORE)) {
 		return false;
 	}
 	/* tables that the SMMU has in use have grown: it has not seen these addresses, so nothing stale to forget */
 	for (uint32_t i = 0; i < core_space.table_count; i++) {
 		to_memory((vm_offset_t)core_space.tables[i].table, 4096);
 	}
+	if (adreno_soc == 8450) {
+		return step_frame_a730();
+	}
 	ring_command(CP_SET_MARKER, 1);
 	ring(12);                               /* "2D blits follow" */
 	ring_register(RB_CCU_CNTL, 0x10000004); /* Mesa's for this GPU when it draws straight into memory */
 	ring_fill(0, 800, 255, 128, 0);         /* orange */
 	ring_fill(800, 1600, 255, 255, 255);
-	ring_fill(1600, TARGET_HEIGHT, 0, 128, 255);
+	ring_fill(1600, target_height, 0, 128, 255);
 	/*
 	 * What it has drawn out of its caches into memory. Each of the two events is followed by an
 	 * address and a word that the core writes there when it is done (Linux's a6xx_submit; Mesa's
@@ -2931,19 +3230,29 @@ step_frame(void)
 	to_memory(core_scratch.memory, 64);
 	printf("adreno: %u: the words it writes when its caches are in memory: %#x, %#x (told: 0xc0c0c0c, 0xd0e0d0e)\n", step,
 	    ((volatile uint32_t *)core_scratch.memory)[8], ((volatile uint32_t *)core_scratch.memory)[4]);
+	return frame_check();
+}
+
+/* The picture read back, three pixels of it checked (top, middle, last row), and shown. */
+static bool
+frame_check(void)
+{
+	const volatile uint8_t *pixel;
+	uint32_t last = target_height - 1;
+
 	to_memory(core_target.memory, core_target.size);
 	pixel = (const volatile uint8_t *)core_target.memory;
 	printf("adreno: %u: the picture's first pixel is %02x %02x %02x %02x (blue green red alpha; told: 00 80 ff ff), one in "
 	    "the middle %02x %02x %02x %02x, one in the last row %02x %02x %02x %02x\n", step, pixel[0], pixel[1], pixel[2],
 	    pixel[3], pixel[1200 * TARGET_ROW + 2160], pixel[1200 * TARGET_ROW + 2161], pixel[1200 * TARGET_ROW + 2162],
-	    pixel[1200 * TARGET_ROW + 2163], pixel[2399 * TARGET_ROW + 4316], pixel[2399 * TARGET_ROW + 4317],
-	    pixel[2399 * TARGET_ROW + 4318], pixel[2399 * TARGET_ROW + 4319]);
-	if ((pixel[0] | pixel[1] | pixel[2]) == 0 || pixel[1200 * TARGET_ROW + 2160] == 0 || (pixel[2399 * TARGET_ROW + 4316] |
-	    pixel[2399 * TARGET_ROW + 4317] | pixel[2399 * TARGET_ROW + 4318]) == 0) {
+	    pixel[1200 * TARGET_ROW + 2163], pixel[last * TARGET_ROW + 4316], pixel[last * TARGET_ROW + 4317],
+	    pixel[last * TARGET_ROW + 4318], pixel[last * TARGET_ROW + 4319]);
+	if ((pixel[0] | pixel[1] | pixel[2]) == 0 || pixel[1200 * TARGET_ROW + 2160] == 0 || (pixel[last * TARGET_ROW + 4316] |
+	    pixel[last * TARGET_ROW + 4317] | pixel[last * TARGET_ROW + 4318]) == 0) {
 		printf("adreno: %u: the picture is not what the 3D core was told to draw\n", step);
 		return false;
 	}
-	MiniIOMobileFramebufferShow((const uint8_t *)core_target.memory, TARGET_WIDTH, TARGET_HEIGHT, TARGET_ROW);
+	MiniIOMobileFramebufferShow((const uint8_t *)core_target.memory, TARGET_WIDTH, target_height, TARGET_ROW);
 	printf("adreno: %u: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue from the top\n", step);
 	return true;
 }
@@ -3168,10 +3477,13 @@ hakios_adreno_quiesce(void)
  * far it has got (a "fence": a submission's number, written by the core when it is through
  * with it). The caller holds one lock around all of these.
  */
-#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
+static uint64_t gpu_chip_id = 0x06030500ull;   /* dt: qcom,chipid; the A730's 0x07030001 (adreno_soc_8450()) */
+static uint32_t gpu_gmem = 512 * 1024;          /* the A730's 2 MB (Linux's adreno_device.c) */
+static uint32_t gpu_bank_bit = 14;              /* step 20's highest bank bit: the A730's 16 (core_registers_a730()) */
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
+#define GPU_BV_FENCE_AT         0x50            /* ... the A730's: the one its BV thread writes when it is through (gpu_submit_a730()) */
 #define GPU_TIMES_AT            0x400           /* ... and when the core began and ended each of its last submissions */
 #define GPU_TIMES               64
 #define CP_ALWAYS_ON_COUNTER    0x0980          /* ticks of the 19.2 MHz crystal, 64 bits: for the core to read itself */
@@ -3184,6 +3496,11 @@ hakios_adreno_quiesce(void)
 #define CP_INDIRECT_BUFFER      0x3f
 #define EVENT_INVALIDATE_DEPTH  0x18
 #define EVENT_INVALIDATE_COLOR  0x19
+#define CP_WAIT_TIMESTAMP       0x14
+#define CP_SET_THREAD_BR        1u              /* CP_THREAD_CONTROL's: the A730's two threads, and both */
+#define CP_SET_THREAD_BV        2u
+#define CP_SET_THREAD_BOTH      3u
+#define CP_SYNC_THREADS         (1u << 31)
 
 static bool gpu_kept;
 static uint32_t gpu_fence;              /* the number of the last submission */
@@ -3266,10 +3583,10 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 0;
 		return true;
 	case 0x02:                              /* GMEM_SIZE */
-		*value = 512 * 1024;
+		*value = gpu_gmem;
 		return true;
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
-		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
+		*value = gpu_chip_id | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
 		*value = core_khz * 1000ull;
@@ -3281,7 +3598,7 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 1;
 		return true;
 	case 0x10:                              /* HIGHEST_BANK_BIT */
-		*value = 14;
+		*value = gpu_bank_bit;
 		return true;
 	case 0x12:                              /* UBWC_SWIZZLE */
 		*value = 6;
@@ -3461,10 +3778,12 @@ hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
  * Linux's a6xx_submit puts them in the ring. Returns the submission's number; 0: the ring is
  * full and the core is not reading it.
  */
+static uint32_t gpu_submit_a730(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+
 uint32_t
 hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
 {
-	uint32_t wanted = 26 + 4 * count, room = 0;
+	uint32_t wanted = (adreno_soc == 8450 ? 60 : 26) + 4 * count, room = 0;
 
 	for (int i = 0; i < 20000; i++) {
 		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
@@ -3479,6 +3798,9 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	gpu_times();
 	if (++gpu_fence == 0) {
 		gpu_fence = 1;
+	}
+	if (adreno_soc == 8450) {
+		return gpu_submit_a730(addresses, words, count);
 	}
 	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
@@ -3501,6 +3823,75 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	ring(CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
 	ring(0);
 	ring(gpu_fence);
+	ring_send();
+	return gpu_fence;
+}
+
+/* A cache clean, and the fence written when the thread that is current is through with it (the A7xx's CP_EVENT_WRITE7). */
+static void
+ring_fence_a730(uint32_t at, uint32_t fence)
+{
+	ring_command(CP_EVENT_WRITE, 4);
+	ring(EVENT_CACHE_CLEAN | EVENT_WRITE_ENABLED);
+	ring(CORE_SCRATCH_ADDRESS + at);
+	ring(0);
+	ring(fence);
+}
+
+/*
+ * The A730's submission, as Linux's a7xx_submit puts it in the ring (and slop's negroni ladder,
+ * on this phone): the command buffers run on both threads (BR draws, BV bins ahead of it),
+ * between the markers that say where a submission's buffers begin and end. At the end BR
+ * invalidates its caches, BV cleans them and writes its fence, and BR waits for that before it
+ * writes the fence that counts, so that BR's fence never says done while BV is still at it.
+ * The times are the A6xx's, taken on both threads.
+ */
+static uint32_t
+gpu_submit_a730(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+{
+	ring_command(CP_THREAD_CONTROL, 1);
+	ring(CP_SYNC_THREADS | CP_SET_THREAD_BR);
+	ring_command(CP_THREAD_CONTROL, 1);
+	ring(CP_SET_THREAD_BOTH);
+	ring_command(CP_SET_MARKER, 1);
+	ring(0x101);                            /* no power collapse between frames (there is none here yet) */
+	ring_command(CP_SET_MARKER, 1);
+	ring(0x00d);                            /* the submission's buffers begin */
+	ring_time(gpu_fence, 0);
+	for (uint32_t i = 0; i < count; i++) {
+		ring_command(CP_INDIRECT_BUFFER, 3);
+		ring((uint32_t)addresses[i]);
+		ring((uint32_t)(addresses[i] >> 32));
+		ring(words[i]);
+	}
+	ring_command(CP_SET_MARKER, 1);
+	ring(0x00e);                            /* ... and end */
+	if (gpu_exact) {
+		ring_command(CP_WAIT_FOR_IDLE, 0);
+	}
+	ring_time(gpu_fence, 1);
+	ring_register(CP_SCRATCH_REG2, gpu_fence);
+	ring_command(CP_THREAD_CONTROL, 1);
+	ring(CP_SET_THREAD_BR);
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_INVALIDATE_DEPTH);
+	ring_command(CP_EVENT_WRITE, 1);
+	ring(EVENT_INVALIDATE_COLOR);
+	ring_command(CP_THREAD_CONTROL, 1);
+	ring(CP_SET_THREAD_BV);
+	ring_fence_a730(GPU_BV_FENCE_AT, gpu_fence);
+	ring_command(CP_THREAD_CONTROL, 1);
+	ring(CP_SET_THREAD_BR);
+	ring_command(CP_WAIT_TIMESTAMP, 4);
+	ring(0);
+	ring(CORE_SCRATCH_ADDRESS + GPU_BV_FENCE_AT);
+	ring(0);
+	ring(gpu_fence);
+	ring_fence_a730(GPU_FENCE_AT, gpu_fence);
+	ring_command(CP_THREAD_CONTROL, 1);
+	ring(CP_SET_THREAD_BOTH);
+	ring_command(CP_SET_MARKER, 1);
+	ring(0x100);
 	ring_send();
 	return gpu_fence;
 }
@@ -3725,7 +4116,7 @@ extern vm_offset_t pe_arm_get_soc_base_phys(void);
 static bool
 start_by_itself(void)
 {
-	static const char *const files[] = { "a660_gmu.bin", "a660_sqe.fw", "a660_zap.mdt", "a660_zap.b02" };
+	const char *const files[] = { fw_gmu, fw_sqe, fw_zap_mdt, fw_zap_image };
 	const char *missing = NULL;
 	uint64_t size;
 
@@ -3749,6 +4140,97 @@ start_by_itself(void)
 }
 
 /*
+ * adreno_soc=8450: the OnePlus 10 Pro (SM8450, Adreno 730v2, dt: qcom,adreno-gpu-gen7-0-1). Its numbers so far, for
+ * steps 1 to 6 (steps 1 to 3 only read; step 3 turns gcc_gpu_cfg_ahb on should it be off, as Linux's probe does):
+ *   - the global clock controller: the same base, 0x1f4200 long (dt: clock-controller@100000), the GPU's branches at
+ *     0x81000 (gcc-sm8450.c: gpu_cfg_ahb 0x81004, memnoc_gfx 0x81010, snoc_dvm_gfx 0x81018, ddrss_gpu_axi 0x81154), the
+ *     PLL votes at 0x62000 (the same bits 15 and 16)
+ *   - the GPU's clock controller: the same base, 0xa000 long (dt: qcom,waipio-gpucc-v2), its registers from
+ *     gpucc-sm8450.c and the phone's own nodes (gpu_cc_cx_gdsc 0x3d99108, gpu_cc_gx_gdsc 0x3d9905c, gpu_cc_cx_hw_ctrl
+ *     0x3d9953c, gpu_cc_gx_domain_addr 0x3d99504, gpu_cc_gx_sw_reset 0x3d99058); no gpu_cc_cb_clk, but
+ *     gpu_cc_memnoc_gfx_clk and gpu_cc_cx_snoc_dvm_clk on the controller's side
+ *   - no speed-bin fuse (step 2 says so)
+ *   - the command database at 0x80860000, as on the X5 Pro (dt: aop_cmd_db_region@80860000)
+ *   - steps 4 and 5 as they are: the GMU's and the hub's clocks have the same sources and dividers (gpucc-sm8450.c:
+ *     200 MHz and 150 MHz from GPLL0's 300 MHz tap, source 6); no cb clock to turn on; and no frequency counter
+ *     (the X5 Pro's is at gcc 0x62000, which is the PLL votes here), so the control registers are what is gone by
+ *     (ahb's reads 0 whatever is written, as on the X5 Pro; the GMU answering in step 6 shows it runs)
+ *   - step 6 as it is: the GMU's registers at 0x3d6a000 as Linux has them (the phone's dt: 0x3d68000 + 0x37000),
+ *     the GPU's bus interface and cx_misc (0x3d9e000) where they were
+ *   - step 7: the RSCC at 0x3d50000 (dt: qcom,kgsl-3d0 "rscc"; Linux's sm8450.dtsi the same), its registers where
+ *     they were (a6xx_gmu.xml, which Linux uses for the A7xx too)
+ *   - steps 8 and 9: the SMMU at the same 0x3da0000 but 0x40000 long (dt: kgsl-smmu@3da0000, qcom,qsmmu-v500 with
+ *     qcom,skip-init), the same streams (dt: gfx3d_user 0, gfx3d_lpac 1, gfx3d_secure 2, the GMU 5, mask 0x400)
+ *   - step 10 as it is: the GMU's data memory through the same window (Linux's a6xx_gmu_fw_load writes the A7xx's
+ *     through REG_A6XX_GMU_CM3_DTCM_START too)
+ *   - steps 11 to 14: the A730's files (gmu_gen70000.bin, a730_sqe.fw, a730_zap.mdt, a730_zap.b01); the zap header's
+ *     segment of hashes found by its type (the A730's is the third); the GMU's memory where its firmware asks for
+ *     it (0x4000, 0x100000, 0x200000, 0x300000, 0x60000000, 0x60001000), the log and HFI page after those as before
+ *   - step 15: the PDC's enabling and the RSC's program first (gmu_rpmh_program(), step 16's on the X5 Pro; the third
+ *     hidden command's data 0x80000000), then the A7xx's start words (Linux a6xx_gmu_fw_start): memory retention in
+ *     cx_misc, fence range 0x32, the chip 0x07030100 in general_10, the log in general_8 and general_9, the CX
+ *     half's bus QoS; no inter-frame collapse or RPMh control words
+ *   - step 16 as it is, less the RSC's program
+ *   - step 17: the phone's speeds (220, 317, 492 MHz at levels 56, 64, 128), the GMU's 200 MHz at level 64,
+ *     a730_build_bw_table's twelve DDR levels and no config-bus vote, "start" before the vote; the core's power
+ *     seen in its switch (gx_gdscr bit 31: the A7xx's sptprac_pwr_clk_status has other bits)
+ *   - step 18 as it is: the 3D core's streams 0 and 1 as on the X5 Pro (dt: gfx3d_user, gfx3d_lpac)
+ *   - step 19: the zap shader's load segment is a730_zap.b01 (program header 1, p_paddr 0x1000, the lowest: at the
+ *     start of the memory; b02 is the hashes), its memory at 0x8b91a000 (dt: gpu_micro_code_region)
+ *   - step 20: Linux's hw_init for the A730 (core_registers_a730()), the two threads' read-position places, and
+ *     a7xx_cp_init: CP_THREAD_CONTROL to the BR thread, then CP_ME_INIT with seven words
+ *   - step 21 as it is
+ *   - step 22: the panel's 2412 rows, and the A7xx's frame (step_frame_a730()): no marker or RB_CCU_CNTL, the
+ *     colour flush and a cache clean with CP_EVENT_WRITE7 (GPU-PLAN.md in the device's project; slop's negroni
+ *     ladder and Linux's a7xx as the references)
+ */
+static void
+adreno_soc_8450(void)
+{
+	gcc.size = 0x1f4200;
+	gcc_pll_vote = 0x62000;
+	gcc_gpu_cfg_ahb = 0x81004;
+	gcc_gpu_memnoc_gfx = 0x81010;
+	gcc_gpu_snoc_dvm_gfx = 0x81018;
+	gcc_ddrss_gpu_axi = 0x81154;
+	gpucc.size = 0xa000;
+	gpucc_at.pll0 = 0x0000;
+	gpucc_at.pll1 = 0x1000;
+	gpucc_at.cxo_aon = 0x9004;
+	gpucc_at.gx_sw_reset = 0x9058;
+	gpucc_at.gx_gdscr = 0x905c;
+	gpucc_at.gx_gmu = 0x90bc;
+	gpucc_at.cx_gdscr = 0x9108;
+	gpucc_at.ahb = 0x911c;
+	gpucc_at.cx_snoc_dvm = 0x9130;
+	gpucc_at.cx_gmu = 0x913c;
+	gpucc_at.cxo = 0x9144;
+	gpucc_at.hub_cx_int = 0x9148;
+	gpucc_at.memnoc_gfx = 0x9150;
+	gpucc_at.gmu_rcgr = 0x9318;
+	gpucc_at.hub_aon = 0x93e8;
+	gpucc_at.hub_rcgr = 0x93ec;
+	gpucc_at.gx_domain_misc = 0x9504;
+	gpucc_at.cx_hw_ctrl = 0x953c;
+	gpucc_at.smmu_vote = 0x7000;
+	gpucc_at.cb = 0;
+	rscc.phys = 0x03d50000;
+	smmu.size = 0x40000;
+	fw_gmu = "gmu_gen70000.bin";
+	fw_sqe = "a730_sqe.fw";
+	fw_zap_mdt = "a730_zap.mdt";
+	fw_zap_image = "a730_zap.b01";    /* the A730's load segment (p_paddr 0x1000, the lowest): b02 is its hashes */
+	zap_memory = 0x8b91a000ull;
+	steps_ported = 22;
+	target_height = 2412;
+	gpu_chip_id = 0x07030001ull;            /* dt: qcom,chipid; Mesa's freedreno_devices.py "FD730" */
+	gpu_gmem = 2u << 20;
+	gpu_bank_bit = 16;
+	printf("adreno: the OnePlus 10 Pro's (SM8450) Adreno 730: gcc %#x + %#x, gpucc %#x + %#x; steps 1 to %u have its "
+	    "numbers\n", gcc.phys, gcc.size, gpucc.phys, gpucc.size, steps_ported);
+}
+
+/*
  * Called while the system starts, before there is a root file system, and the start waits: for
  * as long as the steps and the watch after them last, nothing else writes to the log, so that
  * its end -- all that the loader's notes keep -- is about what is being done here.
@@ -3765,11 +4247,26 @@ hakios_adreno_init(void)
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
 
+	PE_parse_boot_argn("adreno_soc", &adreno_soc, sizeof(adreno_soc));
+	if (adreno_soc == 8450) {
+		adreno_soc_8450();
+	} else if (adreno_soc != 0) {
+		printf("adreno: adreno_soc=%u is none this driver knows (0 the X5 Pro, 8450 the OnePlus 10 Pro): the GPU is left "
+		    "alone\n", adreno_soc);
+		return;
+	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
-		display_probe();
+		if (adreno_soc == 8450) {
+			printf("adreno: display_probe=1 reads the X5 Pro's display controller: not on SM8450\n");
+		} else {
+			display_probe();
+		}
 	}
 	if (!PE_parse_boot_argn("adreno", &last_step, sizeof(last_step))) {
-		if (!(PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) || !start_by_itself()) {
+		if (!(PE_parse_boot_argn("gpu", &only, sizeof(only)) && only)) {
+			return;
+		}
+		if (!start_by_itself()) {
 			return;
 		}
 		by_itself = true;
@@ -3791,6 +4288,11 @@ hakios_adreno_init(void)
 	}
 	if (last_step > STEPS) {
 		last_step = STEPS;
+	}
+	if (adreno_soc == 8450 && last_step > steps_ported) {
+		printf("adreno: adreno=%u asked for, but on SM8450 steps after %u still have the X5 Pro's numbers: up to %u\n",
+		    last_step, steps_ported, steps_ported);
+		last_step = steps_ported;
 	}
 	PE_parse_boot_argn("adreno_watch", &watch_seconds, sizeof(watch_seconds));
 	for (newest_step = last_step; newest_step > 0 && (skip_steps & 1u << newest_step); newest_step--) {
