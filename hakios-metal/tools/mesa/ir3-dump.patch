@@ -1187,7 +1187,7 @@ SPDX-License-Identifier: MIT
 +      nir_shader_intrinsics_pass(nir, lower_point_coord, nir_metadata_control_flow, NULL);
 +   nir_shader_intrinsics_pass(nir, lower_half_derivatives, nir_metadata_control_flow, NULL);
 +   nir_shader_instructions_pass(nir, lower_uclz, nir_metadata_control_flow, NULL);
-+   if (compiler->gen >= 7 && nir->info.stage == MESA_SHADER_COMPUTE) {
++   if (compiler->gen >= 7) {
 +      unsigned num_ssbos = nir->info.num_ssbos;
 +      nir_shader_intrinsics_pass(nir, lower_ibo_to_bindless, nir_metadata_control_flow, &num_ssbos);
 +   }

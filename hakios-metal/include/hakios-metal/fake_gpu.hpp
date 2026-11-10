@@ -299,7 +299,8 @@ private:
     std::vector<uint8_t> gmem_;
     uint32_t chipId_;
     bool gen7Thread_ = false, gen7ComputeDirty_ = false, gen7BlitDirty_ = false;
-    bool gen7BatchReady();
+    bool gen7BatchReady(bool draw = false);
+    bool gen7DrawReady();
     bool tileState(uint32_t* binW, uint32_t* binH, uint32_t win[4]);
     bool eventBlit();
     uint64_t alwaysOn_ = 0;     // CP_ALWAYS_ON_COUNTER as the fake keeps it: one more at each CP_REG_TO_MEM of it

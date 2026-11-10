@@ -739,7 +739,9 @@ bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     ir3_shader_nir_options nirOptions{};
     nir_shader_intrinsics_pass(nir, lowerHalfDerivative, nir_metadata_control_flow, nullptr);
     nir_shader_instructions_pass(nir, lowerUclz, nir_metadata_control_flow, nullptr);
-    if (compiler->gen >= 7 && nir->info.stage == MESA_SHADER_COMPUTE) {
+    // (every stage: a compute kernel's table is its dispatch's, the vertex and fragment stages' the draw's one 3D table,
+    // SP_BINDLESS_BASE[0] -- render.cpp)
+    if (compiler->gen >= 7) {
         unsigned numSsbos = nir->info.num_ssbos;
         nir_shader_intrinsics_pass(nir, lowerIboToBindless, nir_metadata_control_flow, &numSsbos);
     }

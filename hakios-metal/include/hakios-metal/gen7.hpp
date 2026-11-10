@@ -51,6 +51,48 @@ inline constexpr uint32_t CCU_CLEAN_COLOR = 0x21; // adreno_pm4.xml.h:119
 inline constexpr uint32_t CCU_CLEAN_DEPTH = 0x20; // adreno_pm4.xml.h:118
 inline constexpr uint32_t CACHE_CLEAN = 0x31; // adreno_pm4.xml.h:121
 inline constexpr uint32_t CACHE_INVALIDATE7 = 0x33; // adreno_pm4.xml.h:123
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_SRC__MASK = 0x0000007f; // a6xx.xml.h:9033
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_SRC__SHIFT = 0; // a6xx.xml.h:9034
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_SAMP_ID__MASK = 0x00000380; // a6xx.xml.h:9039
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_TEX_ID__MASK = 0x00001c00; // a6xx.xml.h:9045
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_DST__MASK = 0x0007e000; // a6xx.xml.h:9051
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_DST__SHIFT = 13; // a6xx.xml.h:9052
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_WRMASK__MASK = 0x00780000; // a6xx.xml.h:9057
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_WRMASK__SHIFT = 19; // a6xx.xml.h:9058
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_HALF = 0x00800000; // a6xx.xml.h:9063
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_BINDLESS = 0x02000000; // a6xx.xml.h:9064
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_CMD__MASK = 0x3c000000; // a6xx.xml.h:9065
+inline constexpr uint32_t A7XX_SP_FS_PREFETCH_CMD_CMD__SHIFT = 26; // a6xx.xml.h:9066
+inline constexpr uint32_t A6XX_SP_FS_BINDLESS_PREFETCH_CMD_SAMP_ID__MASK = 0x0000ffff; // a6xx.xml.h:9076
+inline constexpr uint32_t A6XX_SP_FS_BINDLESS_PREFETCH_CMD_TEX_ID__SHIFT = 16; // a6xx.xml.h:9083
+// SP_FS_BINDLESS_PREFETCH_CMD[0..3] (a6xx.xml.h:9075): on the A7XX the prefetch's sampler and texture slots live here,
+// bindless or not, and the CMD word's own SAMP_ID/TEX_ID stay 0 (fd6_program.cc emit_fs_inputs)
+inline constexpr uint32_t REG_A6XX_SP_FS_BINDLESS_PREFETCH_CMD = 0x0000a9a3; // a6xx.xml.h:9075
+// the A7XX's SP_FS_PREFETCH_CMD (its own field positions; slots 0)
+constexpr uint32_t spFsPrefetchCmd(uint32_t src, uint32_t dst, uint32_t wrmask, bool half, uint32_t cmd) {
+    return ((src << A7XX_SP_FS_PREFETCH_CMD_SRC__SHIFT) & A7XX_SP_FS_PREFETCH_CMD_SRC__MASK) |
+           ((dst << A7XX_SP_FS_PREFETCH_CMD_DST__SHIFT) & A7XX_SP_FS_PREFETCH_CMD_DST__MASK) |
+           ((wrmask << A7XX_SP_FS_PREFETCH_CMD_WRMASK__SHIFT) & A7XX_SP_FS_PREFETCH_CMD_WRMASK__MASK) | (half ? A7XX_SP_FS_PREFETCH_CMD_HALF : 0u) |
+           ((cmd << A7XX_SP_FS_PREFETCH_CMD_CMD__SHIFT) & A7XX_SP_FS_PREFETCH_CMD_CMD__MASK);
+}
+constexpr uint32_t spFsBindlessPrefetchCmd(uint32_t sampId, uint32_t texId) {
+    return (sampId & A6XX_SP_FS_BINDLESS_PREFETCH_CMD_SAMP_ID__MASK) | texId << A6XX_SP_FS_BINDLESS_PREFETCH_CMD_TEX_ID__SHIFT;
+}
+inline constexpr uint32_t A7XX_RB_DEPTH_BUFFER_INFO_TILEMODE__MASK = 0x00000060; // a6xx.xml.h:5963
+inline constexpr uint32_t A7XX_RB_DEPTH_BUFFER_INFO_TILEMODE__SHIFT = 5; // a6xx.xml.h:5964
+inline constexpr uint32_t A7XX_RB_STENCIL_INFO_TILEMODE__MASK = 0x0000000c; // a6xx.xml.h:6082
+inline constexpr uint32_t A7XX_RB_STENCIL_INFO_TILEMODE__SHIFT = 2; // a6xx.xml.h:6083
+constexpr uint32_t A7XX_RB_DEPTH_BUFFER_INFO_TILEMODE(uint32_t tile) { return (tile << A7XX_RB_DEPTH_BUFFER_INFO_TILEMODE__SHIFT) & A7XX_RB_DEPTH_BUFFER_INFO_TILEMODE__MASK; }
+constexpr uint32_t A7XX_RB_STENCIL_INFO_TILEMODE(uint32_t tile) { return (tile << A7XX_RB_STENCIL_INFO_TILEMODE__SHIFT) & A7XX_RB_STENCIL_INFO_TILEMODE__MASK; }
+inline constexpr uint32_t A7XX_HLSQ_INVALIDATE_CMD_GFX_BINDLESS__MASK = 0x01fe0000; // a6xx.xml.h:11065
+inline constexpr uint32_t A7XX_HLSQ_INVALIDATE_CMD_GFX_BINDLESS__SHIFT = 17; // a6xx.xml.h:11066
+constexpr uint32_t A7XX_HLSQ_INVALIDATE_CMD_GFX_BINDLESS(uint32_t sets) {
+    return (sets << A7XX_HLSQ_INVALIDATE_CMD_GFX_BINDLESS__SHIFT) & A7XX_HLSQ_INVALIDATE_CMD_GFX_BINDLESS__MASK;
+}
+// SP_BINDLESS_BASE[0] of the graphics stages on the A7XX (a6xx.xml.h:9494; the A6XX's is 0xab10), its low bits the
+// descriptor size: BINDLESS_DESCRIPTOR_64B, as compute.cpp's SP_CS_BINDLESS_BASE
+inline constexpr uint32_t REG_A7XX_SP_BINDLESS_BASE = 0x0000ab0a; // a6xx.xml.h:9494
+inline constexpr uint32_t BINDLESS_DESCRIPTOR_64B = 3; // a6xx.xml.h:2317
 struct MagicWrite { uint32_t reg, value; };
 inline constexpr MagicWrite kMagic[] = {
 #define GPU_MAGIC(reg, value) {reg, value},

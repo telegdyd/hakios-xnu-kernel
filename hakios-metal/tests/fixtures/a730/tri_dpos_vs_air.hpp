@@ -9,10 +9,10 @@ namespace hakios::metal::kernels {
 
 constexpr uint32_t a730_tri_dpos_vs_air_words[] = {
     0x00000004, 0x03820000, 0x00000003, 0x02820000,
-    0x0063c000, 0xc02600fc, 0x00000000, 0x14021000,
+    0x0063c100, 0xc02600fc, 0x00000000, 0x14021000,
     0x20010000, 0x4ed00000, 0x00000000, 0x204cc003,
     0x3f800000, 0x204cc004, 0x00000000, 0x00000200,
-    0x00619000, 0xc0260001, 0x00000000, 0x13000000,
+    0x00619100, 0xc0260001, 0x00000000, 0x13000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
@@ -159,14 +159,14 @@ define <4 x float> @tri_dpos_vs(ptr addrspace(1) %pos, i32 %vid) local_unnamed_a
 // @in(r0.x)	in0
 // shps #l4
 // getone #l4
-// resinfo.b.untyped.1d.u32.1.imm r63.x, 0
+// resinfo.b.untyped.1d.u32.1.imm.base0 r63.x, 0
 // (sy)(ss)shpe
 // l4:
 // (jp)shl.b r0.x, r0.x, 1
 // mov.u32u32 r0.w, 0
 // mov.u32u32 r1.x, 0x3f800000
 // (rpt2)nop
-// ldib.b.untyped.1d.u32.2.imm r0.y, r0.x, 0
+// ldib.b.untyped.1d.u32.2.imm.base0 r0.y, r0.x, 0
 // (sy)end
 // nop
 // nop

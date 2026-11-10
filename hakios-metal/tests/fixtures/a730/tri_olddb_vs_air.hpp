@@ -9,9 +9,9 @@ namespace hakios::metal::kernels {
 
 constexpr uint32_t a730_tri_olddb_vs_air_words[] = {
     0x00000004, 0x03820000, 0x00000003, 0x02820000,
-    0x0063c000, 0xc02602fc, 0x00000000, 0x14021000,
+    0x0063c100, 0xc02602fc, 0x00000000, 0x14021000,
     0x20020000, 0x4ed80800, 0x00000000, 0x00000100,
-    0x0061b000, 0xc0260201, 0x00000000, 0x13000000,
+    0x0061b100, 0xc0260201, 0x00000000, 0x13000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
@@ -145,12 +145,12 @@ define <{ <4 x float> }> @tri_olddb_vs(i32 %vid, ptr addrspace(1) %at) local_unn
 // @in(r0.x)	in0
 // shps #l4
 // getone #l4
-// resinfo.b.untyped.1d.u32.1.imm r63.x, 1
+// resinfo.b.untyped.1d.u32.1.imm.base0 r63.x, 1
 // (sy)(ss)shpe
 // l4:
 // (jp)(nop3) shl.b r0.x, r0.x, 2
 // (rpt1)nop
-// ldib.b.untyped.1d.u32.4.imm r0.y, r0.x, 1
+// ldib.b.untyped.1d.u32.4.imm.base0 r0.y, r0.x, 1
 // (sy)end
 // nop
 // nop

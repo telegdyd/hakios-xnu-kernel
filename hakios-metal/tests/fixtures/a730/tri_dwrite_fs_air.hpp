@@ -9,9 +9,9 @@ namespace hakios::metal::kernels {
 
 constexpr uint32_t a730_tri_dwrite_fs_air_words[] = {
     0x00000004, 0x03820000, 0x00000003, 0x02820000,
-    0x0063c000, 0xc02600fc, 0x00000000, 0x14021000,
+    0x0063c100, 0xc02600fc, 0x00000000, 0x14021000,
     0x00000000, 0x284cc000, 0x00000000, 0x00000400,
-    0x0061b000, 0xc0260001, 0x00e77000, 0xd1260001,
+    0x0061b100, 0xc0260001, 0x00e77100, 0xd1260001,
     0x00000000, 0x03000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
@@ -143,13 +143,13 @@ define <4 x float> @tri_dwrite_fs(ptr addrspace(1) %c) local_unnamed_addr {
 // ;   num_enabled:      0
 // shps #l4
 // getone #l4
-// resinfo.b.untyped.1d.u32.1.imm r63.x, 0
+// resinfo.b.untyped.1d.u32.1.imm.base0 r63.x, 0
 // (sy)(ss)shpe
 // l4:
 // (jp)mov.u32u32 r0.x, 0
 // (rpt4)nop
-// ldib.b.untyped.1d.u32.4.imm r0.y, r0.x, 0
-// (sy)stib.b.untyped.1d.u32.4.imm r0.y, r0.x+4, 0
+// ldib.b.untyped.1d.u32.4.imm.base0 r0.y, r0.x, 0
+// (sy)stib.b.untyped.1d.u32.4.imm.base0 r0.y, r0.x+4, 0
 // end
 // nop
 // nop

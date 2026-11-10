@@ -1293,10 +1293,6 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     const bool g7 = stream.gen7();
     if (g7) {
         if (gmem != nullptr) return refuse(why, "A730 GMEM passes wait for their ladder step");
-        if (pass.depth != nullptr || pass.stencil != nullptr) return refuse(why, "A730 depth and stencil attachments wait for their ladder step");
-        if (draw.indirect != nullptr) return refuse(why, "A730 indirect draws wait for their ladder step");
-        if (draw.visibilityMode != 0) return refuse(why, "A730 visibility results wait for their ladder step");
-        if (program.fs.numSamplerPrefetch != 0) return refuse(why, "A730 FS texture prefetch (its A7XX command form) waits for its ladder step");
     }
     const Stage& vs = program.vs;
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
@@ -1462,10 +1458,6 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     GfxIbos ibos;
     if (!gfxIbos(vs, vsBindings, fs, fsBindings, program.fsIboBase, &ibos, why)) {
         return false;
-    }
-    if (g7 && ibos.count != 0) {
-        // (non-bindless IBOs are unreliable on the A730, GPU-PLAN.md section 7; the 3D stages' bindless form is to come)
-        return refuse(why, "A730 vertex and fragment stage buffers and images (bindless 3D IBOs) wait for their ladder step");
     }
     for (int i = 0; i < 4; i++) {
         if (!std::isfinite(draw.blendColor[i])) {
@@ -1679,8 +1671,10 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         const Texture& d = *pass.depth;
         // (a depth array's layer: that many tiled planes on, sliceBytes apart)
         const uint64_t depthAt = d.levelAddress(pass.depthLevel) + uint64_t(pass.depthSlice) * d.sliceBytes();
+        // (A7XX: RB_DEPTH_BUFFER_INFO names the tile mode itself, TILEMODE bits 5-6, as tu6_emit_zs and fd6 emit_zs write
+        // it for their A7XX: TILE6_3, the layout the texture has anyway; LOSSLESSCOMPEN 0, no UBWC depth here)
         regs(stream, REG_A6XX_RB_DEPTH_BUFFER_INFO,
-             {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
+             {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32) | (g7 ? gen7::A7XX_RB_DEPTH_BUFFER_INFO_TILEMODE(TILE6_3) : 0u), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
               A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(uint32_t(d.depthPlaneBytes())), uint32_t(depthAt), uint32_t(depthAt >> 32), 0});
         reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32));
         regs(stream, REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE, {0, 0, 0});
@@ -1688,7 +1682,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
             // the S8 plane as a separate stencil buffer (tu6_emit_zs's D32_SFLOAT_S8_UINT branch): SEPARATE_STENCIL, its
             // pitch and layer, its base, BASE_GMEM 0; A6XX's RB_STENCIL_INFO has no tile field -- stencil is TILE6_3, as laid out
             const uint64_t sb = d.gpuAddress() + d.stencilOffset();
-            regs(stream, REG_A6XX_RB_STENCIL_INFO, {A6XX_RB_STENCIL_INFO_SEPARATE_STENCIL, uint32_t(d.stencilPitch() >> 6), uint32_t(d.stencilPlaneBytes() >> 6),
+            // (A7XX: its TILEMODE, bits 2-3, TILE6_3 as well)
+            regs(stream, REG_A6XX_RB_STENCIL_INFO, {A6XX_RB_STENCIL_INFO_SEPARATE_STENCIL | (g7 ? gen7::A7XX_RB_STENCIL_INFO_TILEMODE(TILE6_3) : 0u), uint32_t(d.stencilPitch() >> 6), uint32_t(d.stencilPlaneBytes() >> 6),
                                                     uint32_t(sb), uint32_t(sb >> 32), 0});
         } else {
             reg(stream, REG_A6XX_RB_STENCIL_INFO, 0);
@@ -1763,10 +1758,16 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // stage with HS, DS and GS off (NTEX = NSAMP = num_samp = 0; CONSTLEN in the field's units of 4 vec4, the FS's 0 is
     // ENABLED alone), SP_IBO_COUNT 0 (fd6's nibo(fs))
     if (o.programConfig) {
+        // (A7XX: and the graphics stages' bindless sets, GFX_BINDLESS 0xff, as fd6_build_bindless_state<A7XX> invalidates
+        // them before it points SP_BINDLESS_BASE at a table)
         reg(stream, REG_A6XX_HLSQ_INVALIDATE_CMD,
             A6XX_HLSQ_INVALIDATE_CMD_VS_STATE | A6XX_HLSQ_INVALIDATE_CMD_HS_STATE | A6XX_HLSQ_INVALIDATE_CMD_DS_STATE |
-                A6XX_HLSQ_INVALIDATE_CMD_GS_STATE | A6XX_HLSQ_INVALIDATE_CMD_FS_STATE | A6XX_HLSQ_INVALIDATE_CMD_GFX_IBO);
-        reg(stream, REG_A6XX_SP_VS_CONFIG, spXsConfig(vs.k.numSamp, vs.k.numSamp, vs.k.numSsbos));
+                A6XX_HLSQ_INVALIDATE_CMD_GS_STATE | A6XX_HLSQ_INVALIDATE_CMD_FS_STATE | A6XX_HLSQ_INVALIDATE_CMD_GFX_IBO |
+                (g7 && ibos.count != 0 ? gen7::A7XX_HLSQ_INVALIDATE_CMD_GFX_BINDLESS(0xff) : 0u));
+        // (A7XX: a stage with IBOs reads them bindless, BINDLESS_IBO, the compiler having made them set 0's descriptors)
+        const uint32_t vsBindlessIbo = g7 && vs.k.numSsbos != 0 ? A6XX_SP_VS_CONFIG_BINDLESS_IBO : 0u;
+        const uint32_t fsBindlessIbo = g7 && fs.k.numSsbos != 0 ? A6XX_SP_VS_CONFIG_BINDLESS_IBO : 0u;
+        reg(stream, REG_A6XX_SP_VS_CONFIG, spXsConfig(vs.k.numSamp, vs.k.numSamp, vs.k.numSsbos) | vsBindlessIbo);
         reg(stream, REG_A6XX_HLSQ_VS_CNTL, hlsqVsCntl(vs.k.constlen));
         reg(stream, REG_A6XX_SP_HS_CONFIG, 0);
         reg(stream, REG_A6XX_HLSQ_HS_CNTL, 0);
@@ -1774,13 +1775,23 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_HLSQ_DS_CNTL, 0);
         reg(stream, REG_A6XX_SP_GS_CONFIG, 0);
         reg(stream, REG_A6XX_HLSQ_GS_CNTL, 0);
-        reg(stream, REG_A6XX_SP_FS_CONFIG, spXsConfig(fs.k.numSamp, fs.k.numSamp, fs.k.numSsbos));
+        reg(stream, REG_A6XX_SP_FS_CONFIG, spXsConfig(fs.k.numSamp, fs.k.numSamp, fs.k.numSsbos) | fsBindlessIbo);
         reg(stream, REG_A6XX_HLSQ_FS_CNTL, hlsqFsCntl(fs.k.constlen));
         // the 3D IBO table's count (fd6's nibo(fs); here the larger of the two stages', the table being one), and the table
         // itself: CP_LOAD_STATE6 (the plain opcode) of ST6_SHADER into SB6_IBO, as both witnesses load it (tu_pipeline.cc:
         // 183, fd6_image.cc:308-335 -- bindless there, from the table here, the SP_CS_IBO way), then SP_IBO at it
         reg(stream, REG_A6XX_SP_IBO_COUNT, ibos.count);
-        if (ibos.count != 0) {
+        if (ibos.count != 0 && g7) {
+            // the A7XX: the table is bindless set 0 (non-bindless IBOs are unreliable on the A730, GPU-PLAN.md section 7):
+            // SP_BINDLESS_BASE[0] at it with 64-byte descriptors, then the IBO block prefetched from set 0's start
+            // (fd6_build_bindless_state<A7XX>'s graphics branch: CP_LOAD_STATE6 ST6_SHADER SS6_BINDLESS SB6_IBO, the
+            // "address" set << 28 | dword offset)
+            const uint64_t base = table + kGfxIboAt;
+            gen7::raw(stream, gen7::REG_A7XX_SP_BINDLESS_BASE, uint32_t(base) | gen7::BINDLESS_DESCRIPTOR_64B);
+            gen7::raw(stream, gen7::REG_A7XX_SP_BINDLESS_BASE + 1, uint32_t(base >> 32));
+            uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_BINDLESS, SB6_IBO, ibos.count), 0, 0};
+            stream.packet(CP_LOAD_STATE6, w, 3);
+        } else if (ibos.count != 0) {
             uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_IBO, ibos.count), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kGfxIboAt)),
                              CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(uint32_t((table + kGfxIboAt) >> 32))};
             stream.packet(CP_LOAD_STATE6, w, 3);
@@ -1981,14 +1992,18 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
             // slots in the command, no SP_FS_BINDLESS_PREFETCH_CMD)
             uint32_t w[1 + kMaxSamplerPrefetch];
             w[0] = spFsPrefetchCntl(fs.numSamplerPrefetch, !validReg(ij[IJ_PERSP_PIXEL]), fs.prefetchEndOfQuad != 0);
-            // (A7XX: CONSTSLOTID and CONSTSLOTID4COORD 0x1ff, none, as fd6_program.cc writes them; there are no prefetch
-            // commands on this chip yet, which encodeDraw refuses above)
+            // (A7XX: CONSTSLOTID and CONSTSLOTID4COORD 0x1ff, none, as fd6_program.cc writes them; its commands have their
+            // own field positions with the slots 0, and the slots go into SP_FS_BINDLESS_PREFETCH_CMD[i], bindless or not)
             if (g7) w[0] |= 0x1ffu << 6 | 0x1ffu << 16;
             for (uint32_t i = 0; i < fs.numSamplerPrefetch; i++) {
                 const SamplerPrefetch& pf = fs.prefetch[i];
-                w[1 + i] = spFsPrefetchCmd(pf.src, pf.sampId, pf.texId, pf.dst, pf.wrmask, pf.half != 0, pf.cmd);
+                w[1 + i] = g7 ? gen7::spFsPrefetchCmd(pf.src, pf.dst, pf.wrmask, pf.half != 0, pf.cmd)
+                              : spFsPrefetchCmd(pf.src, pf.sampId, pf.texId, pf.dst, pf.wrmask, pf.half != 0, pf.cmd);
             }
             stream.registers(REG_A6XX_SP_FS_PREFETCH_CNTL, w, 1 + fs.numSamplerPrefetch);
+            for (uint32_t i = 0; g7 && i < fs.numSamplerPrefetch; i++) {
+                gen7::raw(stream, gen7::REG_A6XX_SP_FS_BINDLESS_PREFETCH_CMD + i, gen7::spFsBindlessPrefetchCmd(fs.prefetch[i].sampId, fs.prefetch[i].texId));
+            }
         }
         regs(stream, REG_A6XX_HLSQ_CONTROL_1_REG,
              {hlsqControl1Reg(), hlsqControl2Reg(fs.faceRegid, fs.sampleIdRegid, fs.sampleMaskInRegid, ij[IJ_PERSP_CENTER_RHW]),
@@ -2181,6 +2196,9 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_RB_SAMPLE_COUNT_CONTROL, A6XX_RB_SAMPLE_COUNT_CONTROL_COPY);
         reg64(stream, REG_A6XX_RB_SAMPLE_COUNT_ADDR, snapshots);
         event(stream, ZPASS_DONE);
+        // (A7XX gen1, the A730, has no CP_EVENT_WRITE7 sample-count write: turnip takes the A6XX's path and follows each
+        // ZPASS_DONE with a CCU_CLEAN_DEPTH, "copied from blob's cmdstream" (tu_query_pool.cc); gen7::event maps it)
+        if (stream.gen7()) event(stream, PC_CCU_FLUSH_DEPTH_TS);
     }
     if (indirect) {
         // tu_CmdDrawIndirect / tu_CmdDrawIndexedIndirect (tu_cmd_buffer.cc:6385-6423): one draw, the CP reading its
@@ -2221,6 +2239,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_RB_SAMPLE_COUNT_CONTROL, A6XX_RB_SAMPLE_COUNT_CONTROL_COPY);
         reg64(stream, REG_A6XX_RB_SAMPLE_COUNT_ADDR, end);
         event(stream, ZPASS_DONE);
+        if (stream.gen7()) event(stream, PC_CCU_FLUSH_DEPTH_TS);
         waitForWordNot(stream, end, ~0u);
         uint32_t w[9] = {CP_MEM_TO_MEM_0_DOUBLE | CP_MEM_TO_MEM_0_NEG_C, uint32_t(result), uint32_t(result >> 32), uint32_t(result), uint32_t(result >> 32),
                          uint32_t(end), uint32_t(end >> 32), uint32_t(snapshots), uint32_t(snapshots >> 32)};
@@ -2247,9 +2266,6 @@ bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass&
 }
 
 bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o, uint32_t skipClears) {
-    if (stream.gen7() && (pass.depth != nullptr || pass.stencil != nullptr)) {
-        return refuse(why, "A730 depth and stencil attachments wait for their ladder step");
-    }
     if (!checkTarget(pass, why)) {
         return false;
     }
@@ -2637,8 +2653,8 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
 }
 
 bool encodeClear(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o) {
-    if (stream.gen7() && (pass.depth || pass.stencil || o.tailTimestampBit))
-        return refuse(why, "A730 host step 1 serves color clears with explicit-value completions");
+    if (stream.gen7() && o.tailTimestampBit)
+        return refuse(why, "the A730's events complete by an explicit value (CP_EVENT_WRITE7), not the A6XX's timestamp bit");
     if (!checkTarget(pass, why)) {
         return false;
     }

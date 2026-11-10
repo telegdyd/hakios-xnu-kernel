@@ -11,6 +11,9 @@
 #include "fixtures/a730/fill_id_air.hpp"
 #include "fixtures/a730/tri_flat_fs_air.hpp"
 #include "fixtures/a730/tri_flat_vs_air.hpp"
+#include "fixtures/a730/tri_color_vs_air.hpp"
+#include "fixtures/a730/tri_tex_fs_air.hpp"
+#include "fixtures/a730/tri_dpos_vs_air.hpp"
 #include "hakios-metal/render.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -411,6 +414,121 @@ TEST(a730_tri_flat_sysmem_draw_carries_freedreno_state) {
     CHECK(hasPacket(w, a6xx::CP_DRAW_INDX_OFFSET, a6xx::drawIndxOffset0(a6xx::DI_PT_TRILIST, a6xx::DI_SRC_SEL_AUTO_INDEX, a6xx::IGNORE_VISIBILITY), ~0u));
 }
 
+// The A730 fake's draw validation: the probe's three tri_flat shapes (one, pair, a Clear then one) through CommandBuffer::draw
+// run clean, three rounds with the queue reopened; then the whole-pass stream of render::encode, submitted by hand, is
+// refused when damaged in each way the phone's first hangs were (an A6XX register, an A6XX preload, a VGPR_CONFIG not 0,
+// a missing gen7 pass register, the A6XX batch thread) and accepted again afterwards.
+TEST(a730_fake_validates_sysmem_draws_and_refuses_a6xx_state) {
+    Rig r;
+    TextureDesc desc;
+    desc.width = 64;
+    desc.height = 64;
+    desc.format = PixelFormat::kRGBA8Unorm;
+    desc.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    std::string why;
+    const Program p{kernels::a730_tri_flat_vs_air, kernels::a730_tri_flat_fs_air, Linkage{}, "a730_tri_flat"};
+    for (const char* shape : {"one", "pair", "clear"}) {
+        for (unsigned round = 0; round < 3; ++round) {
+            auto t = Texture::make(r.gpu, desc, &why);
+            CHECK(t != nullptr);
+            if (!t) return;
+            RenderPass pass;
+            pass.color0 = t.get();
+            if (std::strcmp(shape, "clear") == 0) {
+                pass.load = LoadAction::kClear;
+                pass.clearColor[3] = 1;
+            }
+            Draw d;
+            d.vertexCount = std::strcmp(shape, "pair") == 0 ? 6 : 3;
+            d.viewport = Viewport{0, 0, 64, 64, 0, 1};
+            auto cb = r.queue->commandBuffer();
+            const bool ok = cb->draw(p, pass, d, Bindings{}, Bindings{}, render::Options{});
+            if (!ok) std::printf("       %s: %s\n", shape, cb->error().c_str());
+            CHECK(ok);
+            finish(cb);
+            if (r.fake->stats().faults) std::printf("       fake: %s\n", r.fake->stats().lastFault.c_str());
+            r.queue.reset();
+            r.queue = CommandQueue::make(r.gpu, &why);
+            CHECK(r.queue != nullptr);
+            if (!r.queue) return;
+        }
+    }
+    CHECK_EQ(r.fake->stats().draws, 9u);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+
+    auto target = Texture::make(r.gpu, desc, &why);
+    CHECK(target != nullptr);
+    if (!target) return;
+    auto vsProgram = r.buffer(4ull * p.vs.k.numWords), fsProgram = r.buffer(4ull * p.fs.k.numWords), table = r.buffer(render::kTableBytes),
+         commands = r.buffer(262144);
+    memcpy(vsProgram->contents(), p.vs.k.words, 4ull * p.vs.k.numWords);
+    memcpy(fsProgram->contents(), p.fs.k.words, 4ull * p.fs.k.numWords);
+    RenderPass pass;
+    pass.color0 = target.get();
+    Draw d;
+    d.vertexCount = 3;
+    d.viewport = Viewport{0, 0, 64, 64, 0, 1};
+    pm4::Stream stream(kChipA730.id);
+    CHECK(render::encode(stream, p, pass, d, Bindings{}, Bindings{}, vsProgram->gpuAddress(), fsProgram->gpuAddress(), table->gpuAddress(),
+                         static_cast<uint8_t*>(table->contents()), &why, render::Options{}));
+    auto submit = [&](const std::vector<uint32_t>& words) {
+        CHECK(4 * words.size() <= commands->length());
+        std::memcpy(commands->contents(), words.data(), 4 * words.size());
+        uint32_t fence = 0;
+        const int error = r.gpu.submit(0, commands->bo(), 0, uint32_t(words.size()),
+                                       {{&vsProgram->bo(), false}, {&fsProgram->bo(), false}, {&table->bo(), true}, {&target->buffer()->bo(), true}}, &fence);
+        return error ? error : r.gpu.wait(0, fence, 1000000000);
+    };
+    const uint32_t faults = r.fake->stats().faults;
+    CHECK_EQ(submit(stream.words()), 0);
+    CHECK_EQ(r.fake->stats().faults, faults);
+    if (r.fake->stats().faults != faults) std::printf("       fake: %s\n", r.fake->stats().lastFault.c_str());
+    // 0: HLSQ_FS_CNTL_0 at its A6XX offset 0xb980 (the A7XX's 0xab03); 1: SP_FS_VGPR_CONFIG 1; 2: RB_UNKNOWN_8812 not written
+    // (renamed to an unused register); 3: an A6XX-style preload of the VS program before the draw; 4: CP_THREAD_CONTROL the
+    // A6XX way (no BR selection); 5: PC_RASTER_CNTL at the A6XX's 0x9980
+    const uint32_t fsCntl0 = legacyRegisterOffset(kChipA730, a6xx::REG_A6XX_HLSQ_FS_CNTL_0);
+    for (unsigned mutation = 0; mutation < 6; ++mutation) {
+        auto words = stream.words();
+        bool changed = false;
+        for (size_t i = 0; i < words.size() && !changed;) {
+            const auto h = pm4::decode(words[i]);
+            if (h.kind == pm4::Header::kRegisters && h.count == 1) {
+                if (mutation == 0 && h.reg == fsCntl0) { words[i] = pm4::type4(0xb980, 1); changed = true; }
+                if (mutation == 1 && h.reg == 0xaa01) { words[i + 1] = 1; changed = true; }
+                if (mutation == 2 && h.reg == 0x8812) { words[i] = pm4::type4(0x8813, 1); changed = true; }
+                if (mutation == 5 && h.reg == 0x9107) { words[i] = pm4::type4(0x9980, 1); changed = true; }
+            }
+            if (mutation == 3 && h.kind == pm4::Header::kCommand && h.opcode == a6xx::CP_DRAW_INDX_OFFSET) {
+                const uint32_t preload[] = {pm4::type7(a6xx::CP_LOAD_STATE6_GEOM, 3),
+                                            a6xx::loadState6_0(0, a6xx::ST6_SHADER, a6xx::SS6_INDIRECT, a6xx::SB6_VS_SHADER, 1),
+                                            uint32_t(vsProgram->gpuAddress()), uint32_t(vsProgram->gpuAddress() >> 32)};
+                words.insert(words.begin() + i, std::begin(preload), std::end(preload));
+                changed = true;
+                break;
+            }
+            if (mutation == 4 && h.kind == pm4::Header::kCommand && h.opcode == 0x17) {
+                words[i + 1] = 2;
+                changed = true;
+            }
+            i += h.count + 1;
+        }
+        CHECK(changed);
+        const uint32_t before = r.fake->stats().faults;
+        const int error = submit(words);
+        if (!error) std::printf("       mutation %u was accepted\n", mutation);
+        CHECK(error != 0);
+        CHECK(r.fake->stats().faults > before);
+        // each refused for its own reason
+        const char* const reasons[] = {"wrote 0xb980", "SP_FS_VGPR_CONFIG", "RB_UNKNOWN_8812", "preload of the vertex", "select BR", "wrote 0x9980"};
+        const bool named = r.fake->stats().lastFault.find(reasons[mutation]) != std::string::npos;
+        if (!named) std::printf("       mutation %u: \"%s\", not \"%s\"\n", mutation, r.fake->stats().lastFault.c_str(), reasons[mutation]);
+        CHECK(named);
+    }
+    const uint32_t drawsBefore = r.fake->stats().draws;
+    CHECK_EQ(submit(stream.words()), 0);   // a fault leaves nothing behind for the next submission
+    CHECK_EQ(r.fake->stats().draws, drawsBefore + 1);
+}
+
 // The probe's own submissions as the phone runs them, through CommandQueue (GPU-PLAN.md section 7, "Next" step 1): the
 // fill_id_air control, then tri_flat --scissor-out --trace through CommandBuffer::draw. The draw's whole submission must be
 // the A730's: the gen7 batch start (CP_THREAD_CONTROL), the trace's steps, no A6XX-only register. (Its pass streams
@@ -507,7 +625,9 @@ TEST(a730_probe_submissions_as_rd) {
         CHECK(ok);
         if (env) rec->path = prefix + "-tri.rd";
         cb->commit();
-        cb->waitUntilCompleted();   // (the A730 fake refuses draws: the stream is written before it looks)
+        cb->waitUntilCompleted();
+        CHECK_EQ(cb->status(), CommandBuffer::kCompleted);   // the A730 fake validates the draw too
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s\n", cb->error().c_str());
         render::setA730Trace(0);
     }
     const std::vector<uint32_t>& w = rec->last;
@@ -535,4 +655,320 @@ TEST(a730_probe_submissions_as_rd) {
         if (found) std::printf("       the draw's submission wrote 0x%04x, which the A7XX does not have at that offset\n", reg);
         CHECK(!found);
     }
+}
+
+// The FS texture prefetch on the A730 (fd6_program.cc emit_fs_inputs, A7XX): SP_FS_PREFETCH_CMD[i] in the A7XX's own field
+// positions with its sampler and texture slots 0, the slots in SP_FS_BINDLESS_PREFETCH_CMD[i]. tri_tex (tri_color's VS,
+// tri_tex_fs's one prefetch of texture 0 through sampler 0) draws clean through the fake, and its command decodes as the
+// A7XX form; the A6XX form (the slots in the command) is refused.
+TEST(a730_fs_prefetch_takes_the_a7xx_command_form) {
+    Rig r;
+    std::string why;
+    TextureDesc td;
+    td.width = 64;
+    td.height = 64;
+    td.format = PixelFormat::kRGBA8Unorm;
+    td.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    auto t = Texture::make(r.gpu, td, &why);
+    td.width = td.height = 4;
+    td.usage = kTextureUsageRead;
+    auto tex = Texture::make(r.gpu, td, &why);
+    CHECK(t != nullptr && tex != nullptr);
+    if (!t || !tex) return;
+    Sampler smp;
+    CHECK(makeSampler(SamplerDesc{}, &smp, &why));
+    const Program p{kernels::a730_tri_color_vs_air, kernels::a730_tri_tex_fs_air, Linkage{}, "a730_tri_tex"};
+    CHECK_EQ(p.fs.numSamplerPrefetch, 1u);
+    RenderPass pass;
+    pass.color0 = t.get();
+    Draw d;
+    d.vertexCount = 6;
+    d.viewport = Viewport{0, 0, 64, 64, 0, 1};
+    Bindings fsb;
+    fsb.textures = {tex.get()};
+    fsb.samplers = {&smp};
+    auto cb = r.queue->commandBuffer();
+    const bool ok = cb->draw(p, pass, d, Bindings{}, fsb, render::Options{});
+    if (!ok) std::printf("       %s\n", cb->error().c_str());
+    CHECK(ok);
+    finish(cb);
+    if (r.fake->stats().faults) std::printf("       fake: %s\n", r.fake->stats().lastFault.c_str());
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    CHECK_EQ(r.fake->stats().lastDraw.prefetchCount, 1u);
+    const uint32_t cmd = r.fake->stats().lastDraw.prefetchCmd[0];
+    const SamplerPrefetch& pf = p.fs.prefetch[0];
+    CHECK_EQ(cmd, gen7::spFsPrefetchCmd(pf.src, pf.dst, pf.wrmask, pf.half != 0, pf.cmd));
+    CHECK_EQ(cmd & (gen7::A7XX_SP_FS_PREFETCH_CMD_SAMP_ID__MASK | gen7::A7XX_SP_FS_PREFETCH_CMD_TEX_ID__MASK), 0u);
+
+    // the same draw's stream with the A6XX command form: refused
+    auto vsProgram = r.buffer(4ull * p.vs.k.numWords), fsProgram = r.buffer(4ull * p.fs.k.numWords), table = r.buffer(render::kTableBytes),
+         commands = r.buffer(262144);
+    memcpy(vsProgram->contents(), p.vs.k.words, 4ull * p.vs.k.numWords);
+    memcpy(fsProgram->contents(), p.fs.k.words, 4ull * p.fs.k.numWords);
+    pm4::Stream stream(kChipA730.id);
+    CHECK(render::encode(stream, p, pass, d, Bindings{}, fsb, vsProgram->gpuAddress(), fsProgram->gpuAddress(), table->gpuAddress(),
+                         static_cast<uint8_t*>(table->contents()), &why, render::Options{}));
+    auto submit = [&](const std::vector<uint32_t>& words) {
+        std::memcpy(commands->contents(), words.data(), 4 * words.size());
+        uint32_t fence = 0;
+        const int error = r.gpu.submit(0, commands->bo(), 0, uint32_t(words.size()),
+                                       {{&vsProgram->bo(), false}, {&fsProgram->bo(), false}, {&table->bo(), true}, {&t->buffer()->bo(), true},
+                                        {&tex->buffer()->bo(), false}},
+                                       &fence);
+        return error ? error : r.gpu.wait(0, fence, 1000000000);
+    };
+    CHECK_EQ(submit(stream.words()), 0);
+    auto words = stream.words();
+    bool changed = false;
+    for (size_t i = 0; i < words.size() && !changed;) {
+        const auto h = pm4::decode(words[i]);
+        if (h.kind == pm4::Header::kRegisters && h.reg == a6xx::REG_A6XX_SP_FS_PREFETCH_CNTL && h.count == 2) {
+            words[i + 2] = a6xx::spFsPrefetchCmd(pf.src, pf.sampId, pf.texId, pf.dst, pf.wrmask, pf.half != 0, pf.cmd);
+            changed = true;
+        }
+        i += h.count + 1;
+    }
+    CHECK(changed);
+    const uint32_t before = r.fake->stats().faults;
+    CHECK(submit(words) != 0);
+    CHECK(r.fake->stats().faults > before);
+    CHECK(r.fake->stats().lastFault.find("SP_FS_PREFETCH_CMD") != std::string::npos);
+    CHECK_EQ(submit(stream.words()), 0);
+}
+
+// Depth and stencil attachments on the A730 (tu6_emit_zs / fd6 emit_zs, A7XX): RB_DEPTH_BUFFER_INFO and RB_STENCIL_INFO name
+// their tile mode, TILE6_3 (0x60 and 0xc); the rest is the A6XX's. A depth Clear, a draw under Less + write, a stencil Clear
+// and a stencil test, and a pass that only clears the depth run clean through the fake; the planes without the tile mode
+// are refused.
+TEST(a730_depth_and_stencil_attachments_name_their_tile_mode) {
+    Rig r;
+    std::string why;
+    TextureDesc cd;
+    cd.width = cd.height = 64;
+    cd.format = PixelFormat::kRGBA8Unorm;
+    cd.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    auto t = Texture::make(r.gpu, cd, &why);
+    TextureDesc dd = cd;
+    dd.format = PixelFormat::kDepth32FloatStencil8;
+    dd.usage = kTextureUsageRenderTarget;
+    auto ds = Texture::make(r.gpu, dd, &why);
+    CHECK(t != nullptr && ds != nullptr);
+    if (!t || !ds) return;
+    const Program p{kernels::a730_tri_flat_vs_air, kernels::a730_tri_flat_fs_air, Linkage{}, "a730_tri_flat"};
+    RenderPass pass;
+    pass.color0 = t.get();
+    pass.depth = ds.get();
+    pass.depthLoad = LoadAction::kClear;
+    pass.clearDepth = 1.0;
+    pass.stencil = ds.get();
+    pass.stencilLoad = LoadAction::kClear;
+    pass.clearStencil = 0x5a;
+    Draw d;
+    d.vertexCount = 6;
+    d.viewport = Viewport{0, 0, 64, 64, 0, 1};
+    d.depth = DepthState{1, true};   // Less, write
+    d.stencil.enabled = true;
+    d.stencil.front = StencilFace{3, 0, 0, 2, 0xff, 0x0f};
+    d.stencil.back = d.stencil.front;
+    d.stencil.frontReference = d.stencil.backReference = 7;
+    auto cb = r.queue->commandBuffer();
+    const bool ok = cb->draw(p, pass, d, Bindings{}, Bindings{}, render::Options{});
+    if (!ok) std::printf("       %s\n", cb->error().c_str());
+    CHECK(ok);
+    finish(cb);
+    if (r.fake->stats().faults) std::printf("       fake: %s\n", r.fake->stats().lastFault.c_str());
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    CHECK_EQ(r.fake->stats().lastDraw.depthBase, ds->gpuAddress());
+    CHECK_EQ(r.fake->stats().tiledFills, 2u);   // the depth Clear and the stencil Clear
+    // a pass that only clears the depth
+    RenderPass depthOnly = pass;
+    depthOnly.load = LoadAction::kLoad;
+    depthOnly.stencil = nullptr;
+    auto c = r.queue->commandBuffer();
+    CHECK(c->clear(depthOnly));
+    finish(c);
+    CHECK_EQ(r.fake->stats().tiledFills, 3u);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+
+    // the stream: the tile modes, and each one cleared is refused
+    auto vsProgram = r.buffer(4ull * p.vs.k.numWords), fsProgram = r.buffer(4ull * p.fs.k.numWords), table = r.buffer(render::kTableBytes),
+         commands = r.buffer(262144);
+    memcpy(vsProgram->contents(), p.vs.k.words, 4ull * p.vs.k.numWords);
+    memcpy(fsProgram->contents(), p.fs.k.words, 4ull * p.fs.k.numWords);
+    pm4::Stream stream(kChipA730.id);
+    CHECK(render::encode(stream, p, pass, d, Bindings{}, Bindings{}, vsProgram->gpuAddress(), fsProgram->gpuAddress(), table->gpuAddress(),
+                         static_cast<uint8_t*>(table->contents()), &why, render::Options{}));
+    CHECK_EQ(lastWrite(stream.words(), 0x8872), 0x64u);   // DEPTH6_32 | TILEMODE(TILE6_3)
+    CHECK_EQ(lastWrite(stream.words(), 0x8881), 0x0du);   // SEPARATE_STENCIL | TILEMODE(TILE6_3)
+    auto submit = [&](const std::vector<uint32_t>& words) {
+        std::memcpy(commands->contents(), words.data(), 4 * words.size());
+        uint32_t fence = 0;
+        const int error = r.gpu.submit(0, commands->bo(), 0, uint32_t(words.size()),
+                                       {{&vsProgram->bo(), false}, {&fsProgram->bo(), false}, {&table->bo(), true}, {&t->buffer()->bo(), true},
+                                        {&ds->buffer()->bo(), true}},
+                                       &fence);
+        return error ? error : r.gpu.wait(0, fence, 1000000000);
+    };
+    CHECK_EQ(submit(stream.words()), 0);
+    for (uint32_t which : {0x8872u, 0x8881u}) {
+        auto words = stream.words();
+        bool changed = false;
+        for (size_t i = 0; i < words.size();) {
+            const auto h = pm4::decode(words[i]);
+            if (h.kind == pm4::Header::kRegisters && h.reg == which && h.count >= 1 && (words[i + 1] & (which == 0x8872 ? 0x60u : 0xcu)) != 0) {
+                words[i + 1] &= which == 0x8872 ? ~0x60u : ~0xcu;
+                changed = true;
+            }
+            i += h.count + 1;
+        }
+        CHECK(changed);
+        const uint32_t before = r.fake->stats().faults;
+        CHECK(submit(words) != 0);
+        CHECK(r.fake->stats().faults > before);
+        CHECK(r.fake->stats().lastFault.find("TILEMODE") != std::string::npos);
+    }
+    CHECK_EQ(submit(stream.words()), 0);
+}
+
+// Indirect draws and occlusion queries on the A730: CP_DRAW_INDIRECT_MULTI as on the A6XX (turnip's A7XX form is the same
+// packet); the sample count by RB_SAMPLE_COUNT_ADDR and ZPASS_DONE, each followed by CCU_CLEAN_DEPTH (the A730 is A7XX
+// gen1: no CP_EVENT_WRITE7 sample-count write). The fake reads the indirect arguments when the draw runs and counts the
+// draw's samples into the query's word.
+TEST(a730_indirect_draws_and_occlusion_queries) {
+    Rig r;
+    std::string why;
+    TextureDesc cd;
+    cd.width = cd.height = 64;
+    cd.format = PixelFormat::kRGBA8Unorm;
+    cd.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    auto t = Texture::make(r.gpu, cd, &why);
+    CHECK(t != nullptr);
+    if (!t) return;
+    const Program p{kernels::a730_tri_flat_vs_air, kernels::a730_tri_flat_fs_air, Linkage{}, "a730_tri_flat"};
+    RenderPass pass;
+    pass.color0 = t.get();
+    auto args = r.buffer(64), vis = r.buffer(64);
+    auto* w = static_cast<uint32_t*>(args->contents());
+    w[1] = 3;
+    w[2] = 1;
+    w[3] = 0;
+    w[4] = 0;
+    Draw d;
+    d.vertexCount = 3;
+    d.viewport = Viewport{0, 0, 64, 64, 0, 1};
+    Draw ind = d;
+    ind.indirect = args.get();
+    ind.indirectOffset = 4;
+    auto cb = r.queue->commandBuffer();
+    const bool ok = cb->draw(p, pass, ind, Bindings{}, Bindings{}, render::Options{});
+    if (!ok) std::printf("       %s\n", cb->error().c_str());
+    CHECK(ok);
+    w[1] = 6;
+    w[2] = 2;
+    w[3] = 9;
+    finish(cb);
+    if (r.fake->stats().faults) std::printf("       fake: %s\n", r.fake->stats().lastFault.c_str());
+    CHECK_EQ(r.fake->stats().lastDraw.numIndices, 6u);
+    CHECK_EQ(r.fake->stats().lastDraw.numInstances, 2u);
+    CHECK_EQ(r.fake->stats().lastDraw.vertexIndexOffset, 9u);
+    auto* q = static_cast<uint64_t*>(vis->contents());
+    for (int i = 0; i < 8; i++) q[i] = 0xdeadbeefcafef00dull;
+    auto counted = [&](uint32_t vertices, bool reset) {
+        Draw c = d;
+        c.vertexCount = vertices;
+        c.visibility = vis.get();
+        c.visibilityMode = 2;
+        c.visibilityOffset = 16;
+        c.visibilityReset = reset;
+        auto b = r.queue->commandBuffer();
+        CHECK(b->draw(p, pass, c, Bindings{}, Bindings{}, render::Options{}));
+        finish(b);
+        if (r.fake->stats().faults) std::printf("       fake: %s\n", r.fake->stats().lastFault.c_str());
+        return q[2];
+    };
+    CHECK_EQ(counted(6, true), uint64_t(6));
+    CHECK_EQ(counted(3, false), uint64_t(9));
+    CHECK_EQ(q[1], 0xdeadbeefcafef00dull);
+    CHECK_EQ(q[3], 0xdeadbeefcafef00dull);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// A device buffer in the vertex stage on the A730 (tri_dpos: the pair's positions by ldib through IBO 0): the compiler
+// made the IBO bindless set 0's descriptor 0 (`.base0`), and the draw points SP_BINDLESS_BASE[0] (0xab0a) at its 3D IBO
+// table with 64-byte descriptors, marks SP_VS_CONFIG BINDLESS_IBO, invalidates GFX_BINDLESS and prefetches SB6_IBO from
+// set 0 (fd6_build_bindless_state<A7XX>). The fake takes that, and refuses the A6XX's SP_IBO load from memory.
+TEST(a730_vertex_stage_ibos_are_bindless_set_0) {
+    Rig r;
+    std::string why;
+    TextureDesc cd;
+    cd.width = cd.height = 64;
+    cd.format = PixelFormat::kRGBA8Unorm;
+    cd.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    auto t = Texture::make(r.gpu, cd, &why);
+    CHECK(t != nullptr);
+    if (!t) return;
+    const float xy[6][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, -1}, {1, 1}, {-1, 1}};
+    auto pos = r.buffer(sizeof xy);
+    memcpy(pos->contents(), xy, sizeof xy);
+    const Program p{kernels::a730_tri_dpos_vs_air, kernels::a730_tri_flat_fs_air, Linkage{}, "a730_tri_dpos"};
+    CHECK_EQ(p.vs.k.numSsbos, 1u);
+    RenderPass pass;
+    pass.color0 = t.get();
+    Draw d;
+    d.vertexCount = 6;
+    d.viewport = Viewport{0, 0, 64, 64, 0, 1};
+    Bindings vsb;
+    vsb.buffers = {Binding{pos.get(), 0}};
+    auto cb = r.queue->commandBuffer();
+    const bool ok = cb->draw(p, pass, d, vsb, Bindings{}, render::Options{});
+    if (!ok) std::printf("       %s\n", cb->error().c_str());
+    CHECK(ok);
+    finish(cb);
+    if (r.fake->stats().faults) std::printf("       fake: %s\n", r.fake->stats().lastFault.c_str());
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    CHECK_EQ(r.fake->stats().lastDraw.gfxIbos, 1u);
+
+    auto vsProgram = r.buffer(4ull * p.vs.k.numWords), fsProgram = r.buffer(4ull * p.fs.k.numWords), table = r.buffer(render::kTableBytes),
+         commands = r.buffer(262144);
+    memcpy(vsProgram->contents(), p.vs.k.words, 4ull * p.vs.k.numWords);
+    memcpy(fsProgram->contents(), p.fs.k.words, 4ull * p.fs.k.numWords);
+    pm4::Stream stream(kChipA730.id);
+    CHECK(render::encode(stream, p, pass, d, vsb, Bindings{}, vsProgram->gpuAddress(), fsProgram->gpuAddress(), table->gpuAddress(),
+                         static_cast<uint8_t*>(table->contents()), &why, render::Options{}));
+    const auto& w = stream.words();
+    CHECK_EQ(lastWrite(w, gen7::REG_A7XX_SP_BINDLESS_BASE), uint32_t(table->gpuAddress() + render::kTableVsAt) | 3u);
+    CHECK((lastWrite(w, legacyRegisterOffset(kChipA730, a6xx::REG_A6XX_SP_VS_CONFIG)) & a6xx::A6XX_SP_VS_CONFIG_BINDLESS_IBO) != 0);
+    CHECK((lastWrite(w, legacyRegisterOffset(kChipA730, a6xx::REG_A6XX_HLSQ_INVALIDATE_CMD)) & gen7::A7XX_HLSQ_INVALIDATE_CMD_GFX_BINDLESS__MASK) ==
+          gen7::A7XX_HLSQ_INVALIDATE_CMD_GFX_BINDLESS__MASK);
+    CHECK(hasPacket(w, a6xx::CP_LOAD_STATE6, a6xx::loadState6_0(0, a6xx::ST6_SHADER, a6xx::SS6_BINDLESS, a6xx::SB6_IBO, 1), ~0u));
+    auto submit = [&](const std::vector<uint32_t>& words) {
+        std::memcpy(commands->contents(), words.data(), 4 * words.size());
+        uint32_t fence = 0;
+        const int error = r.gpu.submit(0, commands->bo(), 0, uint32_t(words.size()),
+                                       {{&vsProgram->bo(), false}, {&fsProgram->bo(), false}, {&table->bo(), true}, {&t->buffer()->bo(), true},
+                                        {&pos->bo(), false}},
+                                       &fence);
+        return error ? error : r.gpu.wait(0, fence, 1000000000);
+    };
+    CHECK_EQ(submit(w), 0);
+    // the A6XX's load (SS6_INDIRECT from the table) in its place: refused
+    auto bad = w;
+    bool changed = false;
+    for (size_t i = 0; i < bad.size() && !changed;) {
+        const auto h = pm4::decode(bad[i]);
+        if (h.kind == pm4::Header::kCommand && h.opcode == a6xx::CP_LOAD_STATE6 && bad[i + 1] == a6xx::loadState6_0(0, a6xx::ST6_SHADER, a6xx::SS6_BINDLESS, a6xx::SB6_IBO, 1)) {
+            const uint64_t from = table->gpuAddress() + render::kTableVsAt;
+            bad[i + 1] = a6xx::loadState6_0(0, a6xx::ST6_SHADER, a6xx::SS6_INDIRECT, a6xx::SB6_IBO, 1);
+            bad[i + 2] = uint32_t(from);
+            bad[i + 3] = uint32_t(from >> 32);
+            changed = true;
+        }
+        i += h.count + 1;
+    }
+    CHECK(changed);
+    const uint32_t before = r.fake->stats().faults;
+    CHECK(submit(bad) != 0);
+    CHECK(r.fake->stats().faults > before);
+    CHECK(r.fake->stats().lastFault.find("SB6_IBO") != std::string::npos);
+    CHECK_EQ(submit(w), 0);
 }

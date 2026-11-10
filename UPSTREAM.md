@@ -160,3 +160,15 @@
   `HAKIOS_A730_SUBMIT_RD` writes it as `.rd` for cffdump). On the OnePlus 10 Pro (10 November)
   `tri_flat` passes all three shapes exactly, three rounds each; compute and textures still pass
   after it. Depth, GMEM, indirect draws and 3D IBOs stay refused on the A730; the A6xx path is unchanged.
+- `hakios-metal`: the A730's draw ladder (section 6 step 4). The A730 fake GPU validates draws
+  (`gen7DrawReady`: the gen7 batch, freedreno's fixed FD730 pass state, no A6XX-only register, no
+  preload, BIN_CONTROL 0, the prefetch's and the depth planes' A7XX forms) instead of refusing them.
+  `render.cpp`: the FS texture prefetch in its A7XX form (the command's own field positions, the
+  slots in `SP_FS_BINDLESS_PREFETCH_CMD`); depth and stencil attachments (`RB_DEPTH_BUFFER_INFO` /
+  `RB_STENCIL_INFO` TILEMODE TILE6_3); indirect draws; occlusion queries (each ZPASS_DONE followed by
+  CCU_CLEAN_DEPTH, turnip's A7XX gen1 path); the vertex and fragment stages' IBOs as bindless set 0
+  (`SP_BINDLESS_BASE[0]`, GFX_BINDLESS invalidate, SB6_IBO from set 0; `compiler.cpp` and the
+  fixture tool lower every gen-7 stage's IBOs, not only compute's). The probe's section 9 is
+  `drawSuite()`, every kernel by the chip, `--case draws [--sections 9a,9b,...]`. On the OnePlus 10
+  Pro (10 November): 167 checks of section 9 pass, 0 fail; GMEM stays refused on the A730 (its GMEM
+  lines are printed, not judged). The A6xx path is unchanged.
