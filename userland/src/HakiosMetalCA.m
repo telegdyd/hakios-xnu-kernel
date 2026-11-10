@@ -1584,6 +1584,13 @@ hm_ca_nearest(NSString *frag)
 		if ([wantIn count] != [haveIn count]) {
 			continue;
 		}
+		/* every input the same, or none: another input is another fetch. TmuaA2S1Xhf_Ialp_Isqr (a mask's alpha times
+		 * the colour) drawn by ..._Isrc_Isqr read the one-channel mask as the colour, (r, 0, 0, 1): the home screen's
+		 * edit badges and Done button opaque black squares with red where the circle was (installed boot, 10 November).
+		 * The function's own module, specialised by Metal, draws what was asked (the filters since boot 20). */
+		if (![part(w, 8, want) isEqualToString:part(h, 8, have)]) {
+			continue;
+		}
 		if (filtered) {
 			/* an input with a filter (N<rows>O<ops>) reads its rows from the buffer CoreAnimation lays out for the
 			 * program it asked for: another op list reads them at other offsets, the other precision (h: half4 rows, cx:
@@ -1621,7 +1628,7 @@ hm_ca_nearest(NSString *frag)
 			told[frag] = @YES;
 			hm_print("CoreAnimation's %s is not in the library: %s stands in for it\n", [want UTF8String],
 				 best != nil ? [[best substringFromIndex:[prefix length]] UTF8String] :
-				 filtered ? "nothing with the same filter layout: its own module" : "nothing of the same kind");
+				 filtered ? "nothing with the same filter layout: its own module" : "nothing with the same inputs: its own module");
 		}
 	}
 	return best;
