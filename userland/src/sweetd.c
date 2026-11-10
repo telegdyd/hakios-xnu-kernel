@@ -21,7 +21,9 @@
  *
  * It also answers DHCP on the link (a child process): the PC is given 192.168.7.1/24, no router, no DNS, so
  * that nobody has to set the address by hand. Windows, Linux and macOS ask on their own once the adapter
- * appears. The address is fixed; only the one client on the cable is served.
+ * appears. The address is fixed; only the one client on the cable is served. The answer goes out as a whole
+ * Ethernet frame through BPF on en2: the kernel will not route 255.255.255.255 without a default route
+ * ("Network is unreachable", even with IP_BOUND_IF), and the client has no address to send to yet.
  *
  * The client is devices/negroni/tools/sweet-sh.py. Only peers on the USB Ethernet link (192.168.7.0/24)
  * are served, and only with the token: TOKEN_IMAGE (build.sh copies userland/sweetd.token, made on the PC
@@ -32,8 +34,11 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <net/if.h>
+#include <net/if_dl.h>
 #include <netinet/in.h>
+#include <sys/ioctl.h>
 #include <poll.h>
 #include <signal.h>
 #include <spawn.h>
@@ -452,6 +457,83 @@ dhcp_opt(uint8_t *p, uint8_t code, const void *data, uint8_t len)
 	return 2u + len;
 }
 
+/* net/bpf.h's (the iOS SDK has no net/bpf.h) */
+#define DHCP_BIOCSETIF          _IOW('B', 108, struct ifreq)
+#define DHCP_BIOCSHDRCMPLT      _IOW('B', 117, u_int)
+
+/* A BPF device bound to en2, writing whole frames (the source address ours), and en2's own address: -1 without. */
+static int
+dhcp_bpf(uint8_t mac[6])
+{
+	struct ifaddrs *list, *i;
+	struct ifreq ifr;
+	bool found = false;
+	u_int one = 1;
+	char dev[16];
+	int fd = -1;
+
+	if (getifaddrs(&list) != 0) {
+		return -1;
+	}
+	for (i = list; i != NULL; i = i->ifa_next) {
+		if (i->ifa_addr != NULL && i->ifa_addr->sa_family == AF_LINK && strcmp(i->ifa_name, "en2") == 0 &&
+		    ((struct sockaddr_dl *)i->ifa_addr)->sdl_alen == 6) {
+			memcpy(mac, LLADDR((struct sockaddr_dl *)i->ifa_addr), 6);
+			found = true;
+		}
+	}
+	freeifaddrs(list);
+	for (int n = 0; found && n < 32 && fd < 0; n++) {
+		snprintf(dev, sizeof(dev), "/dev/bpf%d", n);
+		fd = open(dev, O_WRONLY);
+	}
+	if (fd < 0) {
+		return -1;
+	}
+	memset(&ifr, 0, sizeof(ifr));
+	strlcpy(ifr.ifr_name, "en2", sizeof(ifr.ifr_name));
+	if (ioctl(fd, DHCP_BIOCSETIF, &ifr) != 0 || ioctl(fd, DHCP_BIOCSHDRCMPLT, &one) != 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* The answer as a frame: to ff:ff:ff:ff:ff:ff, IP 192.168.7.2 -> 255.255.255.255, UDP 67 -> 68 (no UDP checksum). */
+static ssize_t
+dhcp_bpf_send(int fd, const uint8_t mac[6], const void *payload, size_t len)
+{
+	uint8_t f[14 + 20 + 8 + sizeof(struct dhcp_msg)], *ip = f + 14, *udp = ip + 20;
+	uint32_t sum = 0, src = htonl(PHONE_ADDR);
+	uint16_t total = (uint16_t)(20 + 8 + len), ulen = (uint16_t)(8 + len);
+
+	memset(f, 0, sizeof(f));
+	memset(f, 0xff, 6);
+	memcpy(f + 6, mac, 6);
+	f[12] = 0x08;
+	ip[0] = 0x45;
+	ip[2] = (uint8_t)(total >> 8);
+	ip[3] = (uint8_t)total;
+	ip[8] = 64;
+	ip[9] = IPPROTO_UDP;
+	memcpy(ip + 12, &src, 4);
+	memset(ip + 16, 0xff, 4);
+	for (int k = 0; k < 20; k += 2) {
+		sum += (uint32_t)(ip[k] << 8 | ip[k + 1]);
+	}
+	while (sum >> 16) {
+		sum = (sum & 0xffff) + (sum >> 16);
+	}
+	ip[10] = (uint8_t)(~sum >> 8);
+	ip[11] = (uint8_t)~sum;
+	udp[1] = 67;
+	udp[3] = 68;
+	udp[4] = (uint8_t)(ulen >> 8);
+	udp[5] = (uint8_t)ulen;
+	memcpy(udp + 8, payload, len);
+	return write(fd, f, 14 + 20 + 8 + len);
+}
+
 /* Answers DISCOVER with OFFER and REQUEST with ACK (always the same address), broadcast, as a client without an address expects. */
 static void
 dhcp_serve(void)
@@ -524,13 +606,30 @@ dhcp_serve(void)
 		if (len < 300) {
 			len = 300;
 		}
-		unsigned idx = if_nametoindex("en2");
+		uint8_t mac[6];
+		int bpf = dhcp_bpf(mac);
+		ssize_t sent;
+		const char *how = "BPF on en2";
 
-		if (idx != 0) {
-			setsockopt(s, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx));
+		if (bpf >= 0) {
+			sent = dhcp_bpf_send(bpf, mac, &r, len);
+			close(bpf);
+		} else {
+			/* (without BPF: works only once something routes 255.255.255.255) */
+			unsigned idx = if_nametoindex("en2");
+
+			if (idx != 0) {
+				setsockopt(s, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx));
+			}
+			sent = sendto(s, &r, len, 0, (struct sockaddr *)&to, sizeof(to));
+			how = "UDP (no BPF)";
 		}
-		sendto(s, &r, len, 0, (struct sockaddr *)&to, sizeof(to));
-		fprintf(stderr, "sweetd: dhcp %s -> 192.168.7.1\n", type == 1 ? "offer" : "ack");
+		if (sent < 0) {
+			fprintf(stderr, "sweetd: dhcp %s -> 192.168.7.1 NOT sent (%s): %s\n", type == 1 ? "offer" : "ack", how,
+			    strerror(errno));
+		} else {
+			fprintf(stderr, "sweetd: dhcp %s -> 192.168.7.1 (%s)\n", type == 1 ? "offer" : "ack", how);
+		}
 	}
 }
 
