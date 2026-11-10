@@ -44,7 +44,10 @@
 - `drivers/power/hakios.cpufreq.c`: `cpufreq_epss=<pa>` for a phone other
   than redwood (the RPMh memory vote stays redwood-only by default), the
   frequency table and LMh limit in the log and in `kern.hakios.cpufreq`, and
-  `hakios_cpufreq_cap()` for the thermal driver. `drivers/power/hakios.thermal.c`:
+  `hakios_cpufreq_cap()` for the thermal driver; with `cpufreq_epss=` a
+  load-based governor (`cpufreq_gov`, `cpufreq_gov_ms`, sysctl
+  `kern.hakios.cpufreq_gov`), and the rows put back before the loader runs.
+  `drivers/power/hakios.thermal.c`:
   `thermal_soc=8450` (SM8450 sensor table from the stock tree) and a stepped
   CPU cap from `thermal_slow=` degrees (default 85). Redwood's behaviour is
   unchanged without the new arguments.

@@ -82,7 +82,7 @@ bool hakios_battery_get(int *soc, int *present, int *charger);
 bool hakios_battery_gauge_live(void);   /* the DSP's fuel gauge reported in the last minute (hakios.battery.c) */
 bool hakios_battery_bcl_init(void);    /* boot-arg battery_soc=8450: the OnePlus 10 Pro's estimate (hakios.battery_bcl.c) */
 void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
-void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
+void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor clocks (and cpufreq_gov: by load) */
 void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 void hakios_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void hakios_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */

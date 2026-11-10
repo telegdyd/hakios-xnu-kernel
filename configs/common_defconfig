@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 390 symbols in 18 groups; 36 are set, 27 of them drivers built in.
+# 392 symbols in 18 groups; 36 are set, 27 of them drivers built in.
 #
 
 #
@@ -104,7 +104,7 @@ CONFIG_HAKIOS_VIRTIO_BLK=y
 CONFIG_HAKIOS_WIFI=y
 
 #
-# CPU, memory and boot (22)
+# CPU, memory and boot (24)
 #
 
 # CPU cores the kernel uses, 1 to 8; one if not set
@@ -124,6 +124,12 @@ CONFIG_HAKIOS_WIFI=y
 
 # the first domain's registers, when this is not the reference phone (the OnePlus 10 Pro, SM8450: 0x17d91000, dt ...
 # CONFIG_CPUFREQ_EPSS is not set
+
+# read by hakios.cpufreq.c (kernel)
+# CONFIG_CPUFREQ_GOV is not set
+
+# read by hakios.cpufreq.c (kernel)
+# CONFIG_CPUFREQ_GOV_MS is not set
 
 # every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py ...
 # CONFIG_CPULOAD is not set

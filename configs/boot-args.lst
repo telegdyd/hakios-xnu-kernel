@@ -90,6 +90,8 @@ cam_vblank	k
 cc_fade	u
 cpufreq	k
 cpufreq_epss	k
+cpufreq_gov	k
+cpufreq_gov_ms	k
 cpuload	k
 cpumask	l
 cpus	l

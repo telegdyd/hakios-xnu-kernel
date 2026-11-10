@@ -15,8 +15,11 @@
  * driver lowers when the phone gets hot (hakios_cpufreq_cap(); never below the row the firmware left), and
  * sysctl kern.hakios.cpufreq ("d0 1785/1785 d1 2496/2496 d2 2995/2995 cap 0": asked / allowed by the hardware).
  * The firmware's own limits (LMh) act in the hardware whatever is asked; the second number shows them.
+ * There, a governor picks each group's row from how busy its cores are (cpufreq_gov, below), instead of the top row
+ * all the time: idle at the top rows the cores sat at 67-75 C, held there only by the firmware's limiter.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
@@ -77,14 +80,22 @@ tell(const char *format, ...)
  */
 static vm_offset_t epss_phys = EPSS_PHYS;
 
-/* What was found and done per domain: its table, the row the firmware left, the top row, the row asked for now. */
+/*
+ * What was found and done per domain: its table, the row the firmware left, the top row, the row asked for now, and
+ * the governor's: the row the load wants (gov_row; the top row when there is no governor), and its bookkeeping.
+ */
 static struct {
 	vm_offset_t     base;
 	uint32_t        rows, khz[EPSS_TABLE_ROWS];
 	uint32_t        firmware_row, top_row, row;
 	bool            ours;
+	uint32_t        gov_row, lower_wanted, lower_best;
+	uint64_t        mhz_time, busy_time, time, changes;
 } dom[EPSS_DOMAINS];
 static uint32_t cap_khz;                        /* 0: none; hakios_cpufreq_cap() */
+static LCK_GRP_DECLARE(cpufreq_lock_group, "hakios-cpufreq");
+static LCK_MTX_DECLARE(cpufreq_lock, &cpufreq_lock_group);     /* dom[].row and its register: the cap and the governor */
+static volatile bool cpufreq_leaving;          /* on the way back to the loader: the rows are no longer ours */
 static char cpufreq_line[160];
 
 SYSCTL_DECL(_kern_hakios);
@@ -155,6 +166,19 @@ row_for_cap(uint32_t d)
 	return row;
 }
 
+/* The row a domain is to have: what the governor wants, no higher than the cap allows; written when it changed. With cpufreq_lock. */
+static void
+apply(uint32_t d)
+{
+	uint32_t row = MIN(dom[d].gov_row, row_for_cap(d));
+
+	if (row != dom[d].row && !cpufreq_leaving) {
+		dom[d].row = row;
+		dom[d].changes++;
+		*(volatile uint32_t *)(dom[d].base + EPSS_PERF_STATE) = row;
+	}
+}
+
 static void
 raise_domain(uint32_t domain, uint32_t cores)
 {
@@ -183,6 +207,7 @@ raise_domain(uint32_t domain, uint32_t cores)
 	dom[domain].top_row = top;
 	dom[domain].firmware_row = was <= top ? was : top;
 	dom[domain].ours = true;
+	dom[domain].gov_row = top;
 	dom[domain].row = row_for_cap(domain);
 	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = dom[domain].row;
 	delay_for_interval(20, NSEC_PER_MSEC);
@@ -194,26 +219,21 @@ raise_domain(uint32_t domain, uint32_t cores)
 
 /*
  * For the thermal driver (hakios.thermal.c): no domain above mhz (0: no cap), never below the row the firmware left.
- * Called from one thread only (the thermal one), after hakios_cpufreq_init().
+ * Called from one thread only (the thermal one), after hakios_cpufreq_init(); the governor's thread may write the rows too.
  */
 void hakios_cpufreq_cap(uint32_t mhz);
 
 void
 hakios_cpufreq_cap(uint32_t mhz)
 {
+	lck_mtx_lock(&cpufreq_lock);
 	cap_khz = mhz * 1000;
 	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
-		uint32_t row;
-
-		if (!dom[d].ours) {
-			continue;
-		}
-		row = row_for_cap(d);
-		if (row != dom[d].row) {
-			dom[d].row = row;
-			*(volatile uint32_t *)(dom[d].base + EPSS_PERF_STATE) = row;
+		if (dom[d].ours) {
+			apply(d);
 		}
 	}
+	lck_mtx_unlock(&cpufreq_lock);
 	cpufreq_describe();
 	tell("cpufreq: cap %u MHz: %s\n", mhz, cpufreq_line);
 }
@@ -226,6 +246,150 @@ hakios_cpufreq_line(void)
 {
 	cpufreq_describe();
 	return cpufreq_line;
+}
+
+/*
+ * The governor. Boot-arg cpufreq_gov=0: none, every group at its top row (as before); 1 (the default with cpufreq_epss=,
+ * the OnePlus 10 Pro, where it was measured; elsewhere only when asked for): every cpufreq_gov_ms milliseconds (default 20) it looks at how busy the busiest of our cores of each
+ * group was meanwhile (the time it was not idle, as cpuload= reports it), at the frequency the group really ran at (the
+ * row asked, or less when the firmware's limiter allows less), and picks:
+ *   busier than GOV_UP percent      the top row, at once (whatever the cap allows): a busy core is not kept waiting
+ *   otherwise                       the lowest row at which that core would be about GOV_AIM percent busy
+ * A higher row is taken at once; a lower one only once GOV_DOWN periods in a row have wanted lower, and then the highest
+ * of what they wanted, so that a short pause in the work does not drop the clock. Any row of the table may be picked,
+ * down to the lowest (300-800 MHz): the hardware sets the voltage for each row itself. The thermal cap stays a ceiling.
+ * sysctl kern.hakios.cpufreq_gov, every second: per group the average MHz since start, the busiest core's average
+ * percent, and how many times the row changed: "d0 412 MHz 6% 1520 ...".
+ */
+#define GOV_UP          80
+#define GOV_AIM         70
+#define GOV_DOWN        5
+static uint32_t gov_ms = 20;
+static char gov_line[160];
+
+SYSCTL_STRING(_kern_hakios, OID_AUTO, cpufreq_gov, CTLFLAG_RD | CTLFLAG_LOCKED, gov_line, 0,
+    "per group of cores, since start: the average MHz, the busiest core's average percent, the row changes");
+
+/* The row a group's load wants: busy (percent) of its busiest core, at khz. */
+static uint32_t
+gov_want(uint32_t d, uint32_t busy, uint32_t khz)
+{
+	uint64_t target;
+	uint32_t row = 0;
+
+	if (busy > GOV_UP) {
+		return dom[d].top_row;
+	}
+	target = (uint64_t)khz * busy / GOV_AIM;
+	while (row < dom[d].top_row && dom[d].khz[row] < target) {
+		row++;
+	}
+	return row;
+}
+
+static void
+gov_describe(void)
+{
+	int at = 0;
+
+	gov_line[0] = 0;
+	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		if (!dom[d].ours || dom[d].time == 0) {
+			continue;
+		}
+		at += snprintf(gov_line + at, sizeof(gov_line) - at, "%sd%u %llu MHz %llu%% %llu", at ? " " : "", d,
+		    dom[d].mhz_time / dom[d].time, dom[d].busy_time / dom[d].time, dom[d].changes);
+		if (at >= (int)sizeof(gov_line) - 1) {
+			return;
+		}
+	}
+}
+
+static void
+gov_thread(void *arg __unused, wait_result_t wr __unused)
+{
+	const ml_topology_info_t *topology = ml_get_topology_info();
+	uint64_t idle_before[MAX_CPUS] = { 0 }, then = mach_absolute_time(), described = then, second;
+
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
+	for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+		(void)ml_cpu_idle_time((int)topology->cpus[i].cpu_id, &idle_before[i]);
+	}
+	while (!cpufreq_leaving) {
+		uint32_t busiest[EPSS_DOMAINS] = { 0 };
+		uint64_t now;
+
+		delay_for_interval(gov_ms, NSEC_PER_MSEC);
+		now = mach_absolute_time();
+		if (now == then) {
+			continue;
+		}
+		for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS; i++) {
+			uint64_t idle = 0, idled, busy;
+			uint32_t d = domain_of(topology->cpus[i].phys_id);
+
+			if (!ml_cpu_idle_time((int)topology->cpus[i].cpu_id, &idle)) {
+				continue;
+			}
+			idled = idle >= idle_before[i] ? idle - idle_before[i] : 0;
+			idle_before[i] = idle;
+			busy = idled < now - then ? 100 * (now - then - idled) / (now - then) : 0;
+			busiest[d] = MAX(busiest[d], (uint32_t)busy);
+		}
+		lck_mtx_lock(&cpufreq_lock);
+		for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+			uint32_t asked, lmh, khz, want;
+
+			if (!dom[d].ours) {
+				continue;
+			}
+			asked = dom[d].khz[dom[d].row];
+			lmh = (*(volatile uint32_t *)(dom[d].base + EPSS_DOMAIN_STATE) & 0xff) * XO_KHZ;
+			khz = lmh != 0 ? MIN(asked, lmh) : asked;
+			dom[d].mhz_time += (uint64_t)(khz / 1000) * (now - then);
+			dom[d].busy_time += (uint64_t)busiest[d] * (now - then);
+			dom[d].time += now - then;
+			want = gov_want(d, busiest[d], khz);
+			if (want >= dom[d].gov_row) {
+				dom[d].gov_row = want;
+				dom[d].lower_wanted = 0;
+			} else {
+				dom[d].lower_best = dom[d].lower_wanted ? MAX(dom[d].lower_best, want) : want;
+				if (++dom[d].lower_wanted >= GOV_DOWN) {
+					dom[d].gov_row = dom[d].lower_best;
+					dom[d].lower_wanted = 0;
+				}
+			}
+			apply(d);
+		}
+		lck_mtx_unlock(&cpufreq_lock);
+		then = now;
+		if (now - described >= second) {
+			gov_describe();
+			cpufreq_describe();
+			described = now;
+		}
+	}
+}
+
+static void
+gov_start(void)
+{
+	uint32_t on = epss_phys != EPSS_PHYS;
+	thread_t thread;
+
+	PE_parse_boot_argn("cpufreq_gov", &on, sizeof(on));
+	PE_parse_boot_argn("cpufreq_gov_ms", &gov_ms, sizeof(gov_ms));
+	gov_ms = MAX(5, MIN(gov_ms, 1000));
+	if (!on) {
+		tell("cpufreq: no governor (cpufreq_gov=0): every group at its top row\n");
+		return;
+	}
+	if (kernel_thread_start(gov_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+		tell("cpufreq: governor every %u ms: the top row above %u%% busy, else about %u%% busy; down after %u periods\n",
+		    gov_ms, GOV_UP, GOV_AIM, GOV_DOWN);
+	}
 }
 
 /*
@@ -663,6 +827,18 @@ hakios_ddr_quiesce(void)
 	uint32_t rest = DDR_REST, data[2];
 	bool done;
 
+	/*
+	 * The governor stops writing, and each group goes back to the row it had before there was a governor (the top row,
+	 * or the cap's): the loader runs on the first group, and must not be left at its lowest row. No lock: the other
+	 * processors are stopped, and interrupts are off.
+	 */
+	cpufreq_leaving = true;
+	for (uint32_t d = 0; d < EPSS_DOMAINS; d++) {
+		if (dom[d].ours) {
+			dom[d].row = row_for_cap(d);
+			*(volatile uint32_t *)(dom[d].base + EPSS_PERF_STATE) = dom[d].row;
+		}
+	}
 	if (!ddr_voted) {
 		return;
 	}
@@ -708,6 +884,7 @@ hakios_cpufreq_init(void)
 	}
 	printf("cpufreq: on core %u a loop ran at %u, now at %u\n", here, before, loop_speed());
 	cpufreq_describe();
+	gov_start();
 	/* membench has its own variable: when the boot-arg is absent, the cpufreq value (2 means on) must not start the benchmark */
 	PE_parse_boot_argn("membench", &membench, sizeof(membench));
 	if (membench == 1) {
