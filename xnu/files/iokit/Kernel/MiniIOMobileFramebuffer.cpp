@@ -1417,7 +1417,10 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
 		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
+		MiniIOSurfaceBeginRead(s);
+		MiniIOSurfaceDrawn(s, SWAP_GPU_MS);
 		drawLayer(s, src, dst);
+		MiniIOSurfaceEndRead(s);
 	}
 	fSettling = false;
 	fStatSettled++;
@@ -1434,6 +1437,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	bool report;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		if (surfaces[layer] != NULL) MiniIOSurfaceBeginRead(surfaces[layer]);
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
 			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
 			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
@@ -1546,6 +1550,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
+	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		if (surfaces[layer] != NULL) MiniIOSurfaceEndRead(surfaces[layer]);
 	}
 	fSwapsShown++;
 	if (gTouchLat) {

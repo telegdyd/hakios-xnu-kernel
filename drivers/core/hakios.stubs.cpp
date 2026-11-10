@@ -11,4 +11,6 @@ MiniIOSurfaceDrawn(__unused MiniIOSurface * surface, __unused uint64_t milliseco
 {
 	return true;
 }
+void MiniIOSurfaceBeginRead(__unused MiniIOSurface * surface) {}
+void MiniIOSurfaceEndRead(__unused MiniIOSurface * surface) {}
 #endif

@@ -40,6 +40,7 @@
 #include <mach/vm_param.h>
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 
 #include "MiniIOSurface.h"
 
@@ -182,6 +183,13 @@ struct hakios_show {
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
 static bool gGPUReported;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
+static TUNABLE(uint32_t, gCopyGuard, "fb_copy_guard", 0);
+static uint32_t gCopyWaits;
+static uint32_t gCopyReads, gCopyTimeouts;
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_copy_reads, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyReads, 0, "protected framebuffer reads");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_copy_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyWaits, 0, "GPU submissions delayed by a framebuffer read");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_copy_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyTimeouts, 0, "framebuffer ownership waits that timed out");
 
 /* What the last seconds' submissions were and cost here, for the log. */
 static struct {
@@ -233,6 +241,23 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 		IOLockUnlock(gGPULock);
 	}
 	return done;
+}
+
+void MiniIOSurfaceBeginRead(MiniIOSurface * surface)
+{
+	if (!gCopyGuard || gGPULock == NULL) return;
+	IOLockLock(gGPULock);
+	surface->cpuReaders++;
+	gCopyReads++;
+	IOLockUnlock(gGPULock);
+}
+
+void MiniIOSurfaceEndRead(MiniIOSurface * surface)
+{
+	if (!gCopyGuard || gGPULock == NULL) return;
+	IOLockLock(gGPULock);
+	if (surface->cpuReaders != 0) surface->cpuReaders--;
+	IOLockUnlock(gGPULock);
 }
 
 /*
@@ -993,6 +1018,30 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		goto out;
 	}
 	IOLockLock(gGPULock);
+	{
+		uint64_t since = mach_absolute_time(), patience;
+		bool waited = false;
+		nanoseconds_to_absolutetime(500 * NSEC_PER_MSEC, &patience);
+		for (;;) {
+			bool reading = false;
+			for (uint32_t i = 0; i < request->nr_bos; i++) {
+				struct gpu_buffer * b = buffer(bos[i].handle);
+				reading |= b != NULL && b->surface != NULL && b->surface->cpuReaders != 0;
+			}
+			if (!reading) break;
+			if (mach_absolute_time() - since >= patience) {
+				gCopyTimeouts++;
+				IOLockUnlock(gGPULock);
+				ret = kIOReturnBusy;
+				goto out;
+			}
+			if (!waited && gCopyWaits++ < 8) IOLog("HakiosGPU: submission waits for the framebuffer's CPU read\n");
+			waited = true;
+			IOLockUnlock(gGPULock);
+			delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+			IOLockLock(gGPULock);
+		}
+	}
 	/*
 	 * The GPU reads memory and writes memory. What this processor's cache holds of an IOSurface
 	 * (somebody has written it, or has read it, as the display's driver does, and the GPU is to

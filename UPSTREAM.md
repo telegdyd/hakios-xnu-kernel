@@ -19,6 +19,11 @@
   variant of the same inputs and precision, the function's own module is compiled. The wrong
   stand-ins added a flat garbage colour to the snapshot on cold app launches (boots 12-20).
 
+- `fb_copy_guard=1` (off by default): while the framebuffer driver copies a surface to the panel
+  with the CPU, HakiosGPU holds back submissions that name it (500 ms at most, then EBUSY), and
+  `settle()` waits for the GPU before its redraw. Cures the A730's black bars; counted in
+  `kern.hakios.fb_copy_*`. Remove it with the CPU copy (GPU-PLAN phase 5).
+
 - `xnu-deps/host/bin/xnu-clang`: preserve Clang 14's warning behavior for
   implicit declarations and incompatible pointer conversions on Clang 16+.
   Adapted from ios-vayu commit `852fd53ed2a03a6ae56a323bdd835d1fdeb7c5ae`.
