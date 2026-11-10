@@ -33,6 +33,11 @@
 #include "../tests/fixtures/a730/tex_fill_air.hpp"
 #include "../tests/fixtures/a730/tex_copy_air.hpp"
 #include "../tests/fixtures/a730/img_store.hpp"
+#include "../tests/fixtures/a730/tex_fill_h_air.hpp"
+#include "../tests/fixtures/a730/tex_fill_arr_air.hpp"
+#include "../tests/fixtures/a730/tex_fill_3d_air.hpp"
+#include "../tests/fixtures/a730/tex_sample_gid_air.hpp"
+#include "../tests/fixtures/a730/tex_sample_wide_air.hpp"
 #include "../tests/fixtures/fill_id_air.hpp"
 #include "../tests/fixtures/chain160_air.hpp"
 #include "../tests/fixtures/chain220_air.hpp"
@@ -493,11 +498,1000 @@ static int imageStoreCase(Gpu& gpu, uint64_t chip, const std::string& name, cons
     return 0;
 }
 
+// The texture section of the suite (7a-7g, 9mc, and 7d on the A635): every kernel taken by the chip, so that the A730
+// runs the same checks through its own fixtures (--case textures).
+static void textureSuite(Gpu& gpu, CommandQueue* queue, uint64_t chip, const compute::Options& chosen) {
+    std::string why;
+    auto pick = [&](const Kernel& a635, const Kernel& a730) -> const Kernel& { return chip == kChipA730.id ? a730 : a635; };
+    // 7. textures and samplers: one new mechanism a line, each dispatch its own command buffer, so that a hang in a later
+    // one (gpu_recover=1 resets the GPU and the wait says so) hides nothing of an earlier result. Every line is a
+    // comparison against a rule the probe computes from the kernel's own text: there is no host reference for texture
+    // kernels yet (kernelref.py refuses them, air_run runs only its own pattern).
+    //   7a. tex_fill: a write-only image at IBO slot 0 (stib.b.typed.2d) -- the first 2D storage descriptor this driver binds
+    //   7b. tex_copy: a texture read through the texture table (isaml t#1) beside the image write at IBO slot 0
+    //   7c. tex_sample_gid: a sampler of Metal's (saml s#0) over an RGBA8Unorm texture, nearest and linear
+    //   7d. the three kernels compiled on the phone against the host's fixtures, texture fields included
+    {
+        auto cbuf = newBuffer(gpu, 64, &why);
+        if (cbuf == nullptr) {
+            report(false, "a constant buffer for the texture kernels: " + why);
+        } else {
+            // one dispatch with textures bound, committed and waited for; a dispatch the driver refuses is not committed
+            // and its line carries the reason (status() prints the command buffer's error)
+            auto runTex = [&](const Kernel& k, const uint32_t groups[3], const uint32_t local[3], const Bindings& b) {
+                auto cb = queue->commandBuffer();
+                if (cb->dispatch(k, groups, local, b, nullptr, chosen)) {
+                    cb->commit();
+                    cb->waitUntilCompleted();
+                }
+                return cb;
+            };
+            auto completed = [](const CommandBuffer& cb) { return cb.status() == CommandBuffer::kCompleted; };
+            const uint32_t local88[3] = {8, 8, 1}, local84[3] = {8, 4, 1};
+            const uint32_t c1 = 0x5678, c2 = 0x6789;
+
+            // 7a. tex_fill (kernel K, the fixture or one compiled here) over a W x H texture of FORMAT, GROUPS of LOCAL
+            // threads: lane 0 of every covered pixel holds (y * grid.x + x) * K + c -- the kernel's own definition,
+            // tools/kernels/tex_fill.ll, grid.x = groupsX * local.x -- and lanes 1-3 x, y, 0xdead where the format has
+            // them; every uncovered pixel and every byte of padding is still the canary. The texture is returned for
+            // the Texture::read check.
+            auto texFill = [&](const Kernel& k, PixelFormat format, const char* formatName, uint32_t W, uint32_t H, const uint32_t local[3],
+                               uint32_t groupsX, uint32_t groupsY, uint32_t c, const std::string& label) -> std::shared_ptr<Texture> {
+                TextureDesc d;
+                d.format = format;
+                d.width = W;
+                d.height = H;
+                d.usage = kTextureUsageWrite;
+                auto t = Texture::make(gpu, d, &why);
+                if (t == nullptr) {
+                    report(false, label + ": a " + std::to_string(W) + "x" + std::to_string(H) + " " + formatName + " texture: " + why);
+                    return nullptr;
+                }
+                const uint32_t gridW = groupsX * local[0], gridH = groupsY * local[1];
+                auto value = [=](uint32_t x, uint32_t y, uint32_t lane) -> uint32_t {
+                    return lane == 0 ? expectedWord(y * gridW + x, c) : lane == 1 ? x : lane == 2 ? y : 0xdeadu;
+                };
+                const uint32_t lanes = t->info().bytesPerPixel / 4;
+                const uint32_t canary = texCanary([&](uint32_t v) {
+                    for (uint32_t y = 0; y < H; y++)
+                        for (uint32_t x = 0; x < W; x++)
+                            for (uint32_t l = 0; l < lanes; l++)
+                                if (value(x, y, l) == v) return true;
+                    return false;
+                });
+                fillBo(*t, canary);
+                static_cast<uint32_t*>(cbuf->contents())[0] = c;
+                Bindings b;
+                b.buffers = {Binding{cbuf.get(), 0}};   // [[buffer(0)]]: c, a pushed constant
+                b.textures = {t.get()};                 // [[texture(0)]]: out, the image at IBO slot 0
+                const uint32_t groups[3] = {groupsX, groupsY, 1};
+                auto cb = runTex(k, groups, local, b);
+                PixelRule rule{[=](uint32_t x, uint32_t y) { return x < gridW && y < gridH; }, value};
+                TexReadback r = compareTexture(*t, rule, canary);
+                report(completed(*cb) && r.right == r.covered && r.covered > 0 && r.uncoveredCanary == r.uncovered,
+                       label + ": " + describeTexture(r, "as computed") + status(*cb, gpu));
+                reportPadding(label, r);
+                return t;
+            };
+            auto fill64 = texFill(pick(kernels::tex_fill_air, kernels::a730_tex_fill_air), PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c1,
+                                  "tex_fill R32Uint 64x32, (8,4,1) groups of (8,8,1), c = 0x5678");
+            // the controls: half the grid along x (grid.x = 32, so other words too) leaves the right half canary; another c
+            // moves every word; then a geometry with padding: 48 pixels of 4 bytes are 192-byte rows at a pitch of 256
+            // (texture.hpp: align(width * cpp, 64 * cpp)), 20 rows in a Bo of 32 (align(align(20, 4) * 256, 4096) = 8192)
+            texFill(pick(kernels::tex_fill_air, kernels::a730_tex_fill_air), PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 4, 4, c1,
+                    "control, tex_fill R32Uint 64x32 over the left half, (4,4,1) groups");
+            texFill(pick(kernels::tex_fill_air, kernels::a730_tex_fill_air), PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2, "control, tex_fill R32Uint 64x32, c = 0x6789");
+            auto fill48 = texFill(pick(kernels::tex_fill_air, kernels::a730_tex_fill_air), PixelFormat::kR32Uint, "R32Uint", 48, 20, local84, 6, 5, c1,
+                                  "tex_fill R32Uint 48x20, (6,5,1) groups of (8,4,1), 192-byte rows at a pitch of 256");
+            // the same through a four-lane format: every lane of the stib lands, (word, x, y, 0xdead)
+            texFill(pick(kernels::tex_fill_air, kernels::a730_tex_fill_air), PixelFormat::kRGBA32Uint, "RGBA32Uint", 64, 32, local88, 8, 4, c1,
+                    "tex_fill RGBA32Uint 64x32, (8,4,1) groups of (8,8,1), all four lanes");
+            texFill(pick(kernels::tex_fill_air, kernels::a730_tex_fill_air), PixelFormat::kRGBA32Uint, "RGBA32Uint", 48, 20, local84, 6, 5, c1,
+                    "tex_fill RGBA32Uint 48x20, (6,5,1) groups of (8,4,1), 768-byte rows at a pitch of 1024");
+            // Texture::read (the converter, on the phone): the GPU's rows into a tightly strided host buffer must be the
+            // rows read directly, for the whole texture and for a region inside it; a region past the edge is refused
+            auto readCheck = [&](const Texture& t, const std::string& label) {
+                const uint32_t cpp = t.info().bytesPerPixel, W = t.width(), H = t.height();
+                std::vector<uint8_t> direct = textureBo(t);
+                auto compare = [&](uint32_t x0, uint32_t y0, uint32_t w, uint32_t h) {
+                    std::vector<uint8_t> host(size_t(w) * h * cpp, 0xee);
+                    std::string whyRead;
+                    bool ok = t.read(x0, y0, w, h, host.data(), uint64_t(w) * cpp, &whyRead);
+                    uint32_t same = 0, firstX = 0, firstY = 0;
+                    bool haveFirst = false;
+                    for (uint32_t y = 0; y < h; y++) {
+                        for (uint32_t x = 0; x < w; x++) {
+                            bool eq = memcmp(host.data() + (size_t(y) * w + x) * cpp, direct.data() + (y0 + y) * t.bytesPerRow() + uint64_t(x0 + x) * cpp, cpp) == 0;
+                            if (eq) {
+                                same++;
+                            } else if (!haveFirst) {
+                                haveFirst = true;
+                                firstX = x0 + x;
+                                firstY = y0 + y;
+                            }
+                        }
+                    }
+                    report(ok && same == w * h,
+                           label + ": Texture::read of " + std::to_string(w) + "x" + std::to_string(h) + " at " + std::to_string(x0) + "," + std::to_string(y0) +
+                               " with a stride of " + std::to_string(uint64_t(w) * cpp) + ": " + std::to_string(same) + " of " + std::to_string(w * h) +
+                               " pixels as the GPU rows" + (ok ? "" : " (refused: " + whyRead + ")") +
+                               (same == w * h ? "" : " (first difference at " + std::to_string(firstX) + "," + std::to_string(firstY) + ")"));
+                };
+                compare(0, 0, W, H);
+                compare(5, 3, W - 9, H - 5);
+                std::vector<uint8_t> host(size_t(W) * cpp);
+                std::string whyRead;
+                bool accepted = t.read(W - 1, 0, 2, 1, host.data(), uint64_t(W) * cpp, &whyRead);
+                report(!accepted && !whyRead.empty(), label + ": control, Texture::read of 2 pixels starting at the last column: " +
+                                                          (accepted ? "ACCEPTED a region past the width" : "refused: " + whyRead));
+            };
+            if (fill64) readCheck(*fill64, "tex_fill R32Uint 64x32");
+            if (fill48) readCheck(*fill48, "tex_fill R32Uint 48x20");
+
+            // 7a'. tex_fill_h: a HALF image (texture2d<half, write> over RGBA16Float) written with values exact in half --
+            // (x/64, y/32, 0.5, 1.0) -- so a right pixel is four IEEE half bit patterns and nothing else. Until 29 October
+            // the front end typed every texture write by the call's return type, void, and so as uint: ir3 then emitted
+            // stib.b.typed.2d.u16.4 for a half value, and the driver, judging the kernel by that transport type, refused
+            // RGBA16Float for a texture2d<half> (what the plug-in's MetalFaceMask_Clear line hit, logs/011200-run.log).
+            // With the store typed by its value (f16) the halves land: 2048 of 2048 on 29 October (logs/012127-run.log).
+            // A typed store converts its source as its type says, so a u16 store of half bits would land half(float(bits))
+            // -- 1.0h = 0x3c00 read as 15360 -> 0x7380; the second count is of pixels matching that rule, and must be 0.
+            {
+                auto halfBits = [](float f) -> uint32_t {   // IEEE binary16 of a float, round to nearest even
+                    uint32_t u = 0;
+                    memcpy(&u, &f, 4);
+                    uint32_t sign = (u >> 16) & 0x8000u, mant = u & 0x7fffffu;
+                    int exp = int((u >> 23) & 0xffu) - 127 + 15;
+                    if (exp <= 0) {
+                        if (exp < -10) return sign;
+                        mant |= 0x800000u;
+                        uint32_t shift = uint32_t(14 - exp), h = mant >> shift, rem = mant & ((1u << shift) - 1), half = 1u << (shift - 1);
+                        if (rem > half || (rem == half && (h & 1))) h++;
+                        return sign | h;
+                    }
+                    if (exp >= 31) return sign | 0x7c00u;
+                    uint32_t h = sign | (uint32_t(exp) << 10) | (mant >> 13), rem = mant & 0x1fffu;
+                    if (rem > 0x1000u || (rem == 0x1000u && (h & 1))) h++;
+                    return h;
+                };
+                auto texFillH = [&](const Kernel& k, const std::string& label) {
+                    TextureDesc d;
+                    d.format = PixelFormat::kRGBA16Float;
+                    d.width = 64;
+                    d.height = 32;
+                    d.usage = kTextureUsageWrite;
+                    auto t = Texture::make(gpu, d, &why);
+                    if (t == nullptr) {
+                        report(false, label + ": a 64x32 RGBA16Float texture: " + why);
+                        return;
+                    }
+                    auto halves = [&](uint32_t x, uint32_t y, uint32_t lane) -> uint32_t {
+                        return lane == 0 ? (halfBits(float(x) / 64.0f) | halfBits(float(y) / 32.0f) << 16) : (0x3800u | 0x3c00u << 16);
+                    };
+                    auto asIntegers = [&](uint32_t x, uint32_t y, uint32_t lane) -> uint32_t {
+                        uint32_t w = halves(x, y, lane);
+                        return halfBits(float(w & 0xffffu)) | halfBits(float(w >> 16)) << 16;
+                    };
+                    const uint32_t canary = texCanary([&](uint32_t v) {
+                        for (uint32_t y = 0; y < 32; y++)
+                            for (uint32_t x = 0; x < 64; x++)
+                                for (uint32_t l = 0; l < 2; l++)
+                                    if (halves(x, y, l) == v || asIntegers(x, y, l) == v) return true;
+                        return false;
+                    });
+                    fillBo(*t, canary);
+                    Bindings b;
+                    b.textures = {t.get()};   // [[texture(0)]]: the image at IBO slot 0; the kernel binds no buffer
+                    const uint32_t groups[3] = {8, 4, 1};
+                    auto cb = runTex(k, groups, local88, b);
+                    auto all = [](uint32_t, uint32_t) { return true; };
+                    TexReadback r = compareTexture(*t, PixelRule{all, halves}, canary);
+                    TexReadback ri = compareTexture(*t, PixelRule{all, asIntegers}, canary);
+                    report(completed(*cb) && r.right == 2048,
+                           label + ": " + describeTexture(r, "the half bit patterns") + "; " + std::to_string(ri.right) +
+                               " of 2048 are the halves of the bits read as integers" + status(*cb, gpu));
+                };
+                texFillH(pick(kernels::tex_fill_h_air, kernels::a730_tex_fill_h_air), "tex_fill_h RGBA16Float 64x32, (8,4,1) groups of (8,8,1), the store typed f16");
+            }
+
+            // 7b. tex_copy: in (texture index 1, read through the texture table by isaml t#1) filled through
+            // Texture::replace with a pattern injective over the pixels and unlike tex_fill's words, out (texture
+            // index 0, the image at IBO slot 0) canary; out must come out equal to in, pixel by pixel, in untouched
+            auto texCopy = [&](uint32_t W, uint32_t H, const uint32_t local[3], uint32_t groupsX, uint32_t groupsY, const std::string& label) {
+                TextureDesc din;
+                din.format = PixelFormat::kR32Uint;
+                din.width = W;
+                din.height = H;
+                din.usage = kTextureUsageRead;
+                TextureDesc dout = din;
+                dout.usage = kTextureUsageWrite;
+                auto in = Texture::make(gpu, din, &why);
+                auto out = in ? Texture::make(gpu, dout, &why) : nullptr;
+                if (in == nullptr || out == nullptr) {
+                    report(false, label + ": two " + std::to_string(W) + "x" + std::to_string(H) + " R32Uint textures: " + why);
+                    return;
+                }
+                // 0x01000193 is odd (a bijection on 32-bit words), the xor keeps the words apart from tex_fill's
+                auto inWord = [=](uint32_t x, uint32_t y) -> uint32_t { return ((y * W + x) * 0x01000193u) ^ 0x6a09e667u; };
+                std::vector<uint32_t> host(size_t(W) * H);
+                for (uint32_t y = 0; y < H; y++)
+                    for (uint32_t x = 0; x < W; x++) host[size_t(y) * W + x] = inWord(x, y);
+                const uint32_t canary = texCanary([&](uint32_t v) {
+                    for (uint32_t w : host)
+                        if (w == v) return true;
+                    return false;
+                });
+                fillBo(*in, canary ^ 0xffffffffu);   // in's own padding: something else, so a read of it would show
+                fillBo(*out, canary);
+                std::string whyReplace;
+                if (!in->replace(0, 0, W, H, host.data(), uint64_t(W) * 4, &whyReplace)) {
+                    report(false, label + ": Texture::replace of the input: " + whyReplace);
+                    return;
+                }
+                Bindings b;
+                b.textures = {out.get(), in.get()};   // [[texture(0)]] = out (the image), [[texture(1)]] = in (sampled)
+                const uint32_t groups[3] = {groupsX, groupsY, 1};
+                const uint32_t gridW = groupsX * local[0], gridH = groupsY * local[1];
+                auto cb = runTex(pick(kernels::tex_copy_air, kernels::a730_tex_copy_air), groups, local, b);
+                PixelRule rule{[=](uint32_t x, uint32_t y) { return x < gridW && y < gridH; }, [=](uint32_t x, uint32_t y, uint32_t) { return inWord(x, y); }};
+                TexReadback r = compareTexture(*out, rule, canary);
+                report(completed(*cb) && r.right == r.covered && r.covered > 0 && r.uncoveredCanary == r.uncovered,
+                       label + ": " + describeTexture(r, "equal to the input") + status(*cb, gpu));
+                reportPadding(label, r);
+                // the input is read only: every pixel still the pattern (its padding is not checked: nothing wrote it but us)
+                PixelRule all{[](uint32_t, uint32_t) { return true; }, [=](uint32_t x, uint32_t y, uint32_t) { return inWord(x, y); }};
+                TexReadback rin = compareTexture(*in, all, canary);
+                report(rin.right == rin.covered, label + ": the input afterwards: " + std::to_string(rin.right) + " of " + std::to_string(rin.covered) + " pixels still the pattern");
+            };
+            texCopy(64, 32, local88, 8, 4, "tex_copy R32Uint 64x32, in at texture 1 (isaml), out at texture 0 (IBO slot 0), (8,4,1) groups of (8,8,1)");
+            texCopy(64, 32, local88, 4, 4, "control, tex_copy R32Uint 64x32 over the left half, (4,4,1) groups");
+            texCopy(48, 20, local84, 6, 5, "tex_copy R32Uint 48x20, (6,5,1) groups of (8,4,1), 192-byte rows at a pitch of 256");
+            {
+                // and Texture::replace refuses a region past the edge, by name
+                TextureDesc d;
+                d.format = PixelFormat::kR32Uint;
+                d.width = 8;
+                d.height = 8;
+                auto t = Texture::make(gpu, d, &why);
+                uint32_t eight[8] = {};
+                std::string whyReplace;
+                bool accepted = t && t->replace(7, 0, 2, 1, eight, 32, &whyReplace);
+                report(t && !accepted && !whyReplace.empty(),
+                       std::string("control, Texture::replace of 2 pixels starting at the last column of 8x8: ") + (accepted ? "ACCEPTED a region past the width" : "refused: " + whyReplace));
+            }
+
+            // 7c. tex_sample_gid: an N x N RGBA8Unorm texture whose pixel (x, y) is the bytes (32x, 32y, 16(x^y)+7, 255) --
+            // every neighbour differs in every channel -- sampled by the 8x8 grid of one group at the normalized centres
+            // ((gx+0.5)/8, (gy+0.5)/8) into out[gy*8+gx], 64 float4 of a device buffer NaN-canaried with 0x7fc00001, a
+            // payload no sample of a unorm texture can produce
+            auto pixelByte = [](uint32_t x, uint32_t y, uint32_t ch) -> uint32_t { return ch == 0 ? 32 * x : ch == 1 ? 32 * y : ch == 2 ? 16 * (x ^ y) + 7 : 255; };
+            auto patternTexture = [&](uint32_t n) -> std::shared_ptr<Texture> {
+                TextureDesc d;
+                d.format = PixelFormat::kRGBA8Unorm;
+                d.width = d.height = n;
+                d.usage = kTextureUsageRead;
+                auto t = Texture::make(gpu, d, &why);
+                if (t == nullptr) {
+                    report(false, "a " + std::to_string(n) + "x" + std::to_string(n) + " RGBA8Unorm texture: " + why);
+                    return nullptr;
+                }
+                std::vector<uint8_t> host(size_t(n) * n * 4);
+                for (uint32_t y = 0; y < n; y++)
+                    for (uint32_t x = 0; x < n; x++)
+                        for (uint32_t ch = 0; ch < 4; ch++) host[(size_t(y) * n + x) * 4 + ch] = uint8_t(pixelByte(x, y, ch));
+                fillBo(*t, 0x3c3c3c3cu);
+                std::string whyReplace;
+                if (!t->replace(0, 0, n, n, host.data(), uint64_t(n) * 4, &whyReplace)) {
+                    report(false, "Texture::replace of the " + std::to_string(n) + "x" + std::to_string(n) + " pattern: " + whyReplace);
+                    return nullptr;
+                }
+                return t;
+            };
+            const uint32_t nanCanary = 0x7fc00001u;
+            auto sampleOut = newBuffer(gpu, 64 * 16, &why);
+            Sampler nearest{}, linear{};
+            SamplerDesc sd;   // Metal's defaults: nearest, clamp to edge, normalized coordinates, not mipmapped
+            bool haveNearest = makeSampler(sd, &nearest, &why);
+            if (!haveNearest) report(false, "the default sampler (nearest, clamp to edge): " + why);
+            sd.minFilter = sd.magFilter = 1;   // MTLSamplerMinMagFilterLinear
+            bool haveLinear = makeSampler(sd, &linear, &why);
+            if (!haveLinear) report(false, "the linear sampler: " + why);
+            {
+                // and the refusals of makeSampler, by name: what the dispatch would not know how to encode
+                SamplerDesc bad;
+                Sampler s{};
+                std::string whyBad;
+                bad.maxAnisotropy = 17;   // past Metal's 16 (1 to 16 are served)
+                bool accepted = makeSampler(bad, &s, &whyBad);
+                report(!accepted && !whyBad.empty(), std::string("control, makeSampler with anisotropy 17: ") + (accepted ? "ACCEPTED" : "refused: " + whyBad));
+                bad = SamplerDesc{};
+                bad.sAddress = 5;
+                bad.borderColor = 3;   // past MTLSamplerBorderColor's three (the three have their entries: probe 9mc)
+                accepted = makeSampler(bad, &s, &whyBad);
+                report(!accepted && !whyBad.empty(), std::string("control, makeSampler with border colour 3: ") + (accepted ? "ACCEPTED" : "refused: " + whyBad));
+            }
+            struct Sampled {
+                std::vector<uint32_t> bits;   // 64 x 4 lanes as written, the canary where nothing was
+                std::shared_ptr<CommandBuffer> cb;
+                float at(uint32_t i) const {
+                    float f;
+                    memcpy(&f, &bits[i], 4);
+                    return f;
+                }
+            };
+            auto sample = [&](const Texture& tex, const Sampler& s) -> Sampled {
+                auto* w = static_cast<uint32_t*>(sampleOut->contents());
+                for (uint32_t i = 0; i < 256; i++) w[i] = nanCanary;
+                Bindings b;
+                b.buffers = {Binding{sampleOut.get(), 0}};   // [[buffer(0)]]: out
+                b.textures = {&tex};                         // [[texture(0)]]
+                b.samplers = {&s};                           // [[sampler(0)]]
+                const uint32_t one[3] = {1, 1, 1};
+                Sampled r;
+                r.cb = runTex(pick(kernels::tex_sample_gid_air, kernels::a730_tex_sample_gid_air), one, local88, b);
+                r.bits.resize(256);
+                memcpy(r.bits.data(), sampleOut->contents(), 1024);
+                return r;
+            };
+            // 64 pixels of 4 lanes against EXPECTED(gx, gy, ch) within TOLERANCE; a pixel whose lanes still hold the canary
+            // bits is counted apart (it was not written), one with a NaN or beyond the tolerance is off
+            struct SampleCheck {
+                uint32_t within = 0, canary = 0, off = 0, differ = 0;
+                float maxDev = 0, maxDiff = 0;
+                uint32_t firstX = 0, firstY = 0, firstLane = 0;
+                float firstGot = 0, firstWant = 0;
+            };
+            auto checkSamples = [&](const Sampled& s, const std::function<float(uint32_t, uint32_t, uint32_t)>& expected, float tolerance,
+                                    const Sampled* against) {
+                SampleCheck c;
+                for (uint32_t gy = 0; gy < 8; gy++) {
+                    for (uint32_t gx = 0; gx < 8; gx++) {
+                        uint32_t i = (gy * 8 + gx) * 4;
+                        bool isCanary = true;
+                        for (uint32_t ch = 0; ch < 4; ch++) isCanary = isCanary && s.bits[i + ch] == nanCanary;
+                        if (isCanary) {
+                            c.canary++;
+                            continue;
+                        }
+                        float dev = 0, diff = 0;
+                        uint32_t worst = 0;
+                        for (uint32_t ch = 0; ch < 4; ch++) {
+                            float got = s.at(i + ch), d = std::fabs(got - expected(gx, gy, ch));
+                            if (std::isnan(d)) d = INFINITY;
+                            if (d > dev) {
+                                dev = d;
+                                worst = ch;
+                            }
+                            if (against) {
+                                float o = std::fabs(got - against->at(i + ch));
+                                if (std::isnan(o)) o = INFINITY;
+                                diff = std::max(diff, o);
+                            }
+                        }
+                        c.maxDev = std::max(c.maxDev, dev);
+                        c.maxDiff = std::max(c.maxDiff, diff);
+                        if (against && diff > 1.0f / 512) c.differ++;
+                        if (dev <= tolerance) {
+                            c.within++;
+                        } else {
+                            if (c.off == 0) {
+                                c.firstX = gx;
+                                c.firstY = gy;
+                                c.firstLane = worst;
+                                c.firstGot = s.at(i + worst);
+                                c.firstWant = expected(gx, gy, worst);
+                            }
+                            c.off++;
+                        }
+                    }
+                }
+                return c;
+            };
+            auto describeSamples = [](const SampleCheck& c, const char* tolerance) {
+                char text[200];
+                snprintf(text, sizeof text, "%u of 64 pixels within %s, %u still canary, %u off, max deviation %.6f", c.within, tolerance, c.canary, c.off, c.maxDev);
+                std::string s = text;
+                if (c.off) {
+                    snprintf(text, sizeof text, " (first at %u,%u lane %u: got %.6f expected %.6f)", c.firstX, c.firstY, c.firstLane, c.firstGot, c.firstWant);
+                    s += text;
+                }
+                return s;
+            };
+            auto tex8 = patternTexture(8);
+            if (sampleOut == nullptr) {
+                report(false, "a buffer of 64 float4 for the samples: " + why);
+            } else if (tex8 && haveNearest && haveLinear) {
+                // nearest at the centres: the texel itself, v/255, within half a unorm step
+                auto texel8 = [&](uint32_t gx, uint32_t gy, uint32_t ch) { return pixelByte(gx, gy, ch) / 255.0f; };
+                Sampled near8 = sample(*tex8, nearest);
+                SampleCheck c = checkSamples(near8, texel8, 1.0f / 512, nullptr);
+                report(completed(*near8.cb) && c.within == 64,
+                       "tex_sample_gid nearest over 8x8 RGBA8Unorm at the texel centres: " + describeSamples(c, "1/512 of the texel") + status(*near8.cb, gpu));
+                // linear at the centres: the weights are 1 and 0, so the same texel; how many pixels differ from nearest must be 0
+                Sampled lin8 = sample(*tex8, linear);
+                c = checkSamples(lin8, texel8, 1.0f / 512, &near8);
+                char diff[96];
+                snprintf(diff, sizeof diff, "; differs from nearest at %u of 64 pixels (max |linear - nearest| %.6f)", c.differ, c.maxDiff);
+                report(completed(*lin8.cb) && c.within == 64 && c.differ == 0,
+                       "tex_sample_gid linear over 8x8 at the texel centres: " + describeSamples(c, "1/512 of the texel") + diff + status(*lin8.cb, gpu));
+                // the control that the sampler state took effect: a 4x4 texture under the same 8x8 grid puts every sample
+                // at a quarter or three-quarter position between texels ((gx+0.5)/8 * 4 - 0.5 = gx/2 - 0.25 in texel
+                // space). Nearest reads texel (gx/2, gy/2) exactly; linear mixes the four neighbours with weights 1/4 and
+                // 3/4 (clamped to the edge), which the probe computes itself; the two must differ wherever the mix is not
+                // one texel -- the probe counts where, from the same rule, and expects that many
+                auto tex4 = patternTexture(4);
+                if (tex4) {
+                    auto texel4 = [&](uint32_t gx, uint32_t gy, uint32_t ch) {
+                        return pixelByte(uint32_t(std::floor((gx + 0.5f) / 8.0f * 4)), uint32_t(std::floor((gy + 0.5f) / 8.0f * 4)), ch) / 255.0f;
+                    };
+                    auto bilinear4 = [&](uint32_t gx, uint32_t gy, uint32_t ch) {
+                        float u = (gx + 0.5f) / 8.0f * 4 - 0.5f, v = (gy + 0.5f) / 8.0f * 4 - 0.5f;
+                        int i0 = int(std::floor(u)), j0 = int(std::floor(v));
+                        float f = u - float(i0), g = v - float(j0);
+                        auto clampi = [](int i) { return uint32_t(std::min(std::max(i, 0), 3)); };
+                        auto p = [&](int i, int j) { return pixelByte(clampi(i), clampi(j), ch) / 255.0f; };
+                        return (1 - f) * (1 - g) * p(i0, j0) + f * (1 - g) * p(i0 + 1, j0) + (1 - f) * g * p(i0, j0 + 1) + f * g * p(i0 + 1, j0 + 1);
+                    };
+                    uint32_t expectDiffer = 0;
+                    for (uint32_t gy = 0; gy < 8; gy++)
+                        for (uint32_t gx = 0; gx < 8; gx++) {
+                            bool differs = false;
+                            for (uint32_t ch = 0; ch < 4; ch++) differs = differs || std::fabs(bilinear4(gx, gy, ch) - texel4(gx, gy, ch)) > 1.0f / 512;
+                            expectDiffer += differs;
+                        }
+                    Sampled near4 = sample(*tex4, nearest);
+                    c = checkSamples(near4, texel4, 1.0f / 512, nullptr);
+                    report(completed(*near4.cb) && c.within == 64,
+                           "control, tex_sample_gid nearest over 4x4 sampled by the 8x8 grid: " + describeSamples(c, "1/512 of texel (gx/2, gy/2)") + status(*near4.cb, gpu));
+                    Sampled lin4 = sample(*tex4, linear);
+                    c = checkSamples(lin4, bilinear4, 1.0f / 255 + 1.0f / 512, &near4);
+                    snprintf(diff, sizeof diff, "; differs from nearest at %u of 64 pixels, expected %u (max |linear - nearest| %.6f)", c.differ, expectDiffer, c.maxDiff);
+                    report(completed(*lin4.cb) && c.within == 64 && c.differ == expectDiffer,
+                           "control, tex_sample_gid linear over 4x4 sampled by the 8x8 grid (quarter positions): " +
+                               describeSamples(c, "1/255 + 1/512 of the bilinear expectation") + diff + status(*lin4.cb, gpu));
+                }
+            }
+
+            // 7e. stores into a 2D array and a 3D texture (stib.3d, the layer as z; the storage view's ARRAY_PITCH places
+            // it): every texel of the layers the grid covers holds its own (x, y, layer, 0xdead); the last layer, which the
+            // grid leaves out, and the bytes between one layer's rows and the next layer are still canary. A store that
+            // ignored z would leave layers 1.. canary and write layer 0 last-wins; a wrong pitch would put texels in the gap
+            for (const bool is3d : {false, true}) {
+                // 6 rows: at 16 bytes a pixel a row is 1024 bytes (64 << log2(cpp)), so 6 of them leave 2 KiB of the 8 KiB
+                // slice past the last row -- with 8 the slice is exactly full, and a wrong pitch would have nowhere to show
+                const uint32_t W = 16, H = 6, D = is3d ? 3 : 4;
+                TextureDesc d;
+                d.type = is3d ? TextureType::k3D : TextureType::k2DArray;
+                d.format = PixelFormat::kRGBA32Uint;
+                d.width = W;
+                d.height = H;
+                d.depth = D;
+                d.usage = kTextureUsageWrite;
+                const std::string label = std::string(is3d ? "tex_fill_3d RGBA32Uint 16x6x3" : "tex_fill_arr RGBA32Uint 16x6, 4 layers") + ", the grid over all but the last";
+                auto t = Texture::make(gpu, d, &why);
+                if (t == nullptr) {
+                    report(false, label + ": the texture: " + why);
+                    continue;
+                }
+                const uint32_t canary = 0x5a5a5a5au;   // above every x, y, layer and not 0xdead
+                uint32_t* w = static_cast<uint32_t*>(t->contents());
+                const uint64_t words = t->buffer()->length() / 4;
+                for (uint64_t i = 0; i < words; i++) w[i] = canary;
+                const uint32_t groups[3] = {W / 8, H / 2, D - 1}, local82[3] = {8, 2, 1};
+                auto cb = runTex(is3d ? pick(kernels::tex_fill_3d_air, kernels::a730_tex_fill_3d_air) : pick(kernels::tex_fill_arr_air, kernels::a730_tex_fill_arr_air), groups, local82, Bindings{{}, {t.get()}});
+                uint32_t right = 0, covered = 0, leftCanary = 0, left = 0, gapCanary = 0, gap = 0;
+                const uint64_t slice = t->sliceBytes(), row = t->bytesPerRow();
+                for (uint32_t z = 0; z < D; z++) {
+                    const uint8_t* base = static_cast<const uint8_t*>(t->contents()) + z * slice;
+                    for (uint32_t y = 0; y < H; y++)
+                        for (uint32_t x = 0; x < W; x++) {
+                            uint32_t v[4];
+                            memcpy(v, base + y * row + x * 16, 16);
+                            if (z + 1 < D) {
+                                covered++;
+                                right += v[0] == x && v[1] == y && v[2] == z && v[3] == 0xdeadu;
+                            } else {
+                                left++;
+                                leftCanary += v[0] == canary && v[1] == canary && v[2] == canary && v[3] == canary;
+                            }
+                        }
+                    // every word of the slice no texel names: each row's padding past its 16 pixels, and the rows past H
+                    for (uint64_t b = 0; b + 4 <= slice; b += 4) {
+                        if (b / row < H && b % row < uint64_t(W) * 16) continue;
+                        gap++;
+                        uint32_t v;
+                        memcpy(&v, base + b, 4);
+                        gapCanary += v == canary;
+                    }
+                }
+                report(completed(*cb) && right == covered && leftCanary == left && gapCanary == gap && gap > 0,
+                       label + ": " + std::to_string(right) + " of " + std::to_string(covered) + " texels their own (x, y, layer), " +
+                           std::to_string(leftCanary) + " of " + std::to_string(left) + " of the last layer canary, " + std::to_string(gapCanary) + " of " +
+                           std::to_string(gap) + " words of padding and between layers canary" + status(*cb, gpu));
+            }
+
+            // 7f. a kernel's store through a view (Texture::view): tex_fill over level 1 of a two-level texture, then over
+            // slice 2 of a four-layer array, each viewed as 2D. The parent read back: the viewed level or layer holds
+            // tex_fill's words, every other one is still canary -- a view at the parent's base would fill level 0 or
+            // layer 0 instead, and a view at the wrong pitch would leave the rule broken across rows
+            for (const bool bySlice : {false, true}) {
+                TextureDesc pd;
+                pd.format = PixelFormat::kR32Uint;
+                pd.width = bySlice ? 32 : 64;
+                pd.height = bySlice ? 16 : 32;
+                pd.usage = kTextureUsageRead | kTextureUsageWrite;
+                if (bySlice) {
+                    pd.type = TextureType::k2DArray;
+                    pd.depth = 4;
+                } else {
+                    pd.mipLevels = 2;
+                }
+                const std::string label = bySlice ? "tex_fill through a view of slice 2 of a 4-layer R32Uint 32x16 array" : "tex_fill through a view of level 1 of a 2-level R32Uint 64x32 texture";
+                auto parent = Texture::make(gpu, pd, &why);
+                auto v = parent == nullptr ? nullptr : Texture::view(parent, PixelFormat::kR32Uint, TextureType::k2D, bySlice ? 0 : 1, 1, bySlice ? 2 : 0, 1, &why);
+                if (v == nullptr) {
+                    report(false, label + ": " + why);
+                    continue;
+                }
+                const uint32_t canary = 0xc0ffee00u;
+                uint32_t* w = static_cast<uint32_t*>(parent->contents());
+                for (uint64_t i = 0; i < parent->buffer()->length() / 4; i++) w[i] = canary;
+                static_cast<uint32_t*>(cbuf->contents())[0] = c2;
+                const uint32_t groups[3] = {4, 2, 1};   // the view's 32 x 16, (8,8,1) a group
+                Bindings b;
+                b.buffers = {Binding{cbuf.get(), 0}};
+                b.textures = {v.get()};
+                auto cb = runTex(pick(kernels::tex_fill_air, kernels::a730_tex_fill_air), groups, local88, b);
+                // the parent's views of its parts, as the probe reads them: a level, or a layer at sliceBytes
+                const uint32_t parts = bySlice ? 4 : 2, target = bySlice ? 2 : 1;
+                uint32_t right = 0, covered = 0, untouched = 0, others = 0;
+                for (uint32_t part = 0; part < parts; part++) {
+                    const TextureLevel L = bySlice ? TextureLevel{part * parent->sliceBytes(), parent->bytesPerRow(), 32, 16} : parent->level(part);
+                    const uint8_t* base = static_cast<const uint8_t*>(parent->contents()) + L.offset;
+                    for (uint32_t y = 0; y < L.height; y++)
+                        for (uint32_t x = 0; x < L.width; x++) {
+                            uint32_t word;
+                            memcpy(&word, base + y * L.pitch + x * 4, 4);
+                            if (part == target) {
+                                covered++;
+                                right += word == expectedWord(y * 32 + x, c2);
+                            } else {
+                                others++;
+                                untouched += word == canary;
+                            }
+                        }
+                }
+                report(completed(*cb) && right == covered && untouched == others && covered == 512,
+                       label + ": " + std::to_string(right) + " of " + std::to_string(covered) + " texels of the viewed part as computed, " +
+                           std::to_string(untouched) + " of " + std::to_string(others) + " of the other parts canary" + status(*cb, gpu));
+            }
+
+            // 7g. the integer formats read as uint: each channel of IN (C of them, B bits each) its own value from the
+            // CPU, tex_copy (isaml t#1) to an RGBA32Uint image, every lane compared -- the channels IN has as written,
+            // the ones it has not 0 and alpha 1 (Metal's rule for a read of a format without them). A width or an order
+            // the descriptor gets wrong moves every value
+            {
+                struct F {
+                    PixelFormat f;
+                    const char* name;
+                    uint32_t channels, bits;
+                };
+                const F formats[] = {{PixelFormat::kR8Uint, "R8Uint", 1, 8},     {PixelFormat::kRG8Uint, "RG8Uint", 2, 8},
+                                     {PixelFormat::kRGBA8Uint, "RGBA8Uint", 4, 8}, {PixelFormat::kRG16Uint, "RG16Uint", 2, 16},
+                                     {PixelFormat::kRGBA16Uint, "RGBA16Uint", 4, 16}, {PixelFormat::kRG32Uint, "RG32Uint", 2, 32}};
+                for (const F& f : formats) {
+                    const uint32_t W = 16, H = 8;
+                    TextureDesc din;
+                    din.format = f.f;
+                    din.width = W;
+                    din.height = H;
+                    din.usage = kTextureUsageRead;
+                    TextureDesc dout = din;
+                    dout.format = PixelFormat::kRGBA32Uint;
+                    dout.usage = kTextureUsageWrite;
+                    auto in = Texture::make(gpu, din, &why);
+                    auto out = in ? Texture::make(gpu, dout, &why) : nullptr;
+                    const std::string label = std::string("tex_copy of ") + f.name + " 16x8 into RGBA32Uint, every lane";
+                    if (in == nullptr || out == nullptr) {
+                        report(false, label + ": " + why);
+                        continue;
+                    }
+                    const uint64_t mask = f.bits == 32 ? 0xffffffffull : (1ull << f.bits) - 1;
+                    auto chan = [&](uint32_t x, uint32_t y, uint32_t c) { return uint32_t((x * 7u + y * 13u + c * 61u + 5u + (f.bits == 32 ? 0x10000u * c : 0u)) & mask); };
+                    std::vector<uint8_t> host(size_t(W) * H * f.channels * f.bits / 8);
+                    for (uint32_t y = 0; y < H; y++)
+                        for (uint32_t x = 0; x < W; x++)
+                            for (uint32_t c = 0; c < f.channels; c++) {
+                                const uint32_t v = chan(x, y, c);
+                                memcpy(host.data() + ((size_t(y) * W + x) * f.channels + c) * (f.bits / 8), &v, f.bits / 8);
+                            }
+                    fillBo(*out, 0xa5a5a5a5u);
+                    if (!in->replace(0, 0, W, H, host.data(), uint64_t(W) * f.channels * f.bits / 8, &why)) {
+                        report(false, label + ": Texture::replace: " + why);
+                        continue;
+                    }
+                    Bindings b;
+                    b.textures = {out.get(), in.get()};
+                    const uint32_t groups[3] = {2, 1, 1};
+                    auto cb = runTex(pick(kernels::tex_copy_air, kernels::a730_tex_copy_air), groups, local88, b);
+                    uint32_t right = 0;
+                    for (uint32_t y = 0; y < H; y++)
+                        for (uint32_t x = 0; x < W; x++) {
+                            uint32_t v[4];
+                            memcpy(v, static_cast<const uint8_t*>(out->contents()) + y * out->bytesPerRow() + x * 16, 16);
+                            bool ok = true;
+                            for (uint32_t l = 0; l < 4; l++) ok = ok && v[l] == (l < f.channels ? chan(x, y, l) : l == 3 ? 1u : 0u);
+                            right += ok;
+                        }
+                    report(completed(*cb) && right == W * H, label + ": " + std::to_string(right) + " of 128 pixels each lane as written (absent ones 0, alpha 1)" + status(*cb, gpu));
+                }
+            }
+
+            // 9mc. address modes and border colours: tex_sample_wide samples a 5x3 RGBA8 texture (no power of two in either
+            // size) nearest at coordinates spread over [-1, 2], a 30x18 grid, so each sample is a quarter or three quarters
+            // into a texel and two thirds of them outside it. Every sample has to be the texel (or the border colour) the
+            // mode's own rule names; and each mode is told apart from the rule nearest it -- mirror-clamp from clamp-to-edge
+            // and from mirrored repeat, each border colour from the others -- by the samples where those rules disagree
+            {
+                const uint32_t TW = 5, TH = 3, GW = 30, GH = 18;
+                TextureDesc td;
+                td.format = PixelFormat::kRGBA8Unorm;
+                td.width = TW;
+                td.height = TH;
+                td.usage = kTextureUsageRead;
+                auto tex = Texture::make(gpu, td, &why);
+                auto out = tex ? newBuffer(gpu, uint64_t(GW) * GH * 16, &why) : nullptr;
+                if (out == nullptr) {
+                    report(false, "address modes: the texture or buffer: " + why);
+                } else {
+                    uint8_t texels[TW * TH * 4];
+                    for (uint32_t j = 0; j < TH; j++)
+                        for (uint32_t i = 0; i < TW; i++) {
+                            uint8_t* t = texels + (j * TW + i) * 4;
+                            t[0] = uint8_t(40 * i + 20);
+                            t[1] = uint8_t(70 * j + 30);
+                            t[2] = uint8_t(10 * (i + j) + 100);
+                            t[3] = uint8_t(200 + i);
+                        }
+                    tex->replace(0, 0, TW, TH, texels, TW * 4, &why);
+                    // the rules, on the texel index i = floor(u * size); -1 for the border
+                    auto rule = [](int mode, int i, int size) -> int {
+                        switch (mode) {
+                        case 0: return i < 0 ? 0 : i >= size ? size - 1 : i;
+                        case 1: { int m = i < 0 ? -i - 1 : i; return m >= size ? size - 1 : m; }
+                        case 2: return ((i % size) + size) % size;
+                        case 3: { int m = ((i % (2 * size)) + 2 * size) % (2 * size); return m < size ? m : 2 * size - 1 - m; }
+                        default: return i < 0 || i >= size ? -1 : i;
+                        }
+                    };
+                    struct Case { uint32_t mode, colour; int ruleMode; int against; const char* name; };
+                    const Case cases[] = {{0, 0, 0, 1, "ClampToEdge"}, {1, 0, 1, 0, "MirrorClampToEdge"}, {2, 0, 2, 3, "Repeat"},
+                                          {3, 0, 3, 1, "MirrorRepeat"}, {4, 0, 4, 0, "ClampToZero"}, {5, 1, 4, 0, "ClampToBorderColor OpaqueBlack"},
+                                          {5, 2, 4, 0, "ClampToBorderColor OpaqueWhite"}};
+                    const float borders[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1}};
+                    for (const Case& c : cases) {
+                        SamplerDesc sd;
+                        sd.sAddress = sd.tAddress = c.mode;
+                        sd.borderColor = c.colour;
+                        Sampler smp;
+                        if (!makeSampler(sd, &smp, &why)) {
+                            report(false, std::string("address mode ") + c.name + ": " + why);
+                            continue;
+                        }
+                        for (uint32_t w = 0; w < GW * GH * 4; w++) static_cast<uint32_t*>(out->contents())[w] = 0x7fc00001u;   // a NaN no sample gives
+                        Bindings b;
+                        b.textures = {tex.get()};
+                        b.samplers = {&smp};
+                        b.buffers = {Binding{out.get(), 0}};
+                        const uint32_t groups[3] = {GW / 6, GH / 6, 1}, local[3] = {6, 6, 1};
+                        auto cb = runTex(pick(kernels::tex_sample_wide_air, kernels::a730_tex_sample_wide_air), groups, local, b);
+                        const float* got = static_cast<const float*>(out->contents());
+                        uint32_t right = 0, apart = 0;
+                        for (uint32_t gy = 0; gy < GH; gy++)
+                            for (uint32_t gx = 0; gx < GW; gx++) {
+                                const int ix = int(std::floor(((gx + 0.5) / GW * 3 - 1) * TW)), iy = int(std::floor(((gy + 0.5) / GH * 3 - 1) * TH));
+                                auto expect = [&](int mode, float v[4]) {
+                                    const int x = rule(mode, ix, TW), y = rule(mode, iy, TH);
+                                    if (x < 0 || y < 0) {
+                                        for (int k = 0; k < 4; k++) v[k] = borders[c.colour][k];
+                                    } else {
+                                        for (int k = 0; k < 4; k++) v[k] = texels[(y * TW + x) * 4 + k] / 255.0f;
+                                    }
+                                };
+                                float want[4], other[4];
+                                expect(c.ruleMode, want);
+                                expect(c.against, other);
+                                if (c.mode == 5 || c.mode == 4) {
+                                    // the other border colours are the twin: the same rule with another colour
+                                    for (int k = 0; k < 4; k++) other[k] = (rule(4, ix, TW) < 0 || rule(4, iy, TH) < 0) ? borders[(c.colour + 1) % 3][k] : want[k];
+                                }
+                                const float* g = got + (gy * GW + gx) * 4;
+                                bool ok = true, differs = false;
+                                for (int k = 0; k < 4; k++) {
+                                    ok = ok && std::fabs(g[k] - want[k]) < 0.5f / 255;
+                                    differs = differs || std::fabs(other[k] - want[k]) >= 0.5f / 255;
+                                }
+                                right += ok;
+                                apart += ok && differs;
+                            }
+                        report(completed(*cb) && right == GW * GH && apart >= 40,
+                               std::string("address mode ") + c.name + " over a 5x3 texture sampled on [-1, 2]: " + std::to_string(right) + " of " +
+                                   std::to_string(GW * GH) + " samples its own rule, " + std::to_string(apart) + " of them where the nearest other rule differs" +
+                                   status(*cb, gpu));
+                    }
+                }
+            }
+
+            // 7d. the four kernels compiled on the phone: the same words, layout and texture fields as the host's
+            // fixtures (the core's walk of the NIR against the fixture writer's), and tex_fill dispatched from the
+            // phone's own compile
+            if (chip != kChipA635.id) {
+                std::printf("probe: (7d, compiling the texture kernels on the phone, is A635 only for now)\n");
+            } else if (!hasCompiler()) {
+                std::printf("probe: (no compiler in this build: the texture kernels were not compiled on the phone)\n");
+            } else {
+                struct Pair {
+                    const uint8_t* bc;
+                    size_t size;
+                    const Kernel* fixture;
+                    const char* name;
+                };
+                // tex_fill_h last: its store is typed f16 only by the front end as fixed on 29 October, so this line is also
+                // the proof that the phone's compiler carries that front end (and not the one that typed every write as uint)
+                const Pair pairs[] = {{kernels::tex_fill_bc, kernels::tex_fill_bc_size, &kernels::tex_fill_air, "tex_fill.ll"},
+                                      {kernels::tex_copy_bc, kernels::tex_copy_bc_size, &kernels::tex_copy_air, "tex_copy.ll"},
+                                      {kernels::tex_sample_gid_bc, kernels::tex_sample_gid_bc_size, &kernels::tex_sample_gid_air, "tex_sample_gid.ll"},
+                                      {kernels::tex_fill_h_bc, kernels::tex_fill_h_bc_size, &kernels::tex_fill_h_air, "tex_fill_h.ll"}};
+                for (const Pair& p : pairs) {
+                    std::string whyCompile;
+                    auto compiled = compileAir(p.bc, p.size, &whyCompile);
+                    if (compiled == nullptr) {
+                        report(false, std::string("compile ") + p.name + " on the phone: " + whyCompile);
+                        continue;
+                    }
+                    bool same = false;
+                    std::string text = compareCompiled(compiled->kernel, *p.fixture, &same);
+                    report(same, std::string("compile ") + p.name + " on the phone: " + text);
+                    if (same && p.fixture == &kernels::tex_fill_air) {
+                        texFill(compiled->kernel, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2,
+                                "dispatch of tex_fill compiled on the phone, R32Uint 64x32, c = 0x6789");
+                    }
+                }
+            }
+        }
+    }
+}
+
+// 10, on its own: the --metallib kernels, each compiled for the chip the probe runs on. The A730 has no broad suite
+// yet, so it runs only this when --metallib is given.
+static void metallibSuite(Gpu& gpu, CommandQueue* queue, uint64_t chip, const compute::Options& chosen,
+                          const std::vector<std::pair<std::string, std::string>>& metallibs) {
+    std::string why;
+    // 10. (--metallib FILE FUNCTION) a kernel of the image's own: read off the phone's filesystem, compiled here, and run
+    // over the buffers, textures and samplers its metadata names, each buffer and texture prefilled with a canary. What
+    // is known afterwards: whether the front end and ir3 took it, whether the GPU finished it, and which buffers and
+    // textures it wrote and how much. What is NOT known: whether the values are right -- there is no reference here
+    // (hakios's kernelref.py has no texture path); that is the next instrument, not this one.
+    for (const auto& [path, function] : metallibs) {
+        std::string what = function + " of " + path;
+        if (!hasCompiler(uint32_t(chip))) {
+            report(false, what + ": no compiler in this build (MESA=1)");
+            continue;
+        }
+        std::vector<uint8_t> file;
+        {
+            FILE* f = fopen(path.c_str(), "rb");
+            if (f == nullptr) {
+                report(false, what + ": cannot open the file");
+                continue;
+            }
+            uint8_t chunk[65536];
+            size_t n;
+            while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) file.insert(file.end(), chunk, chunk + n);
+            fclose(f);
+        }
+        MetalLibrary lib;
+        if (!lib.parse(file.data(), file.size())) {
+            report(false, what + ": " + lib.why());
+            continue;
+        }
+        const MetalFunction* fn = lib.find(function);
+        const uint8_t* bitcode = nullptr;
+        uint64_t length = 0;
+        if (fn == nullptr || !lib.bitcode(*fn, &bitcode, &length)) {
+            report(false, what + ": no such function in its " + std::to_string(lib.functions().size()));
+            continue;
+        }
+        std::string why3;
+        auto k = compileAir(bitcode, size_t(length), &why3, {}, uint32_t(chip));
+        if (k == nullptr) {
+            report(false, "compile " + what + ": " + why3);
+            continue;
+        }
+        uint32_t deviceBuffers = 0, constantBuffers = 0, textures = 0, images = 0, samplers = 0, threadgroupBuffers = 0;
+        uint32_t highest = 0, highestTexture = 0, highestSampler = 0;
+        for (const Resource& r : k->resources) {
+            if (r.kind == Resource::kDeviceBuffer) deviceBuffers++;
+            else if (r.kind == Resource::kConstantBuffer) constantBuffers++;
+            else if (r.kind == Resource::kTexture) textures++;
+            else if (r.kind == Resource::kImage) images++;
+            else if (r.kind == Resource::kSampler) samplers++;
+            else threadgroupBuffers++;
+            if (r.kind == Resource::kDeviceBuffer || r.kind == Resource::kConstantBuffer) highest = std::max(highest, r.index);
+            if (r.kind == Resource::kTexture || r.kind == Resource::kImage) highestTexture = std::max(highestTexture, r.index);
+            if (r.kind == Resource::kSampler) highestSampler = std::max(highestSampler, r.index);
+        }
+        report(true, "compile " + what + ": " + std::to_string(k->kernel.numWords) + " words, instrlen " + std::to_string(k->kernel.instrlen) +
+                         ", constlen " + std::to_string(k->kernel.constlen) + ", " + std::to_string(deviceBuffers) + " device and " +
+                         std::to_string(constantBuffers) + " constant buffers, " + std::to_string(textures) + " textures, " + std::to_string(images) +
+                         " images, " + std::to_string(samplers) + " samplers, " + std::to_string(threadgroupBuffers) + " threadgroup buffers, " +
+                         std::to_string(k->threadgroupBytes) + " bytes of threadgroup memory" +
+                         (k->kernel.localSizeVariable ? "" : ", a fixed threadgroup"));
+        if (threadgroupBuffers != 0) {
+            report(false, what + ": binds a threadgroup buffer, which this driver does not serve yet; not dispatched");
+            continue;
+        }
+        // the buffers: a constant one as long as its metadata says (or a page), a device one of a megabyte, every slot
+        // up to the highest index bound so that the descriptor table has no hole, all of them canary
+        const uint32_t canary = 0xa5a5a5a5u;
+        std::vector<std::shared_ptr<Buffer>> owned;
+        std::vector<Binding> bindings(highest + 1);
+        bool ok = true;
+        for (uint32_t index = 0; index <= highest && ok; index++) {
+            uint64_t bytes = 4096;
+            for (const Resource& r : k->resources) {
+                if ((r.kind == Resource::kDeviceBuffer || r.kind == Resource::kConstantBuffer) && r.index == index) {
+                    bytes = r.kind == Resource::kDeviceBuffer ? (1u << 20) : std::max<uint64_t>(r.sizeBytes, 4096);
+                }
+            }
+            auto b = newBuffer(gpu, bytes, &why);
+            if (b == nullptr) {
+                report(false, what + ": a buffer of " + std::to_string(bytes) + " bytes for index " + std::to_string(index) + ": " + why);
+                ok = false;
+                break;
+            }
+            auto* w = static_cast<uint32_t*>(b->contents());
+            for (uint64_t i = 0; i < bytes / 4; i++) w[i] = canary;
+            bindings[index] = Binding{b.get(), 0};
+            owned.push_back(b);
+        }
+        if (!ok) continue;
+        // the textures: a canary-filled 64x64 one at each declared texture index, readable and writable, of the element
+        // class the kernel's own instructions address it with (Kernel::textures, the core's walk of the NIR, which is
+        // what the dispatch checks a binding against): R32Uint for uint, R32Float for float; int has no served format
+        // and a dimension other than 2D no served texture, so those are refused here by name. A default sampler at each
+        // declared sampler index.
+        std::vector<std::shared_ptr<Texture>> ownedTextures;
+        std::vector<Sampler> ownedSamplers(samplers ? highestSampler + 1 : 0);
+        Bindings all;
+        all.buffers = bindings;
+        all.textures.assign((textures + images) ? highestTexture + 1 : 0, nullptr);
+        all.samplers.assign(ownedSamplers.size(), nullptr);
+        for (const Resource& r : k->resources) {
+            if (!ok) break;
+            if (r.kind == Resource::kTexture || r.kind == Resource::kImage) {
+                std::string texture = "texture " + std::to_string(r.index) + " (" + r.typeName + ")";
+                if (r.index >= kMaxTextureSlots) {
+                    report(false, what + ": " + texture + " is past the Kernel's " + std::to_string(kMaxTextureSlots) + " slots; not dispatched");
+                    ok = false;
+                    break;
+                }
+                const KernelTexture& t = k->kernel.textures[r.index];
+                if (t.kind != kTexNone && t.dim != kTexDim2D) {
+                    report(false, what + ": " + texture + " is addressed as a " + dimName(t.dim) + " texture: only 2D is served; not dispatched");
+                    ok = false;
+                    break;
+                }
+                if (t.element == kElemInt) {
+                    report(false, what + ": " + texture + " is addressed as int: no served format carries ints; not dispatched");
+                    ok = false;
+                    break;
+                }
+                TextureDesc d;
+                d.format = t.element == kElemFloat ? PixelFormat::kR32Float : PixelFormat::kR32Uint;
+                d.width = d.height = 64;
+                d.usage = kTextureUsageRead | kTextureUsageWrite;
+                auto tex = Texture::make(gpu, d, &why);
+                if (tex == nullptr) {
+                    report(false, what + ": a 64x64 texture for index " + std::to_string(r.index) + ": " + why);
+                    ok = false;
+                    break;
+                }
+                fillBo(*tex, canary);
+                all.textures[r.index] = tex.get();
+                ownedTextures.push_back(tex);
+            } else if (r.kind == Resource::kSampler) {
+                SamplerDesc sd;
+                if (r.index >= ownedSamplers.size() || !makeSampler(sd, &ownedSamplers[r.index], &why)) {
+                    report(false, what + ": a default sampler for index " + std::to_string(r.index) + ": " + why);
+                    ok = false;
+                    break;
+                }
+                all.samplers[r.index] = &ownedSamplers[r.index];
+            }
+        }
+        if (!ok) continue;
+        const uint32_t g[3] = {1, 1, 1}, local[3] = {64, 1, 1};
+        auto cb = queue->commandBuffer();
+        if (!cb->dispatch(k->kernel, g, k->kernel.localSizeVariable ? local : nullptr, all, nullptr, chosen)) {
+            report(false, "dispatch " + what + ": " + cb->error());
+            continue;
+        }
+        cb->commit();
+        cb->waitUntilCompleted();
+        std::string written;
+        for (uint32_t index = 0; index <= highest; index++) {
+            const Buffer& b = *bindings[index].buffer;
+            std::vector<uint32_t> back(b.length() / 4);
+            memcpy(back.data(), b.contents(), b.length());
+            uint32_t changed = 0, first = 0;
+            for (uint32_t i = 0; i < back.size(); i++) {
+                if (back[i] != canary) {
+                    if (changed == 0) first = i;
+                    changed++;
+                }
+            }
+            // FNV-1a over the whole buffer, so that a host reference (tools/air/kernelref.py in hakios) running the same
+            // kernel through LLVM over the same canary-filled buffers can print the same line and the two be compared
+            uint64_t hash = fnv1a(back.data(), back.size() * 4);
+            char text[240];
+            if (changed == 0) {
+                snprintf(text, sizeof text, "; buffer %u: untouched", index);
+            } else {
+                snprintf(text, sizeof text, "; buffer %u: %u words written from %u on, fnv1a %016llx, the first 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x",
+                         index, changed, first, (unsigned long long)hash, back[first], first + 1 < back.size() ? back[first + 1] : 0,
+                         first + 2 < back.size() ? back[first + 2] : 0, first + 3 < back.size() ? back[first + 3] : 0,
+                         first + 4 < back.size() ? back[first + 4] : 0, first + 5 < back.size() ? back[first + 5] : 0,
+                         first + 6 < back.size() ? back[first + 6] : 0, first + 7 < back.size() ? back[first + 7] : 0);
+            }
+            written += text;
+        }
+        // per texture: how many of its 64x64 pixels changed, and the hash of its whole Bo -- a reading, not a comparison,
+        // until the host reference has a texture path
+        for (uint32_t index = 0; index < all.textures.size(); index++) {
+            const Texture* t = all.textures[index];
+            if (t == nullptr) continue;
+            std::vector<uint8_t> bo = textureBo(*t);
+            uint32_t changed = 0;
+            for (uint32_t y = 0; y < t->height(); y++) {
+                for (uint32_t x = 0; x < t->width(); x++) {
+                    uint32_t word;
+                    memcpy(&word, bo.data() + y * t->bytesPerRow() + uint64_t(x) * 4, 4);
+                    changed += word != canary;
+                }
+            }
+            char text[160];
+            snprintf(text, sizeof text, "; texture %u (%s 64x64, %s): %u pixels written, fnv1a %016llx", index, t->info().name,
+                     k->kernel.textures[index].kind == kTexImage ? "image" : k->kernel.textures[index].kind == kTexSampled ? "sampled" : "not addressed",
+                     changed, (unsigned long long)fnv1a(bo.data(), bo.size()));
+            written += text;
+        }
+        report(cb->status() == CommandBuffer::kCompleted,
+               "dispatch " + what + ", 1 group of 64: " + (cb->status() == CommandBuffer::kCompleted ? "completed" : "did NOT complete") + written +
+                   status(*cb, gpu));
+    }
+}
+
 static int singleCase(Gpu& gpu, uint64_t chip, const std::string& name, const compute::Options& options, bool noEarly) {
     if (name == "img_store") return imageStoreCase(gpu, chip, name, options);
+    if (name == "textures") {
+        // the suite's texture section on its own: half stores, arrays and 3D, views, sampling, the integer formats,
+        // the address modes and border colours (section 7 below, every kernel the chip's own)
+        std::string why;
+        auto queue = CommandQueue::make(gpu, &why);
+        if (!queue) {
+            report(false, "a queue: " + why);
+            return 1;
+        }
+        const uint64_t faults = gpu.faults();
+        textureSuite(gpu, queue.get(), chip, options);
+        report(gpu.faults() == faults, "textures: FAULTS " + std::to_string(gpu.faults()) + " at the end, " + std::to_string(faults) + " at the start");
+        std::printf("probe: %d failures\n", failures);
+        return failures;
+    }
     if (name != "end_only" && name != "fill_id" && name != "fill_id_air" && name != "copy" && name != "fill" &&
         name != "tex_fill" && name != "tex_copy") {
-        std::printf("probe: unknown --case %s (end_only, fill_id, copy, fill, fill_id_air, img_store, tex_fill, tex_copy)\n", name.c_str());
+        std::printf("probe: unknown --case %s (end_only, fill_id, copy, fill, fill_id_air, img_store, tex_fill, tex_copy, textures)\n", name.c_str());
         return 2;
     }
     if (noEarly && name != "fill_id_air") {
@@ -630,6 +1624,16 @@ int main(int argc, char** argv) {
                 recover ? "; the GPU will be hung on purpose at the end (--recover)" : "");
     std::fflush(stdout);
     if (!isolated.empty()) return singleCase(gpu, chip, isolated, chosen, noEarly);
+    if (chip == kChipA730.id && !metallibs.empty()) {
+        auto mq = CommandQueue::make(gpu, &why);
+        if (mq == nullptr) {
+            report(false, "a queue: " + why);
+            return 1;
+        }
+        metallibSuite(gpu, mq.get(), chip, chosen, metallibs);
+        std::printf("probe: %d failures\n", failures);
+        return failures;
+    }
     if (chip != kChipA635.id) {
         report(false, "the broad suite needs A635 fixtures; use --case for the A730 ladder");
         return 2;
@@ -1238,761 +2242,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 7. textures and samplers: one new mechanism a line, each dispatch its own command buffer, so that a hang in a later
-    // one (gpu_recover=1 resets the GPU and the wait says so) hides nothing of an earlier result. Every line is a
-    // comparison against a rule the probe computes from the kernel's own text: there is no host reference for texture
-    // kernels yet (kernelref.py refuses them, air_run runs only its own pattern).
-    //   7a. tex_fill: a write-only image at IBO slot 0 (stib.b.typed.2d) -- the first 2D storage descriptor this driver binds
-    //   7b. tex_copy: a texture read through the texture table (isaml t#1) beside the image write at IBO slot 0
-    //   7c. tex_sample_gid: a sampler of Metal's (saml s#0) over an RGBA8Unorm texture, nearest and linear
-    //   7d. the three kernels compiled on the phone against the host's fixtures, texture fields included
-    {
-        auto cbuf = newBuffer(gpu, 64, &why);
-        if (cbuf == nullptr) {
-            report(false, "a constant buffer for the texture kernels: " + why);
-        } else {
-            // one dispatch with textures bound, committed and waited for; a dispatch the driver refuses is not committed
-            // and its line carries the reason (status() prints the command buffer's error)
-            auto runTex = [&](const Kernel& k, const uint32_t groups[3], const uint32_t local[3], const Bindings& b) {
-                auto cb = queue->commandBuffer();
-                if (cb->dispatch(k, groups, local, b, nullptr, chosen)) {
-                    cb->commit();
-                    cb->waitUntilCompleted();
-                }
-                return cb;
-            };
-            auto completed = [](const CommandBuffer& cb) { return cb.status() == CommandBuffer::kCompleted; };
-            const uint32_t local88[3] = {8, 8, 1}, local84[3] = {8, 4, 1};
-            const uint32_t c1 = 0x5678, c2 = 0x6789;
-
-            // 7a. tex_fill (kernel K, the fixture or one compiled here) over a W x H texture of FORMAT, GROUPS of LOCAL
-            // threads: lane 0 of every covered pixel holds (y * grid.x + x) * K + c -- the kernel's own definition,
-            // tools/kernels/tex_fill.ll, grid.x = groupsX * local.x -- and lanes 1-3 x, y, 0xdead where the format has
-            // them; every uncovered pixel and every byte of padding is still the canary. The texture is returned for
-            // the Texture::read check.
-            auto texFill = [&](const Kernel& k, PixelFormat format, const char* formatName, uint32_t W, uint32_t H, const uint32_t local[3],
-                               uint32_t groupsX, uint32_t groupsY, uint32_t c, const std::string& label) -> std::shared_ptr<Texture> {
-                TextureDesc d;
-                d.format = format;
-                d.width = W;
-                d.height = H;
-                d.usage = kTextureUsageWrite;
-                auto t = Texture::make(gpu, d, &why);
-                if (t == nullptr) {
-                    report(false, label + ": a " + std::to_string(W) + "x" + std::to_string(H) + " " + formatName + " texture: " + why);
-                    return nullptr;
-                }
-                const uint32_t gridW = groupsX * local[0], gridH = groupsY * local[1];
-                auto value = [=](uint32_t x, uint32_t y, uint32_t lane) -> uint32_t {
-                    return lane == 0 ? expectedWord(y * gridW + x, c) : lane == 1 ? x : lane == 2 ? y : 0xdeadu;
-                };
-                const uint32_t lanes = t->info().bytesPerPixel / 4;
-                const uint32_t canary = texCanary([&](uint32_t v) {
-                    for (uint32_t y = 0; y < H; y++)
-                        for (uint32_t x = 0; x < W; x++)
-                            for (uint32_t l = 0; l < lanes; l++)
-                                if (value(x, y, l) == v) return true;
-                    return false;
-                });
-                fillBo(*t, canary);
-                static_cast<uint32_t*>(cbuf->contents())[0] = c;
-                Bindings b;
-                b.buffers = {Binding{cbuf.get(), 0}};   // [[buffer(0)]]: c, a pushed constant
-                b.textures = {t.get()};                 // [[texture(0)]]: out, the image at IBO slot 0
-                const uint32_t groups[3] = {groupsX, groupsY, 1};
-                auto cb = runTex(k, groups, local, b);
-                PixelRule rule{[=](uint32_t x, uint32_t y) { return x < gridW && y < gridH; }, value};
-                TexReadback r = compareTexture(*t, rule, canary);
-                report(completed(*cb) && r.right == r.covered && r.covered > 0 && r.uncoveredCanary == r.uncovered,
-                       label + ": " + describeTexture(r, "as computed") + status(*cb, gpu));
-                reportPadding(label, r);
-                return t;
-            };
-            auto fill64 = texFill(kernels::tex_fill_air, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c1,
-                                  "tex_fill R32Uint 64x32, (8,4,1) groups of (8,8,1), c = 0x5678");
-            // the controls: half the grid along x (grid.x = 32, so other words too) leaves the right half canary; another c
-            // moves every word; then a geometry with padding: 48 pixels of 4 bytes are 192-byte rows at a pitch of 256
-            // (texture.hpp: align(width * cpp, 64 * cpp)), 20 rows in a Bo of 32 (align(align(20, 4) * 256, 4096) = 8192)
-            texFill(kernels::tex_fill_air, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 4, 4, c1,
-                    "control, tex_fill R32Uint 64x32 over the left half, (4,4,1) groups");
-            texFill(kernels::tex_fill_air, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2, "control, tex_fill R32Uint 64x32, c = 0x6789");
-            auto fill48 = texFill(kernels::tex_fill_air, PixelFormat::kR32Uint, "R32Uint", 48, 20, local84, 6, 5, c1,
-                                  "tex_fill R32Uint 48x20, (6,5,1) groups of (8,4,1), 192-byte rows at a pitch of 256");
-            // the same through a four-lane format: every lane of the stib lands, (word, x, y, 0xdead)
-            texFill(kernels::tex_fill_air, PixelFormat::kRGBA32Uint, "RGBA32Uint", 64, 32, local88, 8, 4, c1,
-                    "tex_fill RGBA32Uint 64x32, (8,4,1) groups of (8,8,1), all four lanes");
-            texFill(kernels::tex_fill_air, PixelFormat::kRGBA32Uint, "RGBA32Uint", 48, 20, local84, 6, 5, c1,
-                    "tex_fill RGBA32Uint 48x20, (6,5,1) groups of (8,4,1), 768-byte rows at a pitch of 1024");
-            // Texture::read (the converter, on the phone): the GPU's rows into a tightly strided host buffer must be the
-            // rows read directly, for the whole texture and for a region inside it; a region past the edge is refused
-            auto readCheck = [&](const Texture& t, const std::string& label) {
-                const uint32_t cpp = t.info().bytesPerPixel, W = t.width(), H = t.height();
-                std::vector<uint8_t> direct = textureBo(t);
-                auto compare = [&](uint32_t x0, uint32_t y0, uint32_t w, uint32_t h) {
-                    std::vector<uint8_t> host(size_t(w) * h * cpp, 0xee);
-                    std::string whyRead;
-                    bool ok = t.read(x0, y0, w, h, host.data(), uint64_t(w) * cpp, &whyRead);
-                    uint32_t same = 0, firstX = 0, firstY = 0;
-                    bool haveFirst = false;
-                    for (uint32_t y = 0; y < h; y++) {
-                        for (uint32_t x = 0; x < w; x++) {
-                            bool eq = memcmp(host.data() + (size_t(y) * w + x) * cpp, direct.data() + (y0 + y) * t.bytesPerRow() + uint64_t(x0 + x) * cpp, cpp) == 0;
-                            if (eq) {
-                                same++;
-                            } else if (!haveFirst) {
-                                haveFirst = true;
-                                firstX = x0 + x;
-                                firstY = y0 + y;
-                            }
-                        }
-                    }
-                    report(ok && same == w * h,
-                           label + ": Texture::read of " + std::to_string(w) + "x" + std::to_string(h) + " at " + std::to_string(x0) + "," + std::to_string(y0) +
-                               " with a stride of " + std::to_string(uint64_t(w) * cpp) + ": " + std::to_string(same) + " of " + std::to_string(w * h) +
-                               " pixels as the GPU rows" + (ok ? "" : " (refused: " + whyRead + ")") +
-                               (same == w * h ? "" : " (first difference at " + std::to_string(firstX) + "," + std::to_string(firstY) + ")"));
-                };
-                compare(0, 0, W, H);
-                compare(5, 3, W - 9, H - 5);
-                std::vector<uint8_t> host(size_t(W) * cpp);
-                std::string whyRead;
-                bool accepted = t.read(W - 1, 0, 2, 1, host.data(), uint64_t(W) * cpp, &whyRead);
-                report(!accepted && !whyRead.empty(), label + ": control, Texture::read of 2 pixels starting at the last column: " +
-                                                          (accepted ? "ACCEPTED a region past the width" : "refused: " + whyRead));
-            };
-            if (fill64) readCheck(*fill64, "tex_fill R32Uint 64x32");
-            if (fill48) readCheck(*fill48, "tex_fill R32Uint 48x20");
-
-            // 7a'. tex_fill_h: a HALF image (texture2d<half, write> over RGBA16Float) written with values exact in half --
-            // (x/64, y/32, 0.5, 1.0) -- so a right pixel is four IEEE half bit patterns and nothing else. Until 29 October
-            // the front end typed every texture write by the call's return type, void, and so as uint: ir3 then emitted
-            // stib.b.typed.2d.u16.4 for a half value, and the driver, judging the kernel by that transport type, refused
-            // RGBA16Float for a texture2d<half> (what the plug-in's MetalFaceMask_Clear line hit, logs/011200-run.log).
-            // With the store typed by its value (f16) the halves land: 2048 of 2048 on 29 October (logs/012127-run.log).
-            // A typed store converts its source as its type says, so a u16 store of half bits would land half(float(bits))
-            // -- 1.0h = 0x3c00 read as 15360 -> 0x7380; the second count is of pixels matching that rule, and must be 0.
-            {
-                auto halfBits = [](float f) -> uint32_t {   // IEEE binary16 of a float, round to nearest even
-                    uint32_t u = 0;
-                    memcpy(&u, &f, 4);
-                    uint32_t sign = (u >> 16) & 0x8000u, mant = u & 0x7fffffu;
-                    int exp = int((u >> 23) & 0xffu) - 127 + 15;
-                    if (exp <= 0) {
-                        if (exp < -10) return sign;
-                        mant |= 0x800000u;
-                        uint32_t shift = uint32_t(14 - exp), h = mant >> shift, rem = mant & ((1u << shift) - 1), half = 1u << (shift - 1);
-                        if (rem > half || (rem == half && (h & 1))) h++;
-                        return sign | h;
-                    }
-                    if (exp >= 31) return sign | 0x7c00u;
-                    uint32_t h = sign | (uint32_t(exp) << 10) | (mant >> 13), rem = mant & 0x1fffu;
-                    if (rem > 0x1000u || (rem == 0x1000u && (h & 1))) h++;
-                    return h;
-                };
-                auto texFillH = [&](const Kernel& k, const std::string& label) {
-                    TextureDesc d;
-                    d.format = PixelFormat::kRGBA16Float;
-                    d.width = 64;
-                    d.height = 32;
-                    d.usage = kTextureUsageWrite;
-                    auto t = Texture::make(gpu, d, &why);
-                    if (t == nullptr) {
-                        report(false, label + ": a 64x32 RGBA16Float texture: " + why);
-                        return;
-                    }
-                    auto halves = [&](uint32_t x, uint32_t y, uint32_t lane) -> uint32_t {
-                        return lane == 0 ? (halfBits(float(x) / 64.0f) | halfBits(float(y) / 32.0f) << 16) : (0x3800u | 0x3c00u << 16);
-                    };
-                    auto asIntegers = [&](uint32_t x, uint32_t y, uint32_t lane) -> uint32_t {
-                        uint32_t w = halves(x, y, lane);
-                        return halfBits(float(w & 0xffffu)) | halfBits(float(w >> 16)) << 16;
-                    };
-                    const uint32_t canary = texCanary([&](uint32_t v) {
-                        for (uint32_t y = 0; y < 32; y++)
-                            for (uint32_t x = 0; x < 64; x++)
-                                for (uint32_t l = 0; l < 2; l++)
-                                    if (halves(x, y, l) == v || asIntegers(x, y, l) == v) return true;
-                        return false;
-                    });
-                    fillBo(*t, canary);
-                    Bindings b;
-                    b.textures = {t.get()};   // [[texture(0)]]: the image at IBO slot 0; the kernel binds no buffer
-                    const uint32_t groups[3] = {8, 4, 1};
-                    auto cb = runTex(k, groups, local88, b);
-                    auto all = [](uint32_t, uint32_t) { return true; };
-                    TexReadback r = compareTexture(*t, PixelRule{all, halves}, canary);
-                    TexReadback ri = compareTexture(*t, PixelRule{all, asIntegers}, canary);
-                    report(completed(*cb) && r.right == 2048,
-                           label + ": " + describeTexture(r, "the half bit patterns") + "; " + std::to_string(ri.right) +
-                               " of 2048 are the halves of the bits read as integers" + status(*cb, gpu));
-                };
-                texFillH(kernels::tex_fill_h_air, "tex_fill_h RGBA16Float 64x32, (8,4,1) groups of (8,8,1), the store typed f16");
-            }
-
-            // 7b. tex_copy: in (texture index 1, read through the texture table by isaml t#1) filled through
-            // Texture::replace with a pattern injective over the pixels and unlike tex_fill's words, out (texture
-            // index 0, the image at IBO slot 0) canary; out must come out equal to in, pixel by pixel, in untouched
-            auto texCopy = [&](uint32_t W, uint32_t H, const uint32_t local[3], uint32_t groupsX, uint32_t groupsY, const std::string& label) {
-                TextureDesc din;
-                din.format = PixelFormat::kR32Uint;
-                din.width = W;
-                din.height = H;
-                din.usage = kTextureUsageRead;
-                TextureDesc dout = din;
-                dout.usage = kTextureUsageWrite;
-                auto in = Texture::make(gpu, din, &why);
-                auto out = in ? Texture::make(gpu, dout, &why) : nullptr;
-                if (in == nullptr || out == nullptr) {
-                    report(false, label + ": two " + std::to_string(W) + "x" + std::to_string(H) + " R32Uint textures: " + why);
-                    return;
-                }
-                // 0x01000193 is odd (a bijection on 32-bit words), the xor keeps the words apart from tex_fill's
-                auto inWord = [=](uint32_t x, uint32_t y) -> uint32_t { return ((y * W + x) * 0x01000193u) ^ 0x6a09e667u; };
-                std::vector<uint32_t> host(size_t(W) * H);
-                for (uint32_t y = 0; y < H; y++)
-                    for (uint32_t x = 0; x < W; x++) host[size_t(y) * W + x] = inWord(x, y);
-                const uint32_t canary = texCanary([&](uint32_t v) {
-                    for (uint32_t w : host)
-                        if (w == v) return true;
-                    return false;
-                });
-                fillBo(*in, canary ^ 0xffffffffu);   // in's own padding: something else, so a read of it would show
-                fillBo(*out, canary);
-                std::string whyReplace;
-                if (!in->replace(0, 0, W, H, host.data(), uint64_t(W) * 4, &whyReplace)) {
-                    report(false, label + ": Texture::replace of the input: " + whyReplace);
-                    return;
-                }
-                Bindings b;
-                b.textures = {out.get(), in.get()};   // [[texture(0)]] = out (the image), [[texture(1)]] = in (sampled)
-                const uint32_t groups[3] = {groupsX, groupsY, 1};
-                const uint32_t gridW = groupsX * local[0], gridH = groupsY * local[1];
-                auto cb = runTex(kernels::tex_copy_air, groups, local, b);
-                PixelRule rule{[=](uint32_t x, uint32_t y) { return x < gridW && y < gridH; }, [=](uint32_t x, uint32_t y, uint32_t) { return inWord(x, y); }};
-                TexReadback r = compareTexture(*out, rule, canary);
-                report(completed(*cb) && r.right == r.covered && r.covered > 0 && r.uncoveredCanary == r.uncovered,
-                       label + ": " + describeTexture(r, "equal to the input") + status(*cb, gpu));
-                reportPadding(label, r);
-                // the input is read only: every pixel still the pattern (its padding is not checked: nothing wrote it but us)
-                PixelRule all{[](uint32_t, uint32_t) { return true; }, [=](uint32_t x, uint32_t y, uint32_t) { return inWord(x, y); }};
-                TexReadback rin = compareTexture(*in, all, canary);
-                report(rin.right == rin.covered, label + ": the input afterwards: " + std::to_string(rin.right) + " of " + std::to_string(rin.covered) + " pixels still the pattern");
-            };
-            texCopy(64, 32, local88, 8, 4, "tex_copy R32Uint 64x32, in at texture 1 (isaml), out at texture 0 (IBO slot 0), (8,4,1) groups of (8,8,1)");
-            texCopy(64, 32, local88, 4, 4, "control, tex_copy R32Uint 64x32 over the left half, (4,4,1) groups");
-            texCopy(48, 20, local84, 6, 5, "tex_copy R32Uint 48x20, (6,5,1) groups of (8,4,1), 192-byte rows at a pitch of 256");
-            {
-                // and Texture::replace refuses a region past the edge, by name
-                TextureDesc d;
-                d.format = PixelFormat::kR32Uint;
-                d.width = 8;
-                d.height = 8;
-                auto t = Texture::make(gpu, d, &why);
-                uint32_t eight[8] = {};
-                std::string whyReplace;
-                bool accepted = t && t->replace(7, 0, 2, 1, eight, 32, &whyReplace);
-                report(t && !accepted && !whyReplace.empty(),
-                       std::string("control, Texture::replace of 2 pixels starting at the last column of 8x8: ") + (accepted ? "ACCEPTED a region past the width" : "refused: " + whyReplace));
-            }
-
-            // 7c. tex_sample_gid: an N x N RGBA8Unorm texture whose pixel (x, y) is the bytes (32x, 32y, 16(x^y)+7, 255) --
-            // every neighbour differs in every channel -- sampled by the 8x8 grid of one group at the normalized centres
-            // ((gx+0.5)/8, (gy+0.5)/8) into out[gy*8+gx], 64 float4 of a device buffer NaN-canaried with 0x7fc00001, a
-            // payload no sample of a unorm texture can produce
-            auto pixelByte = [](uint32_t x, uint32_t y, uint32_t ch) -> uint32_t { return ch == 0 ? 32 * x : ch == 1 ? 32 * y : ch == 2 ? 16 * (x ^ y) + 7 : 255; };
-            auto patternTexture = [&](uint32_t n) -> std::shared_ptr<Texture> {
-                TextureDesc d;
-                d.format = PixelFormat::kRGBA8Unorm;
-                d.width = d.height = n;
-                d.usage = kTextureUsageRead;
-                auto t = Texture::make(gpu, d, &why);
-                if (t == nullptr) {
-                    report(false, "a " + std::to_string(n) + "x" + std::to_string(n) + " RGBA8Unorm texture: " + why);
-                    return nullptr;
-                }
-                std::vector<uint8_t> host(size_t(n) * n * 4);
-                for (uint32_t y = 0; y < n; y++)
-                    for (uint32_t x = 0; x < n; x++)
-                        for (uint32_t ch = 0; ch < 4; ch++) host[(size_t(y) * n + x) * 4 + ch] = uint8_t(pixelByte(x, y, ch));
-                fillBo(*t, 0x3c3c3c3cu);
-                std::string whyReplace;
-                if (!t->replace(0, 0, n, n, host.data(), uint64_t(n) * 4, &whyReplace)) {
-                    report(false, "Texture::replace of the " + std::to_string(n) + "x" + std::to_string(n) + " pattern: " + whyReplace);
-                    return nullptr;
-                }
-                return t;
-            };
-            const uint32_t nanCanary = 0x7fc00001u;
-            auto sampleOut = newBuffer(gpu, 64 * 16, &why);
-            Sampler nearest{}, linear{};
-            SamplerDesc sd;   // Metal's defaults: nearest, clamp to edge, normalized coordinates, not mipmapped
-            bool haveNearest = makeSampler(sd, &nearest, &why);
-            if (!haveNearest) report(false, "the default sampler (nearest, clamp to edge): " + why);
-            sd.minFilter = sd.magFilter = 1;   // MTLSamplerMinMagFilterLinear
-            bool haveLinear = makeSampler(sd, &linear, &why);
-            if (!haveLinear) report(false, "the linear sampler: " + why);
-            {
-                // and the refusals of makeSampler, by name: what the dispatch would not know how to encode
-                SamplerDesc bad;
-                Sampler s{};
-                std::string whyBad;
-                bad.maxAnisotropy = 17;   // past Metal's 16 (1 to 16 are served)
-                bool accepted = makeSampler(bad, &s, &whyBad);
-                report(!accepted && !whyBad.empty(), std::string("control, makeSampler with anisotropy 17: ") + (accepted ? "ACCEPTED" : "refused: " + whyBad));
-                bad = SamplerDesc{};
-                bad.sAddress = 5;
-                bad.borderColor = 3;   // past MTLSamplerBorderColor's three (the three have their entries: probe 9mc)
-                accepted = makeSampler(bad, &s, &whyBad);
-                report(!accepted && !whyBad.empty(), std::string("control, makeSampler with border colour 3: ") + (accepted ? "ACCEPTED" : "refused: " + whyBad));
-            }
-            struct Sampled {
-                std::vector<uint32_t> bits;   // 64 x 4 lanes as written, the canary where nothing was
-                std::shared_ptr<CommandBuffer> cb;
-                float at(uint32_t i) const {
-                    float f;
-                    memcpy(&f, &bits[i], 4);
-                    return f;
-                }
-            };
-            auto sample = [&](const Texture& tex, const Sampler& s) -> Sampled {
-                auto* w = static_cast<uint32_t*>(sampleOut->contents());
-                for (uint32_t i = 0; i < 256; i++) w[i] = nanCanary;
-                Bindings b;
-                b.buffers = {Binding{sampleOut.get(), 0}};   // [[buffer(0)]]: out
-                b.textures = {&tex};                         // [[texture(0)]]
-                b.samplers = {&s};                           // [[sampler(0)]]
-                const uint32_t one[3] = {1, 1, 1};
-                Sampled r;
-                r.cb = runTex(kernels::tex_sample_gid_air, one, local88, b);
-                r.bits.resize(256);
-                memcpy(r.bits.data(), sampleOut->contents(), 1024);
-                return r;
-            };
-            // 64 pixels of 4 lanes against EXPECTED(gx, gy, ch) within TOLERANCE; a pixel whose lanes still hold the canary
-            // bits is counted apart (it was not written), one with a NaN or beyond the tolerance is off
-            struct SampleCheck {
-                uint32_t within = 0, canary = 0, off = 0, differ = 0;
-                float maxDev = 0, maxDiff = 0;
-                uint32_t firstX = 0, firstY = 0, firstLane = 0;
-                float firstGot = 0, firstWant = 0;
-            };
-            auto checkSamples = [&](const Sampled& s, const std::function<float(uint32_t, uint32_t, uint32_t)>& expected, float tolerance,
-                                    const Sampled* against) {
-                SampleCheck c;
-                for (uint32_t gy = 0; gy < 8; gy++) {
-                    for (uint32_t gx = 0; gx < 8; gx++) {
-                        uint32_t i = (gy * 8 + gx) * 4;
-                        bool isCanary = true;
-                        for (uint32_t ch = 0; ch < 4; ch++) isCanary = isCanary && s.bits[i + ch] == nanCanary;
-                        if (isCanary) {
-                            c.canary++;
-                            continue;
-                        }
-                        float dev = 0, diff = 0;
-                        uint32_t worst = 0;
-                        for (uint32_t ch = 0; ch < 4; ch++) {
-                            float got = s.at(i + ch), d = std::fabs(got - expected(gx, gy, ch));
-                            if (std::isnan(d)) d = INFINITY;
-                            if (d > dev) {
-                                dev = d;
-                                worst = ch;
-                            }
-                            if (against) {
-                                float o = std::fabs(got - against->at(i + ch));
-                                if (std::isnan(o)) o = INFINITY;
-                                diff = std::max(diff, o);
-                            }
-                        }
-                        c.maxDev = std::max(c.maxDev, dev);
-                        c.maxDiff = std::max(c.maxDiff, diff);
-                        if (against && diff > 1.0f / 512) c.differ++;
-                        if (dev <= tolerance) {
-                            c.within++;
-                        } else {
-                            if (c.off == 0) {
-                                c.firstX = gx;
-                                c.firstY = gy;
-                                c.firstLane = worst;
-                                c.firstGot = s.at(i + worst);
-                                c.firstWant = expected(gx, gy, worst);
-                            }
-                            c.off++;
-                        }
-                    }
-                }
-                return c;
-            };
-            auto describeSamples = [](const SampleCheck& c, const char* tolerance) {
-                char text[200];
-                snprintf(text, sizeof text, "%u of 64 pixels within %s, %u still canary, %u off, max deviation %.6f", c.within, tolerance, c.canary, c.off, c.maxDev);
-                std::string s = text;
-                if (c.off) {
-                    snprintf(text, sizeof text, " (first at %u,%u lane %u: got %.6f expected %.6f)", c.firstX, c.firstY, c.firstLane, c.firstGot, c.firstWant);
-                    s += text;
-                }
-                return s;
-            };
-            auto tex8 = patternTexture(8);
-            if (sampleOut == nullptr) {
-                report(false, "a buffer of 64 float4 for the samples: " + why);
-            } else if (tex8 && haveNearest && haveLinear) {
-                // nearest at the centres: the texel itself, v/255, within half a unorm step
-                auto texel8 = [&](uint32_t gx, uint32_t gy, uint32_t ch) { return pixelByte(gx, gy, ch) / 255.0f; };
-                Sampled near8 = sample(*tex8, nearest);
-                SampleCheck c = checkSamples(near8, texel8, 1.0f / 512, nullptr);
-                report(completed(*near8.cb) && c.within == 64,
-                       "tex_sample_gid nearest over 8x8 RGBA8Unorm at the texel centres: " + describeSamples(c, "1/512 of the texel") + status(*near8.cb, gpu));
-                // linear at the centres: the weights are 1 and 0, so the same texel; how many pixels differ from nearest must be 0
-                Sampled lin8 = sample(*tex8, linear);
-                c = checkSamples(lin8, texel8, 1.0f / 512, &near8);
-                char diff[96];
-                snprintf(diff, sizeof diff, "; differs from nearest at %u of 64 pixels (max |linear - nearest| %.6f)", c.differ, c.maxDiff);
-                report(completed(*lin8.cb) && c.within == 64 && c.differ == 0,
-                       "tex_sample_gid linear over 8x8 at the texel centres: " + describeSamples(c, "1/512 of the texel") + diff + status(*lin8.cb, gpu));
-                // the control that the sampler state took effect: a 4x4 texture under the same 8x8 grid puts every sample
-                // at a quarter or three-quarter position between texels ((gx+0.5)/8 * 4 - 0.5 = gx/2 - 0.25 in texel
-                // space). Nearest reads texel (gx/2, gy/2) exactly; linear mixes the four neighbours with weights 1/4 and
-                // 3/4 (clamped to the edge), which the probe computes itself; the two must differ wherever the mix is not
-                // one texel -- the probe counts where, from the same rule, and expects that many
-                auto tex4 = patternTexture(4);
-                if (tex4) {
-                    auto texel4 = [&](uint32_t gx, uint32_t gy, uint32_t ch) {
-                        return pixelByte(uint32_t(std::floor((gx + 0.5f) / 8.0f * 4)), uint32_t(std::floor((gy + 0.5f) / 8.0f * 4)), ch) / 255.0f;
-                    };
-                    auto bilinear4 = [&](uint32_t gx, uint32_t gy, uint32_t ch) {
-                        float u = (gx + 0.5f) / 8.0f * 4 - 0.5f, v = (gy + 0.5f) / 8.0f * 4 - 0.5f;
-                        int i0 = int(std::floor(u)), j0 = int(std::floor(v));
-                        float f = u - float(i0), g = v - float(j0);
-                        auto clampi = [](int i) { return uint32_t(std::min(std::max(i, 0), 3)); };
-                        auto p = [&](int i, int j) { return pixelByte(clampi(i), clampi(j), ch) / 255.0f; };
-                        return (1 - f) * (1 - g) * p(i0, j0) + f * (1 - g) * p(i0 + 1, j0) + (1 - f) * g * p(i0, j0 + 1) + f * g * p(i0 + 1, j0 + 1);
-                    };
-                    uint32_t expectDiffer = 0;
-                    for (uint32_t gy = 0; gy < 8; gy++)
-                        for (uint32_t gx = 0; gx < 8; gx++) {
-                            bool differs = false;
-                            for (uint32_t ch = 0; ch < 4; ch++) differs = differs || std::fabs(bilinear4(gx, gy, ch) - texel4(gx, gy, ch)) > 1.0f / 512;
-                            expectDiffer += differs;
-                        }
-                    Sampled near4 = sample(*tex4, nearest);
-                    c = checkSamples(near4, texel4, 1.0f / 512, nullptr);
-                    report(completed(*near4.cb) && c.within == 64,
-                           "control, tex_sample_gid nearest over 4x4 sampled by the 8x8 grid: " + describeSamples(c, "1/512 of texel (gx/2, gy/2)") + status(*near4.cb, gpu));
-                    Sampled lin4 = sample(*tex4, linear);
-                    c = checkSamples(lin4, bilinear4, 1.0f / 255 + 1.0f / 512, &near4);
-                    snprintf(diff, sizeof diff, "; differs from nearest at %u of 64 pixels, expected %u (max |linear - nearest| %.6f)", c.differ, expectDiffer, c.maxDiff);
-                    report(completed(*lin4.cb) && c.within == 64 && c.differ == expectDiffer,
-                           "control, tex_sample_gid linear over 4x4 sampled by the 8x8 grid (quarter positions): " +
-                               describeSamples(c, "1/255 + 1/512 of the bilinear expectation") + diff + status(*lin4.cb, gpu));
-                }
-            }
-
-            // 7e. stores into a 2D array and a 3D texture (stib.3d, the layer as z; the storage view's ARRAY_PITCH places
-            // it): every texel of the layers the grid covers holds its own (x, y, layer, 0xdead); the last layer, which the
-            // grid leaves out, and the bytes between one layer's rows and the next layer are still canary. A store that
-            // ignored z would leave layers 1.. canary and write layer 0 last-wins; a wrong pitch would put texels in the gap
-            for (const bool is3d : {false, true}) {
-                // 6 rows: at 16 bytes a pixel a row is 1024 bytes (64 << log2(cpp)), so 6 of them leave 2 KiB of the 8 KiB
-                // slice past the last row -- with 8 the slice is exactly full, and a wrong pitch would have nowhere to show
-                const uint32_t W = 16, H = 6, D = is3d ? 3 : 4;
-                TextureDesc d;
-                d.type = is3d ? TextureType::k3D : TextureType::k2DArray;
-                d.format = PixelFormat::kRGBA32Uint;
-                d.width = W;
-                d.height = H;
-                d.depth = D;
-                d.usage = kTextureUsageWrite;
-                const std::string label = std::string(is3d ? "tex_fill_3d RGBA32Uint 16x6x3" : "tex_fill_arr RGBA32Uint 16x6, 4 layers") + ", the grid over all but the last";
-                auto t = Texture::make(gpu, d, &why);
-                if (t == nullptr) {
-                    report(false, label + ": the texture: " + why);
-                    continue;
-                }
-                const uint32_t canary = 0x5a5a5a5au;   // above every x, y, layer and not 0xdead
-                uint32_t* w = static_cast<uint32_t*>(t->contents());
-                const uint64_t words = t->buffer()->length() / 4;
-                for (uint64_t i = 0; i < words; i++) w[i] = canary;
-                const uint32_t groups[3] = {W / 8, H / 2, D - 1}, local82[3] = {8, 2, 1};
-                auto cb = runTex(is3d ? kernels::tex_fill_3d_air : kernels::tex_fill_arr_air, groups, local82, Bindings{{}, {t.get()}});
-                uint32_t right = 0, covered = 0, leftCanary = 0, left = 0, gapCanary = 0, gap = 0;
-                const uint64_t slice = t->sliceBytes(), row = t->bytesPerRow();
-                for (uint32_t z = 0; z < D; z++) {
-                    const uint8_t* base = static_cast<const uint8_t*>(t->contents()) + z * slice;
-                    for (uint32_t y = 0; y < H; y++)
-                        for (uint32_t x = 0; x < W; x++) {
-                            uint32_t v[4];
-                            memcpy(v, base + y * row + x * 16, 16);
-                            if (z + 1 < D) {
-                                covered++;
-                                right += v[0] == x && v[1] == y && v[2] == z && v[3] == 0xdeadu;
-                            } else {
-                                left++;
-                                leftCanary += v[0] == canary && v[1] == canary && v[2] == canary && v[3] == canary;
-                            }
-                        }
-                    // every word of the slice no texel names: each row's padding past its 16 pixels, and the rows past H
-                    for (uint64_t b = 0; b + 4 <= slice; b += 4) {
-                        if (b / row < H && b % row < uint64_t(W) * 16) continue;
-                        gap++;
-                        uint32_t v;
-                        memcpy(&v, base + b, 4);
-                        gapCanary += v == canary;
-                    }
-                }
-                report(completed(*cb) && right == covered && leftCanary == left && gapCanary == gap && gap > 0,
-                       label + ": " + std::to_string(right) + " of " + std::to_string(covered) + " texels their own (x, y, layer), " +
-                           std::to_string(leftCanary) + " of " + std::to_string(left) + " of the last layer canary, " + std::to_string(gapCanary) + " of " +
-                           std::to_string(gap) + " words of padding and between layers canary" + status(*cb, gpu));
-            }
-
-            // 7f. a kernel's store through a view (Texture::view): tex_fill over level 1 of a two-level texture, then over
-            // slice 2 of a four-layer array, each viewed as 2D. The parent read back: the viewed level or layer holds
-            // tex_fill's words, every other one is still canary -- a view at the parent's base would fill level 0 or
-            // layer 0 instead, and a view at the wrong pitch would leave the rule broken across rows
-            for (const bool bySlice : {false, true}) {
-                TextureDesc pd;
-                pd.format = PixelFormat::kR32Uint;
-                pd.width = bySlice ? 32 : 64;
-                pd.height = bySlice ? 16 : 32;
-                pd.usage = kTextureUsageRead | kTextureUsageWrite;
-                if (bySlice) {
-                    pd.type = TextureType::k2DArray;
-                    pd.depth = 4;
-                } else {
-                    pd.mipLevels = 2;
-                }
-                const std::string label = bySlice ? "tex_fill through a view of slice 2 of a 4-layer R32Uint 32x16 array" : "tex_fill through a view of level 1 of a 2-level R32Uint 64x32 texture";
-                auto parent = Texture::make(gpu, pd, &why);
-                auto v = parent == nullptr ? nullptr : Texture::view(parent, PixelFormat::kR32Uint, TextureType::k2D, bySlice ? 0 : 1, 1, bySlice ? 2 : 0, 1, &why);
-                if (v == nullptr) {
-                    report(false, label + ": " + why);
-                    continue;
-                }
-                const uint32_t canary = 0xc0ffee00u;
-                uint32_t* w = static_cast<uint32_t*>(parent->contents());
-                for (uint64_t i = 0; i < parent->buffer()->length() / 4; i++) w[i] = canary;
-                static_cast<uint32_t*>(cbuf->contents())[0] = c2;
-                const uint32_t groups[3] = {4, 2, 1};   // the view's 32 x 16, (8,8,1) a group
-                Bindings b;
-                b.buffers = {Binding{cbuf.get(), 0}};
-                b.textures = {v.get()};
-                auto cb = runTex(kernels::tex_fill_air, groups, local88, b);
-                // the parent's views of its parts, as the probe reads them: a level, or a layer at sliceBytes
-                const uint32_t parts = bySlice ? 4 : 2, target = bySlice ? 2 : 1;
-                uint32_t right = 0, covered = 0, untouched = 0, others = 0;
-                for (uint32_t part = 0; part < parts; part++) {
-                    const TextureLevel L = bySlice ? TextureLevel{part * parent->sliceBytes(), parent->bytesPerRow(), 32, 16} : parent->level(part);
-                    const uint8_t* base = static_cast<const uint8_t*>(parent->contents()) + L.offset;
-                    for (uint32_t y = 0; y < L.height; y++)
-                        for (uint32_t x = 0; x < L.width; x++) {
-                            uint32_t word;
-                            memcpy(&word, base + y * L.pitch + x * 4, 4);
-                            if (part == target) {
-                                covered++;
-                                right += word == expectedWord(y * 32 + x, c2);
-                            } else {
-                                others++;
-                                untouched += word == canary;
-                            }
-                        }
-                }
-                report(completed(*cb) && right == covered && untouched == others && covered == 512,
-                       label + ": " + std::to_string(right) + " of " + std::to_string(covered) + " texels of the viewed part as computed, " +
-                           std::to_string(untouched) + " of " + std::to_string(others) + " of the other parts canary" + status(*cb, gpu));
-            }
-
-            // 7g. the integer formats read as uint: each channel of IN (C of them, B bits each) its own value from the
-            // CPU, tex_copy (isaml t#1) to an RGBA32Uint image, every lane compared -- the channels IN has as written,
-            // the ones it has not 0 and alpha 1 (Metal's rule for a read of a format without them). A width or an order
-            // the descriptor gets wrong moves every value
-            {
-                struct F {
-                    PixelFormat f;
-                    const char* name;
-                    uint32_t channels, bits;
-                };
-                const F formats[] = {{PixelFormat::kR8Uint, "R8Uint", 1, 8},     {PixelFormat::kRG8Uint, "RG8Uint", 2, 8},
-                                     {PixelFormat::kRGBA8Uint, "RGBA8Uint", 4, 8}, {PixelFormat::kRG16Uint, "RG16Uint", 2, 16},
-                                     {PixelFormat::kRGBA16Uint, "RGBA16Uint", 4, 16}, {PixelFormat::kRG32Uint, "RG32Uint", 2, 32}};
-                for (const F& f : formats) {
-                    const uint32_t W = 16, H = 8;
-                    TextureDesc din;
-                    din.format = f.f;
-                    din.width = W;
-                    din.height = H;
-                    din.usage = kTextureUsageRead;
-                    TextureDesc dout = din;
-                    dout.format = PixelFormat::kRGBA32Uint;
-                    dout.usage = kTextureUsageWrite;
-                    auto in = Texture::make(gpu, din, &why);
-                    auto out = in ? Texture::make(gpu, dout, &why) : nullptr;
-                    const std::string label = std::string("tex_copy of ") + f.name + " 16x8 into RGBA32Uint, every lane";
-                    if (in == nullptr || out == nullptr) {
-                        report(false, label + ": " + why);
-                        continue;
-                    }
-                    const uint64_t mask = f.bits == 32 ? 0xffffffffull : (1ull << f.bits) - 1;
-                    auto chan = [&](uint32_t x, uint32_t y, uint32_t c) { return uint32_t((x * 7u + y * 13u + c * 61u + 5u + (f.bits == 32 ? 0x10000u * c : 0u)) & mask); };
-                    std::vector<uint8_t> host(size_t(W) * H * f.channels * f.bits / 8);
-                    for (uint32_t y = 0; y < H; y++)
-                        for (uint32_t x = 0; x < W; x++)
-                            for (uint32_t c = 0; c < f.channels; c++) {
-                                const uint32_t v = chan(x, y, c);
-                                memcpy(host.data() + ((size_t(y) * W + x) * f.channels + c) * (f.bits / 8), &v, f.bits / 8);
-                            }
-                    fillBo(*out, 0xa5a5a5a5u);
-                    if (!in->replace(0, 0, W, H, host.data(), uint64_t(W) * f.channels * f.bits / 8, &why)) {
-                        report(false, label + ": Texture::replace: " + why);
-                        continue;
-                    }
-                    Bindings b;
-                    b.textures = {out.get(), in.get()};
-                    const uint32_t groups[3] = {2, 1, 1};
-                    auto cb = runTex(kernels::tex_copy_air, groups, local88, b);
-                    uint32_t right = 0;
-                    for (uint32_t y = 0; y < H; y++)
-                        for (uint32_t x = 0; x < W; x++) {
-                            uint32_t v[4];
-                            memcpy(v, static_cast<const uint8_t*>(out->contents()) + y * out->bytesPerRow() + x * 16, 16);
-                            bool ok = true;
-                            for (uint32_t l = 0; l < 4; l++) ok = ok && v[l] == (l < f.channels ? chan(x, y, l) : l == 3 ? 1u : 0u);
-                            right += ok;
-                        }
-                    report(completed(*cb) && right == W * H, label + ": " + std::to_string(right) + " of 128 pixels each lane as written (absent ones 0, alpha 1)" + status(*cb, gpu));
-                }
-            }
-
-            // 9mc. address modes and border colours: tex_sample_wide samples a 5x3 RGBA8 texture (no power of two in either
-            // size) nearest at coordinates spread over [-1, 2], a 30x18 grid, so each sample is a quarter or three quarters
-            // into a texel and two thirds of them outside it. Every sample has to be the texel (or the border colour) the
-            // mode's own rule names; and each mode is told apart from the rule nearest it -- mirror-clamp from clamp-to-edge
-            // and from mirrored repeat, each border colour from the others -- by the samples where those rules disagree
-            {
-                const uint32_t TW = 5, TH = 3, GW = 30, GH = 18;
-                TextureDesc td;
-                td.format = PixelFormat::kRGBA8Unorm;
-                td.width = TW;
-                td.height = TH;
-                td.usage = kTextureUsageRead;
-                auto tex = Texture::make(gpu, td, &why);
-                auto out = tex ? newBuffer(gpu, uint64_t(GW) * GH * 16, &why) : nullptr;
-                if (out == nullptr) {
-                    report(false, "address modes: the texture or buffer: " + why);
-                } else {
-                    uint8_t texels[TW * TH * 4];
-                    for (uint32_t j = 0; j < TH; j++)
-                        for (uint32_t i = 0; i < TW; i++) {
-                            uint8_t* t = texels + (j * TW + i) * 4;
-                            t[0] = uint8_t(40 * i + 20);
-                            t[1] = uint8_t(70 * j + 30);
-                            t[2] = uint8_t(10 * (i + j) + 100);
-                            t[3] = uint8_t(200 + i);
-                        }
-                    tex->replace(0, 0, TW, TH, texels, TW * 4, &why);
-                    // the rules, on the texel index i = floor(u * size); -1 for the border
-                    auto rule = [](int mode, int i, int size) -> int {
-                        switch (mode) {
-                        case 0: return i < 0 ? 0 : i >= size ? size - 1 : i;
-                        case 1: { int m = i < 0 ? -i - 1 : i; return m >= size ? size - 1 : m; }
-                        case 2: return ((i % size) + size) % size;
-                        case 3: { int m = ((i % (2 * size)) + 2 * size) % (2 * size); return m < size ? m : 2 * size - 1 - m; }
-                        default: return i < 0 || i >= size ? -1 : i;
-                        }
-                    };
-                    struct Case { uint32_t mode, colour; int ruleMode; int against; const char* name; };
-                    const Case cases[] = {{0, 0, 0, 1, "ClampToEdge"}, {1, 0, 1, 0, "MirrorClampToEdge"}, {2, 0, 2, 3, "Repeat"},
-                                          {3, 0, 3, 1, "MirrorRepeat"}, {4, 0, 4, 0, "ClampToZero"}, {5, 1, 4, 0, "ClampToBorderColor OpaqueBlack"},
-                                          {5, 2, 4, 0, "ClampToBorderColor OpaqueWhite"}};
-                    const float borders[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1}};
-                    for (const Case& c : cases) {
-                        SamplerDesc sd;
-                        sd.sAddress = sd.tAddress = c.mode;
-                        sd.borderColor = c.colour;
-                        Sampler smp;
-                        if (!makeSampler(sd, &smp, &why)) {
-                            report(false, std::string("address mode ") + c.name + ": " + why);
-                            continue;
-                        }
-                        for (uint32_t w = 0; w < GW * GH * 4; w++) static_cast<uint32_t*>(out->contents())[w] = 0x7fc00001u;   // a NaN no sample gives
-                        Bindings b;
-                        b.textures = {tex.get()};
-                        b.samplers = {&smp};
-                        b.buffers = {Binding{out.get(), 0}};
-                        const uint32_t groups[3] = {GW / 6, GH / 6, 1}, local[3] = {6, 6, 1};
-                        auto cb = runTex(kernels::tex_sample_wide_air, groups, local, b);
-                        const float* got = static_cast<const float*>(out->contents());
-                        uint32_t right = 0, apart = 0;
-                        for (uint32_t gy = 0; gy < GH; gy++)
-                            for (uint32_t gx = 0; gx < GW; gx++) {
-                                const int ix = int(std::floor(((gx + 0.5) / GW * 3 - 1) * TW)), iy = int(std::floor(((gy + 0.5) / GH * 3 - 1) * TH));
-                                auto expect = [&](int mode, float v[4]) {
-                                    const int x = rule(mode, ix, TW), y = rule(mode, iy, TH);
-                                    if (x < 0 || y < 0) {
-                                        for (int k = 0; k < 4; k++) v[k] = borders[c.colour][k];
-                                    } else {
-                                        for (int k = 0; k < 4; k++) v[k] = texels[(y * TW + x) * 4 + k] / 255.0f;
-                                    }
-                                };
-                                float want[4], other[4];
-                                expect(c.ruleMode, want);
-                                expect(c.against, other);
-                                if (c.mode == 5 || c.mode == 4) {
-                                    // the other border colours are the twin: the same rule with another colour
-                                    for (int k = 0; k < 4; k++) other[k] = (rule(4, ix, TW) < 0 || rule(4, iy, TH) < 0) ? borders[(c.colour + 1) % 3][k] : want[k];
-                                }
-                                const float* g = got + (gy * GW + gx) * 4;
-                                bool ok = true, differs = false;
-                                for (int k = 0; k < 4; k++) {
-                                    ok = ok && std::fabs(g[k] - want[k]) < 0.5f / 255;
-                                    differs = differs || std::fabs(other[k] - want[k]) >= 0.5f / 255;
-                                }
-                                right += ok;
-                                apart += ok && differs;
-                            }
-                        report(completed(*cb) && right == GW * GH && apart >= 40,
-                               std::string("address mode ") + c.name + " over a 5x3 texture sampled on [-1, 2]: " + std::to_string(right) + " of " +
-                                   std::to_string(GW * GH) + " samples its own rule, " + std::to_string(apart) + " of them where the nearest other rule differs" +
-                                   status(*cb, gpu));
-                    }
-                }
-            }
-
-            // 7d. the four kernels compiled on the phone: the same words, layout and texture fields as the host's
-            // fixtures (the core's walk of the NIR against the fixture writer's), and tex_fill dispatched from the
-            // phone's own compile
-            if (!hasCompiler()) {
-                std::printf("probe: (no compiler in this build: the texture kernels were not compiled on the phone)\n");
-            } else {
-                struct Pair {
-                    const uint8_t* bc;
-                    size_t size;
-                    const Kernel* fixture;
-                    const char* name;
-                };
-                // tex_fill_h last: its store is typed f16 only by the front end as fixed on 29 October, so this line is also
-                // the proof that the phone's compiler carries that front end (and not the one that typed every write as uint)
-                const Pair pairs[] = {{kernels::tex_fill_bc, kernels::tex_fill_bc_size, &kernels::tex_fill_air, "tex_fill.ll"},
-                                      {kernels::tex_copy_bc, kernels::tex_copy_bc_size, &kernels::tex_copy_air, "tex_copy.ll"},
-                                      {kernels::tex_sample_gid_bc, kernels::tex_sample_gid_bc_size, &kernels::tex_sample_gid_air, "tex_sample_gid.ll"},
-                                      {kernels::tex_fill_h_bc, kernels::tex_fill_h_bc_size, &kernels::tex_fill_h_air, "tex_fill_h.ll"}};
-                for (const Pair& p : pairs) {
-                    std::string whyCompile;
-                    auto compiled = compileAir(p.bc, p.size, &whyCompile);
-                    if (compiled == nullptr) {
-                        report(false, std::string("compile ") + p.name + " on the phone: " + whyCompile);
-                        continue;
-                    }
-                    bool same = false;
-                    std::string text = compareCompiled(compiled->kernel, *p.fixture, &same);
-                    report(same, std::string("compile ") + p.name + " on the phone: " + text);
-                    if (same && p.fixture == &kernels::tex_fill_air) {
-                        texFill(compiled->kernel, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2,
-                                "dispatch of tex_fill compiled on the phone, R32Uint 64x32, c = 0x6789");
-                    }
-                }
-            }
-        }
-    }
+    textureSuite(gpu, queue.get(), chip, chosen);
 
     // 9. the first draw: one triangle, then the pair, then per-vertex colours, into a 64x64 RGBA8Unorm target in sysmem
     // mode. The fake GPU held every one of these streams together; only this says whether the GPU draws them, where, and
@@ -6438,209 +6688,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 10. (--metallib FILE FUNCTION) a kernel of the image's own: read off the phone's filesystem, compiled here, and run
-    // over the buffers, textures and samplers its metadata names, each buffer and texture prefilled with a canary. What
-    // is known afterwards: whether the front end and ir3 took it, whether the GPU finished it, and which buffers and
-    // textures it wrote and how much. What is NOT known: whether the values are right -- there is no reference here
-    // (hakios's kernelref.py has no texture path); that is the next instrument, not this one.
-    for (const auto& [path, function] : metallibs) {
-        std::string what = function + " of " + path;
-        if (!hasCompiler()) {
-            report(false, what + ": no compiler in this build (MESA=1)");
-            continue;
-        }
-        std::vector<uint8_t> file;
-        {
-            FILE* f = fopen(path.c_str(), "rb");
-            if (f == nullptr) {
-                report(false, what + ": cannot open the file");
-                continue;
-            }
-            uint8_t chunk[65536];
-            size_t n;
-            while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) file.insert(file.end(), chunk, chunk + n);
-            fclose(f);
-        }
-        MetalLibrary lib;
-        if (!lib.parse(file.data(), file.size())) {
-            report(false, what + ": " + lib.why());
-            continue;
-        }
-        const MetalFunction* fn = lib.find(function);
-        const uint8_t* bitcode = nullptr;
-        uint64_t length = 0;
-        if (fn == nullptr || !lib.bitcode(*fn, &bitcode, &length)) {
-            report(false, what + ": no such function in its " + std::to_string(lib.functions().size()));
-            continue;
-        }
-        std::string why3;
-        auto k = compileAir(bitcode, size_t(length), &why3);
-        if (k == nullptr) {
-            report(false, "compile " + what + ": " + why3);
-            continue;
-        }
-        uint32_t deviceBuffers = 0, constantBuffers = 0, textures = 0, images = 0, samplers = 0, threadgroupBuffers = 0;
-        uint32_t highest = 0, highestTexture = 0, highestSampler = 0;
-        for (const Resource& r : k->resources) {
-            if (r.kind == Resource::kDeviceBuffer) deviceBuffers++;
-            else if (r.kind == Resource::kConstantBuffer) constantBuffers++;
-            else if (r.kind == Resource::kTexture) textures++;
-            else if (r.kind == Resource::kImage) images++;
-            else if (r.kind == Resource::kSampler) samplers++;
-            else threadgroupBuffers++;
-            if (r.kind == Resource::kDeviceBuffer || r.kind == Resource::kConstantBuffer) highest = std::max(highest, r.index);
-            if (r.kind == Resource::kTexture || r.kind == Resource::kImage) highestTexture = std::max(highestTexture, r.index);
-            if (r.kind == Resource::kSampler) highestSampler = std::max(highestSampler, r.index);
-        }
-        report(true, "compile " + what + ": " + std::to_string(k->kernel.numWords) + " words, instrlen " + std::to_string(k->kernel.instrlen) +
-                         ", constlen " + std::to_string(k->kernel.constlen) + ", " + std::to_string(deviceBuffers) + " device and " +
-                         std::to_string(constantBuffers) + " constant buffers, " + std::to_string(textures) + " textures, " + std::to_string(images) +
-                         " images, " + std::to_string(samplers) + " samplers, " + std::to_string(threadgroupBuffers) + " threadgroup buffers, " +
-                         std::to_string(k->threadgroupBytes) + " bytes of threadgroup memory" +
-                         (k->kernel.localSizeVariable ? "" : ", a fixed threadgroup"));
-        if (threadgroupBuffers != 0) {
-            report(false, what + ": binds a threadgroup buffer, which this driver does not serve yet; not dispatched");
-            continue;
-        }
-        // the buffers: a constant one as long as its metadata says (or a page), a device one of a megabyte, every slot
-        // up to the highest index bound so that the descriptor table has no hole, all of them canary
-        const uint32_t canary = 0xa5a5a5a5u;
-        std::vector<std::shared_ptr<Buffer>> owned;
-        std::vector<Binding> bindings(highest + 1);
-        bool ok = true;
-        for (uint32_t index = 0; index <= highest && ok; index++) {
-            uint64_t bytes = 4096;
-            for (const Resource& r : k->resources) {
-                if ((r.kind == Resource::kDeviceBuffer || r.kind == Resource::kConstantBuffer) && r.index == index) {
-                    bytes = r.kind == Resource::kDeviceBuffer ? (1u << 20) : std::max<uint64_t>(r.sizeBytes, 4096);
-                }
-            }
-            auto b = newBuffer(gpu, bytes, &why);
-            if (b == nullptr) {
-                report(false, what + ": a buffer of " + std::to_string(bytes) + " bytes for index " + std::to_string(index) + ": " + why);
-                ok = false;
-                break;
-            }
-            auto* w = static_cast<uint32_t*>(b->contents());
-            for (uint64_t i = 0; i < bytes / 4; i++) w[i] = canary;
-            bindings[index] = Binding{b.get(), 0};
-            owned.push_back(b);
-        }
-        if (!ok) continue;
-        // the textures: a canary-filled 64x64 one at each declared texture index, readable and writable, of the element
-        // class the kernel's own instructions address it with (Kernel::textures, the core's walk of the NIR, which is
-        // what the dispatch checks a binding against): R32Uint for uint, R32Float for float; int has no served format
-        // and a dimension other than 2D no served texture, so those are refused here by name. A default sampler at each
-        // declared sampler index.
-        std::vector<std::shared_ptr<Texture>> ownedTextures;
-        std::vector<Sampler> ownedSamplers(samplers ? highestSampler + 1 : 0);
-        Bindings all;
-        all.buffers = bindings;
-        all.textures.assign((textures + images) ? highestTexture + 1 : 0, nullptr);
-        all.samplers.assign(ownedSamplers.size(), nullptr);
-        for (const Resource& r : k->resources) {
-            if (!ok) break;
-            if (r.kind == Resource::kTexture || r.kind == Resource::kImage) {
-                std::string texture = "texture " + std::to_string(r.index) + " (" + r.typeName + ")";
-                if (r.index >= kMaxTextureSlots) {
-                    report(false, what + ": " + texture + " is past the Kernel's " + std::to_string(kMaxTextureSlots) + " slots; not dispatched");
-                    ok = false;
-                    break;
-                }
-                const KernelTexture& t = k->kernel.textures[r.index];
-                if (t.kind != kTexNone && t.dim != kTexDim2D) {
-                    report(false, what + ": " + texture + " is addressed as a " + dimName(t.dim) + " texture: only 2D is served; not dispatched");
-                    ok = false;
-                    break;
-                }
-                if (t.element == kElemInt) {
-                    report(false, what + ": " + texture + " is addressed as int: no served format carries ints; not dispatched");
-                    ok = false;
-                    break;
-                }
-                TextureDesc d;
-                d.format = t.element == kElemFloat ? PixelFormat::kR32Float : PixelFormat::kR32Uint;
-                d.width = d.height = 64;
-                d.usage = kTextureUsageRead | kTextureUsageWrite;
-                auto tex = Texture::make(gpu, d, &why);
-                if (tex == nullptr) {
-                    report(false, what + ": a 64x64 texture for index " + std::to_string(r.index) + ": " + why);
-                    ok = false;
-                    break;
-                }
-                fillBo(*tex, canary);
-                all.textures[r.index] = tex.get();
-                ownedTextures.push_back(tex);
-            } else if (r.kind == Resource::kSampler) {
-                SamplerDesc sd;
-                if (r.index >= ownedSamplers.size() || !makeSampler(sd, &ownedSamplers[r.index], &why)) {
-                    report(false, what + ": a default sampler for index " + std::to_string(r.index) + ": " + why);
-                    ok = false;
-                    break;
-                }
-                all.samplers[r.index] = &ownedSamplers[r.index];
-            }
-        }
-        if (!ok) continue;
-        const uint32_t g[3] = {1, 1, 1}, local[3] = {64, 1, 1};
-        auto cb = queue->commandBuffer();
-        if (!cb->dispatch(k->kernel, g, k->kernel.localSizeVariable ? local : nullptr, all, nullptr, chosen)) {
-            report(false, "dispatch " + what + ": " + cb->error());
-            continue;
-        }
-        cb->commit();
-        cb->waitUntilCompleted();
-        std::string written;
-        for (uint32_t index = 0; index <= highest; index++) {
-            const Buffer& b = *bindings[index].buffer;
-            std::vector<uint32_t> back(b.length() / 4);
-            memcpy(back.data(), b.contents(), b.length());
-            uint32_t changed = 0, first = 0;
-            for (uint32_t i = 0; i < back.size(); i++) {
-                if (back[i] != canary) {
-                    if (changed == 0) first = i;
-                    changed++;
-                }
-            }
-            // FNV-1a over the whole buffer, so that a host reference (tools/air/kernelref.py in hakios) running the same
-            // kernel through LLVM over the same canary-filled buffers can print the same line and the two be compared
-            uint64_t hash = fnv1a(back.data(), back.size() * 4);
-            char text[240];
-            if (changed == 0) {
-                snprintf(text, sizeof text, "; buffer %u: untouched", index);
-            } else {
-                snprintf(text, sizeof text, "; buffer %u: %u words written from %u on, fnv1a %016llx, the first 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x",
-                         index, changed, first, (unsigned long long)hash, back[first], first + 1 < back.size() ? back[first + 1] : 0,
-                         first + 2 < back.size() ? back[first + 2] : 0, first + 3 < back.size() ? back[first + 3] : 0,
-                         first + 4 < back.size() ? back[first + 4] : 0, first + 5 < back.size() ? back[first + 5] : 0,
-                         first + 6 < back.size() ? back[first + 6] : 0, first + 7 < back.size() ? back[first + 7] : 0);
-            }
-            written += text;
-        }
-        // per texture: how many of its 64x64 pixels changed, and the hash of its whole Bo -- a reading, not a comparison,
-        // until the host reference has a texture path
-        for (uint32_t index = 0; index < all.textures.size(); index++) {
-            const Texture* t = all.textures[index];
-            if (t == nullptr) continue;
-            std::vector<uint8_t> bo = textureBo(*t);
-            uint32_t changed = 0;
-            for (uint32_t y = 0; y < t->height(); y++) {
-                for (uint32_t x = 0; x < t->width(); x++) {
-                    uint32_t word;
-                    memcpy(&word, bo.data() + y * t->bytesPerRow() + uint64_t(x) * 4, 4);
-                    changed += word != canary;
-                }
-            }
-            char text[160];
-            snprintf(text, sizeof text, "; texture %u (%s 64x64, %s): %u pixels written, fnv1a %016llx", index, t->info().name,
-                     k->kernel.textures[index].kind == kTexImage ? "image" : k->kernel.textures[index].kind == kTexSampled ? "sampled" : "not addressed",
-                     changed, (unsigned long long)fnv1a(bo.data(), bo.size()));
-            written += text;
-        }
-        report(cb->status() == CommandBuffer::kCompleted,
-               "dispatch " + what + ", 1 group of 64: " + (cb->status() == CommandBuffer::kCompleted ? "completed" : "did NOT complete") + written +
-                   status(*cb, gpu));
-    }
+    metallibSuite(gpu, queue.get(), chip, chosen, metallibs);
 
     // 11. (--bisect) end_only under each part of the dispatch stream switched off in turn, and under none of them: when
     // every dispatch hangs (28 October: HLSQ busy, SP idle, the CP through its IB), this says which part the hang needs,

@@ -144,3 +144,11 @@
   instructions. `compute.cpp` points SP_CS_BINDLESS_BASE[0] at the dispatch's table and
   prefetches with SS6_BINDLESS. The fake refuses the non-bindless form on the A730. A6xx
   unchanged. Fixes the "typed texture stores" item above: `tex_fill` and `tex_copy` pass.
+- `hakios-metal/tools/probe.cpp`: the suite's texture section (7a-7g and 9mc: half stores, 2D
+  arrays and 3D, views of a level and a layer, nearest/linear sampling, six integer formats,
+  the address modes and border colours) is now `textureSuite()`, every kernel taken by the chip,
+  and runs on its own as `--case textures`; 7d (compiling them on the phone) stays A635 only.
+  `--metallib` is `metallibSuite()`, compiling for the chip it runs on, and is the one part of
+  the broad suite an A730 runs. On the OnePlus 10 Pro (10 November) all 47 texture checks pass
+  twice in one boot, and eight PortraitFilters kernels compile on the phone and complete, the
+  same words in two runs. No behaviour change for the A635.
