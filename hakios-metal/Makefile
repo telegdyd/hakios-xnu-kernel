@@ -51,21 +51,22 @@ IOS_CXX   ?= $(abspath $(HAKIOS))/xnu-deps/host/bin/xnu-clang++ -arch arm64 -isy
 IOS_AR    ?= llvm-ar --format=darwin rcs
 endif
 
-CORE      = src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.cpp src/render.cpp src/link.cpp src/compiler.cpp src/metallib.cpp src/c_api.cpp
+CORE      = src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.cpp src/render.cpp src/link.cpp src/compiler.cpp src/metallib.cpp src/c_api.cpp src/gen7.cpp
 HOST      = $(CORE) src/fake_gpu.cpp
 TESTS     = $(wildcard tests/*_test.cpp) tests/main.cpp
+TABLES    = $(wildcard include/hakios-metal/*.inc)
 
 .PHONY: test tsan asan check ios darwin clean sweep
 
 # (and the front end's archive: a test binary linked before the front end changed passed or failed for the old one)
-$(HOSTOUT)/tests: $(HOST) $(TESTS) $(wildcard include/hakios-metal/*.hpp) $(wildcard tests/fixtures/*.hpp) tests/test.hpp \
+$(HOSTOUT)/tests: $(HOST) $(TESTS) $(wildcard include/hakios-metal/*.hpp) $(TABLES) $(wildcard tests/fixtures/*.hpp tests/fixtures/a730/*.hpp) tests/test.hpp \
 		$(if $(strip $(MESA)),$(MESA_BUILD)/src/compiler/air/libair.a)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -pthread -o $@ $(HOST) $(TESTS) $(HOSTLIBS)
 
 # the metallib sweep (tools/sweep.cpp): every function of the libraries given through the compiler, the refusals counted;
 # `make sweep MESA=1` builds $(HOSTOUT)/sweep, then run it on the libraries where they lie
-$(HOSTOUT)/sweep: tools/sweep.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp)
+$(HOSTOUT)/sweep: tools/sweep.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp) $(TABLES)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -pthread -o $@ tools/sweep.cpp $(HOST) $(HOSTLIBS)
 
@@ -107,14 +108,14 @@ IOS_CXXFLAGS += -DHAKIOS_METAL_CACHE_BUILD='"$(IOS_CACHE_BUILD)"'
 endif
 endif
 
-out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
+out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp) $(TABLES)
 	@mkdir -p out/ios/obj
 	cd out/ios/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
 		$(IOS_CXX) $(IOS_CXXFLAGS) -I../../../include -c ../../../$$f || exit 1; done
 	rm -f $@ && $(IOS_AR) $@ out/ios/obj/*.o
 
 # (and the front end's archive, as the host tests: a probe linked before the front end changed tests the old one)
-out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard tests/fixtures/*.hpp) \
+out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard tests/fixtures/*.hpp tests/fixtures/a730/*.hpp) \
 		$(if $(strip $(MESA)),$(IOS_MESA_BUILD)/src/compiler/air/libair.a)
 	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/probe.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
 		-framework IOKit -framework CoreFoundation -framework IOSurface

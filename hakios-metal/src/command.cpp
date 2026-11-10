@@ -1,5 +1,6 @@
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/texture.hpp"
+#include "hakios-metal/chip.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -9,6 +10,8 @@
 #include <cstring>
 
 namespace hakios::metal {
+
+CommandBuffer::CommandBuffer(CommandQueue& queue) : queue_(queue), stream_(queue.gpu().chipId()) {}
 
 namespace {
 constexpr size_t kCommandBo = 64 * 1024;           // one command buffer's packets, at most (grown when needed)
@@ -453,7 +456,7 @@ bool CommandBuffer::copy(const Buffer& from, uint64_t fromOffset, const Buffer& 
         if (!piece(render::kTableBytes, &table, &why)) {
             return fail(std::string("no memory for the copy's table: ") + why);
         }
-        pm4::Stream added;
+        pm4::Stream added(queue_.gpu().chipId());
         render::encodeBytes(added, from.gpuAddress() + fromOffset, to.gpuAddress() + toOffset, length, table.gpuAddress(), table.contents());
         appendStream(stream_, added);
         use(from, false);
@@ -513,6 +516,10 @@ bool CommandBuffer::fill(const Buffer& b, uint64_t offset, uint64_t length, uint
 // --- CommandQueue -----------------------------------------------------------------------------------------------
 
 std::unique_ptr<CommandQueue> CommandQueue::make(Gpu& gpu, std::string* why) {
+    if (chipInfo(gpu.chipId()) == nullptr) {
+        *why = "no command-generation table for this chip ID";
+        return nullptr;
+    }
     uint32_t id = 0;
     int e = gpu.newQueue(0, &id);
     if (e != 0) {
@@ -557,7 +564,6 @@ std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
 
 namespace {
 // the A635's SP cores and fibers an SP (freedreno_devices.py, the 7c+ Gen 3 entry: num_ccu 2, fibers_per_sp 128 * 2 * 16)
-constexpr uint32_t kSpCores = 2;
 constexpr uint32_t kFibersPerSp = 128 * 2 * 16;
 }  // namespace
 
@@ -568,7 +574,7 @@ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave
         uint32_t perFiber = 512;
         while (perFiber < bytes) perFiber *= 2;
         const uint64_t perSp = (uint64_t(perFiber) * kFibersPerSp + 4095) & ~uint64_t(4095);
-        std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * kSpCores, why);
+        std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * chipInfo(gpu_.chipId())->numCcu, why);
         if (b == nullptr) return nullptr;
         private_[l].push_back(std::move(b));
         privatePerFiber_[l] = perFiber;

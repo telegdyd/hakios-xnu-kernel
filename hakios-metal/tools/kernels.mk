@@ -124,3 +124,20 @@ tests/fixtures/%_air.hpp: out/host/kernels/%.bc tools/kernels/%.ll $(IR3_COMPILE
 	$(IR3_COMPILER) --chip-id $(CHIP_ID) -o $@ -s tools/kernels/$*.ll -n $*_air $< > out/host/kernels/$*.listing
 
 air-fixtures: $(KERNEL_AIR_FIXTURES)
+
+# A second fixture set, with distinct symbols and paths. Changing CHIP_ID on
+# air-fixtures would overwrite the A6xx reference and make its tests meaningless.
+A730_AIR_FIXTURES = $(patsubst tools/kernels/%.ll,tests/fixtures/a730/%_air.hpp,$(KERNEL_LL))
+.PHONY: a730-air-fixtures
+tests/fixtures/a730/%_air.hpp: out/host/kernels/%.bc tools/kernels/%.ll $(IR3_COMPILER)
+	@mkdir -p $(dir $@) out/host/kernels/a730
+	$(IR3_COMPILER) --chip-id 0x07030001 -o $@ -s tools/kernels/$*.ll -n a730_$*_air $< > out/host/kernels/a730/$*.listing
+
+a730-air-fixtures: $(A730_AIR_FIXTURES)
+
+A730_ASM_FIXTURES = $(patsubst tools/kernels/%.asm,tests/fixtures/a730/%.hpp,$(KERNEL_ASM))
+tests/fixtures/a730/%.hpp: tools/kernels/%.asm out/host/ir3-kernel
+	@mkdir -p $(dir $@)
+	out/host/ir3-kernel --chip-id 0x07030001 --name a730_$* -o $@ $<
+.PHONY: a730-fixtures
+a730-fixtures: a730-air-fixtures $(A730_ASM_FIXTURES)

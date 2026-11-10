@@ -27,6 +27,12 @@
 #include "hakios-metal/texture.hpp"
 #include "../tests/fixtures/end_only.hpp"
 #include "../tests/fixtures/fill_id.hpp"
+#include "../tests/fixtures/a730/end_only.hpp"
+#include "../tests/fixtures/a730/fill_id.hpp"
+#include "../tests/fixtures/a730/fill_id_air.hpp"
+#include "../tests/fixtures/a730/tex_fill_air.hpp"
+#include "../tests/fixtures/a730/tex_copy_air.hpp"
+#include "../tests/fixtures/a730/img_store.hpp"
 #include "../tests/fixtures/fill_id_air.hpp"
 #include "../tests/fixtures/chain160_air.hpp"
 #include "../tests/fixtures/chain220_air.hpp"
@@ -373,12 +379,230 @@ static const char* dimName(uint8_t dim) {
     return dim == kTexDim1D ? "1D" : dim == kTexDim2D ? "2D" : dim == kTexDim3D ? "3D" : dim == kTexDimCube ? "cube" : "undeclared";
 }
 
+// A deliberately narrow hardware ladder: each invocation submits only its named case.
+// Keep the large historical A635 suite away from an A730 until its later draw steps.
+static int textureCase(Gpu& gpu, uint64_t chip, const std::string& name, const compute::Options& options) {
+    const uint64_t faults = gpu.faults();
+    std::string why;
+    for (unsigned round = 0; round < 3; ++round) {
+        auto queue = CommandQueue::make(gpu, &why);
+        auto constant = newBuffer(gpu, 16, &why);
+        TextureDesc desc;
+        // Start with full waves and tightly packed rows, then padding/partial coverage.
+        desc.width = round == 0 ? 64 : 48; desc.height = round == 0 ? 32 : 20;
+        desc.format = round == 2 ? PixelFormat::kRGBA32Uint : PixelFormat::kR32Uint;
+        desc.usage = kTextureUsageRead | kTextureUsageWrite;
+        auto src = Texture::make(gpu, desc, &why), dst = Texture::make(gpu, desc, &why);
+        if (!queue || !constant || !src || !dst) {
+            report(false, name + " resources: " + why);
+            return 1;
+        }
+        const uint32_t gridW = round == 1 ? 24 : desc.width, c = 0x5678 + round * 0x1000;
+        auto value = [=](uint32_t x, uint32_t y, uint32_t lane) {
+            return lane == 0 ? expectedWord(y * gridW + x, c) : lane == 1 ? x : lane == 2 ? y : 0xdeadu;
+        };
+        const uint32_t lanes = src->info().bytesPerPixel / 4;
+        const uint32_t canary = texCanary([&](uint32_t v) {
+            for (uint32_t y = 0; y < desc.height; ++y)
+                for (uint32_t x = 0; x < desc.width; ++x)
+                    for (uint32_t l = 0; l < lanes; ++l) if (value(x, y, l) == v) return true;
+            return false;
+        });
+        fillBo(*src, canary); fillBo(*dst, canary);
+        for (uint32_t y = 0; y < desc.height; ++y)
+            for (uint32_t x = 0; x < desc.width; ++x)
+                for (uint32_t l = 0; l < lanes; ++l) {
+                    const uint32_t word = value(x, y, l);
+                    memcpy(static_cast<uint8_t*>(src->contents()) + y * src->bytesPerRow() + (x * lanes + l) * 4, &word, 4);
+                }
+        memset(constant->contents(), 0, 16);
+        static_cast<uint32_t*>(constant->contents())[0] = c;
+        Bindings bindings;
+        const bool copy = name == "tex_copy";
+        bindings.textures = copy ? std::vector<const Texture*>{dst.get(), src.get()} : std::vector<const Texture*>{dst.get()};
+        if (!copy) bindings.buffers = {{constant.get(), 0}};
+        const Kernel& kernel = chip == kChipA730.id
+            ? (copy ? kernels::a730_tex_copy_air : kernels::a730_tex_fill_air)
+            : (copy ? kernels::tex_copy_air : kernels::tex_fill_air);
+        const uint32_t localY = round == 0 ? 8 : 4;
+        const uint32_t groups[3] = {gridW / 8, desc.height / localY, 1}, local[3] = {8, localY, 1};
+        auto cb = queue->commandBuffer();
+        if (!cb->dispatch(kernel, groups, local, bindings, nullptr, options)) {
+            report(false, name + " recording: " + cb->error()); return 1;
+        }
+        cb->commit(); cb->waitUntilCompleted();
+        const auto r = compareTexture(*dst, PixelRule{[=](uint32_t x, uint32_t) { return x < gridW; }, value}, canary);
+        const bool ok = cb->status() == CommandBuffer::kCompleted && r.right == r.covered && r.covered != 0 &&
+                        r.uncoveredCanary == r.uncovered && r.paddingUntouched == r.padding && gpu.faults() == faults;
+        const std::string label = name + " round " + std::to_string(round + 1);
+        report(ok, label + ": " + describeTexture(r, "as computed") + status(*cb, gpu));
+        reportPadding(label, r);
+        if (!ok) return 1;
+    }
+    std::printf("probe: 0 failures\n");
+    return 0;
+}
+
+// --case img_store (A730): one typed 2D store of fill_id's word into a 64x32 R32Uint image at IBO 0, from hand-written
+// instructions (tools/kernels/img_store.asm; ir3-kernel makes the store bindless on gen 7), with tex_fill's binding.
+// The narrowest test of the A730's image path: no preamble, no AIR front end.
+static int imageStoreCase(Gpu& gpu, uint64_t chip, const std::string& name, const compute::Options& options) {
+    if (chip != kChipA730.id) {
+        std::printf("probe: --case %s is A730 only\n", name.c_str());
+        return 2;
+    }
+    Kernel kernel = kernels::a730_img_store;
+    kernel.numIbos = 1;
+    kernel.textures[0] = kernels::a730_tex_fill_air.textures[0];   // image 2D of uint as 32-bit, written
+    const uint64_t faults = gpu.faults();
+    std::string why;
+    for (unsigned round = 0; round < 3; ++round) {
+        auto queue = CommandQueue::make(gpu, &why);
+        TextureDesc desc;
+        desc.width = 64; desc.height = 32; desc.format = PixelFormat::kR32Uint;
+        desc.usage = kTextureUsageRead | kTextureUsageWrite;
+        auto dst = Texture::make(gpu, desc, &why);
+        if (!queue || !dst) {
+            report(false, name + " resources: " + why);
+            return 1;
+        }
+        const uint32_t c = 0x5678 + round * 0x1000;
+        auto value = [=](uint32_t x, uint32_t y, uint32_t) { return expectedWord(y * 64 + x, c); };
+        const uint32_t canary = texCanary([&](uint32_t v) {
+            for (uint32_t y = 0; y < 32; ++y)
+                for (uint32_t x = 0; x < 64; ++x) if (value(x, y, 0) == v) return true;
+            return false;
+        });
+        fillBo(*dst, canary);
+        Bindings bindings;
+        bindings.textures = {dst.get()};
+        const uint32_t immediates[4] = {c, 0, 0, 0};
+        const uint32_t groups[3] = {8, 4, 1}, local[3] = {8, 8, 1};
+        auto cb = queue->commandBuffer();
+        if (!cb->dispatch(kernel, groups, local, bindings, immediates, options)) {
+            report(false, name + " recording: " + cb->error()); return 1;
+        }
+        cb->commit(); cb->waitUntilCompleted();
+        const auto r = compareTexture(*dst, PixelRule{[](uint32_t, uint32_t) { return true; }, value}, canary);
+        const bool ok = cb->status() == CommandBuffer::kCompleted && r.right == r.covered && r.covered != 0 && gpu.faults() == faults;
+        report(ok, name + " round " + std::to_string(round + 1) + ": " +
+                       describeTexture(r, "as computed") + status(*cb, gpu));
+        if (!ok) return 1;
+    }
+    std::printf("probe: 0 failures\n");
+    return 0;
+}
+
+static int singleCase(Gpu& gpu, uint64_t chip, const std::string& name, const compute::Options& options, bool noEarly) {
+    if (name == "img_store") return imageStoreCase(gpu, chip, name, options);
+    if (name != "end_only" && name != "fill_id" && name != "fill_id_air" && name != "copy" && name != "fill" &&
+        name != "tex_fill" && name != "tex_copy") {
+        std::printf("probe: unknown --case %s (end_only, fill_id, copy, fill, fill_id_air, img_store, tex_fill, tex_copy)\n", name.c_str());
+        return 2;
+    }
+    if (noEarly && name != "fill_id_air") {
+        std::printf("probe: --noearly is a diagnostic only for --case fill_id_air\n");
+        return 2;
+    }
+    if (noEarly) std::printf("probe: diagnostic: EARLYPREAMBLE disabled; shader ISA unchanged\n");
+    if (name == "tex_fill" || name == "tex_copy") return textureCase(gpu, chip, name, options);
+    if (chip != kChipA635.id && chip != kChipA730.id) {
+        report(false, "unsupported chip for isolated probe");
+        return 2;
+    }
+    std::string why;
+    const uint64_t faults = gpu.faults();
+    // Reopening the queue also checks resource lifetime across independent submissions.
+    for (unsigned round = 0; round < 3; ++round) {
+        auto queue = CommandQueue::make(gpu, &why);
+        auto src = newBuffer(gpu, 8192, &why), dst = newBuffer(gpu, 8192, &why);
+        if (!queue || !src || !dst) {
+            report(false, "isolated probe resources: " + why);
+            return 1;
+        }
+        std::vector<uint8_t> expected(8192, 0xa5), source(8192);
+        for (unsigned i = 0; i < source.size(); ++i) source[i] = uint8_t(i * 37 + round);
+        memcpy(src->contents(), source.data(), source.size());
+        memcpy(dst->contents(), expected.data(), expected.size());
+        auto cb = queue->commandBuffer();
+        bool recorded = false;
+        if (name == "end_only" || name == "fill_id" || name == "fill_id_air") {
+            const bool air = name == "fill_id_air", fill = name != "end_only";
+            Kernel kernel = chip == kChipA730.id
+                ? (air ? kernels::a730_fill_id_air : fill ? kernels::a730_fill_id : kernels::a730_end_only)
+                : (air ? kernels::fill_id_air : fill ? kernels::fill_id : kernels::end_only);
+            if (noEarly) kernel.earlyPreamble = false; // diagnostic register toggle; ISA is unchanged
+            const uint32_t groups[3] = {fill ? 16u : 1u, 1, 1};
+            const uint32_t c = 0x1234 + round * 0x1000;
+            const uint32_t imm[4] = {c, 0, 0, 0};
+            std::vector<Binding> bindings;
+            if (fill) bindings.push_back({dst.get(), 0});
+            if (air) {
+                static_cast<uint32_t*>(src->contents())[0] = c;
+                bindings.push_back({src.get(), 0});
+            }
+            const uint32_t local[3] = {64, 1, 1};
+            recorded = cb->dispatch(kernel, groups, air ? local : nullptr, bindings, fill && !air ? imm : nullptr, options);
+            if (fill) {
+                for (uint32_t i = 0; i < 1024; ++i) {
+                    const uint32_t word = expectedWord(i, c);
+                    memcpy(expected.data() + i * 4, &word, 4);
+                }
+            }
+        } else if (name == "copy") {
+            // An aligned CP copy followed by an unaligned 2D copy; both have guards.
+            recorded = cb->copy(*src, 4, *dst, 8, 1024);
+            recorded = cb->copy(*src, 1, *dst, 2051, 1073) && recorded;
+            memcpy(expected.data() + 8, source.data() + 4, 1024);
+            memcpy(expected.data() + 2051, source.data() + 1, 1073);
+        } else {
+            // CP_MEM_WRITE fills whole words; the unaligned byte path is covered by copy.
+            recorded = cb->fill(*dst, 4, 4100, uint8_t(0x63 + round));
+            std::fill(expected.begin() + 4, expected.begin() + 4104, uint8_t(0x63 + round));
+        }
+        if (!recorded) {
+            report(false, name + " recording: " + cb->error());
+            return 1;
+        }
+        cb->commit();
+        cb->waitUntilCompleted();
+        std::vector<uint8_t> actual(expected.size());
+        memcpy(actual.data(), dst->contents(), actual.size());
+        const auto mismatch = std::mismatch(actual.begin(), actual.end(), expected.begin());
+        const bool same = mismatch.first == actual.end();
+        if (!same) {
+            const size_t at = size_t(mismatch.first - actual.begin()) & ~size_t(3);
+            uint32_t got = 0, want = 0;
+            memcpy(&got, actual.data() + at, 4); memcpy(&want, expected.data() + at, 4);
+            std::printf("probe: mismatch word %zu: got %08x expected %08x\n", at / 4, got, want);
+            if (name == "fill_id_air") {
+                const auto r = readBack(*dst, 1024, 0x1234 + round * 0x1000, 0xa5a5a5a5);
+                std::printf("probe: %s\n", describe(r, 1024, 1024).c_str());
+            }
+        }
+        const bool ok = cb->status() == CommandBuffer::kCompleted && same && gpu.faults() == faults;
+        report(ok, name + " round " + std::to_string(round + 1) + ": " +
+                   (same ? "8192 bytes and guards exact" : "first mismatch at byte " + std::to_string(mismatch.first - actual.begin())) +
+                   status(*cb, gpu));
+        if (!ok) return 1; // The caller decides when it is safe to advance the ladder.
+    }
+    std::printf("probe: 0 failures\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
-    bool recover = false, bisect = false, binTrace = false;
+    bool recover = false, bisect = false, binTrace = false, noEarly = false;
     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
+    std::string isolated;
     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--case") == 0) {
+            if (++i == argc) { std::printf("probe: --case needs a name\n"); return 2; }
+            isolated = argv[i];
+            continue;
+        }
         recover = recover || strcmp(argv[i], "--recover") == 0;
+        noEarly = noEarly || strcmp(argv[i], "--noearly") == 0;
         bisect = bisect || strcmp(argv[i], "--bisect") == 0;
         binTrace = binTrace || strcmp(argv[i], "--bin-trace") == 0;
         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
@@ -404,6 +628,12 @@ int main(int argc, char** argv) {
     std::printf("probe: GPU %llu, chip id 0x%llx, %llu MHz, FAULTS %llu%s\n", (unsigned long long)id, (unsigned long long)chip,
                 (unsigned long long)(freq / 1000000), (unsigned long long)gpu.faults(),
                 recover ? "; the GPU will be hung on purpose at the end (--recover)" : "");
+    std::fflush(stdout);
+    if (!isolated.empty()) return singleCase(gpu, chip, isolated, chosen, noEarly);
+    if (chip != kChipA635.id) {
+        report(false, "the broad suite needs A635 fixtures; use --case for the A730 ladder");
+        return 2;
+    }
     {
         // what this processor's writes and reads of a GPU buffer cost against its own memory: a draw writes some 3 KB
         // of descriptors into one, and an uncached mapping makes each store a bus transaction

@@ -179,7 +179,7 @@ public:
 
 private:
     friend class CommandQueue;
-    explicit CommandBuffer(CommandQueue& queue) : queue_(queue) {}
+    explicit CommandBuffer(CommandQueue& queue);
 public:
     ~CommandBuffer();   // (its stamp buffers back to the queue: read until the last reader lets go, which is now)
 private:

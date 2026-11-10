@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <map>
 
 #ifdef HAKIOS_METAL_MESA
 // Mesa's headers carry their own C++ guards (and templates behind them: no extern "C" around these) and are not clean
@@ -23,14 +24,14 @@ namespace hakios::metal {
 
 #ifndef HAKIOS_METAL_MESA
 
-bool hasCompiler() { return false; }
+bool hasCompiler(uint32_t) { return false; }
 
-std::unique_ptr<CompiledKernel> compileAir(const void*, size_t, std::string* why, const FunctionConstants&) {
+std::unique_ptr<CompiledKernel> compileAir(const void*, size_t, std::string* why, const FunctionConstants&, uint32_t) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
     return nullptr;
 }
 
-std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* why, const FunctionConstants&, uint32_t, const KnownBuffer*) {
+std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* why, const FunctionConstants&, uint32_t, const KnownBuffer*, uint32_t) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
     return nullptr;
 }
@@ -51,12 +52,26 @@ namespace {
 
 std::mutex gCompilerLock;   // ir3 keeps state in the compiler object; one compilation at a time
 
-// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row
+// Selected only while gCompilerLock is held; every public compilation restores
+// the previous target, including refusal paths. Each chip owns its ir3 state.
+uint32_t gCompilerChip = kChipA635.id;
+struct CompilerTarget {
+    uint32_t previous = gCompilerChip;
+    explicit CompilerTarget(uint32_t chip) { gCompilerChip = chipInfo(chip) ? chipInfo(chip)->id : chip; }
+    ~CompilerTarget() { gCompilerChip = previous; }
+};
+
 ir3_compiler* theCompiler() {
-    static ir3_compiler* compiler = [] {
-        fd_dev_id id{};
-        id.gpu_id = 0;
-        id.chip_id = a6xx::kChipId;
+    if (chipInfo(gCompilerChip) == nullptr) return nullptr;
+    // ir3 retains dev_id: it must outlive ir3_compiler_create, rather than
+    // pointing into the stack frame of the initialization lambda.
+    static std::map<uint32_t, fd_dev_id> ids;
+    static std::map<uint32_t, ir3_compiler*> compilers;
+    auto found = compilers.find(gCompilerChip);
+    if (found != compilers.end()) return found->second;
+    auto& id = ids[gCompilerChip];
+    id.chip_id = gCompilerChip;
+    ir3_compiler* compiler = [&] {
         // A framebuffer fetch (nir_texop_txf_ms_fb) through the FS's own texture table, at the slot after its last
         // texture, as turnip has it (tu_device.cc: -1): the zero default would make it a bindless read of descriptor
         // set 0, which this driver never binds
@@ -67,6 +82,7 @@ ir3_compiler* theCompiler() {
         glsl_type_singleton_init_or_ref();
         return ir3_compiler_create(nullptr, &id, fd_dev_info_raw(&id), &options);
     }();
+    compilers[gCompilerChip] = compiler;
     return compiler;
 }
 
@@ -542,6 +558,37 @@ bool lowerUclz(nir_builder* b, nir_instr* instr, void*) {
     return true;
 }
 
+// On gen 7 a compute kernel's SSBOs and images are descriptors of bindless set 0 (stib/ldib/atomic/resinfo .base0), at
+// the IBO slots the non-bindless path gave them: SSBO i at i, image i at num_ssbos + i (ir3_image_to_ibo), so the
+// dispatch's descriptor table is laid out as before and SP_CS_BINDLESS_BASE[0] points at it (compute.cpp). The A730
+// runs non-bindless IBOs unreliably (GPU-PLAN.md, 10 November: one non-bindless typed store, or any bindless dispatch,
+// and every later non-bindless store writes nothing); Gallium (ir3_nir_lower_io_to_bindless) and turnip are bindless on
+// every gen 6+. tools/mesa/ir3-dump.patch's lower_ibo_to_bindless is the same pass, for the fixtures.
+bool lowerIboToBindless(nir_builder* b, nir_intrinsic_instr* intr, void* data) {
+    const unsigned numSsbos = *static_cast<const unsigned*>(data);
+    unsigned src = 0, base = 0;
+    switch (intr->intrinsic) {
+    case nir_intrinsic_load_ssbo: case nir_intrinsic_ssbo_atomic: case nir_intrinsic_ssbo_atomic_swap:
+    case nir_intrinsic_get_ssbo_size:
+        break;
+    case nir_intrinsic_store_ssbo:
+        src = 1;
+        break;
+    case nir_intrinsic_image_load: case nir_intrinsic_image_store: case nir_intrinsic_image_atomic:
+    case nir_intrinsic_image_atomic_swap: case nir_intrinsic_image_size: case nir_intrinsic_image_samples:
+        base = numSsbos;
+        break;
+    default:
+        return false;
+    }
+    b->cursor = nir_before_instr(&intr->instr);
+    nir_def* index = nir_iadd_imm(b, intr->src[src].ssa, base);
+    _nir_bindless_resource_ir3_indices set{};
+    set.desc_set = 0;
+    nir_src_rewrite(&intr->src[src], _nir_build_bindless_resource_ir3(b, 32, index, set));
+    return true;
+}
+
 bool lowerHalfDerivative(nir_builder* b, nir_intrinsic_instr* intr, void*) {
     switch (intr->intrinsic) {
     case nir_intrinsic_ddx: case nir_intrinsic_ddx_fine: case nir_intrinsic_ddx_coarse:
@@ -692,6 +739,10 @@ bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     ir3_shader_nir_options nirOptions{};
     nir_shader_intrinsics_pass(nir, lowerHalfDerivative, nir_metadata_control_flow, nullptr);
     nir_shader_instructions_pass(nir, lowerUclz, nir_metadata_control_flow, nullptr);
+    if (compiler->gen >= 7 && nir->info.stage == MESA_SHADER_COMPUTE) {
+        unsigned numSsbos = nir->info.num_ssbos;
+        nir_shader_intrinsics_pass(nir, lowerIboToBindless, nir_metadata_control_flow, &numSsbos);
+    }
     ir3_nir_lower_io_to_temporaries(nir);
     ir3_finalize_nir(compiler, &nirOptions, nir);
     if (!lowerFbRead(nir, t.fbTargets, why)) return false;
@@ -1065,12 +1116,17 @@ const char* className(uint8_t element) { return element == kElemFloat ? "floats"
 
 }  // namespace
 
-bool hasCompiler() { return theCompiler() != nullptr; }
-
-std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
+bool hasCompiler(uint32_t chipId) {
     std::lock_guard<std::mutex> g(gCompilerLock);
+    CompilerTarget target(chipId);
+    return theCompiler() != nullptr;
+}
+
+std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t chipId) {
+    std::lock_guard<std::mutex> g(gCompilerLock);
+    CompilerTarget target(chipId);
     if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+        refuse(why, "ir3 has no compiler for the requested chip ID");
         return nullptr;
     }
     Translation t;
@@ -1082,6 +1138,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
     }
     // the textures, images and samplers as the instructions address them, before any lowering touches them
     auto out = std::make_unique<CompiledKernel>();
+    out->chipId = gCompilerChip;
     uint32_t highestSampler = 0;
     if (!walkTextures(t.nir, out->kernel, &highestSampler, why)) return nullptr;
     if (!nullTextures(t, out->kernel, false, why)) return nullptr;
@@ -1164,7 +1221,7 @@ std::string stageCacheName(const void* bitcode, size_t size, const FunctionConst
             h[1] = (h[1] ^ b) * 0x1000193ull + (h[1] >> 29);
         }
     };
-    const uint32_t layout[3] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase};
+    const uint32_t layout[4] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase, gCompilerChip};
     mix(kCacheBuild, strlen(kCacheBuild));
     mix(layout, sizeof(layout));
     mix(bitcode, size);
@@ -1191,6 +1248,7 @@ std::string stageCacheWritable(const std::string& name) {
 void stageCacheSave(const std::string& path, const CompiledStage& s) {
     CacheWriter w;
     w.u32(kCacheMagic);
+    w.u32(s.chipId);
     w.raw(&s.stage, sizeof(s.stage));
     w.u32(uint32_t(s.words.size()));
     w.raw(s.words.data(), s.words.size() * 4);
@@ -1235,7 +1293,8 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
     fclose(f);
     CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
     auto s = std::make_unique<CompiledStage>();
-    if (r.u32() != kCacheMagic || !r.raw(&s->stage, sizeof(s->stage))) return nullptr;
+    if (r.u32() != kCacheMagic || r.u32() != gCompilerChip || !r.raw(&s->stage, sizeof(s->stage))) return nullptr;
+    s->chipId = gCompilerChip;
     s->words.resize(r.u32());
     r.raw(s->words.data(), s->words.size() * 4);
     s->immediates.resize(r.u32());
@@ -1276,10 +1335,11 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
 }  // namespace
 
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                           const KnownBuffer* known) {
+                                           const KnownBuffer* known, uint32_t chipId) {
     std::lock_guard<std::mutex> g(gCompilerLock);
+    CompilerTarget target(chipId);
     if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+        refuse(why, "ir3 has no compiler for the requested chip ID");
         return nullptr;
     }
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
@@ -1337,6 +1397,7 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
         return nullptr;
     }
     auto out = std::make_unique<CompiledStage>();
+    out->chipId = gCompilerChip;
     // read off the NIR before any lowering touches it: the textures the instructions address and the outputs' classes
     uint32_t highestSampler = 0;
     if (!walkTextures(t.nir, out->stage.k, &highestSampler, why)) return nullptr;
@@ -1394,6 +1455,10 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
                                              std::string* why) {
     if (vs == nullptr || fs == nullptr) {
         refuse(why, "linkProgram needs a vertex and a fragment stage; one is missing");
+        return nullptr;
+    }
+    if (vs->chipId != fs->chipId) {
+        refuse(why, "linkProgram needs both stages compiled for the same chip ID");
         return nullptr;
     }
     const Stage& V = vs->stage;
@@ -1556,6 +1621,7 @@ bool argumentBufferLayout(const void* bitcode, size_t size, uint32_t set, std::v
     // Evil 4 asks for encoders on one thread while it compiles on others -- unlocked, the same function's layout came
     // back with 23 members, then 12, its set numbers garbage, and the encoders built from it wrote nothing
     std::lock_guard<std::mutex> g(gCompilerLock);
+    CompilerTarget target(kChipA635.id);
     // the interface alone: a body the front end cannot translate yet does not keep a set's layout from being known
     Translation t;
     t.mem = ralloc_context(nullptr);

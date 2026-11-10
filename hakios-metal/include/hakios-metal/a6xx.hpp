@@ -144,12 +144,12 @@ enum a6xx_format : uint32_t {
     // ASTC (LDR and sRGB alike: TEX_CONST_0.SRGB tells them apart), sampled only (fd6_format_table.c's _T_ rows)
     // ETC2 and EAC, 4 x 4 blocks of 8 or 16 bytes: sampled alone (fd6_format_table.c:290-299, _T_ rows)
     FMT6_ETC2_RG11_UNORM = 171,    // a6xx.xml.h:156
-    FMT6_ETC2_RG11_SNORM = 172,
-    FMT6_ETC2_R11_UNORM = 173,
-    FMT6_ETC2_R11_SNORM = 174,
+    FMT6_ETC2_RG11_SNORM = 172, // a6xx.xml.h:157
+    FMT6_ETC2_R11_UNORM = 173, // a6xx.xml.h:158
+    FMT6_ETC2_R11_SNORM = 174, // a6xx.xml.h:159
     FMT6_ETC2_RGB8 = 176,          // a6xx.xml.h:161
-    FMT6_ETC2_RGBA8 = 177,
-    FMT6_ETC2_RGB8A1 = 178,
+    FMT6_ETC2_RGBA8 = 177, // a6xx.xml.h:162
+    FMT6_ETC2_RGB8A1 = 178, // a6xx.xml.h:163
     FMT6_ASTC_4x4 = 193,           // a6xx.xml.h:174
     FMT6_ASTC_5x4 = 194,           // a6xx.xml.h:175
     FMT6_ASTC_5x5 = 195,           // a6xx.xml.h:176
@@ -306,7 +306,7 @@ enum a6xx_marker : uint32_t {
     RM6_DIRECT_RENDER = 1,         // adreno_pm4.xml.h:519
     RM6_BIN_VISIBILITY = 2,        // adreno_pm4.xml.h:520  the binning pass (emit_binning_pass)
     RM6_BIN_RENDER_START = 4,      // adreno_pm4.xml.h:522  a GMEM tile's draws begin (tu6_emit_tile_select)
-    RM6_BIN_END_OF_DRAWS = 5,      // adreno_pm4.xml:1802  a binned tile's draws done (tu6_render_tile, under hw binning)
+    RM6_BIN_END_OF_DRAWS = 5,      // adreno_pm4.xml:1802  a binned tile's draws done (tu6_render_tile, under hw binning) // adreno_pm4.xml.h:523
     RM6_BIN_RESOLVE = 6,           // adreno_pm4.xml.h:524  the tile's store to memory (tu6_emit_tile_store)
     RM6_BIN_RENDER_END = 7,        // adreno_pm4.xml.h:525
     RM6_COMPUTE = 8,               // adreno_pm4.xml.h:526
@@ -335,7 +335,7 @@ enum Opcode : uint32_t {
     CP_WAIT_FOR_ME = 0x13,         // adreno_pm4.xml.h:270
     CP_SET_BIN_DATA5 = 0x2f,       // adreno_pm4.xml.h:227  a tile's visibility streams by address, 7 words (fd6_emit_tile_prep)
     CP_SET_BIN_DATA5_OFFSET = 0x2e,   // adreno_pm4.xml.h:329  ...by offsets from the VSC_*_ADDRESS registers, 4 words (tu6_emit_tile_select)
-    CP_COND_WRITE5 = 0x45,         // adreno_pm4.xml:308  a word written where a register or word compares true (emit_vsc_overflow_test)
+    CP_COND_WRITE5 = 0x45,         // adreno_pm4.xml:308  a word written where a register or word compares true (emit_vsc_overflow_test) // adreno_pm4.xml.h:233
     CP_WAIT_MEM_GTE = 0x14,        // adreno_pm4.xml.h:326  wait until a memory word >= REF (signed)
     CP_SKIP_IB2_ENABLE_GLOBAL = 0x1d,  // adreno_pm4.xml.h:294  1 word, 0 at pass begin and end (tu_cmd_buffer.cc:2134-2135, 2161-2162); undocumented
     CP_SKIP_IB2_ENABLE_LOCAL = 0x23,   // adreno_pm4.xml.h:295  1 word, 1: fd6 only ("I think that is not required", fd6_gmem.cc:2048)
@@ -1322,12 +1322,12 @@ constexpr uint32_t loadState6_0(uint32_t dstOff, a6xx_state_type type, a6xx_stat
 
 // CP_EXEC_CS_INDIRECT word 3 (A5XX_CP_EXEC_CS_INDIRECT_3, adreno_pm4.xml.h:2574-2584, the form turnip emits on a6xx,
 // tu_cmd_buffer.cc:7002-7008): the local size, each axis minus one, beside the group counts' address in words 1-2
-inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX__MASK = 0x00000ffc;
-inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX__SHIFT = 2;
-inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY__MASK = 0x003ff000;
-inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY__SHIFT = 12;
-inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEZ__MASK = 0xffc00000;
-inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEZ__SHIFT = 22;
+inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX__MASK = 0x00000ffc; // adreno_pm4.xml.h:2589
+inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX__SHIFT = 2; // adreno_pm4.xml.h:2590
+inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY__MASK = 0x003ff000; // adreno_pm4.xml.h:2595
+inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY__SHIFT = 12; // adreno_pm4.xml.h:2596
+inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEZ__MASK = 0xffc00000; // adreno_pm4.xml.h:2601
+inline constexpr uint32_t A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEZ__SHIFT = 22; // adreno_pm4.xml.h:2602
 constexpr uint32_t execCsIndirect3(uint32_t localX, uint32_t localY, uint32_t localZ) {
     return field(localX - 1, A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX__SHIFT, A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEX__MASK) |
            field(localY - 1, A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY__SHIFT, A5XX_CP_EXEC_CS_INDIRECT_3_LOCALSIZEY__MASK) |
@@ -1412,9 +1412,12 @@ inline constexpr uint32_t kSysmemPerCcuColorCacheSize = 0x10000;  // not-in-head
 // tiled rendering: the on-chip memory and the tile grid (a6xx_gen4 / adreno_7c3 in freedreno_devices.py)
 inline constexpr uint32_t kGmemBytes = 512 * 1024;                // not-in-headers: freedreno_devices.py adreno_7c3 gmem_size (Linux a6xx_gpu adreno_7c3 SZ_512K)
 inline constexpr uint32_t kGmemCcuColorCacheFraction = 4;          // not-in-headers: freedreno_devices.py a6xx_gen4 gmem_ccu_color_cache_fraction QUARTER
-inline constexpr uint32_t kTileAlignW = 32, kTileAlignH = 16;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_align_w/h
-inline constexpr uint32_t kGmemAlignW = 16, kGmemAlignH = 4;       // not-in-headers: freedreno_devices.py a6xx_gen4 gmem_align_w/h (the event blit's granule)
-inline constexpr uint32_t kTileMaxW = 1024, kTileMaxH = 1008;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_max_w/h
+inline constexpr uint32_t kTileAlignW = 32;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_align_w/h
+inline constexpr uint32_t kTileAlignH = 16;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_align_w/h
+inline constexpr uint32_t kGmemAlignW = 16;       // not-in-headers: freedreno_devices.py a6xx_gen4 gmem_align_w/h (the event blit's granule)
+inline constexpr uint32_t kGmemAlignH = 4;       // not-in-headers: freedreno_devices.py a6xx_gen4 gmem_align_w/h (the event blit's granule)
+inline constexpr uint32_t kTileMaxW = 1024;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_max_w/h
+inline constexpr uint32_t kTileMaxH = 1008;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_max_w/h
 // the border color table both TP base registers point at: Gallium's is FD6_MAX_BORDER_COLORS (256) entries of
 // sizeof(struct fd6_bcolor_entry) (128 bytes: 32 fp32/fp16/int words); zeros are a valid table (black, transparent)
 inline constexpr uint32_t kBorderColorBytes = 256 * 128;          // not-in-headers: fd6_texture.h FD6_MAX_BORDER_COLORS * FD6_BORDER_COLOR_SIZE
@@ -3975,7 +3978,9 @@ constexpr uint32_t regVfdDestCntlInstr(uint32_t i) { return REG_A6XX_VFD_DEST_CN
 // by 2^23 (exact: a float has 24 significant bits). A finite value round-trips exactly (tests/a6xx_test.cpp holds it
 // to memcpy); NaN gives the quiet NaN, an infinity 0x7f800000 with its sign.
 constexpr uint32_t fui(float f) {
-    uint32_t sign = __builtin_signbit(f) ? 0x80000000u : 0u;
+    // Clang does not accept __builtin_signbit in a C++17 constant expression.
+    // Its bit-cast intrinsic preserves negative zero here too (as GCC's does).
+    uint32_t sign = __builtin_bit_cast(uint32_t, f) & 0x80000000u;
     if (f != f) {
         return 0x7fc00000u;
     }
@@ -4086,7 +4091,7 @@ constexpr uint32_t binControlGmem(bool lrzFeedback, uint32_t binw, uint32_t binh
 // RB_CCU_CNTL for tiled rendering: the colour cache shrunk to its GMEM fraction and moved to GMEM's end, so the tiles
 // own everything below it (tu_cmd_buffer.cc tu6_emit_ccu_cntl, gmem: ccu_offset_gmem = gmem - num_ccu * color cache /
 // fraction); depth cache unused (no depth attachment in a GMEM pass here). 0x3c400000 on this chip
-constexpr uint32_t kGmemCcuColorOffset = kGmemBytes - kNumCcu * kSysmemPerCcuColorCacheSize / kGmemCcuColorCacheFraction;
+constexpr uint32_t kGmemCcuColorOffset = kGmemBytes - kNumCcu * kSysmemPerCcuColorCacheSize / kGmemCcuColorCacheFraction; // not-in-headers: CCU split derived from chip cache sizes above
 constexpr uint32_t rbCcuCntlGmem() {
     return (kHasGmemFastClear ? 0u : A6XX_RB_CCU_CNTL_GMEM_FAST_CLEAR_DISABLE) | A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(kGmemCcuColorOffset >> 21) |
            A6XX_RB_CCU_CNTL_COLOR_CACHE_SIZE(CCU_CACHE_SIZE_QUARTER) | A6XX_RB_CCU_CNTL_COLOR_OFFSET(kGmemCcuColorOffset & 0x1fffff);
@@ -4102,9 +4107,9 @@ inline constexpr uint32_t REG_A6XX_VSC_DRAW_STRM_SIZE_ADDRESS = 0x0c03;         
 inline constexpr uint32_t REG_A6XX_VSC_BIN_COUNT = 0x0c06;                                   // a6xx.xml.h:4167  NX at 1, NY at 11
 inline constexpr uint32_t REG_A6XX_VSC_PIPE_CONFIG_REG = 0x0c10;                             // a6xx.xml.h:4184  32 of them: X 0-9, Y 10-19, W 20-25, H 26-31 (bins)
 inline constexpr uint32_t REG_A6XX_VSC_PRIM_STRM_ADDRESS = 0x0c30;                           // a6xx.xml.h:4211  64-bit, then PITCH 0x0c32, LIMIT 0x0c33
-inline constexpr uint32_t REG_A6XX_VSC_PRIM_STRM_PITCH = 0x0c32;
+inline constexpr uint32_t REG_A6XX_VSC_PRIM_STRM_PITCH = 0x0c32; // a6xx.xml.h:4214
 inline constexpr uint32_t REG_A6XX_VSC_DRAW_STRM_ADDRESS = 0x0c34;                           // a6xx.xml.h:4220  64-bit, then PITCH 0x0c36, LIMIT 0x0c37
-inline constexpr uint32_t REG_A6XX_VSC_DRAW_STRM_PITCH = 0x0c36;
+inline constexpr uint32_t REG_A6XX_VSC_DRAW_STRM_PITCH = 0x0c36; // a6xx.xml.h:4223
 constexpr uint32_t vscBinSize(uint32_t w, uint32_t h) { return (w >> 5) | (h >> 4) << 8; }
 constexpr uint32_t vscBinCount(uint32_t nx, uint32_t ny) { return nx << 1 | ny << 11; }
 constexpr uint32_t vscPipeConfig(uint32_t x, uint32_t y, uint32_t w, uint32_t h) { return x | y << 10 | w << 20 | h << 26; }
@@ -4335,7 +4340,7 @@ enum a6xx_2d_ifmt : uint32_t {
 
 // RB_2D_BLIT_CNTL and GRAS_2D_BLIT_CNTL take the same word (r2d_setup_common writes one value to both)
 inline constexpr uint32_t REG_A6XX_RB_2D_BLIT_CNTL = 0x8c00;                                // a6xx.xml.h:6555
-inline constexpr uint32_t A6XX_RB_2D_BLIT_CNTL_ROTATE__MASK = 0x00000007;                   // a6xx.xml: a6xx_rotation, bits 0..2
+inline constexpr uint32_t A6XX_RB_2D_BLIT_CNTL_ROTATE__MASK = 0x00000007;                   // a6xx.xml: a6xx_rotation, bits 0..2 // a6xx.xml.h:6556
 inline constexpr uint32_t A6XX_RB_2D_BLIT_CNTL_SOLID_COLOR = 128;                           // a6xx.xml.h:6569
 inline constexpr uint32_t A6XX_RB_2D_BLIT_CNTL_COLOR_FORMAT__MASK = 0x0000ff00;             // a6xx.xml.h:6570
 inline constexpr uint32_t A6XX_RB_2D_BLIT_CNTL_COLOR_FORMAT__SHIFT = 8;                     // a6xx.xml.h:6571

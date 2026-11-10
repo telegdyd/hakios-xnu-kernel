@@ -63,6 +63,9 @@ Header decode(uint32_t word);
 // A stream of packets being written. Addresses are the GPU's (the IOVA of a buffer plus an offset).
 class Stream {
 public:
+    explicit Stream(uint32_t chipId = 0x06030500) : chipId_(chipId) {}
+    uint32_t chipId() const { return chipId_; }
+    bool gen7() const { return chipId_ == 0x07030001; }
     void registers(uint32_t reg, const uint32_t* values, uint32_t count);
     void nop(uint32_t words = 0);
     void waitForIdle();
@@ -85,6 +88,7 @@ private:
         words_.push_back(uint32_t(a >> 32));
     }
     std::vector<uint32_t> words_;
+    uint32_t chipId_;
 };
 
 }  // namespace hakios::metal::pm4

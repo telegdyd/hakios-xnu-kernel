@@ -115,3 +115,32 @@
   the a730 as half-drawn quads, black or in stale colours, with GMEM and sysmem, with UBWC and
   without. FD_MESA_DEBUG=flush and glfetch=0 both hid it; this does, at full speed
   (OnePlus 10 Pro, 10 November). The A6xx path is unchanged.
+- `hakios-metal`: A730 host preparation (10 November): shared chip facts and generated
+  register-offset/magic-state tables; GPU-targeted command streams; gen7 batch start,
+  sysmem CCU split, compute state, explicit-value completion events and 2D copies/clears.
+  The fake validates those paths, including negative stream tests, with separate A730
+  shader fixtures and per-chip ir3 compilers/caches. The fixture compiler lowers uclz
+  as the driver's compiler already does. The A730 Metal plug-in gate remains closed;
+  its draws/GMEM wait for their later ladder steps. See the parent workspace's
+  GPU-PLAN.md, section 7, for checks and the next phone-probe milestone.
+- `hakios-metal/tools/probe.cpp`: isolated `--case` hardware ladder with per-chip
+  A635/A730 fixture selection; refuses the historical A635-only broad suite on
+  other chips. Each case checks results/guards and faults across three queue
+  reopenings, stopping at its first failure. Probe build dependencies include
+  the A730 fixtures. The float-register helper uses a constexpr bit-cast for
+  the sign (including negative zero), which works in the iOS Clang C++17 build.
+- A730 compute follows `fd6_emit_shader(A7XX)` for instruction fetch (no A6xx
+  instruction-preload packet), and resets `SP_CS_VGPR_CONFIG` through the shared
+  generated table. The fake checks both requirements. Fresh-phone assembly and
+  AIR buffer compute pass; typed texture stores still leave memory untouched
+  and can affect subsequent compute until restart. This is not Metal UI enablement.
+- A730 compute IBOs are bindless set 0, as Gallium (`ir3_nir_lower_io_to_bindless`) and turnip
+  have them on every gen 6+. The non-bindless IBO path, which no Mesa driver runs there, is
+  unreliable on the A730: after one non-bindless typed store, or any bindless dispatch, every
+  later non-bindless store wrote nothing until a reboot (OnePlus 10 Pro, 10 November). The
+  same instructions with only the bindless bit set worked in that state. `compiler.cpp`'s
+  `lowerIboToBindless` and the fixture tool's `lower_ibo_to_bindless` keep the IBO slots (SSBO i
+  at i, image i at num_ssbos + i). `tools/ir3-kernel` adds `.base0` to gen 7 assembly's IBO
+  instructions. `compute.cpp` points SP_CS_BINDLESS_BASE[0] at the dispatch's table and
+  prefetches with SS6_BINDLESS. The fake refuses the non-bindless form on the A730. A6xx
+  unchanged. Fixes the "typed texture stores" item above: `tex_fill` and `tex_copy` pass.

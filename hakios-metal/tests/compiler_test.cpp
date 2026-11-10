@@ -19,6 +19,13 @@
 #include "fixtures/argbuf_res_air.hpp"
 #include "hakios-metal/hakios_metal.h"
 #include "fixtures/fill_id_air.hpp"
+#include "fixtures/a730/fill_id_air.hpp"
+#include "fixtures/a730/clz_id_air.hpp"
+#include "fixtures/a730/tex_fill_h_air.hpp"
+#include "fixtures/a730/tex_copy_air.hpp"
+#include "fixtures/a730/tex_sample_gid_air.hpp"
+#include "fixtures/a730/tri_flat_vs_air.hpp"
+#include "fixtures/a730/tri_flat_fs_air.hpp"
 #include "fixtures/tex_copy_air.hpp"
 #include "fixtures/tex_fill_air.hpp"
 #include "fixtures/tex_size_h_air.hpp"
@@ -116,7 +123,8 @@ void compareKernelFields(const char* name, const Kernel& a, const Kernel& b, boo
 
 // NAME.ll compiled here against its fixture B: every field of the Kernel, the words, and what the compiler reported
 // about the resources; NEEDLE is an instruction the listing must carry. Returns the compiled kernel for more checks.
-std::unique_ptr<CompiledKernel> compareWithFixture(const char* name, const Kernel& b, const char* entry, const char* needle) {
+std::unique_ptr<CompiledKernel> compareWithFixture(const char* name, const Kernel& b, const char* entry, const char* needle,
+                                                  uint32_t chipId = kChipA635.id) {
     std::vector<uint8_t> bc = bitcodeOf(name);
     // a build with the compiler and no bitcode is a broken build, not a pass
     CHECK(!bc.empty());
@@ -125,13 +133,14 @@ std::unique_ptr<CompiledKernel> compareWithFixture(const char* name, const Kerne
         return nullptr;
     }
     std::string why;
-    auto k = compileAir(bc.data(), bc.size(), &why);
+    auto k = compileAir(bc.data(), bc.size(), &why, {}, chipId);
     CHECK(k != nullptr);
     if (k == nullptr) {
         std::printf("       %s: %s\n", name, why.c_str());
         return nullptr;
     }
     const Kernel& a = k->kernel;
+    CHECK_EQ(k->chipId, chipId);
     compareKernelFields(name, a, b);
     // the resources the front end reported (what was declared) against what the fixture says the code does with them:
     // a declared texture is the slot's sampled kind, a declared image its image kind, a declared sampler a bit of the mask
@@ -172,6 +181,22 @@ TEST(compiler_without_mesa_refuses_by_name_and_with_it_matches_the_fixture) {
     uint8_t garbage[16] = {'B', 'C', 0xc0, 0xde, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     CHECK(compileAir(garbage, sizeof garbage, &why) == nullptr);
     CHECK(why.find("refused") != std::string::npos);
+}
+
+TEST(compiler_a730_matches_its_own_compute_fixtures_and_restores_a635_target) {
+    if (!hasCompiler()) return;
+    CHECK(hasCompiler(kChipA730.id));
+    CHECK(!hasCompiler(0x07040001));
+    compareWithFixture("fill_id", kernels::a730_fill_id_air, "fill_id", "", kChipA730.id);
+    compareWithFixture("clz_id", kernels::a730_clz_id_air, "clz_id", "", kChipA730.id);
+    compareWithFixture("tex_fill_h", kernels::a730_tex_fill_h_air, "tex_fill_h", "", kChipA730.id);
+    compareWithFixture("tex_copy", kernels::a730_tex_copy_air, "tex_copy", "", kChipA730.id);
+    compareWithFixture("tex_sample_gid", kernels::a730_tex_sample_gid_air, "tex_sample_gid", "", kChipA730.id);
+    compareWithFixture("fill_id", kernels::fill_id_air, "fill_id", "stib");
+    auto bc = bitcodeOf("fill_id");
+    std::string why;
+    CHECK(compileAir(bc.data(), bc.size(), &why, {}, 0x07040001) == nullptr);
+    CHECK(why.find("chip ID") != std::string::npos);
 }
 
 // A size query is a tex too (txs), its result an integer whatever the texture holds: the texture's class comes from the
@@ -427,7 +452,8 @@ TEST(compiler_reads_the_sampling_kernel_off_the_nir) {
 namespace {
 // NAME.ll compiled here as a Stage against its fixture B (tools/mesa/ir3-dump.patch's emit_stage_fields): the Kernel part
 // field for field as above, then every field of render.hpp's Stage. Returns the compiled stage, shared, for the link tests.
-std::shared_ptr<CompiledStage> compareStageWithFixture(const char* name, const Stage& b, const char* entry, const char* needle) {
+std::shared_ptr<CompiledStage> compareStageWithFixture(const char* name, const Stage& b, const char* entry, const char* needle,
+                                                      uint32_t chipId = kChipA635.id) {
     std::vector<uint8_t> bc = bitcodeOf(name);
     CHECK(!bc.empty());
     if (bc.empty()) {
@@ -435,13 +461,14 @@ std::shared_ptr<CompiledStage> compareStageWithFixture(const char* name, const S
         return nullptr;
     }
     std::string why;
-    std::shared_ptr<CompiledStage> s = compileStage(bc.data(), bc.size(), &why);
+    std::shared_ptr<CompiledStage> s = compileStage(bc.data(), bc.size(), &why, {}, 0, nullptr, chipId);
     CHECK(s != nullptr);
     if (s == nullptr) {
         std::printf("       %s: %s\n", name, why.c_str());
         return nullptr;
     }
     const Stage& a = s->stage;
+    CHECK_EQ(s->chipId, chipId);
     compareKernelFields(name, a.k, b.k, b.kind == kStageFragment);
     CHECK_EQ(a.kind, b.kind);
     CHECK_EQ(a.numInputs, b.numInputs);
@@ -1440,5 +1467,47 @@ TEST(a_compiled_stage_comes_back_from_the_cache_and_from_a_seed) {
         for (const std::string& n : files(d)) remove((d + "/" + n).c_str());
         rmdir(d.c_str());
     }
+    rmdir(base);
+}
+
+TEST(compiler_a730_graphics_fixtures_and_cross_chip_cache_are_separate) {
+    if (!hasCompiler()) return;
+    auto vs = compareStageWithFixture("tri_flat_vs", kernels::a730_tri_flat_vs_air, "tri_flat_vs", "", kChipA730.id);
+    auto fs = compareStageWithFixture("tri_flat_fs", kernels::a730_tri_flat_fs_air, "tri_flat_fs", "", kChipA730.id);
+    auto bc = bitcodeOf("tri_flat_vs");
+    if (bc.empty()) return;
+    std::string why;
+    auto old = compileStage(bc.data(), bc.size(), &why);
+    CHECK(linkProgram(std::move(old), fs, PixelFormat::kRGBA8Unorm, &why) == nullptr);
+    CHECK(why.find("same chip ID") != std::string::npos);
+
+    char base[] = "/tmp/hakios-metal-chip-cache-XXXXXX";
+    if (mkdtemp(base) == nullptr) { CHECK(false); return; }
+    const char* prior = getenv("HAKIOS_METAL_CACHE");
+    const bool hadPrior = prior != nullptr;
+    const std::string saved = prior ? prior : "";
+    setenv("HAKIOS_METAL_CACHE", base, 1);
+    auto a = compileStage(bc.data(), bc.size(), &why);
+    auto b = compileStage(bc.data(), bc.size(), &why, {}, 0, nullptr, kChipA730.id);
+    auto again = compileStage(bc.data(), bc.size(), &why, {}, 0, nullptr, kChipA730.id);
+    CHECK(a != nullptr && b != nullptr && again != nullptr);
+    if (a && b && again) {
+        CHECK_EQ(a->chipId, kChipA635.id);
+        CHECK_EQ(b->chipId, kChipA730.id);
+        CHECK_EQ(again->chipId, kChipA730.id);
+        CHECK(b->words == again->words);
+    }
+    unsigned count = 0;
+    if (DIR* dir = opendir(base)) {
+        while (dirent* entry = readdir(dir)) {
+            if (entry->d_name[0] == '.') continue;
+            ++count;
+            remove((std::string(base) + "/" + entry->d_name).c_str());
+        }
+        closedir(dir);
+    }
+    CHECK_EQ(count, 2u);
+    if (hadPrior) setenv("HAKIOS_METAL_CACHE", saved.c_str(), 1);
+    else unsetenv("HAKIOS_METAL_CACHE");
     rmdir(base);
 }

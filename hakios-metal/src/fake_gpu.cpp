@@ -6,6 +6,8 @@
 #include <cstring>
 
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/chip.hpp"
+#include "hakios-metal/gen7.hpp"
 #include "hakios-metal/pm4.hpp"
 
 namespace hakios::metal {
@@ -167,7 +169,9 @@ bool allZero(const uint32_t* d, uint32_t n) {
 }
 }  // namespace
 
-FakeGpu::FakeGpu(bool async, uint32_t delayUs, bool recovers) : async_(async), recovers_(recovers), delayUs_(delayUs) {
+FakeGpu::FakeGpu(bool async, uint32_t delayUs, bool recovers, uint32_t chipId)
+    : gmem_(chipInfo(chipId) ? chipInfo(chipId)->gmemBytes : 0), chipId_(chipId),
+      async_(async), recovers_(recovers), delayUs_(delayUs) {
     if (async_) {
         thread_ = std::thread([this] { worker(); });
     }
@@ -271,12 +275,37 @@ void FakeGpu::fault(const std::string& why) {
     stats_.lastFault = why;
 }
 
-uint32_t FakeGpu::reg(uint32_t r) const {
-    auto it = regs_.find(r);
+uint32_t FakeGpu::reg(uint32_t r, uint32_t word) const {
+    if (chipId_ == kChipA730.id) r = legacyRegisterOffset(kChipA730, r);
+    auto it = regs_.find(r + word);
     return it == regs_.end() ? 0 : it->second;
 }
 
-uint64_t FakeGpu::reg64(uint32_t r) const { return reg(r) | uint64_t(reg(r + 1)) << 32; }
+uint64_t FakeGpu::reg64(uint32_t r) const {
+    if (chipId_ == kChipA730.id) r = legacyRegisterOffset(kChipA730, r);
+    auto lo = regs_.find(r), hi = regs_.find(r + 1);
+    return (lo == regs_.end() ? 0 : lo->second) | (uint64_t(hi == regs_.end() ? 0 : hi->second) << 32);
+}
+
+bool FakeGpu::gen7BatchReady() {
+    if (chipId_ != kChipA730.id) return true;
+    if (!gen7Thread_) { fault("A730 batch has no BR thread selection"); return false; }
+    auto ccu = regs_.find(0x8e07), ccu2 = regs_.find(0x88e5);
+    if (!written_.count(0x8e07) || !written_.count(0x88e5) || ccu == regs_.end() || ccu2 == regs_.end() ||
+        ccu->second != 0 || ccu2->second != 0x80000000) {
+        fault("A730 sysmem CCU split is missing or still in the A6xx register"); return false;
+    }
+    for (const auto& w : gen7::kMagic) {
+        auto value = regs_.find(w.reg);
+        if (!written_.count(w.reg) || value == regs_.end() || value->second != w.value) {
+            fault(text("missing or wrong A730 batch register %#llx", w.reg)); return false;
+        }
+    }
+    if (!written_.count(a6xx::REG_A6XX_SP_FS_CTRL_REG0) || reg(a6xx::REG_A6XX_SP_FS_CTRL_REG0) != 0) {
+        fault("A730 batch did not clear the stale FS early preamble"); return false;
+    }
+    return true;
+}
 
 // CP_LOAD_STATE6_FRAG, _GEOM or the plain CP_LOAD_STATE6: a program, constants or descriptors into one stage's state
 // block. Which opcode may load which block is Mesa's pairing (tu6_stage2opcode, tu_shader.cc:1349; fd6_stage2opcode,
@@ -366,6 +395,26 @@ bool FakeGpu::loadState(uint32_t opcode, const uint32_t* p, uint32_t count) {
         return false;
     }
     uint64_t from = 0;
+    // The A730's IBOs are bindless set 0 (compute.cpp; non-bindless IBOs are unreliable on it, GPU-PLAN.md 10 November):
+    // the compute block's ST6_IBO load is the SS6_BINDLESS prefetch, whose address words are set << 28 | dword offset,
+    // the descriptors then read through SP_CS_BINDLESS_BASE[set] at the dispatch. Any other IBO load is refused there.
+    const bool a730 = chipId_ == kChipA730.id;
+    if (a730 && xs == nullptr && !texBlock && type == ST6_IBO) {
+        if (src != SS6_BINDLESS || count != 3) {
+            fault("a non-bindless IBO load on the A730: its IBOs are bindless set 0 (SS6_BINDLESS), the only form it runs reliably");
+            return false;
+        }
+        if (dstOff != 0 || p[1] != 0 || p[2] != 0) {
+            fault(text("a bindless IBO prefetch from set %llu, dword %llu, into slot %llu: the dispatch's table is set 0 from its start", p[1] >> 28,
+                       p[1] & 0x0fffffffu, dstOff));
+            return false;
+        }
+        cs_.ibosLoaded = true;
+        cs_.ibosBindless = true;
+        cs_.ibosFrom = 0;
+        cs_.iboUnits = units;
+        return true;
+    }
     if (src == SS6_DIRECT) {
         if (type == ST6_SHADER || texBlock) {
             fault(texBlock ? "a texture or sampler table loaded from the packet itself: not what this GPU model runs"
@@ -625,6 +674,20 @@ bool FakeGpu::checkSampler(const uint32_t* d, uint32_t i) {
 // CP_EXEC_CS: the dispatch itself. Everything the registers and the loads say about it has to hold together; what
 // the real GPU does with state that does not is hang, and that is what a fault stands for here.
 bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
+    if (!gen7BatchReady()) return false;
+    if (chipId_ == kChipA730.id) {
+        for (const auto logical : {Register::HLSQ_CS_CNTL, Register::SP_CS_CNTL_0, Register::SP_CS_CNTL_1,
+                                  Register::HLSQ_CS_CNTL_1, Register::HLSQ_CS_LAST_LOCAL_SIZE,
+                                  Register::SP_CS_CTRL_REG0, Register::SP_CS_CTRL_REG1, Register::HLSQ_CS_NDRANGE_0,
+                                  Register::SP_CS_VGPR_CONFIG}) {
+            if (!written_.count(registerOffset(kChipA730, logical))) {
+                fault("A730 dispatch is missing current-submission compute state"); return false;
+            }
+        }
+        if (cs_.programLoaded || regs_.at(registerOffset(kChipA730, Register::SP_CS_VGPR_CONFIG)) != 0) {
+            fault("A730 compute requires object-start instruction fetch and zero VGPR_CONFIG"); return false;
+        }
+    }
     using namespace a6xx;
     if (count != 4) {
         fault(text("CP_EXEC_CS of %llu words, not 4", count));
@@ -645,7 +708,7 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
         fault(text("the program at SP_CS_OBJ_START %#llx, %llu units: outside every buffer or not 32-byte aligned", program, instrlen));
         return false;
     }
-    if (!cs_.programLoaded || cs_.programFrom != program) {
+    if (chipId_ != kChipA730.id && (!cs_.programLoaded || cs_.programFrom != program)) {
         fault("CP_EXEC_CS without the program preloaded from where SP_CS_OBJ_START points");
         return false;
     }
@@ -667,11 +730,11 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
         fault("SP_CS_CTRL_REG0 and HLSQ_CS_CNTL_1 disagree about the thread size");
         return false;
     }
-    if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
+    if (chipId_ != kChipA730.id && (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1))) {
         fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
         return false;
     }
-    if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
+    if (chipId_ != kChipA730.id && reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
         fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
         return false;
     }
@@ -680,6 +743,17 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
     uint32_t local[3] = {fieldOf(nd0, A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEX__MASK, A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEX__SHIFT) + 1,
                          fieldOf(nd0, A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEY__MASK, A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEY__SHIFT) + 1,
                          fieldOf(nd0, A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEZ__MASK, A6XX_HLSQ_CS_NDRANGE_0_LOCALSIZEZ__SHIFT) + 1};
+    if (chipId_ == kChipA730.id) {
+        const uint32_t ids = reg(REG_A6XX_SP_CS_CNTL_1), h = reg(REG_A6XX_HLSQ_CS_CNTL_1);
+        const uint32_t height = local[1] % 8 == 0 ? 3 : local[1] % 4 == 0 ? 5 : local[1] % 2 == 0 ? 9 : 17;
+        const uint32_t expectedLast = ((local[0] - 1) << 2) | ((local[1] - 1) << 12) | ((local[2] - 1) << 22);
+        auto last = regs_.find(0xa9df), extra = regs_.find(0xa9be);
+        if ((ids & 0xff) != 0xfc || ((ids >> 8) & 1) != spThreads || (ids & ~0x1ffu) != 0 ||
+            (h & 0xff) != 0xfc || !(h & 0x800) || ((h >> 20) & 0x3f) != 4 || ((h >> 26) & 0x3f) != height ||
+            last == regs_.end() || last->second != expectedLast || extra == regs_.end() || extra->second != 0) {
+            fault("A730 compute ID, thread-size or local-size state is inconsistent"); return false;
+        }
+    }
     if (dim == 0) {
         fault("HLSQ_CS_NDRANGE_0 with a kernel dimension of 0");
         return false;
@@ -703,12 +777,36 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
         }
     }
     uint32_t nibo = fieldOf(config, A6XX_SP_CS_CONFIG_NIBO__MASK, A6XX_SP_CS_CONFIG_NIBO__SHIFT);
-    if (nibo != reg(REG_A6XX_SP_CS_IBO_COUNT)) {
+    uint64_t iboTable = 0;
+    if (chipId_ == kChipA730.id && nibo != 0) {
+        // bindless set 0: SP_CS_BINDLESS_BASE[0] holds the table with 64-byte descriptors (BINDLESS_DESCRIPTOR_64B in its
+        // low bits), SP_CS_CONFIG says the IBOs are bindless, and this dispatch prefetched them
+        constexpr uint32_t kSpCsBindlessBase0 = 0xa9e8;   // REG_A7XX_SP_CS_BINDLESS_BASE(0), the A6xx's offset too
+        auto raw = [&](uint32_t r) -> uint64_t { auto it = regs_.find(r); return it == regs_.end() ? 0 : it->second; };
+        const uint64_t base = raw(kSpCsBindlessBase0) | raw(kSpCsBindlessBase0 + 1) << 32;
+        if ((config & A6XX_SP_CS_CONFIG_BINDLESS_IBO) == 0) {
+            fault("SP_CS_CONFIG does not mark the A730's IBOs bindless (BINDLESS_IBO)");
+            return false;
+        }
+        if (!written_.count(kSpCsBindlessBase0) || (base & 3) != 3) {
+            fault(text("SP_CS_BINDLESS_BASE[0] is %#llx: not a set of 64-byte descriptors (low bits 3) written for the dispatch", base));
+            return false;
+        }
+        if (!cs_.ibosLoaded || !cs_.ibosBindless || cs_.iboUnits != nibo) {
+            fault("the A730's IBOs were not prefetched from bindless set 0 for this dispatch, or not as many as SP_CS_CONFIG names");
+            return false;
+        }
+        iboTable = base & ~uint64_t(3);
+        if (!checkIboDescriptors(iboTable, nibo)) {
+            return false;
+        }
+    } else if (nibo != reg(REG_A6XX_SP_CS_IBO_COUNT)) {
         fault(text("SP_CS_CONFIG names %llu IBOs and SP_CS_IBO_COUNT %llu", nibo, reg(REG_A6XX_SP_CS_IBO_COUNT)));
         return false;
     }
-    if (nibo != 0) {
+    if (nibo != 0 && chipId_ != kChipA730.id) {
         uint64_t table = reg64(REG_A6XX_SP_CS_IBO);
+        iboTable = table;
         if (!cs_.ibosLoaded || cs_.ibosFrom != table || cs_.iboUnits != nibo) {
             fault("the IBO descriptors were not loaded from where SP_CS_IBO points, or not as many as SP_CS_IBO_COUNT says");
             return false;
@@ -782,6 +880,7 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
         }
     }
     stats_.dispatches++;
+    if (chipId_ == kChipA730.id) gen7ComputeDirty_ = true;
     Dispatch& d = stats_.lastDispatch;
     d = Dispatch{};
     for (int i = 0; i < 3; i++) {
@@ -795,7 +894,7 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
     d.consts = cs_.consts;
     d.textureCount = texCount;
     d.samplerCount = texCount != 0 ? cs_.sampUnits : 0;
-    d.iboTable = nibo != 0 ? reg64(REG_A6XX_SP_CS_IBO) : 0;
+    d.iboTable = iboTable;
     d.texConstTable = texTable;
     d.texSampTable = sampTable;
     if (nibo != 0) {
@@ -858,6 +957,8 @@ bool FakeGpu::checkStageProgram(const char* what, const StageLoads& xs, uint32_t
 // texel at the same size, bilinear at another with FILTER (each destination pixel's centre mapped into the source),
 // nearest without. Only between linear images of one format: a conversion is not modelled.
 bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
+    if (!gen7BatchReady()) return false;
+    if (chipId_ == kChipA730.id) gen7BlitDirty_ = true;
     using namespace a6xx;
     if (count != 1 || fieldOf(p[0], CP_BLIT_0_OP__MASK, CP_BLIT_0_OP__SHIFT) != BLIT_OP_SCALE) {
         fault(text("CP_BLIT of %llu words, op %llu: one word, BLIT_OP_SCALE (3), is what this GPU model runs", count, count ? fieldOf(p[0], CP_BLIT_0_OP__MASK, CP_BLIT_0_OP__SHIFT) : 0));
@@ -970,7 +1071,7 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     // one pixel's bytes from the four solid words: 8-bit channels in the swap's order (WXYZ puts B first), halfs and words as they are
     const uint32_t swap = fieldOf(info, A6XX_RB_2D_DST_INFO_COLOR_SWAP__MASK, A6XX_RB_2D_DST_INFO_COLOR_SWAP__SHIFT);
     uint32_t c[4];
-    for (uint32_t i = 0; i < 4; i++) c[i] = reg(REG_A6XX_RB_2D_SRC_SOLID_C0 + i);
+    for (uint32_t i = 0; i < 4; i++) c[i] = reg(REG_A6XX_RB_2D_SRC_SOLID_C0, i);
     uint8_t pixel[16] = {};
     if (ifmt == R2D_UNORM8 || ifmt == R2D_UNORM8_SRGB) {
         static const uint32_t rgba[4] = {0, 1, 2, 3}, bgra[4] = {2, 1, 0, 3};
@@ -1213,6 +1314,9 @@ bool FakeGpu::eventBlit() {
 // together (fake_gpu.hpp's file comment lists what); what the GPU does with state that does not is hang or write
 // nothing, and a fault here stands for either. Nothing is rasterized.
 bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
+    if (chipId_ == kChipA730.id) {
+        fault("A730 draw validation waits for the sysmem-draw ladder step"); return false;
+    }
     using namespace a6xx;
     if (count != 3 && count != 7) {
         fault(text("CP_DRAW_INDX_OFFSET of %llu words: the 3-word auto-indexed form and the 7-word indexed one are what this GPU model runs", count));
@@ -1913,6 +2017,10 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
 
 // the packets from ADDRESS on, WORDS of them; false on a fault (the submission stops there)
 bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
+    if (chipInfo(chipId_) == nullptr) {
+        fault("command execution is not modeled for this chip ID yet");
+        return false;
+    }
     using namespace a6xx;
     const uint32_t* w = reinterpret_cast<const uint32_t*>(at(address, 4ull * words));
     if (w == nullptr) {
@@ -1943,6 +2051,12 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
             }
         } else {
             switch (h.opcode) {
+            case 0x17: // CP_THREAD_CONTROL
+                if (chipId_ != kChipA730.id || h.count != 1 || p[0] != 0x08000001) {
+                    fault("A730 submissions must select BR with concurrent binning disabled"); return false;
+                }
+                gen7Thread_ = true;
+                break;
             case pm4::kNop:
             case pm4::kWaitForIdle:
             case pm4::kWaitMemWrites:
@@ -2144,6 +2258,29 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 }
                 break;
             case CP_EVENT_WRITE: {
+                if (chipId_ == kChipA730.id) {
+                    if ((h.count != 1 && h.count != 4)) {
+                        fault("CP_EVENT_WRITE7 on the wrong chip or with a bad length"); return false;
+                    }
+                    const bool write = p[0] & 0x08000000;
+                    if ((h.count == 4) != write || (p[0] & ~0x080000ffu) != 0) {
+                        fault("CP_EVENT_WRITE7 must use explicit USER_32B RAM writes"); return false;
+                    }
+                    const uint32_t ev = p[0] & 0xff;
+                    if (ev == 0x07 || ev == 0x09) {
+                        fault("legacy cache/CCU event in an A730 stream"); return false;
+                    }
+                    if (write) {
+                        const uint64_t to = p[1] | uint64_t(p[2]) << 32;
+                        auto* d = at(to, 4);
+                        if (!d || to % 4) { fault("CP_EVENT_WRITE7 outside every buffer"); return false; }
+                        memcpy(d, p + 3, 4);
+                    }
+                    if (ev == 0x21) { gen7BlitDirty_ = false; drawsWithoutCcuFlush_ = 0; }
+                    if (ev == 0x20) drawsWithoutDepthFlush_ = 0;
+                    if (ev == 0x31) { gen7ComputeDirty_ = false; drawsWithoutCacheFlush_ = 0; }
+                    break;
+                }
                 // 1 word: the event; 4: and the address and value written when it completes (at once here: the model
                 // is in order, so what a later wait reads is what an earlier event wrote)
                 if (h.count != 1 && h.count != 4) {
@@ -2380,7 +2517,12 @@ void FakeGpu::run(const Job& job) {
     passBegun_ = ccuCntlWritten_ = ccuCntlAfterWfi_ = lastWasWfi_ = inTile_ = binning_ = false;
     drawsInSubmission_ = drawsWithoutCcuFlush_ = drawsWithoutCacheFlush_ = drawsWithoutDepthFlush_ = 0;
     written_.clear();
+    gen7Thread_ = gen7ComputeDirty_ = gen7BlitDirty_ = false;
     bool ok = execute(job.address, job.words, 0);
+    if (ok && chipId_ == kChipA730.id && (gen7ComputeDirty_ || gen7BlitDirty_)) {
+        fault("A730 submission ended without cleaning its compute/2D writes");
+        ok = false;
+    }
     if (ok && drawsInSubmission_ != 0) {
         // the colour a draw wrote sits in the CCU until PC_CCU_FLUSH_COLOR_TS (the kernel's own end-of-submit fence
         // flushes the UCHE, not the CCU: hakios.adreno.c:3496-3516), and what the CCU flushed sits in the UCHE until
@@ -2437,16 +2579,16 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         // the kernel's table (bsd/dev/hakios.adreno.c, hakios_gpu_parameter), number for number
         switch (p->param) {
         case kParamGpuId: p->value = 0; return 0;                   // "none, the chip ID says it"
-        case kParamGmemSize: p->value = kGmemBytes; return 0;
-        case kParamChipId: p->value = kChipId | kSpeedBin << 32; return 0;
-        case kParamMaxFreq: p->value = kMaxFrequencyHz; return 0;
+        case kParamGmemSize: if (!chipInfo(chipId_)) return EINVAL; p->value = gmem_.size(); return 0;
+        case kParamChipId: p->value = uint64_t(chipId_) | (chipId_ == kChipId ? kSpeedBin << 32 : 0); return 0;
+        case kParamMaxFreq: p->value = chipId_ == kChipA730.id ? 492000000 : kMaxFrequencyHz; return 0;
         case kParamTimestamp: p->value = uint64_t(nowNs()); return 0;
         case kParamGmemBase: p->value = 0; return 0;
         case kParamPriorities: p->value = 1; return 0;
         case kParamPpPgtable: p->value = 0; return 0;
         case kParamFaults: p->value = stats_.recoveries; return 0;
         case kParamSuspends: p->value = 0; return 0;
-        case kParamHighestBankBit: p->value = 14; return 0;
+        case kParamHighestBankBit: if (!chipInfo(chipId_)) return EINVAL; p->value = chipInfo(chipId_)->highestBankBit; return 0;
         case kParamRaytracing: p->value = 0; return 0;
         case kParamUbwcSwizzle: p->value = 6; return 0;
         case kParamMacrotileMode: p->value = 1; return 0;

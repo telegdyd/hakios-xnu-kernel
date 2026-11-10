@@ -164,7 +164,7 @@ public:
     // ASYNC: submissions run on a thread of their own, after DELAY_US each, as the real GPU runs them after the call
     // has returned; otherwise at once, inside the submit call. RECOVERS: the kernel resets the GPU after a hang
     // (gpu_recover=1); false is the kernel without it, where the first hang ends every later wait at once.
-    explicit FakeGpu(bool async = false, uint32_t delayUs = 0, bool recovers = true);
+    explicit FakeGpu(bool async = false, uint32_t delayUs = 0, bool recovers = true, uint32_t chipId = 0x06030500);
     ~FakeGpu() override;
 
     int call(uint32_t request, void* data, size_t size) override;
@@ -213,6 +213,7 @@ private:
         uint64_t programFrom = 0;
         uint32_t programUnits = 0;
         bool ibosLoaded = false;
+        bool ibosBindless = false;   // A730: the prefetch named bindless set 0 (SS6_BINDLESS), not an address
         uint64_t ibosFrom = 0;
         uint32_t iboUnits = 0;
         std::vector<UboDescriptor> ubos;   // the ST6_UBO loads into SB6_CS_SHADER, by UBO index
@@ -255,7 +256,7 @@ private:
     bool check2d(const uint32_t* d, const char* what, uint32_t i, bool sampled);
     bool checkIboDescriptors(uint64_t table, uint32_t nibo);
     bool checkSampler(const uint32_t* d, uint32_t i);
-    uint32_t reg(uint32_t r) const;
+    uint32_t reg(uint32_t r, uint32_t word = 0) const;
     uint64_t reg64(uint32_t r) const;
     void fault(const std::string& why);
     void hung();
@@ -295,7 +296,10 @@ private:
     std::set<uint64_t> ubwcWritten_;   // the UBWC images a copy has written (their data addresses)
     uint32_t binQueued_ = 0;   // tiles' streams handed over (CP_SET_BIN_DATA5*) and not yet let go by RM6_BIN_END_OF_DRAWS
     bool binning_ = false;   // between RM6_BIN_VISIBILITY and the first tile: the draws only bin
-    std::vector<uint8_t> gmem_ = std::vector<uint8_t>(a6xx::kGmemBytes);
+    std::vector<uint8_t> gmem_;
+    uint32_t chipId_;
+    bool gen7Thread_ = false, gen7ComputeDirty_ = false, gen7BlitDirty_ = false;
+    bool gen7BatchReady();
     bool tileState(uint32_t* binW, uint32_t* binH, uint32_t win[4]);
     bool eventBlit();
     uint64_t alwaysOn_ = 0;     // CP_ALWAYS_ON_COUNTER as the fake keeps it: one more at each CP_REG_TO_MEM of it

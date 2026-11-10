@@ -1,4 +1,5 @@
 #include "hakios-metal/texture.hpp"
+#include "hakios-metal/chip.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -463,7 +464,12 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
             if (staging == nullptr) return nullptr;
         }
         fd_dev_id id{};
-        id.chip_id = a6xx::kChipId;
+        const ChipInfo* chip = chipInfo(gpu.chipId());
+        if (chip == nullptr) {
+            refuse(why, "no texture layout for the GPU's chip ID");
+            return nullptr;
+        }
+        id.chip_id = chip->id;
         const struct ::fd_dev_info* dev = ::fd_dev_info_raw(&id);
         fdl_layout l{};
         l.ubwc = true;

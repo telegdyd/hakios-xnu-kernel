@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/gen7.hpp"
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/texture.hpp"
 
@@ -22,11 +23,11 @@ bool refuse(std::string* why, const std::string& text) {
     return false;
 }
 
-void reg(pm4::Stream& st, uint32_t r, uint32_t v) { st.registers(r, &v, 1); }
+void reg(pm4::Stream& st, uint32_t r, uint32_t v) { gen7::registers(st, r, &v, 1); }
 
 void reg64(pm4::Stream& st, uint32_t r, uint64_t a) {
     uint32_t v[2] = {uint32_t(a), uint32_t(a >> 32)};
-    st.registers(r, v, 2);
+    gen7::registers(st, r, v, 2);
 }
 
 // CP_LOAD_STATE6_FRAG with the data already in GPU memory. The block is the compute shader's (program, constants,
@@ -51,12 +52,14 @@ void loadDirect(pm4::Stream& st, a6xx_state_type type, uint32_t dstOff, uint32_t
 }
 
 void event(pm4::Stream& st, vgt_event_type e) {
+    if (st.gen7()) { gen7::event(st, e); return; }
     uint32_t w = eventWrite0(e, false);
     st.packet(CP_EVENT_WRITE, &w, 1);
 }
 
 // an event that writes VALUE to ADDRESS when it has completed: how the GPU says the caches are flushed
 void eventTimestamp(pm4::Stream& st, vgt_event_type e, uint64_t address, uint32_t value, bool timestampBit) {
+    if (st.gen7()) { gen7::event(st, e, address, value, true); return; }
     uint32_t w[4] = {eventWrite0(e, timestampBit), uint32_t(address), uint32_t(address >> 32), value};
     st.packet(CP_EVENT_WRITE, w, 4);
 }
@@ -101,6 +104,8 @@ namespace {
 bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], uint64_t indirect, const uint32_t local[3], const Bindings& bindings,
                const uint32_t* immediates, uint64_t program, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o) {
     static const char* const axis = "xyz";
+    if (!chipInfo(stream.chipId())) return refuse(why, "no compute table for this chip ID");
+    if (stream.gen7() && o.tailTimestampBit) return refuse(why, "A730 completion uses explicit USER_32B values");
     const std::vector<Binding>& buffers = bindings.buffers;
     // --- the grid ---
     uint64_t threads = 1;
@@ -128,7 +133,7 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     if (k.instrlen == 0 || uint64_t(k.numWords) * 4 < uint64_t(k.instrlen) * 128) {
         return refuse(why, std::string(k.name) + ": " + n(k.numWords) + " words do not hold its instrlen of " + n(k.instrlen) + " units");
     }
-    if (k.constlen > 256) {
+    if (k.constlen > (stream.gen7() ? 512u : 256u)) {
         return refuse(why, std::string(k.name) + " wants " + n(k.constlen) + " vec4 of constants: compute has 256 on this GPU");
     }
     // private memory: the queue's (CommandBuffer::dispatch binds it), as large as the kernel's fibers want and in the
@@ -401,6 +406,7 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     }
 
     // --- nothing is refused from here on: the stream, in computerator's order ---
+    if (o.prelude && stream.gen7()) gen7::batchStart(stream);
     if (o.prelude) {
         reg(stream, REG_A6XX_SP_MODE_CONTROL, A6XX_SP_MODE_CONTROL_CONSTANT_DEMOTION_ENABLE | A6XX_SP_MODE_CONTROL_ISAMMODE(ISAMMODE_GL));
         reg(stream, REG_A6XX_SP_PERFCTR_ENABLE, A6XX_SP_PERFCTR_ENABLE_CS);
@@ -423,8 +429,8 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     }
     reg(stream, REG_A6XX_HLSQ_CS_CNTL, hlsqCsCntl(k.constlen));
     {
-        uint32_t v[2] = {spCsConfig(nibo, k.numSamp, k.numSamp), k.instrlen};   // SP_CS_CONFIG, SP_CS_INSTRLEN
-        stream.registers(REG_A6XX_SP_CS_CONFIG, v, 2);
+        uint32_t v[2] = {spCsConfig(nibo, k.numSamp, k.numSamp) | (stream.gen7() ? A6XX_SP_CS_CONFIG_BINDLESS_IBO : 0u), k.instrlen};   // SP_CS_CONFIG, SP_CS_INSTRLEN
+        gen7::registers(stream, REG_A6XX_SP_CS_CONFIG, v, 2);
     }
     reg(stream, REG_A6XX_SP_CS_CTRL_REG0,
         spCsCtrlReg0(uint32_t(k.maxReg + 1), uint32_t(k.maxHalfReg + 1), k.branchstackHw, threadsize, k.mergedRegs, k.earlyPreamble));
@@ -432,32 +438,52 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     // the HLSQ the real size where computerator writes 1, and the one that is right when they disagree is not measured
     uint32_t ctrl1 = spCsCtrlReg1(shared, k.constlen);
     reg(stream, REG_A6XX_SP_CS_CTRL_REG1, ctrl1);
-    if (o.hlsqCopies) {
+    if (o.hlsqCopies && !stream.gen7()) {
         reg(stream, REG_A6XX_HLSQ_CS_CTRL_REG1, ctrl1);
     }
+    if (stream.gen7()) {
+        reg(stream, REG_A6XX_HLSQ_FS_CNTL_0, 0); // THREAD64
+        reg(stream, REG_A6XX_SP_CS_CNTL_0, csCntl0(k.workGroupIdRegid, k.localIdRegid));
+        reg(stream, REG_A6XX_SP_CS_CNTL_1, 0xfc | (uint32_t(threadsize) << gen7::A7XX_SP_CS_CNTL_1_THREADSIZE__SHIFT));
+        reg(stream, REG_A6XX_HLSQ_CS_CNTL_1, gen7::hlsqCsControl(threadsize, local[1]));
+        const uint32_t last = ((local[0] - 1) << 2) | ((local[1] - 1) << 12) | ((local[2] - 1) << 22);
+        stream.registers(registerOffset(kChipA730, Register::HLSQ_CS_LAST_LOCAL_SIZE), &last, 1);
+        const uint32_t zero = 0;
+        stream.registers(registerOffset(kChipA730, Register::SP_CS_UNKNOWN_A9BE), &zero, 1);
+        const uint32_t controls[4] = {0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0x0000fc00};
+        gen7::registers(stream, REG_A6XX_HLSQ_CONTROL_2_REG, controls, 4);
+    } else {
     {
         uint32_t v[2] = {csCntl0(k.workGroupIdRegid, k.localIdRegid), csCntl1(threadsize)};
-        stream.registers(REG_A6XX_HLSQ_CS_CNTL_0, v, 2);   // HLSQ_CS_CNTL_0, HLSQ_CS_CNTL_1
-        if (o.hlsqCopies) {
-            stream.registers(REG_A6XX_SP_CS_CNTL_0, v, 2); // SP_CS_CNTL_0, SP_CS_CNTL_1 (has_lpac)
+        gen7::registers(stream, REG_A6XX_HLSQ_CS_CNTL_0, v, 2);   // HLSQ_CS_CNTL_0, HLSQ_CS_CNTL_1
+        if (o.hlsqCopies && !stream.gen7()) {
+            gen7::registers(stream, REG_A6XX_SP_CS_CNTL_0, v, 2); // SP_CS_CNTL_0, SP_CS_CNTL_1 (has_lpac)
         }
+    }
     }
     {
         uint32_t v[3] = {0, uint32_t(program), uint32_t(program >> 32)};   // SP_CS_OBJ_FIRST_EXEC_OFFSET, SP_CS_OBJ_START lo, hi
-        stream.registers(REG_A6XX_SP_CS_OBJ_FIRST_EXEC_OFFSET, v, 3);
+        gen7::registers(stream, REG_A6XX_SP_CS_OBJ_FIRST_EXEC_OFFSET, v, 3);
     }
     if (k.pvtmemSize != 0) {
         // SP_CS_PVT_MEM_PARAM, _ADDR lo, hi, _SIZE and the stack offset as tu6_emit_xs writes a stage's (the draw's the same)
         uint32_t v[4] = {A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(pm.perFiber), uint32_t(pm.address), uint32_t(pm.address >> 32),
                          A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)};
-        stream.registers(REG_A6XX_SP_CS_PVT_MEM_PARAM, v, 4);
+        gen7::registers(stream, REG_A6XX_SP_CS_PVT_MEM_PARAM, v, 4);
         reg(stream, REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
     } else if (o.pvtmemZero) {
         uint32_t v[4] = {0, 0, 0, 0};   // SP_CS_PVT_MEM_PARAM, _ADDR lo, hi, _SIZE: no private memory
-        stream.registers(REG_A6XX_SP_CS_PVT_MEM_PARAM, v, 4);
+        gen7::registers(stream, REG_A6XX_SP_CS_PVT_MEM_PARAM, v, 4);
         reg(stream, REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET, 0);
     }
-    loadIndirect(stream, ST6_SHADER, 0, std::min({k.instrlen, kInstrCacheSize, o.preloadCap != 0 ? o.preloadCap : kInstrCacheSize}), program);
+    if (stream.gen7()) {
+        const uint32_t zero = 0; // fd6_emit_shader(A7XX), after private-memory state
+        stream.registers(registerOffset(kChipA730, Register::SP_CS_VGPR_CONFIG), &zero, 1);
+    }
+    // fd6_emit_shader(A7XX) fetches instructions through SP_CS_OBJ_START.
+    // Only A6xx preloads them with CP_LOAD_STATE6.
+    if (!stream.gen7())
+        loadIndirect(stream, ST6_SHADER, 0, std::min({k.instrlen, kInstrCacheSize, o.preloadCap != 0 ? o.preloadCap : kInstrCacheSize}), program);
     if (immUnits != 0) {
         loadDirect(stream, ST6_CONSTANTS, k.immediatesOffsetVec4, immUnits, imm.data(), uint32_t(imm.size()));
     }
@@ -474,7 +500,18 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     if (!ubos.empty()) {
         loadDirect(stream, ST6_UBO, 0, uint32_t(ubos.size() / 2), ubos.data(), uint32_t(ubos.size()));
     }
-    if (nibo != 0) {
+    if (nibo != 0 && stream.gen7()) {
+        // On the A7xx the IBOs are bindless set 0 (compiler.cpp: lowerIboToBindless; non-bindless IBOs are unreliable
+        // there). fd6_image.cc fd6_build_bindless_state<A7XX>(COMPUTE): invalidate the CS bindless state, set 0's base
+        // with its descriptor size, then the IBO prefetch from that set (the "address" is set << 28 | dword offset)
+        const uint32_t invalidate = 0xffu << 9; // A7XX_HLSQ_INVALIDATE_CMD_CS_BINDLESS(0xff)
+        stream.registers(registerOffset(kChipA730, Register::HLSQ_INVALIDATE_CMD), &invalidate, 1);
+        const uint64_t base = (table + kTableIbosAt) | 3u; // BINDLESS_DESCRIPTOR_64B
+        const uint32_t b[2] = {uint32_t(base), uint32_t(base >> 32)};
+        stream.registers(0xa9e8, b, 2); // REG_A7XX_SP_CS_BINDLESS_BASE(0), the same offset as the A6xx's
+        uint32_t w[3] = {loadState6_0(0, ST6_IBO, SS6_BINDLESS, SB6_CS_SHADER, nibo), 0, 0};
+        stream.packet(CP_LOAD_STATE6_FRAG, w, 3);
+    } else if (nibo != 0) {
         loadIndirect(stream, ST6_IBO, 0, nibo, table + kTableIbosAt);
         reg64(stream, REG_A6XX_SP_CS_IBO, table + kTableIbosAt);
         reg(stream, REG_A6XX_SP_CS_IBO_COUNT, nibo);
@@ -525,9 +562,9 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     }
     {
         uint32_t v[7] = {ndrange0(3, local[0], local[1], local[2]), local[0] * groups[0], 0, local[1] * groups[1], 0, local[2] * groups[2], 0};
-        stream.registers(REG_A6XX_HLSQ_CS_NDRANGE_0, v, 7);
+        gen7::registers(stream, REG_A6XX_HLSQ_CS_NDRANGE_0, v, 7);
         uint32_t ones[3] = {1, 1, 1};
-        stream.registers(REG_A6XX_HLSQ_CS_KERNEL_GROUP_X, ones, 3);
+        gen7::registers(stream, REG_A6XX_HLSQ_CS_KERNEL_GROUP_X, ones, 3);
     }
     // A program longer than the instruction cache is fetched from memory as it runs, and that fetch is bounds-checked
     // against SP_FS_INSTRLEN of the other register context instead of SP_CS_INSTRLEN (Mesa issue 5892, MR 19023: "affects
@@ -635,7 +672,7 @@ bool CommandBuffer::dispatchAny(const Kernel& k, const uint32_t* groups, const B
         }
         b = &withScratch;
     }
-    pm4::Stream added;
+    pm4::Stream added(queue_.gpu().chipId());
     const bool encoded = args != nullptr ? compute::encodeIndirect(added, k, args->gpuAddress() + offset, loc, *b, immediates, program, table.gpuAddress(),
                                                                    table.contents(), &why, options)
                                          : compute::encode(added, k, groups, loc, *b, immediates, program, table.gpuAddress(), table.contents(), &why, options);

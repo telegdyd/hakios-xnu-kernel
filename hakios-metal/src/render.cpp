@@ -14,6 +14,7 @@
 #include <tuple>
 
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/gen7.hpp"
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/texture.hpp"
 
@@ -38,11 +39,11 @@ bool refuse(std::string* why, const std::string& text) {
 
 const char* stageName(const Stage& s) { return s.k.name != nullptr ? s.k.name : s.kind == kStageVertex ? "the vertex stage" : "the fragment stage"; }
 
-void reg(pm4::Stream& st, uint32_t r, uint32_t v) { st.registers(r, &v, 1); }
+void reg(pm4::Stream& st, uint32_t r, uint32_t v) { gen7::registers(st, r, &v, 1); }
 
 void reg64(pm4::Stream& st, uint32_t r, uint64_t a) {
     uint32_t v[2] = {uint32_t(a), uint32_t(a >> 32)};
-    st.registers(r, v, 2);
+    gen7::registers(st, r, v, 2);
 }
 
 // consecutive registers from R on, one type-4 (turnip's pkt4 of several)
@@ -50,13 +51,14 @@ void regs(pm4::Stream& st, uint32_t r, std::initializer_list<uint32_t> values) {
     uint32_t v[16];
     uint32_t count = 0;
     for (uint32_t x : values) v[count++] = x;
-    st.registers(r, v, count);
+    gen7::registers(st, r, v, count);
 }
 
 // a type-7 packet of one word
 void command1(pm4::Stream& st, uint32_t opcode, uint32_t word) { st.packet(opcode, &word, 1); }
 
 void event(pm4::Stream& st, vgt_event_type e) {
+    if (st.gen7()) { gen7::event(st, e); return; }
     uint32_t w = eventWrite0(e, false);
     st.packet(CP_EVENT_WRITE, &w, 1);
 }
@@ -65,6 +67,7 @@ void event(pm4::Stream& st, vgt_event_type e) {
 // tu_cmd_buffer.cc:48-70) has no TIMESTAMP bit; with it the GPU writes a timestamp instead and the wait below never
 // ends (28 October, every compute dispatch). The bit is here for the fake GPU's test of that alone.
 void eventTimestamp(pm4::Stream& st, vgt_event_type e, uint64_t address, uint32_t value, bool timestampBit) {
+    if (st.gen7()) { gen7::event(st, e, address, value, true); return; }
     uint32_t w[4] = {eventWrite0(e, timestampBit), uint32_t(address), uint32_t(address >> 32), value};
     st.packet(CP_EVENT_WRITE, w, 4);
 }
@@ -1139,6 +1142,13 @@ void tableStart(uint8_t* tableCpu) {
 // steps 1 to 3 of a pass: the batch start, the CCU set to sysmem, the pass begin -- what a draw and a Clear without a
 // draw both need before the 2D engine or the 3D pipe writes the target
 void passStart(pm4::Stream& stream, uint32_t W, uint32_t H, uint64_t table, const Options& o) {
+    if (stream.gen7()) {
+        // Initial 2D path: independent of A6xx render/GMEM state. Shared 2D
+        // fields keep MUTABLEEN/INDIRECT clear; their formats are explicit.
+        if (o.batchStart) gen7::batchStart(stream);
+        command1(stream, CP_SET_MARKER, setMarker0(RM6_DIRECT_RENDER));
+        return;
+    }
     // 1. batch start: fd6_emit_restore (fd6_emit.cc:1090-1160) with turnip's tu6_init_hw as the second witness
     // (tu_cmd_buffer.cc:1584-1660): CP_SET_MODE 0; the three invalidates (fd6_cache_inv, fd6_emit.h:271-276; turnip's A6XX
     // path has CACHE_INVALIDATE alone, the kernel already emits both CCU invalidates per submit); HLSQ_INVALIDATE_CMD;
@@ -1249,6 +1259,7 @@ namespace {
 bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                 const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
                 const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false) {
+    if (stream.gen7()) return refuse(why, "A730 draws are not enabled before the sysmem-draw ladder step");
     const Stage& vs = program.vs;
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
     // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
@@ -2135,6 +2146,7 @@ bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass&
 }
 
 bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o, uint32_t skipClears) {
+    if (stream.gen7()) return refuse(why, "A730 render passes wait for the sysmem-draw ladder step");
     if (!checkTarget(pass, why)) {
         return false;
     }
@@ -2520,6 +2532,8 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
 }
 
 bool encodeClear(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o) {
+    if (stream.gen7() && (pass.depth || pass.stencil || o.tailTimestampBit))
+        return refuse(why, "A730 host step 1 serves color clears with explicit-value completions");
     if (!checkTarget(pass, why)) {
         return false;
     }
@@ -2763,6 +2777,7 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
 
 bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
                          const render::Options& options) {
+    if (queue_.gpu().chipId() == kChipA730.id) return refuseWork("A730 draws wait for the sysmem-draw ladder step");
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }
@@ -3145,7 +3160,7 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
     if (!piece(render::kTableBytes, &table, &why)) {
         return fail(std::string("no memory for the copy's table: ") + why);
     }
-    pm4::Stream added;
+    pm4::Stream added(queue_.gpu().chipId());
     if (!render::encodeBlit(added, src, srcLevel, s, dst, dstLevel, d, linear, table.gpuAddress(), table.contents(), &why, options)) {
         return refuseWork(why);
     }
@@ -3335,7 +3350,7 @@ bool CommandBuffer::clear(const RenderPass& pass, const render::Options& options
     if (!piece(render::kTableBytes, &table, &why)) {
         return fail(std::string("no memory for the pass's table: ") + why);
     }
-    pm4::Stream added;
+    pm4::Stream added(queue_.gpu().chipId());
     if (!render::encodeClear(added, pass, table.gpuAddress(), table.contents(), &why, options)) {
         return refuseWork(why);
     }

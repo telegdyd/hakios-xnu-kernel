@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "hakios-metal/kernel.hpp"
+#include "hakios-metal/chip.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/texture.hpp"
 
@@ -63,6 +64,7 @@ bool argumentBufferLayout(const void* bitcode, size_t size, uint32_t set, std::v
 
 // a kernel compiled here, owning what its Kernel points into
 struct CompiledKernel {
+    uint32_t chipId = kChipA635.id;
     Kernel kernel{};
     std::vector<uint32_t> words;
     std::vector<uint32_t> immediates;
@@ -80,6 +82,7 @@ struct CompiledKernel {
 
 // a vertex or fragment function compiled here (render.hpp's Stage), owning what its Stage points into
 struct CompiledStage {
+    uint32_t chipId = kChipA635.id;
     Stage stage{};
     std::vector<uint32_t> words;
     std::vector<uint32_t> immediates;
@@ -100,7 +103,7 @@ struct CompiledProgram {
 };
 
 // whether a compiler is in this build
-bool hasCompiler();
+bool hasCompiler(uint32_t chipId = kChipA635.id);
 
 // A function constant's value as the pipeline supplies it (MTLFunctionConstantValues): INDEX is the module's
 // [[function_constant(n)]], BITS the value as the bits of its type -- a bool 0 or 1, an integer or a float its own bits
@@ -130,7 +133,7 @@ struct KnownBuffer {
     std::vector<uint8_t> bytes;
 };
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
-                                           uint32_t iboBase = 0, const KnownBuffer* known = nullptr);
+                                           uint32_t iboBase = 0, const KnownBuffer* known = nullptr, uint32_t chipId = kChipA635.id);
 // compileStage's choice for a stage that spilled with ir3's preamble (WITH) and was compiled again without it (WITHOUT):
 // the one that spills less, then the one with fewer registers; WITH on a tie. (CoreAnimation's fixed_frag_lph_cpf: 48
 // registers and 512 bytes of spills with the preamble, 21 and none without; its draws 6.6 ms each so, 2.6 without.)
@@ -146,6 +149,7 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
 // One AIR module (the bitcode of one function, as metallib.hpp hands it out, or a .bc) compiled for this chip.
 // nullptr with *why: the front end's refusal, named by stage ("intrinsic: air.simd_sum not handled"), or ir3's, or
 // "not a compute kernel", or that no compiler is in this build.
-std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {});
+std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
+                                         uint32_t chipId = kChipA635.id);
 
 }  // namespace hakios::metal
