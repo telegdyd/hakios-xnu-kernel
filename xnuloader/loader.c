@@ -4527,6 +4527,17 @@ efi_main(efi_handle image, efi_system_table *st)
 			}
 		}
 		run_kernel(0, 0);
+		/*
+		 * boot-arg loader_stay=1 (a test of a boot-partition image): a kernel that came back is followed by this
+		 * loader's USB commands, not a reset, so that the host can fetch the log (fastboot get_staged).
+		 */
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "loader_stay=1") && (c == pi.cmdline || c[-1] == ' ')) {
+				print("loader_stay: the kernel came back; USB commands, no reset\n");
+				flush_log();
+				usb_command_loop();
+			}
+		}
 	}
 	reboot();
 	return 0;

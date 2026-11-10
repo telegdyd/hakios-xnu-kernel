@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 393 symbols in 18 groups; 36 are set, 27 of them drivers built in.
+# 394 symbols in 18 groups; 36 are set, 27 of them drivers built in.
 #
 
 #
@@ -1122,7 +1122,7 @@ CONFIG_MODEM_AGAIN=y
 # CONFIG_USTACKS_TNAME is not set
 
 #
-# Loader (4)
+# Loader (5)
 #
 
 # read by loader.c (loader)
@@ -1130,6 +1130,9 @@ CONFIG_MODEM_AGAIN=y
 
 # read by loader.c (loader)
 # CONFIG_GAMUT is not set
+
+# read by loader.c (loader)
+# CONFIG_LOADER_STAY is not set
 
 # read by loader.c (loader)
 # CONFIG_SERIAL is not set

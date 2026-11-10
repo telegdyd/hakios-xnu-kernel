@@ -105,3 +105,6 @@
   `struct hakios_battery_state` gains `estimated` (CapacityEstimated, no made-up
   Temperature); `hakios_battery_get()` lets battguard read the driver directly
   instead of through `kernel_sysctlbyname()`, which read -1 there.
+- `xnuloader/loader.c`: boot-arg `loader_stay=1` for a one-shot boot (a payload from
+  the boot partition, no host): a kernel that returns is followed by the loader's USB
+  commands instead of a reset, so the host can fetch the log (`fastboot get_staged`).

@@ -164,6 +164,7 @@ haptic	k
 haptic_effect	k
 hv_wdt_pet	k
 loader_return_after	kl
+loader_stay	l
 m2v_utrace	u
 machine_name	k
 membench	k
