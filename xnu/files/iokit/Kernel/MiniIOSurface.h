@@ -169,6 +169,23 @@ void            MiniIOSurfaceClearKept(void);
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
 void            MiniIOSurfaceBeginRead(MiniIOSurface * surface);
 void            MiniIOSurfaceEndRead(MiniIOSurface * surface);
+/*
+ * The framebuffer's frames put on the panel by the GPU (boot-arg fb_gpu=1; hakios.gpu.cpp): each layer's rectangle of
+ * its surface scaled, bilinear, into a rectangle of the panel's memory, in the GPU's one ring after whatever was drawn
+ * into the surfaces before. The surfaces are held until the GPU is done with them. Returns the submission's fence, 0
+ * when it cannot be done so (the caller draws the frame itself).
+ */
+struct MiniIOSurfacePresentLayer {
+	MiniIOSurface * surface;
+	uint32_t        sx, sy, sw, sh;         /* in the surface */
+	uint32_t        dx, dy, dw, dh;         /* on the panel, inside it */
+};
+uint32_t        MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned count, uint64_t panelPhys,
+    uint32_t panelRowBytes, uint32_t panelWidth, uint32_t panelHeight);
+/* Wait, so many milliseconds at most, for a present's fence: before the processor writes the panel itself. */
+bool            MiniIOSurfacePresentDone(uint32_t fence, uint64_t milliseconds);
+/* What presenting has cost since this was last asked: presents, microseconds of the processor's each, of the GPU's each, mappings made. */
+void            MiniIOSurfacePresentCost(uint32_t * presents, uint64_t * submitting, uint64_t * gpu, uint32_t * timed, uint32_t * mapped);
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */

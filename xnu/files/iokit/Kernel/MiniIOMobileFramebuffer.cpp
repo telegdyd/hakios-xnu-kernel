@@ -190,6 +190,34 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
  */
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
 /*
+ * Boot-arg fb_gpu=1: frames put on the panel by the GPU's 2D engine (MiniIOSurfacePresent(), hakios.gpu.cpp), not by the
+ * processors: a submission of the kernel's own, after whatever drew the frame, scaling it bilinear onto the panel. The
+ * processors' part is a few hundred words of commands; nothing is drawn twice (fb_filter's second, filtered frame is
+ * not needed), and no processor reads a surface the GPU may be drawing into (fb_copy_guard). A frame the GPU cannot take
+ * (a surface of a program's own memory, a layer partly off the panel, a surface no GPU has drawn into, no A7XX) is
+ * drawn by the processors, as with fb_gpu=0, after the GPU is done with what it was given of the panel.
+ * GPU-PRESENT-PLAN.md step 1.
+ */
+static TUNABLE(uint32_t, gGPUPresent, "fb_gpu", 0);
+static uint32_t gLastPresent;           /* the last frame's fence when the GPU put it on the panel (0: the processor did) */
+static uint64_t gPanelPhys;
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, fb_panel_phys, CTLFLAG_RD | CTLFLAG_LOCKED, &gPanelPhys, "fb_gpu: the panel's memory");
+static uint64_t gConsolePhys;
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, fb_console_phys, CTLFLAG_RD | CTLFLAG_LOCKED, &gConsolePhys, "the console's v_physaddr");
+/*
+ * ... and whether it is the picture the processors would have drawn: the 60th frame the GPU puts on the panel, and every
+ * 1800th after it (half a minute at 60 a second), is waited for, and 256 of its pixels on the panel are compared with
+ * what drawLayer()'s bilinear makes of the surface there ("fb_gpu: check"). A frame whose surface was drawn into again
+ * meanwhile is not counted.
+ */
+#define GPU_CHECK_FIRST         60
+#define GPU_CHECK_EVERY         1800
+extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+extern "C" vm_offset_t ml_vtophys(vm_offset_t vaddr);
+/* why frames went to the processors under fb_gpu, counted for the 5-second line */
+enum { kRefusedNoPanel, kRefusedBlack, kRefusedOffPanel, kRefusedNotGPUDrawn, kRefusedNothing, kRefusedByGPU, kRefusedKinds };
+/*
  * Boot-arg fb_pri=N: the scheduling priority of the threads that put frames on the panel (the presenter and its
  * helpers); 0 is the kernel's default for its threads. By default 92 (BASEPRI_PREEMPT): at the kernel's they lost the
  * processors to the window server's own real-time threads under load, and a frame took 3.6 ms to put on the panel
@@ -347,6 +375,15 @@ class IOMobileFramebuffer : public IOService
 public:
 	IOLock *        fLock;
 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
+	uint64_t        fPanelPhys;             /* ... its physical address (fb_gpu) */
+	bool            fShownOnGPU;            /* the last frame was put on the panel by the GPU (fb_gpu) */
+	/* what putting frames on the panel cost (GPU-PRESENT-PLAN.md step 0): frames by each, the processors' time scaling */
+	uint32_t        fStatGPUFrames, fStatCPUFrames;
+	uint32_t        fGPUFrames;             /* frames the GPU has put on the panel, for the check */
+	uint32_t        fStatRefused[kRefusedKinds];
+	struct MiniIOSurfacePresentLayer fGPUFirst;     /* the last such frame's first layer, and how many it had */
+	unsigned        fGPULayers;
+	uint64_t        fStatCPUTime;           /* (mach_absolute_time, summed over the threads, settle()'s redraws included) */
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
 	MiniIOSurface * fDefaultSurface;
@@ -430,6 +467,9 @@ public:
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	bool showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces);
+	void checkOnGPU(void);
+	void panelForProcessor(void);
 	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
 	bool fSettling;                 /* drawing the last frame again, filtered (fb_filter=2) */
 	bool fFilterFrame;              /* this frame came slowly: filtered as it is (fb_filter=2) */
@@ -603,6 +643,24 @@ IOMobileFramebuffer::start(IOService * provider)
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
+	/*
+	 * fb_gpu: where the panel's memory is. Not taken on trust from the console's v_physaddr (on the phone the two agree,
+	 * 0xb8000000, 11 November; kern.hakios.fb_console_phys, fb_panel_phys): the mapping is asked, at its first byte and
+	 * its last, which must be as far apart as in the kernel's view -- one piece of memory, as the boot loader's
+	 * framebuffer is.
+	 */
+	gConsolePhys = vinfo.v_physaddr;
+	if (fBase != NULL) {
+		uint64_t last = (uint64_t) fRowBytes * fPanelHeight - 1;
+		uint64_t first = ml_vtophys((vm_offset_t) fBase), end = ml_vtophys((vm_offset_t) fBase + last);
+
+		fPanelPhys = first != 0 && end == first + last ? first : 0;
+		gPanelPhys = first;
+		if (gGPUPresent && fPanelPhys == 0) {
+			IOLog("MiniIOMobileFramebuffer: fb_gpu: the panel's memory is not one piece (%#llx, and %#llx at its end): "
+			    "frames by the processors\n", first, end);
+		}
+	}
 	fWidth = gFBWidth ? gFBWidth : fPanelWidth;
 	fHeight = gFBHeight ? gFBHeight : fPanelHeight;
 	if (gFBScale != 0 && gFBScale != kFBDefaultScale) {
@@ -635,8 +693,8 @@ IOMobileFramebuffer::start(IOService * provider)
 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
 	fDiff = gDiff != 0;
 	fDiffLeft = fDiffTop = ~0u;
-	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
-	    fPanelWidth, fPanelHeight, fRowBytes);
+	IOLog("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row) at %#llx%s\n", fWidth, fHeight,
+	    fPanelWidth, fPanelHeight, fRowBytes, fPanelPhys, gGPUPresent ? "; frames to it by the GPU (fb_gpu)" : "");
 
 	if (gRecSeconds != 0) {
 		/* one piece of physical memory: the loader will send it over USB as it lies */
@@ -1052,6 +1110,7 @@ IOMobileFramebuffer::beamShareDone(const struct RowJob * job, unsigned share, in
 {
 	uint64_t now = mach_absolute_time();
 
+	__atomic_fetch_add(&fStatCPUTime, now - began, __ATOMIC_RELAXED);
 	__atomic_fetch_add(&fStatShareTime[share], now - began, __ATOMIC_RELAXED);
 	__atomic_fetch_add(&fStatShares[share], 1, __ATOMIC_RELAXED);
 	if (job->scan != 0) {
@@ -1186,7 +1245,10 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
 	job.scan = fSettling ? 0 : fBeamScan;
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
+		uint64_t began = mach_absolute_time();
+
 		drawRows(&job, job.ry0, job.ry1, fBlendRow);
+		__atomic_fetch_add(&fStatCPUTime, mach_absolute_time() - began, __ATOMIC_RELAXED);
 		return;
 	}
 	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
@@ -1379,7 +1441,7 @@ IOMobileFramebuffer::presenter(void)
 			show(swap, surfaces);
 			lastFrame = mach_absolute_time();
 		}
-		unsettled = gFilter == 2 && !fFilterFrame;
+		unsettled = gFilter == 2 && !fFilterFrame && !fShownOnGPU;      /* (the GPU's is filtered already) */
 		/*
 		 * The surfaces are let go of as soon as their pixels are in the panel's memory, not when the next frame comes:
 		 * held, they were in use to CoreAnimation, which had no surface to draw the next frame into while that one
@@ -1408,6 +1470,7 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (!fGraphics) {
 		return;
 	}
+	panelForProcessor();
 	fSettling = true;
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		MiniIOSurface * s = surfaces[layer];
@@ -1426,6 +1489,176 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fStatSettled++;
 }
 
+/*
+ * fb_gpu: the frame's layers onto the panel by the GPU, all of them or none (then the processors draw it, show()). The
+ * rectangles are drawLayer()'s; a layer partly off the panel is not cut here, the processors draw that frame. A surface
+ * no submission has named (drawn == 0) is one the processor drew: what it wrote may be in its cache yet, not in memory.
+ */
+bool
+IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces)
+{
+	struct MiniIOSurfacePresentLayer layers[SWAP_LAYERS];
+	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
+	unsigned count = 0;
+	uint32_t fence;
+
+	if (fPanelPhys == 0) {
+		fStatRefused[kRefusedNoPanel]++;
+		return false;
+	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+		MiniIOSurface * s = surfaces[layer];
+		int32_t src[4], dst[4];
+
+		if (sid == 0) {
+			if (layer == 0 && (set & 1)) {
+				fStatRefused[kRefusedBlack]++;
+				return false;           /* (the screen made black: the processors' bzero()) */
+			}
+			continue;
+		}
+		if (s == NULL || s->info.bytesPerElement != 4 || s->info.planeCount != 0) {
+			continue;                       /* (nothing drawn for it by the processors either) */
+		}
+		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
+		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
+		int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
+		int32_t dx = dst[0], dy = dst[1], dw = dst[2], dh = dst[3];
+
+		if (sw <= 0 || sh <= 0) {
+			sx = sy = 0;
+			sw = (int32_t) s->info.width;
+			sh = (int32_t) s->info.height;
+		}
+		if (dw <= 0 || dh <= 0) {
+			dx = dy = 0;
+			dw = (int32_t) fWidth;
+			dh = (int32_t) fHeight;
+		}
+		if (sx < 0 || sy < 0 || (uint32_t) (sx + sw) > s->info.width || (uint32_t) (sy + sh) > s->info.height ||
+		    !surfaceHolds(s, (uint32_t) (sy + sh), (uint32_t) (sx + sw))) {
+			continue;
+		}
+		int64_t qx0 = (int64_t) dx * fPanelWidth / fWidth;
+		int64_t qy0 = (int64_t) dy * fPanelHeight / fHeight;
+		int64_t qx1 = ((int64_t) dx + dw) * fPanelWidth / fWidth;
+		int64_t qy1 = ((int64_t) dy + dh) * fPanelHeight / fHeight;
+
+		if (qx1 <= qx0 || qy1 <= qy0 || qx1 <= 0 || qy1 <= 0 || qx0 >= fPanelWidth || qy0 >= fPanelHeight) {
+			continue;                       /* (nothing of it on the panel) */
+		}
+		if (qx0 < 0 || qy0 < 0 || qx1 > fPanelWidth || qy1 > fPanelHeight) {
+			fStatRefused[kRefusedOffPanel]++;
+			return false;
+		}
+		if (s->drawn == 0) {
+			fStatRefused[kRefusedNotGPUDrawn]++;
+			return false;
+		}
+		if (!fGraphics) {
+			fGraphics = true;
+			PE_initialize_console(NULL, kPEGraphicsMode);
+		}
+		layers[count].surface = s;
+		layers[count].sx = (uint32_t) sx;
+		layers[count].sy = (uint32_t) sy;
+		layers[count].sw = (uint32_t) sw;
+		layers[count].sh = (uint32_t) sh;
+		layers[count].dx = (uint32_t) qx0;
+		layers[count].dy = (uint32_t) qy0;
+		layers[count].dw = (uint32_t) (qx1 - qx0);
+		layers[count].dh = (uint32_t) (qy1 - qy0);
+		count++;
+	}
+	if (count == 0) {
+		fStatRefused[kRefusedNothing]++;
+		return false;
+	}
+	fence = MiniIOSurfacePresent(layers, count, fPanelPhys, fRowBytes, fPanelWidth, fPanelHeight);
+	if (fence == 0) {
+		fStatRefused[kRefusedByGPU]++;
+		return false;
+	}
+	gLastPresent = fence;
+	fGPUFirst = layers[0];
+	fGPULayers = count;
+	fGPUFrames++;
+	return true;
+}
+
+/* fb_gpu: the panel's pixels the GPU wrote against drawLayer()'s bilinear of the same surface (see GPU_CHECK_FIRST). */
+void
+IOMobileFramebuffer::checkOnGPU(void)
+{
+	const struct MiniIOSurfacePresentLayer * l = &fGPUFirst;
+	MiniIOSurface * s = l->surface;
+	uint32_t drawn = s->drawn, close = 0, near = 0, far = 0, worst = 0, wx = 0, wy = 0, expect = 0, got = 0;
+
+	if (fGPULayers != 1 || !MiniIOSurfacePresentDone(gLastPresent, 100)) {
+		IOLog("MiniIOMobileFramebuffer: fb_gpu: check: frame %u not checked (%u layers, or the GPU not done)\n", fGPUFrames,
+		    fGPULayers);
+		return;
+	}
+	for (uint32_t i = 0; i < 256; i++) {
+		/* a 16 x 16 grid over the rectangle, each point moved a little so that they do not all fall on one phase */
+		uint32_t x = l->dx + (uint32_t) ((uint64_t) l->dw * (i % 16) / 16) + (i * 7) % 13;
+		uint32_t y = l->dy + (uint32_t) ((uint64_t) l->dh * (i / 16) / 16) + (i * 11) % 17;
+
+		x = x < l->dx + l->dw ? x : l->dx + l->dw - 1;
+		y = y < l->dy + l->dh ? y : l->dy + l->dh - 1;
+		int64_t ax = sample_at(x - l->dx, l->sw, l->dw), ay = sample_at(y - l->dy, l->sh, l->dh);
+		uint32_t c0 = (uint32_t) (ax >> 8), r0 = (uint32_t) (ay >> 8);
+		uint32_t c1 = c0 + 1 < l->sw ? c0 + 1 : c0, r1 = r0 + 1 < l->sh ? r0 + 1 : r0;
+		const uint8_t * upper = s->pixels() + (size_t) (l->sy + r0) * s->info.bytesPerRow + (size_t) l->sx * 4;
+		const uint8_t * lower = s->pixels() + (size_t) (l->sy + r1) * s->info.bytesPerRow + (size_t) l->sx * 4;
+		uint32_t * panel = (uint32_t *) (fBase + (size_t) y * fRowBytes) + x;
+
+		/* (what the processor's cache may hold of either is older than memory, where the GPU read and wrote) */
+		flush_dcache64((addr64_t) (uintptr_t) (upper + c0 * 4), 8, FALSE);
+		flush_dcache64((addr64_t) (uintptr_t) (lower + c0 * 4), 8, FALSE);
+		flush_dcache64((addr64_t) (uintptr_t) panel, 4, FALSE);
+		uint32_t top = blend(((const uint32_t *) upper)[c0], ((const uint32_t *) upper)[c1], (uint32_t) (ax & 255));
+		uint32_t bottom = blend(((const uint32_t *) lower)[c0], ((const uint32_t *) lower)[c1], (uint32_t) (ax & 255));
+		uint32_t want = blend(top, bottom, (uint32_t) (ay & 255)), have = *(volatile uint32_t *) panel, diff = 0;
+
+		for (unsigned shift = 0; shift < 32; shift += 8) {
+			int32_t d = (int32_t) (want >> shift & 0xff) - (int32_t) (have >> shift & 0xff);
+
+			diff = (uint32_t) (d < 0 ? -d : d) > diff ? (uint32_t) (d < 0 ? -d : d) : diff;
+		}
+		close += diff <= 4;
+		near += diff > 4 && diff <= 32;
+		far += diff > 32;
+		if (diff > worst) {
+			worst = diff;
+			wx = x;
+			wy = y;
+			expect = want;
+			got = have;
+		}
+	}
+	if (s->drawn != drawn) {
+		IOLog("MiniIOMobileFramebuffer: fb_gpu: check: frame %u: its surface was drawn into again meanwhile: not counted\n",
+		    fGPUFrames);
+		return;
+	}
+	IOLog("MiniIOMobileFramebuffer: fb_gpu: check: frame %u (surface %u, %ux%u at %u,%u onto %ux%u at %u,%u): of 256 "
+	    "pixels %u within 4 of the processors' bilinear, %u within 32, %u further; the worst %u at %u,%u (%#x, the "
+	    "processors' %#x)\n", fGPUFrames, s->sid, l->sw, l->sh, l->sx, l->sy, l->dw, l->dh, l->dx, l->dy, close, near, far,
+	    worst, wx, wy, got, expect);
+}
+
+/* Before the processors write the panel: the GPU done with what it was given to write there (it would write over them). */
+void
+IOMobileFramebuffer::panelForProcessor(void)
+{
+	if (gLastPresent != 0) {
+		MiniIOSurfacePresentDone(gLastPresent, 100);
+		gLastPresent = 0;
+	}
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
@@ -1434,10 +1667,19 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
-	bool report;
+	bool report, onGPU = false;
+	/*
+	 * fb_copy_guard: no submission names a surface while a processor reads it. With fb_gpu none does, but for a frame the
+	 * GPU cannot take and for the recording (rec_secs): the guard is taken for those, as they come.
+	 */
+	bool guarded[SWAP_LAYERS] = { false };
+	bool guardNow = !gGPUPresent || fRecBase != NULL;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-		if (surfaces[layer] != NULL) MiniIOSurfaceBeginRead(surfaces[layer]);
+		if (surfaces[layer] != NULL && guardNow) {
+			MiniIOSurfaceBeginRead(surfaces[layer]);
+			guarded[layer] = true;
+		}
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
 			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with surface %u after %u ms; shown as it is\n",
 			    swapWord(swap, SWAP_ID), swapWord(swap, SWAP_SURFACE(layer)), SWAP_GPU_MS);
@@ -1474,6 +1716,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	shown = began;
+	/*
+	 * fb_gpu: the frame into the GPU's ring before the swap after it is taken (and with it, CoreAnimation's leave to draw
+	 * into this frame's surfaces again): whatever it draws there next is behind this in the ring.
+	 */
+	if (gGPUPresent) {
+		onGPU = showOnGPU(swap, surfaces);
+	}
+	if (!onGPU) {
+		panelForProcessor();
+		for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+			if (surfaces[layer] != NULL && !guarded[layer]) {
+				MiniIOSurfaceBeginRead(surfaces[layer]);
+				MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS);
+				guarded[layer] = true;
+			}
+		}
+	}
+	fShownOnGPU = onGPU;
+	fStatGPUFrames += onGPU;
+	fStatCPUFrames += !onGPU;
 	/* its turn has come: the swap after it may be handed over */
 	IOLockLock(fSwapLock);
 	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
@@ -1513,7 +1775,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		if (sid == 0) {
 			/* the bottom layer taken away: nothing is shown, the screen is black */
-			if (layer == 0 && (set & 1) && fGraphics) {
+			if (layer == 0 && (set & 1) && fGraphics && !onGPU) {
 				for (uint32_t y = 0; y < fPanelHeight; y++) {
 					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
 				}
@@ -1540,7 +1802,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				fGraphics = true;
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
-			drawLayer(s, src, dst);
+			if (!onGPU) {
+				drawLayer(s, src, dst);
+			}
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 				gShownSurface = sid;
@@ -1551,8 +1815,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (recorded != NULL) {
 		record(recorded);
 	}
+	if (onGPU && (fGPUFrames == GPU_CHECK_FIRST || (fGPUFrames > GPU_CHECK_FIRST && (fGPUFrames - GPU_CHECK_FIRST) % GPU_CHECK_EVERY == 0))) {
+		checkOnGPU();
+	}
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
-		if (surfaces[layer] != NULL) MiniIOSurfaceEndRead(surfaces[layer]);
+		if (guarded[layer]) MiniIOSurfaceEndRead(surfaces[layer]);
 	}
 	fSwapsShown++;
 	if (gTouchLat) {
@@ -1587,6 +1854,23 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
 		    fStatHeld, fStatLost, fStatSwapsLate, fStatSettled, fStatScansMissed, fStatScans);
 		fStatScans = fStatScansMissed = 0;
+		/* GPU-PRESENT-PLAN.md step 0: what the frames cost the processors, and the GPU's part with fb_gpu */
+		{
+			uint32_t presents, timed, mapped;
+			uint64_t submitting, gpu, cpu;
+
+			MiniIOSurfacePresentCost(&presents, &submitting, &gpu, &timed, &mapped);
+			absolutetime_to_nanoseconds(__atomic_exchange_n(&fStatCPUTime, 0, __ATOMIC_RELAXED), &cpu);
+			IOLog("MiniIOMobileFramebuffer: present: %u frames by the processors, %llu us of their time each (all %u threads, "
+			    "redraws included); %u by the GPU, %llu us each to hand over, %llu us of the GPU's (%u timed); %u surfaces "
+			    "entered into its address space; not by the GPU: %u no panel address, %u black, %u off the panel, %u drawn "
+			    "by a processor, %u nothing to draw, %u refused by it\n", fStatCPUFrames,
+			    fStatCPUFrames ? cpu / NSEC_PER_USEC / fStatCPUFrames : 0, fThreads, fStatGPUFrames, submitting, gpu, timed,
+			    mapped, fStatRefused[kRefusedNoPanel], fStatRefused[kRefusedBlack], fStatRefused[kRefusedOffPanel],
+			    fStatRefused[kRefusedNotGPUDrawn], fStatRefused[kRefusedNothing], fStatRefused[kRefusedByGPU]);
+			fStatCPUFrames = fStatGPUFrames = 0;
+			bzero(fStatRefused, sizeof(fStatRefused));
+		}
 		if (fBeamIntf != 0) {
 			char shares[8 * 24] = "";
 			size_t at = 0;
@@ -2052,6 +2336,9 @@ MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t hei
 
 	if (vinfo.v_baseaddr == 0 || vinfo.v_depth != 32) {
 		return;
+	}
+	if (gLastPresent != 0) {
+		MiniIOSurfacePresentDone(gLastPresent, 100);    /* (fb_gpu: the GPU is not to write over it) */
 	}
 	for (uint32_t y = 0; y < rows; y++) {
 		memcpy((void *) (vinfo.v_baseaddr + (size_t) y * vinfo.v_rowbytes), pixels + (size_t) y * rowBytes,

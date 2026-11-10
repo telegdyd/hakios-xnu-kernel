@@ -104,8 +104,10 @@ epoch	k
 fb_beam	k
 fb_beat	k
 fb_ca_hz	k
+fb_copy_guard	k
 fb_diff	k
 fb_filter	k
+fb_gpu	k
 fb_hz	k
 fb_intf	k
 fb_measure	k

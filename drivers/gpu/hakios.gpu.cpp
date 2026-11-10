@@ -260,6 +260,540 @@ void MiniIOSurfaceEndRead(MiniIOSurface * surface)
 	IOLockUnlock(gGPULock);
 }
 
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/*
+ * The framebuffer's frames onto the panel by the GPU (boot-arg fb_gpu=1, MiniIOMobileFramebuffer.cpp; GPU-PRESENT-PLAN.md
+ * step 1). Without it the processor scales every frame onto the panel, 1125 x 2436 into 1080 x 2412: some 2 ms of three
+ * processors a frame, 21 MB through their caches, and the GPU drawing the next frame into a surface the processor is
+ * still reading (fb_copy_guard). Here the GPU's 2D engine does it, bilinear, in the same ring as and after what was drawn
+ * into the surfaces: a submission of a few hundred words of the kernel's own, as hakios-metal's encodeCopy() does a
+ * scaled copy on the A730 (render.cpp), with turnip's r2d_* (tu_clear_blit.cc) for what that does not write.
+ *
+ * The A7XX's (gen 7) registers only: the A6XX's 2D source registers are elsewhere and it is not tried (0: the processor
+ * draws). The panel's memory is entered into the GPU's address space once; each surface shown is entered once and held,
+ * a few at a time, and let go of when the GPU is done with it and it has not been shown for a while (CoreAnimation
+ * draws into a few surfaces in turn; a surface made for every frame costs a mapping a frame).
+ *
+ * The 2D engine writes rows a multiple of 64 bytes apart (RB_2D_DST_PITCH counts 64-byte units), and this panel's are
+ * 4320 bytes (1080 pixels; seen on the phone, 11 November). Two of them are 8640, 135 units. So the frame is scaled into
+ * memory of the GPU's own with rows of 4352 bytes, and copied from there onto the panel by two blits that see the panel
+ * as rows of two: the even rows are the left half of each, the odd rows the right half (from 4320 bytes on), each read
+ * from every other row of the GPU's copy. Integer coordinates throughout, the filtering done once. A panel whose rows
+ * are a multiple of 64 bytes already is scaled into directly.
+ */
+static TUNABLE(uint32_t, gGPUPresentMode, "fb_gpu", 0);
+#define PRESENT_SLOTS           16             /* submissions of ours the GPU may be at, at most */
+#define PRESENT_SLOT_WORDS      512             /* commands of one; its last 4 words: the GPU's clock at its start and end */
+#define PRESENT_MAPS            6               /* surfaces kept in the GPU's address space */
+#define PRESENT_IDLE_MS         1000            /* ... one not shown for so long is let go */
+#define PRESENT_WAIT_MS         200             /* for a slot or a mapping the GPU is still at */
+
+/* the registers (a6xx.xml, Mesa 25.0.7; A7XX- variants where there are two) and commands (adreno_pm4.xml) */
+#define R2D_GRAS_BLIT_CNTL      0x8400
+#define R2D_GRAS_SRC_TL_X       0x8401          /* .. SRC_BR_Y 0x8404, then GRAS_2D_DST_TL 0x8405, DST_BR 0x8406 */
+#define R2D_RB_BLIT_CNTL        0x8c00
+#define R2D_RB_UNKNOWN_8C01     0x8c01
+#define R2D_RB_DST_INFO         0x8c17          /* .. RB_2D_DST lo, hi 0x8c18, RB_2D_DST_PITCH 0x8c1a */
+#define R2D_RB_DST_FLAGS        0x8c20
+#define R2D_SP_DST_FORMAT_A7XX  0xa9bf          /* (0xacc0 on the A6XX) */
+#define R2D_SP_SRC_INFO_A7XX    0xb2c0          /* .. SIZE, SRC lo, hi, PITCH 0xb2c4 (0xb4c0 on the A6XX) */
+#define R2D_SP_SRC_FLAGS_A7XX   0xb2ca
+#define R2D_TPL1_SRC_CNTL_A7XX  0xb2d2
+#define R2D_FMT_8888            0x30            /* FMT6_8_8_8_8_UNORM; swap WZYX (0) both ways: the bytes as they are */
+#define R2D_IFMT_UNORM8         0x10
+#define R2D_BLIT_CNTL           (R2D_FMT_8888 << 8 | 0xfu << 20 | R2D_IFMT_UNORM8 << 24)
+#define R2D_SRC_FILTER          (1u << 16)
+#define R2D_SRC_UNK20_UNK22     (1u << 20 | 1u << 22)
+#define R2D_TEX_2D              (1u << 29)      /* TPL1_2D_SRC_CNTL.TYPE = A6XX_TEX_2D */
+#define PM4_THREAD_CONTROL      0x17
+#define PM4_WAIT_FOR_IDLE       0x26
+#define PM4_BLIT                0x2c
+#define PM4_REG_TO_MEM          0x3e
+#define PM4_EVENT_WRITE7        0x46
+#define PM4_SET_MARKER          0x65
+#define PM4_THREAD_BR           1u
+#define PM4_CONCURRENT_BIN_DISABLE (1u << 27)
+#define PM4_RM6_DIRECT_RENDER   1u
+#define PM4_BLIT_OP_SCALE       3u
+#define EV7_CCU_INVALIDATE_COLOR 25
+#define EV7_CCU_CLEAN_COLOR     0x21
+#define EV7_CACHE_INVALIDATE    0x33
+#define REG_ALWAYS_ON_COUNTER   0x0980
+
+struct present_map {
+	MiniIOSurface *         surface;        /* held; NULL: a free place */
+	uint64_t                address, size;
+	uint32_t                fence;          /* the last present that reads it */
+	uint64_t                used;
+};
+
+static struct {
+	bool                    tried, ready;
+	IOBufferMemoryDescriptor * commands;    /* PRESENT_SLOTS slots, write-combined */
+	uint64_t                commandAddress;
+	uint32_t                slotFence[PRESENT_SLOTS];
+	unsigned                next;
+	uint64_t                panelPhys, panelAddress, panelSize;
+	IOBufferMemoryDescriptor * staging;     /* the frame scaled, rows of stagingPitch bytes (NULL: scaled onto the panel itself) */
+	uint64_t                stagingAddress;
+	uint32_t                stagingPitch;
+	struct present_map      maps[PRESENT_MAPS];
+	/* since MiniIOSurfacePresentCost() was asked */
+	uint32_t                presents, mapped, timed;
+	uint64_t                submitting, gpuTicks;
+} gPresent;
+/* kern.hakios.fb_gpu_state: 0 not tried yet, 1 ready, 2 not an A7XX, 3 no memory for the commands, 4 not entered into the GPU */
+static uint32_t gPresentState;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_gpu_state, CTLFLAG_RD | CTLFLAG_LOCKED, &gPresentState, 0, "fb_gpu: the GPU's present set up");
+static uint32_t gPresentTotal;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_gpu_presents, CTLFLAG_RD | CTLFLAG_LOCKED, &gPresentTotal, 0, "fb_gpu: frames put on the panel by the GPU");
+
+static inline uint32_t
+pm4Parity(uint32_t v)
+{
+	return 0x9669 >> (0xf & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28)) & 1;
+}
+
+struct present_stream {
+	uint32_t * words;
+	uint32_t   at;
+};
+
+static void
+pm4Regs(struct present_stream * st, uint32_t reg, const uint32_t * values, uint32_t count)
+{
+	st->words[st->at++] = 4u << 28 | count | pm4Parity(count) << 7 | reg << 8 | pm4Parity(reg) << 27;
+	for (uint32_t i = 0; i < count; i++) {
+		st->words[st->at++] = values[i];
+	}
+}
+
+static void
+pm4Reg(struct present_stream * st, uint32_t reg, uint32_t value)
+{
+	pm4Regs(st, reg, &value, 1);
+}
+
+static void
+pm4Packet(struct present_stream * st, uint32_t opcode, const uint32_t * values, uint32_t count)
+{
+	st->words[st->at++] = 7u << 28 | count | pm4Parity(count) << 15 | opcode << 16 | pm4Parity(opcode) << 23;
+	for (uint32_t i = 0; i < count; i++) {
+		st->words[st->at++] = values[i];
+	}
+}
+
+static void
+pm4Packet1(struct present_stream * st, uint32_t opcode, uint32_t value)
+{
+	pm4Packet(st, opcode, &value, 1);
+}
+
+/* the GPU's own clock (19.2 MHz) into memory, 64 bits */
+static void
+pm4Time(struct present_stream * st, uint64_t address)
+{
+	const uint32_t w[3] = { REG_ALWAYS_ON_COUNTER | 2u << 18 | 1u << 30, (uint32_t) address, (uint32_t) (address >> 32) };
+
+	pm4Packet(st, PM4_REG_TO_MEM, w, 3);
+}
+
+/* Pages of physical memory, or of a descriptor, into the GPU's address space. With the lock held; 0: no room. */
+static uint64_t
+presentMapMemory(IOMemoryDescriptor * memory, uint64_t from, uint64_t phys, uint64_t size, bool readOnly)
+{
+	uint64_t address = hakios_gpu_address(size);
+	bool mapped = address != 0;
+
+	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
+		addr64_t page = phys + offset;
+
+		if (memory != NULL) {
+			IOByteCount length = 0;
+
+			page = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
+		}
+		mapped = page != 0 && hakios_gpu_map(address + offset, page, readOnly);
+	}
+	if (address == 0) {
+		return 0;
+	}
+	hakios_gpu_mapped();
+	if (!mapped) {
+		hakios_gpu_unmap(address, size);
+		hakios_gpu_address_free(address, size);
+		return 0;
+	}
+	return address;
+}
+
+static void
+presentUnmap(struct present_map * m)
+{
+	hakios_gpu_unmap(m->address, m->size);
+	hakios_gpu_address_free(m->address, m->size);
+	MiniIOSurfaceDrop(m->surface);
+	bzero(m, sizeof(*m));
+}
+
+/* With the lock held: the command memory, the panel (and the GPU's own copy of it) in the GPU's address space, once. */
+static bool
+presentSetUp(uint64_t panelPhys, uint32_t panelRowBytes, uint32_t panelWidth, uint32_t panelHeight)
+{
+	uint64_t chip = 0;
+	uint64_t size = (uint64_t) PRESENT_SLOTS * PRESENT_SLOT_WORDS * 4;
+	uint64_t panelSize = (uint64_t) panelRowBytes * panelHeight;
+
+	if (gPresent.tried) {
+		return gPresent.ready && gPresent.panelPhys == panelPhys && gPresent.panelSize >= panelSize;
+	}
+	gPresent.tried = true;
+	/* rows the 2D engine cannot write one by one: two at a time (see above), from a copy of the GPU's own */
+	if ((panelRowBytes & 63) != 0) {
+		uint64_t stagingSize;
+
+		if ((panelRowBytes & 3) != 0 || ((2 * panelRowBytes) & 63) != 0 || panelRowBytes / 4 + panelWidth > 16384) {
+			IOLog("HakiosGPU: fb_gpu: the panel's rows of %u bytes cannot be written by the 2D engine\n", panelRowBytes);
+			gPresentState = 5;
+			return false;
+		}
+		gPresent.stagingPitch = (panelWidth * 4 + 63) & ~63u;
+		stagingSize = round_page_64((uint64_t) gPresent.stagingPitch * panelHeight);
+		gPresent.staging = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMapWriteCombineCache,
+		    (vm_size_t) stagingSize, PAGE_SIZE);
+		if (gPresent.staging == NULL || (gPresent.stagingAddress = presentMapMemory(gPresent.staging, 0, 0, stagingSize, false)) == 0) {
+			IOLog("HakiosGPU: fb_gpu: no memory for the GPU's copy of the panel (%llu bytes)\n", stagingSize);
+			gPresentState = 3;
+			return false;
+		}
+	}
+	if (!hakios_gpu_parameter(0x03, &chip) || (chip >> 24 & 0xff) != 7) {
+		IOLog("HakiosGPU: fb_gpu: the GPU (chip %#llx) is not an A7XX: the processor puts frames on the panel\n", chip & 0xffffffff);
+		gPresentState = 2;
+		return false;
+	}
+	gPresent.commands = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMapWriteCombineCache,
+	    (vm_size_t) size, PAGE_SIZE);
+	if (gPresent.commands == NULL) {
+		IOLog("HakiosGPU: fb_gpu: no memory for the commands\n");
+		gPresentState = 3;
+		return false;
+	}
+	gPresent.commandAddress = presentMapMemory(gPresent.commands, 0, 0, size, false);     /* (the GPU writes its times there) */
+	gPresent.panelSize = (panelSize + 4095) & ~4095ull;
+	gPresent.panelAddress = presentMapMemory(NULL, 0, panelPhys, gPresent.panelSize, false);
+	if (gPresent.commandAddress == 0 || gPresent.panelAddress == 0) {
+		IOLog("HakiosGPU: fb_gpu: the commands or the panel's memory (%#llx, %llu bytes) cannot be entered into the GPU's "
+		    "address space\n", panelPhys, panelSize);
+		gPresentState = 4;
+		return false;
+	}
+	gPresent.panelPhys = panelPhys;
+	gPresent.ready = true;
+	gPresentState = 1;
+	IOLog("HakiosGPU: fb_gpu: frames go to the panel by the GPU's 2D engine: the panel's memory %#llx (%llu bytes) at %#llx%s\n",
+	    panelPhys, gPresent.panelSize, gPresent.panelAddress, gPresent.staging ? ", by a copy of the GPU's own with rows of 64-byte units" : "");
+	return true;
+}
+
+/*
+ * One blit of the 2D engine, 32-bit pixels as they are (bilinear when the two rectangles differ in size): from a
+ * rectangle of SW x SH pixels at SX, SY of memory at SRC (rows SPITCH bytes apart, W x H of them there) to one of DW x DH
+ * at DX, DY of memory at DST (DPITCH). hakios-metal's encodeCopy(), the registers in its order.
+ */
+static void
+pm4Blit(struct present_stream * st, uint64_t src, uint32_t spitch, uint32_t w, uint32_t h, uint32_t sx, uint32_t sy, uint32_t sw,
+    uint32_t sh, uint64_t dst, uint32_t dpitch, uint32_t dx, uint32_t dy, uint32_t dw, uint32_t dh)
+{
+	bool scaled = sw != dw || sh != dh;
+	const uint32_t rect[6] = {
+		sx << 8, (sx + sw - 1) << 8, sy << 8, (sy + sh - 1) << 8,
+		dx | dy << 16, (dx + dw - 1) | (dy + dh - 1) << 16,
+	};
+	const uint32_t source[5] = {
+		R2D_FMT_8888 | R2D_SRC_UNK20_UNK22 | (scaled ? R2D_SRC_FILTER : 0), w | h << 15, (uint32_t) src, (uint32_t) (src >> 32),
+		(spitch >> 6) << 9,
+	};
+	const uint32_t destination[4] = { R2D_FMT_8888, (uint32_t) dst, (uint32_t) (dst >> 32), dpitch >> 6 };
+	const uint32_t none[3] = { 0, 0, 0 };
+
+	pm4Regs(st, R2D_GRAS_SRC_TL_X, rect, 6);
+	pm4Regs(st, R2D_SP_SRC_INFO_A7XX, source, 5);
+	pm4Regs(st, R2D_SP_SRC_FLAGS_A7XX, none, 3);
+	pm4Regs(st, R2D_RB_DST_INFO, destination, 4);
+	pm4Regs(st, R2D_RB_DST_FLAGS, none, 3);
+	pm4Packet1(st, PM4_BLIT, PM4_BLIT_OP_SCALE);
+}
+
+/* what the 2D engine wrote, in memory for the next to read: the colour cache cleaned, the GPU's caches invalidated */
+static void
+pm4BlitBarrier(struct present_stream * st)
+{
+	pm4Packet1(st, PM4_EVENT_WRITE7, EV7_CCU_CLEAN_COLOR);
+	pm4Packet(st, PM4_WAIT_FOR_IDLE, NULL, 0);
+	pm4Packet1(st, PM4_EVENT_WRITE7, EV7_CCU_INVALIDATE_COLOR);
+	pm4Packet1(st, PM4_EVENT_WRITE7, EV7_CACHE_INVALIDATE);
+	pm4Packet(st, PM4_WAIT_FOR_IDLE, NULL, 0);
+}
+
+/*
+ * A rectangle of the GPU's copy onto the panel, unscaled, by rows of two (see above): rows Y.. of the copy (pitch CP) at
+ * the same place on the panel (pitch PP, not a multiple of 64 bytes, twice it is).
+ */
+static void
+pm4PanelRows(struct present_stream * st, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t panelRowBytes, uint32_t panelHeight)
+{
+	const uint32_t cp = gPresent.stagingPitch, pp = panelRowBytes;
+
+	for (uint32_t odd = 0; odd < 2; odd++) {
+		uint32_t first = (y & 1) == odd ? y : y + 1;            /* the first row of this kind */
+		uint32_t rows = first < y + h ? (y + h - first + 1) / 2 : 0;
+
+		if (rows == 0 || first >= panelHeight) {
+			continue;
+		}
+		/* the copy's rows FIRST, FIRST + 2, ...: from its row FIRST on, every other; the panel's: their pair's half */
+		pm4Blit(st, gPresent.stagingAddress + (uint64_t) first * cp, 2 * cp, x + w, rows, x, 0, w, rows,
+		    gPresent.panelAddress + (uint64_t) (first - odd) * pp, 2 * pp, odd * (pp / 4) + x, 0, w, rows);
+	}
+}
+
+/* With the lock held: a surface's GPU address (its pixels' first byte), its mapping made or found; 0: none to be had. */
+static uint64_t
+presentSurface(MiniIOSurface * s, uint64_t now)
+{
+	struct present_map * m = NULL, * oldest = NULL;
+	uint64_t idle, size;
+
+	nanoseconds_to_absolutetime((uint64_t) PRESENT_IDLE_MS * NSEC_PER_MSEC, &idle);
+	for (unsigned i = 0; i < PRESENT_MAPS; i++) {
+		struct present_map * k = &gPresent.maps[i];
+
+		if (k->surface == s) {
+			m = k;
+		} else if (k->surface != NULL && now - k->used > idle && hakios_gpu_done(k->fence)) {
+			presentUnmap(k);            /* (not shown for a while: its memory is not held for nothing) */
+		}
+	}
+	if (m != NULL) {
+		m->used = now;
+		return m->address + s->info.offset;
+	}
+	/* (memory of a program's own with a surface made around it: not entered here) */
+	if (s->client != NULL) {
+		return 0;
+	}
+	for (unsigned i = 0; i < PRESENT_MAPS && m == NULL; i++) {
+		struct present_map * k = &gPresent.maps[i];
+
+		if (k->surface == NULL) {
+			m = k;
+		} else if (oldest == NULL || k->used < oldest->used) {
+			oldest = k;
+		}
+	}
+	if (m == NULL) {
+		if (!gpuWait(oldest->fence, PRESENT_WAIT_MS)) {
+			return 0;
+		}
+		presentUnmap(oldest);
+		m = oldest;
+	}
+	/* the pixels, from the page after the surface's shared state on (as surfaceBuffer() enters them) */
+	size = round_page_64(s->info.allocSize);
+	if (size == 0 || size > GPU_BUFFER_MAX) {
+		return 0;
+	}
+	m->address = presentMapMemory(s->memory, PAGE_SIZE, 0, size, true);
+	if (m->address == 0) {
+		return 0;
+	}
+	MiniIOSurface * held = MiniIOSurfaceCopy(s->sid);
+
+	if (held != s) {
+		/* (the surface is going: not held, not entered) */
+		if (held != NULL) {
+			MiniIOSurfaceDrop(held);
+		}
+		hakios_gpu_unmap(m->address, size);
+		hakios_gpu_address_free(m->address, size);
+		m->address = 0;
+		return 0;
+	}
+	m->surface = s;
+	m->size = size;
+	m->fence = 0;
+	m->used = now;
+	gPresent.mapped++;
+	return m->address + s->info.offset;
+}
+
+uint32_t
+MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned count, uint64_t panelPhys, uint32_t panelRowBytes,
+    uint32_t panelWidth, uint32_t panelHeight)
+{
+	uint64_t began = mach_absolute_time(), sources[4];
+	uint32_t fence = 0, words;
+	static uint32_t said;
+
+	/* (why not, for kern.hakios.fb_gpu_state while nothing has been set up: 10 the arguments, 11 no GPU, 12 the GPU reported) */
+	if (gGPULock == NULL || count == 0 || count > 4 || panelPhys == 0 || (panelPhys & 63)) {
+		gPresentState = gPresentState == 0 ? 10 : gPresentState;
+		return 0;
+	}
+	IOLockLock(gGPULock);
+	if (!hakios_gpu_ready() || gGPUReported) {
+		gPresentState = gPresentState == 0 ? (gGPUReported ? 12 : 11) : gPresentState;
+		IOLockUnlock(gGPULock);
+		return 0;
+	}
+	if (!presentSetUp(panelPhys, panelRowBytes, panelWidth, panelHeight)) {
+		IOLockUnlock(gGPULock);
+		return 0;
+	}
+	for (unsigned i = 0; i < count; i++) {
+		const struct MiniIOSurfacePresentLayer * l = &layers[i];
+		const MiniIOSurface * s = l->surface;
+
+		/* what the 2D engine takes: 16-bit coordinates, rows a multiple of 64 bytes, 64-byte-aligned pixels */
+		if (l->sw == 0 || l->sh == 0 || l->dw == 0 || l->dh == 0 || l->dx + l->dw > panelWidth || l->dy + l->dh > panelHeight ||
+		    s->info.width > 16384 || s->info.height > 16384 || (s->info.bytesPerRow & 63) || (s->info.offset & 63) ||
+		    (sources[i] = presentSurface(l->surface, began)) == 0) {
+			if (said++ < 8) {
+				IOLog("HakiosGPU: fb_gpu: layer %u (surface %u, %ux%u, %u bytes a row, at %u) is drawn by the processor\n", i,
+				    s->sid, s->info.width, s->info.height, s->info.bytesPerRow, s->info.offset);
+			}
+			IOLockUnlock(gGPULock);
+			return 0;
+		}
+	}
+	/* the slot: the GPU done with what was in it before */
+	unsigned slot = gPresent.next % PRESENT_SLOTS;
+
+	if (gPresent.slotFence[slot] != 0 && !gpuWait(gPresent.slotFence[slot], PRESENT_WAIT_MS)) {
+		IOLockUnlock(gGPULock);
+		return 0;
+	}
+	uint32_t * base = (uint32_t *) gPresent.commands->getBytesNoCopy() + slot * PRESENT_SLOT_WORDS;
+	uint64_t address = gPresent.commandAddress + (uint64_t) slot * PRESENT_SLOT_WORDS * 4;
+	uint64_t times = address + (PRESENT_SLOT_WORDS - 4) * 4;
+	volatile uint64_t * timesCpu = (volatile uint64_t *) (base + PRESENT_SLOT_WORDS - 4);
+	struct present_stream st = { base, 0 };
+
+	/* (what the GPU measured of the slot's last present) */
+	if (gPresent.slotFence[slot] != 0 && timesCpu[1] > timesCpu[0]) {
+		gPresent.gpuTicks += timesCpu[1] - timesCpu[0];
+		gPresent.timed++;
+	}
+	timesCpu[0] = timesCpu[1] = 0;
+	/* turnip's tu6_init_hw (A7XX) and r2d_setup: the BR thread, the colour cache and the GPU's caches invalidated */
+	pm4Packet1(&st, PM4_THREAD_CONTROL, PM4_THREAD_BR | PM4_CONCURRENT_BIN_DISABLE);
+	pm4Time(&st, times);
+	pm4Packet1(&st, PM4_EVENT_WRITE7, EV7_CCU_INVALIDATE_COLOR);
+	pm4Packet1(&st, PM4_EVENT_WRITE7, EV7_CACHE_INVALIDATE);
+	pm4Packet(&st, PM4_WAIT_FOR_IDLE, NULL, 0);
+	pm4Packet1(&st, PM4_SET_MARKER, PM4_RM6_DIRECT_RENDER);
+	pm4Reg(&st, R2D_RB_UNKNOWN_8C01, 0);
+	pm4Reg(&st, R2D_RB_BLIT_CNTL, R2D_BLIT_CNTL);
+	pm4Reg(&st, R2D_GRAS_BLIT_CNTL, R2D_BLIT_CNTL);
+	pm4Reg(&st, R2D_SP_DST_FORMAT_A7XX, R2D_FMT_8888 << 3 | 0xfu << 12);
+	/*
+	 * (TPL1_2D_SRC_CNTL, which turnip writes TYPE 2D for an image's blit, is left as it is: hakios-metal's 2D copies on
+	 * this A730 never write it, and Metal's next submission is not to find it changed. If the picture comes out wrong,
+	 * boot-arg fb_gpu=2 writes it.)
+	 */
+	if (gGPUPresentMode == 2) {
+		pm4Reg(&st, R2D_TPL1_SRC_CNTL_A7XX, R2D_TEX_2D);
+	}
+	/* each layer scaled into the GPU's copy of the panel, or into the panel itself when its rows allow */
+	uint64_t target = gPresent.staging != NULL ? gPresent.stagingAddress : gPresent.panelAddress;
+	uint32_t targetPitch = gPresent.staging != NULL ? gPresent.stagingPitch : panelRowBytes;
+
+	for (unsigned i = 0; i < count; i++) {
+		const struct MiniIOSurfacePresentLayer * l = &layers[i];
+		const MiniIOSurface * s = l->surface;
+
+		pm4Blit(&st, sources[i], s->info.bytesPerRow, s->info.width, s->info.height, l->sx, l->sy, l->sw, l->sh, target,
+		    targetPitch, l->dx, l->dy, l->dw, l->dh);
+	}
+	pm4BlitBarrier(&st);
+	/* ... and from the copy onto the panel, each layer's rectangle, by rows of two */
+	if (gPresent.staging != NULL) {
+		for (unsigned i = 0; i < count; i++) {
+			pm4PanelRows(&st, layers[i].dx, layers[i].dy, layers[i].dw, layers[i].dh, panelRowBytes, panelHeight);
+		}
+		pm4BlitBarrier(&st);
+	}
+	pm4Time(&st, times + 8);
+	words = st.at;
+	if (words > PRESENT_SLOT_WORDS - 4) {
+		panic("HakiosGPU: fb_gpu: %u words of commands in a slot of %u", words, PRESENT_SLOT_WORDS - 4);
+	}
+	hakios_gpu_to_memory(NULL, 0);          /* (what was written is in memory: a barrier) */
+	fence = hakios_gpu_submit(&address, &words, 1);
+	if (fence == 0) {
+		if (!gGPUReported) {
+			gGPUReported = true;
+			hakios_gpu_report("the ring is full (fb_gpu)");
+		}
+		IOLockUnlock(gGPULock);
+		return 0;
+	}
+	gPresent.slotFence[slot] = fence;
+	gPresent.next++;
+	for (unsigned i = 0; i < count; i++) {
+		for (unsigned k = 0; k < PRESENT_MAPS; k++) {
+			if (gPresent.maps[k].surface == layers[i].surface) {
+				gPresent.maps[k].fence = fence;
+			}
+		}
+	}
+	if (gpu_log) {
+		hakios_tl("tl: P %u: %u layers, %u words\n", fence, count, words);
+	}
+	gPresent.presents++;
+	gPresentTotal++;
+	gPresent.submitting += mach_absolute_time() - began;
+	IOLockUnlock(gGPULock);
+	return fence;
+}
+
+bool
+MiniIOSurfacePresentDone(uint32_t fence, uint64_t milliseconds)
+{
+	bool done = true;
+
+	if (fence != 0 && gGPULock != NULL) {
+		IOLockLock(gGPULock);
+		done = !hakios_gpu_ready() || gpuWait(fence, milliseconds);
+		IOLockUnlock(gGPULock);
+	}
+	return done;
+}
+
+void
+MiniIOSurfacePresentCost(uint32_t * presents, uint64_t * submitting, uint64_t * gpu, uint32_t * timed, uint32_t * mapped)
+{
+	uint64_t ns;
+
+	if (gGPULock == NULL) {
+		*presents = *timed = *mapped = 0;
+		*submitting = *gpu = 0;
+		return;
+	}
+	IOLockLock(gGPULock);
+	absolutetime_to_nanoseconds(gPresent.submitting, &ns);
+	*presents = gPresent.presents;
+	*submitting = gPresent.presents ? ns / NSEC_PER_USEC / gPresent.presents : 0;
+	*timed = gPresent.timed;
+	*gpu = gPresent.timed ? gPresent.gpuTicks * 10 / 192 / gPresent.timed : 0;
+	*mapped = gPresent.mapped;
+	gPresent.presents = gPresent.mapped = gPresent.timed = 0;
+	gPresent.submitting = gPresent.gpuTicks = 0;
+	IOLockUnlock(gGPULock);
+}
+
 /*
  * Boot-arg touch_lat=1: a line for every wait of a program's for the GPU that took a millisecond or
  * more ("tl: f KIND US at US"), for telling apart what holds a frame up (tools/frames.py).
