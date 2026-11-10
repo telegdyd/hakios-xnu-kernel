@@ -1555,6 +1555,14 @@ hm_ca_nearest(NSString *frag)
 	if (w == nil) {
 		return nil;
 	}
+	static NSRegularExpression *filter;
+	static dispatch_once_t filterOnce;
+
+	dispatch_once(&filterOnce, ^{
+		filter = [[NSRegularExpression alloc] initWithPattern:@"_I[A-Za-z0-9]*N[0-9]+O" options:0 error:NULL];
+	});
+	const BOOL filtered = [filter firstMatchInString:want options:0 range:NSMakeRange(0, [want length])] != nil;
+
 	for (NSString *candidate in hm_ca_frag_vert) {
 		if (![candidate hasPrefix:prefix] || hm_ca_variants[candidate] == nil) {
 			continue;
@@ -1576,6 +1584,23 @@ hm_ca_nearest(NSString *frag)
 		if ([wantIn count] != [haveIn count]) {
 			continue;
 		}
+		if (filtered) {
+			/* an input with a filter (N<rows>O<ops>) reads its rows from the buffer CoreAnimation lays out for the
+			 * program it asked for: another op list reads them at other offsets, the other precision (h: half4 rows, cx:
+			 * float4) at twice or half the stride, and the bias comes out as a flat colour added to the picture (the
+			 * app-open flash, boots 12-19). Only the same inputs at the same precision, or none. */
+			if (![part(w, 8, want) isEqualToString:part(h, 8, have)]) {
+				continue;
+			}
+			BOOL alike = YES;
+			for (NSString *p in @[@"h", @"c", @"x"]) {
+				alike = alike && ([wantFlags rangeOfString:p].location == NSNotFound) ==
+						 ([haveFlags rangeOfString:p].location == NSNotFound);
+			}
+			if (!alike) {
+				continue;
+			}
+		}
 		for (NSUInteger i = 0; i < [wantIn count]; i++) {
 			/* (an input that does more than was asked for last: IsrcN3Oc3mtc4 is a colour matrix, not a plain sample) */
 			cost += [wantIn[i] isEqualToString:haveIn[i]] ? 0 : 100 + labs((long)[haveIn[i] length] - (long)[wantIn[i] length]);
@@ -1595,7 +1620,8 @@ hm_ca_nearest(NSString *frag)
 		if (told[frag] == nil) {
 			told[frag] = @YES;
 			hm_print("CoreAnimation's %s is not in the library: %s stands in for it\n", [want UTF8String],
-				 best != nil ? [[best substringFromIndex:[prefix length]] UTF8String] : "nothing of the same kind");
+				 best != nil ? [[best substringFromIndex:[prefix length]] UTF8String] :
+				 filtered ? "nothing with the same filter layout: its own module" : "nothing of the same kind");
 		}
 	}
 	return best;
@@ -2889,7 +2915,7 @@ hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned
 		hakios_metal_constant constants[64];
 		unsigned count = hm_function_constants(function, constants, 64);
 
-		kernel = hakios_metal_kernel_compile_bitcode_constants([air bytes], [air length], constants, count);
+		kernel = hakios_metal_kernel_compile_for_device(_gpu, [air bytes], [air length], constants, count);
 		if (kernel != NULL) {
 			hm_dump_function("cs", function, "metal_dump=fn", constants, count);
 		}
@@ -3198,7 +3224,7 @@ hm_describe_function(id f)
 		hakios_metal_constant vsConstants[64], fsConstants[64];
 		unsigned vsCount = hm_function_constants(vs, vsConstants, 64), fsCount = hm_function_constants(fs, fsConstants, 64);
 
-		program = hakios_metal_program_new_bitcode_constants([vsAir bytes], [vsAir length], vsConstants, vsCount, fsAir != nil ? [fsAir bytes] : NULL,
+		program = hakios_metal_program_new_for_device(_gpu, [vsAir bytes], [vsAir length], vsConstants, vsCount, fsAir != nil ? [fsAir bytes] : NULL,
 								     fsAir != nil ? [fsAir length] : 0,
 								     fsConstants, fsCount, format);
 		if (program != NULL) {

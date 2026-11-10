@@ -277,6 +277,13 @@ hakios_metal_program *hakios_metal_program_new_bitcode(const void *vs_bitcode, s
 /* ...each function specialised by its own constants, as each MTLFunction of a pipeline carries its own. FS_BITCODE
  * NULL (or FS_SIZE 0) is a pipeline with no fragment function: a built-in one that writes nothing is drawn, so only
  * depth and stencil come out (a depth-only pass's pipeline). */
+/* Device-aware entry points compile for this GPU. Legacy entry points retain the A635 default. */
+hakios_metal_device *hakios_metal_open_fake_chip(uint32_t chip);
+hakios_metal_kernel *hakios_metal_kernel_compile_for_device(hakios_metal_device *device, const void *bitcode, size_t size,
+    const hakios_metal_constant *constants, unsigned count);
+hakios_metal_program *hakios_metal_program_new_for_device(hakios_metal_device *device, const void *vs_bitcode, size_t vs_size,
+    const hakios_metal_constant *vs_constants, unsigned vs_count, const void *fs_bitcode, size_t fs_size,
+    const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned color_pixel_format);
 hakios_metal_program *hakios_metal_program_new_bitcode_constants(const void *vs_bitcode, size_t vs_size,
     const hakios_metal_constant *vs_constants, unsigned vs_count, const void *fs_bitcode, size_t fs_size,
     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned color_pixel_format);

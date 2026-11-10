@@ -59,11 +59,11 @@ std::shared_ptr<Buffer> bufferAt(uint64_t address, uint64_t* offset) {
 std::atomic<uint32_t> gBuffersMade{0}, gBuffersReused{0};
 std::atomic<uint64_t> gBytesMade{0};
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why) {
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, uint64_t minBacking) {
     gBuffersMade++;
     gBytesMade += length;
     int error = 0;
-    std::unique_ptr<Bo> bo = gpu.newBo(length, kBoWriteCombined, &error);
+    std::unique_ptr<Bo> bo = gpu.newBo(std::max(length, minBacking), kBoWriteCombined, &error);
     if (bo == nullptr) {
         *why = "the driver gave no buffer of " + std::to_string(length) + " bytes: " + strerror(error);
         return nullptr;

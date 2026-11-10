@@ -199,6 +199,13 @@ flash_root(const char *dev)
 	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not Darwin's");
 	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
 	    "our audio device, not Apple's plug-ins");
+	if (stat(in_image("/lib/HakiosMetal.bundle"), &fw_st) == 0) {
+		/* The flash root predates this RAM image: expose its Metal bundle without writing the system volume. */
+		const char *at = "/flash/System/Library/Extensions/HakiosMetal.bundle";
+		int exists = stat(at, &fw_st) == 0;
+		check((exists || synthetic_dir(at)) && bind_dir(in_image("/lib/HakiosMetal.bundle"), at),
+		    "this image's Metal plug-in on the read-only system volume");
+	}
 	if (stat("/fw", &fw_st) == 0) {
 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
 		check(synthetic_dir("/flash/fw") && bind_dir("/fw", "/flash/fw"), "the firmware on /fw (adsp=1, sound=N)");

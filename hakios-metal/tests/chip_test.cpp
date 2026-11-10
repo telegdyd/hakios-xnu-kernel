@@ -25,7 +25,7 @@ TEST(chip_identity_and_memory_match_each_kernel_target) {
     }
     CHECK(chipInfo(0) == &kChipA635);
     CHECK(chipInfo(0x07040001) == nullptr);
-    CHECK(!hakios_metal_chip_known(kChipA730.id));
+    CHECK(hakios_metal_chip_known(kChipA730.id));
 }
 
 TEST(chip_a730_cache_split_and_tile_alignment) {

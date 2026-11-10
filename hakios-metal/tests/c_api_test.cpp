@@ -9,6 +9,7 @@
 #include "test.hpp"
 
 namespace {
+std::vector<uint8_t> readFile(const char* path);
 void counted(hakios_metal_cb* cb, void* context) {
     if (hakios_metal_cb_status(cb) == HAKIOS_METAL_COMPLETED) {
         static_cast<std::atomic<int>*>(context)->fetch_add(1);
@@ -60,8 +61,84 @@ TEST(c_api_copy_and_callbacks) {
     CHECK(hakios_metal_open() == nullptr);      // no kernel GPU on this machine
     CHECK(hakios_metal_chip_known(0x06030500));  // this phone's
     CHECK(hakios_metal_chip_known(0));           // a kernel that does not say
+    CHECK(hakios_metal_chip_known(0x07030001));  // A730, sysmem only
     CHECK(!hakios_metal_chip_known(0x06060000)); // another Adreno: the tables here would hang it
     CHECK(strlen(hakios_metal_error()) > 0);
+}
+
+TEST(c_api_compiles_for_each_device_and_specializes_for_the_same_chip) {
+    if (!hakios_metal_has_compiler()) return;
+    auto vs = readFile("out/host/kernels/tri_flat_vs.bc");
+    auto fs = readFile("out/host/kernels/tri_flat_fs.bc");
+    auto cfs = readFile("out/host/kernels/tri_cflat_fs.bc");
+    auto cs = readFile("out/host/kernels/fill_id.bc");
+    for (uint32_t chip : {0x07030001u, 0x06030500u}) {
+        auto* d = hakios_metal_open_fake_chip(chip);
+        CHECK_EQ(hakios_metal_gpu_id(d), uint64_t(chip));
+        auto* q = hakios_metal_queue_new(d);
+        auto* rt = hakios_metal_texture_new(d, 2, 70, 64, 64, 5);
+        struct hakios_metal_render_pass pass{};
+        pass.color0 = rt; pass.load_action = 1; pass.store_action = 1;
+        auto* p = hakios_metal_program_new_for_device(d, vs.data(), vs.size(), nullptr, 0, fs.data(), fs.size(), nullptr, 0, 70);
+        CHECK(p != nullptr);
+        if (p != nullptr) {
+            uint32_t known = 0;
+            auto* sp = hakios_metal_program_specialize(p, fs.data(), fs.size(), nullptr, 0, 0, &known, sizeof known);
+            CHECK(sp != nullptr);
+            for (auto* program : {p, sp}) {
+                if (program == nullptr) continue;
+                auto* cb = hakios_metal_cb_new(q);
+                CHECK_EQ(hakios_metal_cb_draw(cb, program, &pass, nullptr, nullptr, 3, 0, 3, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
+                hakios_metal_cb_commit(cb, nullptr, nullptr);
+                hakios_metal_cb_wait(cb);
+                CHECK_EQ(hakios_metal_cb_status(cb), HAKIOS_METAL_COMPLETED);
+                unsigned passes = 99, tiles = 99;
+                hakios_metal_cb_gmem_counts(cb, &passes, &tiles);
+                if (chip == 0x07030001u) { CHECK_EQ(passes, 0u); CHECK_EQ(tiles, 0u); }
+                hakios_metal_cb_free(cb);
+            }
+            hakios_metal_program_free(sp);
+            hakios_metal_program_free(p);
+        }
+        // A float4 supplied by -setFragmentBytes: has 16 logical bytes; ir3's pushed range reads 64 backing bytes.
+        auto* shortBuffer = hakios_metal_buffer_new(d, 16);
+        CHECK_EQ(hakios_metal_buffer_length(shortBuffer), 16ull);
+        auto* cp = hakios_metal_program_new_for_device(d, vs.data(), vs.size(), nullptr, 0, cfs.data(), cfs.size(), nullptr, 0, 70);
+        CHECK(cp != nullptr);
+        if (cp != nullptr) {
+            auto* tailBuffer = hakios_metal_buffer_new(d, 4096);
+            CHECK_EQ(hakios_metal_buffer_length(tailBuffer), 4096ull);
+            for (auto* buffer : {shortBuffer, tailBuffer}) {
+            auto* cb = hakios_metal_cb_new(q);
+            hakios_metal_buffer* buffers[] = {buffer};
+            const uint64_t offset = buffer == tailBuffer ? 4080 : 0;
+            CHECK_EQ(hakios_metal_cb_draw(cb, cp, &pass, nullptr, nullptr, 3, 0, 3, 1, nullptr, nullptr, 0, buffers, &offset, 1), 0);
+            hakios_metal_cb_commit(cb, nullptr, nullptr); hakios_metal_cb_wait(cb);
+            CHECK_EQ(hakios_metal_cb_status(cb), HAKIOS_METAL_COMPLETED);
+            hakios_metal_cb_free(cb);
+            }
+            hakios_metal_buffer_free(tailBuffer); hakios_metal_program_free(cp);
+        }
+        hakios_metal_buffer_free(shortBuffer);
+        CHECK(hakios_metal_buffer_new(d, UINT64_MAX) == nullptr);
+        auto* k = hakios_metal_kernel_compile_for_device(d, cs.data(), cs.size(), nullptr, 0);
+        CHECK(k != nullptr);
+        if (k != nullptr) {
+            auto* out = hakios_metal_buffer_new(d, 4096);
+            auto* c = hakios_metal_buffer_new(d, 64);
+            hakios_metal_buffer* buffers[] = {out, c};
+            const unsigned groups[] = {16, 1, 1}, threads[] = {64, 1, 1};
+            auto* cb = hakios_metal_cb_new(q);
+            CHECK_EQ(hakios_metal_cb_dispatch(cb, k, groups, threads, buffers, nullptr, 2), 0);
+            hakios_metal_cb_commit(cb, nullptr, nullptr);
+            hakios_metal_cb_wait(cb);
+            CHECK_EQ(hakios_metal_cb_status(cb), HAKIOS_METAL_COMPLETED);
+            hakios_metal_cb_free(cb);
+            hakios_metal_buffer_free(out); hakios_metal_buffer_free(c);
+            hakios_metal_kernel_free(k);
+        }
+        hakios_metal_texture_free(rt); hakios_metal_queue_free(q); hakios_metal_close(d);
+    }
 }
 
 namespace {

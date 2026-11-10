@@ -212,9 +212,8 @@ void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long 
 
 const char* hakios_metal_error(void) { return lastError.c_str(); }
 
-// Tiles, GMEM offsets and the shader compiler are built for one chip (a6xx.hpp). A kernel that does not say (0) is taken at its
-// word that it is that one: only a chip it names as another is refused, so that the window server stays on OpenGL ES there.
-bool hakios_metal_chip_known(uint32_t chip) { return chip == 0 || chip == a6xx::kChipId; }
+// Old kernels that do not report a chip retain the A635 default. The A730 uses gen7 state and sysmem only.
+bool hakios_metal_chip_known(uint32_t chip) { return chip == 0 || chip == kChipA635.id || chip == kChipA730.id; }
 
 static hakios_metal_device* deviceOn(std::unique_ptr<Transport> t) {
     auto* d = new hakios_metal_device;
@@ -234,8 +233,8 @@ hakios_metal_device* hakios_metal_open(void) {
     hakios_metal_device* d = deviceOn(std::move(t));
     if (!hakios_metal_chip_known(d->gpu->chipId())) {
         char text[160];
-        snprintf(text, sizeof(text), "the GPU's chip ID is %#x: the tables of this driver are the Adreno's of chip ID %#x (a6xx.hpp), another's would hang it",
-                 d->gpu->chipId(), a6xx::kChipId);
+        snprintf(text, sizeof(text), "unsupported GPU chip ID %#x; this driver supports A635 (%#x) and A730 (%#x, sysmem only)",
+                 d->gpu->chipId(), kChipA635.id, kChipA730.id);
         failed(text);
         delete d;
         return nullptr;
@@ -248,6 +247,10 @@ hakios_metal_device* hakios_metal_open(void) {
 }
 
 hakios_metal_device* hakios_metal_open_fake(void) { return deviceOn(std::make_unique<FakeGpu>(true)); }
+hakios_metal_device* hakios_metal_open_fake_chip(uint32_t chip) {
+    if (!hakios_metal_chip_known(chip)) { failed("unsupported fake GPU chip"); return nullptr; }
+    return deviceOn(std::make_unique<FakeGpu>(true, 0, true, chip == 0 ? kChipA635.id : chip));
+}
 
 void hakios_metal_close(hakios_metal_device* d) { delete d; }
 
@@ -288,8 +291,13 @@ hakios_metal_kernel* hakios_metal_kernel_compile_bitcode(const void* bitcode, si
 }
 
 hakios_metal_kernel* hakios_metal_kernel_compile_bitcode_constants(const void* bitcode, size_t size, const hakios_metal_constant* constants, unsigned count) {
+    return hakios_metal_kernel_compile_for_device(nullptr, bitcode, size, constants, count);
+}
+
+hakios_metal_kernel* hakios_metal_kernel_compile_for_device(hakios_metal_device* d, const void* bitcode, size_t size, const hakios_metal_constant* constants, unsigned count) {
     std::string why;
-    std::unique_ptr<CompiledKernel> k = compileAir(bitcode, size, &why, constantsOf(constants, count));
+    uint32_t chip = d != nullptr && d->gpu->chipId() != 0 ? d->gpu->chipId() : kChipA635.id;
+    std::unique_ptr<CompiledKernel> k = compileAir(bitcode, size, &why, constantsOf(constants, count), chip);
     if (k == nullptr) {
         failed(why);
         return nullptr;
@@ -353,7 +361,12 @@ unsigned hakios_metal_kernel_threadgroup_memory(hakios_metal_kernel* k) { return
 
 hakios_metal_buffer* hakios_metal_buffer_new(hakios_metal_device* d, uint64_t length) {
     std::string why;
-    auto b = newBuffer(*d->gpu, length ? length : 1, &why);
+    const uint64_t logical = length ? length : 1;
+    if (logical > UINT64_MAX - 63) { failed("buffer length overflows its constant-load padding"); return nullptr; }
+    // ir3 pushes constants in 64-byte ranges, even for a 16-byte float4 at the end of a larger buffer. Keep Metal's
+    // logical length, but reserve a tail beyond it: rounding the logical length alone leaves an aligned buffer's
+    // final binding with no padding. The kernel zeroes the backing and Gpu::newBo rounds it to whole pages.
+    auto b = newBuffer(*d->gpu, logical, &why, logical + 63);
     if (b == nullptr) {
         failed(why);
         return nullptr;
@@ -1127,8 +1140,15 @@ hakios_metal_program* hakios_metal_program_new_bitcode(const void* vsBitcode, si
 hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsBitcode, size_t vsSize, const hakios_metal_constant* vsConstants, unsigned vsCount,
                                                                  const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
                                                                  unsigned colorPixelFormat) {
+    return hakios_metal_program_new_for_device(nullptr, vsBitcode, vsSize, vsConstants, vsCount, fsBitcode, fsSize, fsConstants, fsCount, colorPixelFormat);
+}
+
+hakios_metal_program* hakios_metal_program_new_for_device(hakios_metal_device* d, const void* vsBitcode, size_t vsSize, const hakios_metal_constant* vsConstants, unsigned vsCount,
+                                                        const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
+                                                        unsigned colorPixelFormat) {
     std::string why;
-    std::unique_ptr<CompiledStage> vs = compileStage(vsBitcode, vsSize, &why, constantsOf(vsConstants, vsCount));
+    uint32_t chip = d != nullptr && d->gpu->chipId() != 0 ? d->gpu->chipId() : kChipA635.id;
+    std::unique_ptr<CompiledStage> vs = compileStage(vsBitcode, vsSize, &why, constantsOf(vsConstants, vsCount), 0, nullptr, chip);
     if (vs == nullptr) {
         failed(why);
         return nullptr;
@@ -1142,7 +1162,7 @@ hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsB
         fsCount = 0;
     }
     // the FS's device buffers past the VS's in the one IBO table the two share
-    std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), vs->stage.k.numSsbos);
+    std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), vs->stage.k.numSsbos, nullptr, chip);
     if (fs == nullptr) {
         failed(why);
         return nullptr;
@@ -1161,7 +1181,7 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
     known.binding = binding;
     known.bytes.assign(static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + length);
     const Program& was = base->program->program;
-    std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), was.fsIboBase, &known);
+    std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), was.fsIboBase, &known, base->program->vs->chipId);
     if (fs == nullptr) {
         failed(why);
         return nullptr;

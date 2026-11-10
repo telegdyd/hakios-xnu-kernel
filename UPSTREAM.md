@@ -1,5 +1,24 @@
 # Changes on negroni-dev
 
+- A730 Metal activation: device-aware C API compile entry points and CoreAnimation plug-in callers
+  target HakiosGPU's chip; specialization retains the base program's chip. The A635 legacy API
+  default is preserved. Admit FD730 with GMEM still off. Expose the RAM image's Metal bundle on a
+  read-only flash root with a synthetic mount point and bindfs. The sweep accepts `--chip`, and
+  ca-metallib accepts an already extracted AIR library as well as a universal one.
+  The A730 draw shadow is disabled: 200 joined draws corrupt pixels with register deduplication,
+  but all 4096 pixels are exact without it. Also preserve HLSQ_INVALIDATE_CMD at the selected
+  chip's offset, since repeated values execute work. Regression fails on the old stream (two
+  invalidates instead of four). Host: 282 / 283 tests; phone with Metal CoreAnimation active:
+  168 draw checks, textures and AIR compute pass. The owner confirms the checkerboard corruption
+  is gone; first-use transient flicker is being tested separately from framebuffer fetch.
+  C API buffers retain their logical length with 64-byte-aligned backing for ir3's padded
+  constant pushes (a 16-byte float4 otherwise refused a 64-byte push). Both chip paths are
+  tested through the C API; low-level short-buffer bounds checks remain intact.
+  CoreAnimation's colour-filter fragment functions (`_I…N<n>O…`) no longer take a stand-in that
+  reads the filter rows in another layout (another op list, or half4 versus float4 rows): with no
+  variant of the same inputs and precision, the function's own module is compiled. The wrong
+  stand-ins added a flat garbage colour to the snapshot on cold app launches (boots 12-20).
+
 - `xnu-deps/host/bin/xnu-clang`: preserve Clang 14's warning behavior for
   implicit declarations and incompatible pointer conversions on Clang 16+.
   Adapted from ios-vayu commit `852fd53ed2a03a6ae56a323bdd835d1fdeb7c5ae`.

@@ -49,7 +49,7 @@ private:
     uint64_t length_;
 };
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why);
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, uint64_t minBacking = 0);
 // the live Buffer whose memory holds GPU address ADDRESS, and *OFFSET its offset in it; nullptr when none does. An
 // argument buffer names a buffer member by the address it was encoded with (setBuffer:offset:atIndex:, or the
 // gpuAddress an application writes itself), and this is how the draw finds the Buffer to bind and keep.

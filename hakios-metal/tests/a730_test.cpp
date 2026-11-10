@@ -577,6 +577,39 @@ private:
 };
 }  // namespace
 
+TEST(a730_repeated_draws_keep_the_invalidate_command) {
+    RecordingTransport* rec = nullptr;
+    Gpu gpu([&] {
+        auto t = std::make_unique<RecordingTransport>(std::make_unique<FakeGpu>(false, 0, true, kChipA730.id));
+        rec = t.get(); return t;
+    }());
+    std::string why;
+    auto queue = CommandQueue::make(gpu, &why);
+    TextureDesc desc;
+    desc.width = desc.height = 64;
+    desc.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    auto t = Texture::make(gpu, desc, &why);
+    CHECK(t != nullptr);
+    if (!t) return;
+    const Program flat{kernels::a730_tri_flat_vs_air, kernels::a730_tri_flat_fs_air, Linkage{}, "flat"};
+    RenderPass pass;
+    pass.color0 = t.get();
+    Draw d;
+    d.vertexCount = 3;
+    d.viewport = Viewport{0, 0, 64, 64, 0, 1};
+    d.scissor = Scissor{0, 0, 64, 64};
+    auto cb = queue->commandBuffer();
+    for (int draw = 0; draw < 3; draw++) CHECK(cb->draw(flat, pass, d, {}, {}));
+    finish(cb);
+    unsigned invalidates = 0;
+    for (size_t i = 0; i < rec->last.size();) {
+        auto h = pm4::decode(rec->last[i]);
+        if (h.kind == pm4::Header::kRegisters && h.reg <= 0xab1f && h.reg + h.count > 0xab1f) invalidates++;
+        i += h.count + 1;
+    }
+    CHECK_EQ(invalidates, 4u); // batch start and each draw: repeated values still execute the command
+}
+
 TEST(a730_probe_submissions_as_rd) {
     const char* env = std::getenv("HAKIOS_A730_SUBMIT_RD");
     const std::string prefix = env != nullptr ? env : "";

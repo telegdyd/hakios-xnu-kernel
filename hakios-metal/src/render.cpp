@@ -2867,7 +2867,8 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
             uint32_t runStart = 0, runLen = 0;
             for (uint32_t k = 0; k < h.count; k++) {
                 const uint32_t reg = h.reg + k, value = w[i + 1 + k];
-                const bool same = regs.hold(reg, value) && reg != REG_A6XX_HLSQ_INVALIDATE_CMD;
+                const uint32_t invalidate = legacyRegisterOffset(*chipInfo(from.chipId()), REG_A6XX_HLSQ_INVALIDATE_CMD);
+                const bool same = regs.hold(reg, value) && reg != invalidate;
                 if (!same) {
                     if (runLen == 0) runStart = k;
                     runLen++;
@@ -2897,9 +2898,14 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
 }
 
 bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
-                         const render::Options& options) {
+                         const render::Options& requested) {
     // (the A730 draws in sysmem only until GMEM has its own ladder step: render::encodeDraw refuses a tile there)
     const bool a730 = queue_.gpu().chipId() == kChipA730.id;
+    render::Options options = requested;
+    // Rewriting equal state can trigger work on gen7 (early preambles among it). The A6xx shadow does not model
+    // those side effects: A730 probe 9r corrupts its joined draws with deduplication, and is exact without it.
+    // Keep every draw's state until the gen7 shadow has its own hardware validation.
+    if (a730) options.dedupRegs = false;
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }

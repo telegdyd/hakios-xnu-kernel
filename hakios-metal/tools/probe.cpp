@@ -3879,7 +3879,7 @@ static void drawSuite(Gpu& gpu, std::unique_ptr<CommandQueue>& queue, uint64_t c
             Bindings fsb;
             fsb.buffers = {Binding{cbuf.get(), 0}};
             const int N = 200;
-            for (int mode = 0; mode < 2; mode++) {
+            for (int mode = 0; mode < 3; mode++) {
                 fillBo(*t, canary);
                 int64_t gpuNs = 0;
                 bool ok = true;
@@ -3889,7 +3889,9 @@ static void drawSuite(Gpu& gpu, std::unique_ptr<CommandQueue>& queue, uint64_t c
                     RenderPass rp;
                     rp.color0 = t.get();
                     rp.load = k == 0 ? LoadAction::kClear : LoadAction::kLoad;
-                    ok = cb->draw(add, rp, drawOf(0, 6), Bindings{}, fsb);
+                    render::Options options;
+                    options.dedupRegs = mode != 2;
+                    ok = cb->draw(add, rp, drawOf(0, 6), Bindings{}, fsb, options);
                     if (mode == 1 || k == N - 1) {
                         cb->commit();
                         cb->waitUntilCompleted();
@@ -3902,9 +3904,46 @@ static void drawSuite(Gpu& gpu, std::unique_ptr<CommandQueue>& queue, uint64_t c
                 const uint32_t want = 0xc8c8c8c8u;   // 200 in each byte
                 PixelRule all{[](uint32_t, uint32_t) { return true; }, [=](uint32_t, uint32_t, uint32_t) { return want; }};
                 TexReadback rb = compareTexture(*t, all, canary);
-                report(ok && rb.right == 4096, std::string(mode == 0 ? "200 draws in ONE command buffer (one pass)" : "control, the 200 draws as 200 command buffers") +
+                report(ok && rb.right == 4096, std::string(mode == 0 ? "200 draws in ONE command buffer (one pass)" : mode == 1 ? "control, the 200 draws as 200 command buffers" : "control, 200 draws without register deduplication") +
                                                    ", One + One of 1/255: " + describeTexture(rb, "200 in every channel") + "; " + std::to_string(gpuNs / 1000) +
                                                    " us on the GPU, " + std::to_string(wall / 1000) + " us wall" + status(*cb, gpu));
+            }
+        }
+    }
+    // 9r2. Changing constants, and alternating programs, in one pass: each one-column strip must keep its own state.
+    if (t && section("9r2")) {
+        const Program cflat{pick(kernels::tri_flat_vs_air, kernels::a730_tri_flat_vs_air), pick(kernels::tri_cflat_fs_air, kernels::a730_tri_cflat_fs_air), Linkage{}, "strip_constants"};
+        const Program flat{pick(kernels::tri_flat_vs_air, kernels::a730_tri_flat_vs_air), pick(kernels::tri_flat_fs_air, kernels::a730_tri_flat_fs_air), Linkage{}, "strip_literal"};
+        for (unsigned alternate = 0; alternate < 2; alternate++) {
+            for (unsigned separate = 0; separate < 2; separate++) {
+                fillBo(*t, canary);
+                bool ok = true;
+                auto cb = queue->commandBuffer();
+                std::vector<std::shared_ptr<Buffer>> kept;
+                for (unsigned x = 0; x < 64 && ok; x++) {
+                    auto buffer = newBuffer(gpu, 64, &why);
+                    if (!buffer) { ok = false; break; }
+                    kept.push_back(buffer);
+                    float* f = static_cast<float*>(buffer->contents());
+                    f[0] = float(x * 4) / 255; f[1] = float(255 - x * 4) / 255; f[2] = 64.0f / 255; f[3] = 1;
+                    Bindings fsb;
+                    fsb.buffers = {Binding{buffer.get(), 0}};
+                    RenderPass rp;
+                    rp.color0 = t.get(); rp.load = x == 0 ? LoadAction::kClear : LoadAction::kLoad;
+                    Draw draw = drawOf(0, 6);
+                    draw.scissor = Scissor{x, 0, 1, 64};
+                    ok = cb->draw(alternate && (x & 1) ? flat : cflat, rp, draw, {}, fsb);
+                    if (separate || x == 63) {
+                        cb->commit(); cb->waitUntilCompleted(); ok = ok && completed(*cb);
+                        if (x != 63) cb = queue->commandBuffer();
+                    }
+                }
+                PixelRule rule{[](uint32_t, uint32_t) { return true; }, [=](uint32_t x, uint32_t, uint32_t) {
+                    return alternate && (x & 1) ? 0xff804020u : 0xff400000u | ((255u - x * 4) << 8) | x * 4;
+                }};
+                auto rb = compareTexture(*t, rule, canary);
+                report(ok && rb.right == 4096, std::string("strip state, ") + (alternate ? "alternating programs, " : "one program, ") +
+                    (separate ? "separate buffers: " : "one command buffer: ") + describeTexture(rb, "per-column colours") + status(*cb, gpu));
             }
         }
     }
