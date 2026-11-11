@@ -8,6 +8,7 @@
 #ifndef HAKIOS_BACKLIGHT
 /* the display starts the panel's brightness: without the driver the panel stays as the boot loader left it */
 void hakios_backlight_start(__unused IOService * display) {}
+void hakios_backlight_display(__unused bool on) {}
 int hakios_dsi_dcs_write(__unused const uint8_t * buf, __unused uint32_t len, __unused bool lowPower) { return -1; }
 #endif
 

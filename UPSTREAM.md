@@ -1,5 +1,13 @@
 # Changes on negroni-dev
 
+- Display sleep (`hakios.backlight.cpp`): the display's `RequestPowerChange` now reaches the backlight.
+  Off: DBV 0, then the boot loader's term sequence (DCS 0x28, 21 ms, 0x10, 101 ms): no TE, no frames
+  while locked. On: the boot loader's whole 101-packet init sequence (from its panel XML,
+  `devices/negroni/tools/panel-on-table.py`), the 129-byte 9E PPS by memory DMA from the last 16 KiB of
+  the splash region, with INTF_1's auto-refresh paused, then the level. `MiniIOMobileFramebuffer` does
+  not flip while the panel sleeps (`hakios_fb_panel_asleep`), so fb_flip does not time out. Installed;
+  repeated lock/wake on the phone.
+
 - Panel brightness (`drivers/gpu/hakios.backlight.cpp`, `CONFIG_HAKIOS_BACKLIGHT`, boot-arg
   `backlight=8450`): an `AppleARMBacklight` service that CoreBrightness drives through its legacy
   `IODisplayParameters` path, and DCS 0x51 writes to the OnePlus 10 Pro's panel through DSI0's command

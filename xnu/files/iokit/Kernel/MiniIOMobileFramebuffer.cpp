@@ -575,6 +575,18 @@ SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_flip, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlip
 #define FLIP_TAKEN_MS           100
 #define FLIP_TIMED              16                      /* the first so many flips are timed to when they are taken */
 static uint32_t gFlipState;
+/*
+ * The panel asleep (hakios.backlight.cpp, from the display's RequestPowerChange(0) until it is woken): it sends no TE, so
+ * no flip would be taken and fb_flip would turn itself off after 100 ms. Meanwhile frames go into the panel's own
+ * memory, and flipping starts again with the first frame after the wake.
+ */
+static volatile bool gPanelAsleep;
+
+void
+hakios_fb_panel_asleep(bool asleep)
+{
+	gPanelAsleep = asleep;
+}
 SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_flip_state, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipState, 0,
     "fb_flip: 0 not tried, 1 ready, 2 no fb_mdss, 3 the controller not as expected, 4 no room, 5 not mapped, 6 a flush not taken");
 /* the scan position: the tear check's read pointer, from INTF_TEAR_START_POS at the TE on */
@@ -2178,7 +2190,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 */
 	int target = -1;
 
-	if (gGPUPresent && gFlip && fPanelPhys != 0 && (fFlipTried ? gFlipState == 1 : flipSetUp())) {
+	if (gGPUPresent && gFlip && !gPanelAsleep && fPanelPhys != 0 && (fFlipTried ? gFlipState == 1 : flipSetUp())) {
 		/* the buffer not shown, once the controller has left it */
 		if (fFlipPending && !flipTaken(FLIP_TAKEN_MS)) {
 			flipOff("a flush not taken in 100 ms");
@@ -2663,10 +2675,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()));
 		}
 		return kIOReturnSuccess;
+	case kFBMethodRequestPowerChange:               /* in: 1 the display on, 0 off (backboardd, as the screen locks or wakes) */
+		if (args->scalarInputCount > 0) {
+			hakios_backlight_display(in[0] != 0);
+		}
+		return kIOReturnSuccess;
 	case kFBMethodSwapSignal:
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
-	case kFBMethodRequestPowerChange:
 	case kFBMethodChangeFrameInfo:
 		return kIOReturnSuccess;
 

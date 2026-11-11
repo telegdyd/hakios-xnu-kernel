@@ -32,15 +32,22 @@
  * setProperties() only notes what was asked: the panel is written from this service's own work loop, in 16 ms steps
  * through a fade, so backboardd never waits for the DSI.
  *
+ * Display sleep: the display's RequestPowerChange (backboardd, as the screen locks and wakes) comes here too. Off: DBV 0
+ * and the panel into sleep (0x28, 0x10), so it sends no TE and the controller no frames; on: the panel woken with the
+ * whole sequence the boot loader started it with, then the level iOS asks for (sleepPanel(), wakePanel()). Without the
+ * buffer for long packets or INTF_1 the display goes dark with DBV 0 only.
+ *
  * Boot-args: backlight=8450, backlight_max=DBV (default 2047, at most 4095), backlight_min=DBV (default 24: the slider's
  * bottom).
  *
  * Checked on the OnePlus 10 Pro (11 November): the Control Center slider moves the panel's light, DBV 24..2047, no
- * failed command; installed. Not here yet: display sleep (the DCS off and on sequences), the panel's high-brightness mode.
+ * failed command; installed. Display sleep: locked and woken again and again, 101 of 101 packets, 6 frames in the 50 ms
+ * after each wake, fb_flip still on. Not here: the panel's high-brightness mode, its panic wake.
  */
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
+#include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
@@ -127,6 +134,23 @@ dsi_wr(uint32_t offset, uint32_t value)
 	gDSI[offset / 4] = value;
 }
 
+/*
+ * Packets longer than the FIFO holds (the panel's 129-byte 9E PPS when it wakes) go from memory, as the boot loader sent
+ * that one: the last 16 KiB of its display memory (the live DT's cont_splash_region, 0xb8000000 + 0x2b00000), which
+ * MiniIOMobileFramebuffer's flip buffers stop short of (FLIP_SPLASH_KEEP). The display's stream is not translated by
+ * the SMMU (fb_smmu), so the DSI's DMA reads it at its physical address. A DMA from memory that fails is not tried
+ * again until the next boot.
+ */
+#define DSI_CMD_BUFFER_SM8450   0xbaafc000UL
+#define DSI_CMD_BUFFER_SIZE     0x4000
+#define DSI_DMA_CMD_OFFSET      0x048           /* the command's address in memory */
+#define DSI_DMA_FIFO_CTRL       0x050           /* bits 20 and 16: the DMA's watermarks off */
+#define DSI_MEM_MAX_PAYLOAD     1024
+
+static uint64_t gDSIBufferPhys;
+static volatile uint8_t * gDSIBuffer;
+static bool gDSIBufferFailed;
+
 /* Map DSI0 and check that it is a running DSI 2.x controller in command mode, as the boot loader leaves it. */
 static bool
 dsi_start(uint64_t physical)
@@ -149,26 +173,77 @@ dsi_start(uint64_t physical)
 	return true;
 }
 
+/* The buffer in memory for long packets (no buffer: no display sleep, as a panel woken without its PPS is no picture). */
+static void
+dsi_buffer_start(uint64_t physical)
+{
+	IOMemoryDescriptor * md = IOMemoryDescriptor::withPhysicalAddress(physical, DSI_CMD_BUFFER_SIZE, kIODirectionInOut);
+	IOMemoryMap * map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+
+	OSSafeReleaseNULL(md);                  /* (the map keeps it) */
+	if (map != NULL) {
+		gDSIBuffer = (volatile uint8_t *) map->getVirtualAddress();
+		gDSIBufferPhys = physical;
+	}
+	bl_say("backlight: DSI0 long packets from memory at %#llx: %s\n", physical, gDSIBuffer != NULL ? "mapped" : "NOT mapped");
+}
+
+/* ---- INTF_1: the display controller's auto-refresh of the panel ------------------------------------------------- */
+
 /*
- * One DCS write to the panel on virtual channel 0: buf[0] the command, then its parameters. A short write without
- * (0x05) or with one parameter (0x15), else a long write (0x39). 0 when the controller reported the DMA done.
- * Thread context only: it sleeps on the lock and spins up to about 50 ms.
+ * The boot loader leaves the controller sending the panel a frame of its memory on every TE (DSIEnableAutoRefresh). While
+ * the panel's on-sequence goes out that is paused, as Linux's _sde_encoder_autorefresh_disable_seq1 does before a
+ * commit, so no frame goes between its packets; then it is put back and the frame counter looked at for 50 ms.
  */
-int
-hakios_dsi_dcs_write(const uint8_t * buf, uint32_t len, bool lowPower)
+#define INTF1_SM8450                    0x0ae36000UL
+#define INTF_FRAME_COUNT                0x0ac
+#define INTF_TEAR_AUTOREFRESH_CONFIG    0x2b4   /* bit 31 on, [15:0] frames per refresh */
+
+static volatile uint32_t * gIntf;
+
+static uint32_t
+intf_rd(uint32_t offset)
+{
+	return gIntf[offset / 4];
+}
+
+static void
+intf_wr(uint32_t offset, uint32_t value)
+{
+	gIntf[offset / 4] = value;
+	__builtin_arm_dsb(0xf);
+}
+
+static bool
+dsi_long_type(uint8_t type)
+{
+	return type == 0x39 || type == 0x29 || type == 0x0a;
+}
+
+/*
+ * One packet to the panel on virtual channel 0, of DSI data type `type`: 0x05 (DCS, no parameter) or 0x15 (DCS, one)
+ * carry their bytes in the header; 0x39 (DCS long), 0x29 (generic long) and 0x0a (PPS) a count and the bytes after
+ * it. 0 when the controller reported the DMA done. Thread context only: it sleeps on the lock and spins up to 50 ms.
+ */
+static int
+dsi_packet(uint8_t type, const uint8_t * buf, uint32_t len, bool lowPower)
 {
 	uint32_t words[2 + DSI_MAX_PAYLOAD / 4];
-	uint32_t n = 0, i;
+	uint32_t n = 0, i, bytes;
+	bool isLong = dsi_long_type(type), memory = isLong && len > DSI_MAX_PAYLOAD;
 	int rc = 0;
 
-	if (gDSI == NULL || len == 0 || len > DSI_MAX_PAYLOAD) {
+	if (gDSI == NULL || len == 0 || (!isLong && len > 2) || len > DSI_MEM_MAX_PAYLOAD ||
+	    (memory && (gDSIBuffer == NULL || gDSIBufferFailed))) {
 		return -1;
 	}
 	/* the header, embedded mode: [7:0] data 0 or count low, [15:8] data 1 or count high, [21:16] type, 30 long, 31 last */
-	if (len <= 2) {
-		words[n++] = 1u << 31 | (len == 1 ? 0x05u : 0x15u) << 16 | (len == 2 ? (uint32_t) buf[1] << 8 : 0u) | buf[0];
-	} else {
-		words[n++] = 1u << 31 | 1u << 30 | 0x39u << 16 | len;
+	if (!isLong) {
+		words[n++] = 1u << 31 | (uint32_t) type << 16 | (len == 2 ? (uint32_t) buf[1] << 8 : 0u) | buf[0];
+		bytes = 4;
+		words[n++] = 0;                 /* the FIFO takes an even number of words */
+	} else if (!memory) {
+		words[n++] = 1u << 31 | 1u << 30 | (uint32_t) type << 16 | len;
 		for (i = 0; i < len; i += 4) {
 			uint32_t w = 0;
 			for (uint32_t b = 0; b < 4 && i + b < len; b++) {
@@ -176,10 +251,12 @@ hakios_dsi_dcs_write(const uint8_t * buf, uint32_t len, bool lowPower)
 			}
 			words[n++] = w;
 		}
-	}
-	uint32_t bytes = n * 4;
-	if (n & 1u) {
-		words[n++] = 0;                 /* the FIFO takes an even number of words */
+		bytes = n * 4;
+		if (n & 1u) {
+			words[n++] = 0;
+		}
+	} else {
+		bytes = 4 + ((len + 3) & ~3u);  /* the header, the bytes, 0xff up to a word (dsi_ctrl_copy_and_pad_cmd) */
 	}
 
 	IOLockLock(gDSILock);
@@ -201,16 +278,35 @@ hakios_dsi_dcs_write(const uint8_t * buf, uint32_t len, bool lowPower)
 			bl_say("backlight: DSI0 sending frames for 20 ms; command sent anyway\n");
 		}
 		uint32_t tpg = dsi_rd(DSI_TPG_CTRL), dma = dsi_rd(DSI_CMD_DMA_CTRL), trig = dsi_rd(DSI_TRIG_CTRL);
+		uint32_t fifo = dsi_rd(DSI_DMA_FIFO_CTRL);
+		uint32_t ctrl = (dma & ~(1u << 31 | 1u << 30 | 1u << 26)) | 1u << 28 | (lowPower ? 1u << 26 : 0u);
 		if ((trig & 0xfu) != DSI_TRIGGER_SW) {
 			dsi_wr(DSI_TRIG_CTRL, (trig & ~0xfu) | DSI_TRIGGER_SW);
 		}
 		dsi_wr(DSI_INT_CTRL, (dsi_rd(DSI_INT_CTRL) & DSI_INT_ENABLES) | DSI_INT_DMA_DONE);
-		dsi_wr(DSI_TPG_CTRL, DSI_TPG_FIFO_ON);
-		for (uint32_t w = 0; w < n; w++) {
-			dsi_wr(DSI_TPG_CMD_DMA_INIT, words[w]);
+		if (memory) {
+			uint32_t header = 1u << 31 | 1u << 30 | (uint32_t) type << 16 | len;
+			for (uint32_t b = 0; b < 4; b++) {
+				gDSIBuffer[b] = (uint8_t) (header >> (8 * b));
+			}
+			for (uint32_t b = 0; b < bytes - 4; b++) {
+				gDSIBuffer[4 + b] = b < len ? buf[b] : 0xff;
+			}
+			__builtin_arm_dsb(0xf);
+			/* dsi_ctrl_hw_cmn_kickoff_command: from memory, not the FIFO; packet type and count select cleared */
+			dsi_wr(DSI_TPG_CTRL, 0);
+			dsi_wr(DSI_CMD_DMA_CTRL, ctrl & ~(1u << 24 | 1u << 29));
+			dsi_wr(DSI_DMA_FIFO_CTRL, fifo | 1u << 20 | 1u << 16);
+			dsi_wr(DSI_DMA_CMD_OFFSET, (uint32_t) gDSIBufferPhys);
+			dsi_wr(DSI_DMA_CMD_LENGTH, bytes & 0xffffffu);
+		} else {
+			dsi_wr(DSI_TPG_CTRL, DSI_TPG_FIFO_ON);
+			for (uint32_t w = 0; w < n; w++) {
+				dsi_wr(DSI_TPG_CMD_DMA_INIT, words[w]);
+			}
+			dsi_wr(DSI_CMD_DMA_CTRL, ctrl);
+			dsi_wr(DSI_DMA_CMD_LENGTH, bytes);
 		}
-		dsi_wr(DSI_CMD_DMA_CTRL, (dma & ~(1u << 31 | 1u << 30 | 1u << 26)) | 1u << 28 | (lowPower ? 1u << 26 : 0u));
-		dsi_wr(DSI_DMA_CMD_LENGTH, bytes);
 		__builtin_arm_dsb(0xf);
 		dsi_wr(DSI_CMD_DMA_SW_TRIGGER, 1);
 		__builtin_arm_dsb(0xf);
@@ -230,18 +326,22 @@ hakios_dsi_dcs_write(const uint8_t * buf, uint32_t len, bool lowPower)
 		dsi_wr(DSI_TPG_DMA_FIFO_RESET, 0);
 		dsi_wr(DSI_TPG_CTRL, tpg);
 		dsi_wr(DSI_CMD_DMA_CTRL, dma);
+		if (memory) {
+			dsi_wr(DSI_DMA_FIFO_CTRL, fifo);
+		}
 		if ((trig & 0xfu) != DSI_TRIGGER_SW) {
 			dsi_wr(DSI_TRIG_CTRL, trig);
 		}
 		__builtin_arm_dsb(0xf);
 		if (!done) {
 			rc = -3;
+			gDSIBufferFailed = gDSIBufferFailed || memory;
 		}
 	}
 	if (rc != 0) {
 		gDSIFailures++;
-		bl_say("backlight: DCS %#04x (%u bytes) failed %d, status %#010x int %#010x (failure %u)\n", buf[0], len, rc,
-		    dsi_rd(DSI_STATUS), dsi_rd(DSI_INT_CTRL), gDSIFailures);
+		bl_say("backlight: DSI packet %#04x %#04x (%u bytes%s) failed %d, status %#010x int %#010x (failure %u)\n", type,
+		    buf[0], len, memory ? ", from memory" : "", rc, dsi_rd(DSI_STATUS), dsi_rd(DSI_INT_CTRL), gDSIFailures);
 		if (gDSIFailures >= 3) {
 			gDSIDead = true;
 			bl_say("backlight: three DSI commands failed in a row; none sent until the next boot\n");
@@ -251,6 +351,16 @@ hakios_dsi_dcs_write(const uint8_t * buf, uint32_t len, bool lowPower)
 	}
 	IOLockUnlock(gDSILock);
 	return rc;
+}
+
+/* One DCS write: buf[0] the command, then its parameters (0x05, 0x15 or 0x39 by its length). */
+int
+hakios_dsi_dcs_write(const uint8_t * buf, uint32_t len, bool lowPower)
+{
+	if (len == 0 || len > DSI_MAX_PAYLOAD) {
+		return -1;
+	}
+	return dsi_packet(len == 1 ? 0x05 : len == 2 ? 0x15 : 0x39, buf, len, lowPower);
 }
 
 /* ---- AppleARMBacklight ------------------------------------------------------------------------------------------ */
@@ -271,8 +381,11 @@ class AppleARMBacklight : public IOService
 	uint32_t                fTarget;
 	uint32_t                fFadeFrom;
 	uint64_t                fFadeStart, fFadePeriod;        /* absolute time */
+	bool                    fDisplayOn;     /* RequestPowerChange: the display on */
 
 	/* the work loop's */
+	bool                    fAsleep;        /* the panel in sleep (DCS 0x28, 0x10) */
+	bool                    fCanSleep;      /* the long-packet buffer and INTF_1 are there: it can be woken again */
 	bool                    fKnown;         /* fLevel is what the panel has */
 	uint32_t                fLevel;
 	uint32_t                fWrites;
@@ -286,12 +399,15 @@ class AppleARMBacklight : public IOService
 	void step(void);
 	void apply(uint32_t level, bool last);
 	void publish(uint32_t level);
+	void sleepPanel(void);
+	void wakePanel(void);
 
 public:
 	uint32_t                fMax;
 
-	bool startBacklight(void);
+	bool startBacklight(bool canSleep);
 	void again(void);
+	void displayPower(bool on);
 	IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
 };
 
@@ -324,8 +440,10 @@ AppleARMBacklight::publish(uint32_t level)
 }
 
 bool
-AppleARMBacklight::startBacklight(void)
+AppleARMBacklight::startBacklight(bool canSleep)
 {
+	fCanSleep = canSleep;
+	fDisplayOn = true;
 	fState = IOSimpleLockAlloc();
 	fWorkLoop = IOWorkLoop::workLoop();
 	fTimer = IOTimerEventSource::timerEventSource(this, &AppleARMBacklight::timerFired);
@@ -339,7 +457,8 @@ AppleARMBacklight::startBacklight(void)
 	setProperty("backlight-control", true);
 	publish(fTarget);
 	registerService();
-	bl_say("backlight: AppleARMBacklight up, DBV 0..%u, low-power DCS\n", fMax);
+	bl_say("backlight: AppleARMBacklight up, DBV 0..%u, low-power DCS; display sleep %s\n", fMax,
+	    fCanSleep ? "on (DCS 0x28 0x10, woken by the boot loader's on-sequence)" : "off (DBV 0 only)");
 	return true;
 }
 
@@ -389,7 +508,22 @@ AppleARMBacklight::step(void)
 	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
 	uint32_t to = fTarget, from = fFadeFrom;
 	uint64_t t = now - fFadeStart, period = fFadePeriod;
+	bool on = fDisplayOn;
 	IOSimpleLockUnlockEnableInterrupt(fState, is);
+
+	if (!on) {
+		/* the display off: dark, and the panel to sleep; a level iOS sets meanwhile waits for the display on */
+		apply(0, true);
+		if (fCanSleep && !fAsleep) {
+			sleepPanel();
+		}
+		return;
+	}
+	if (fAsleep) {
+		wakePanel();
+		now = mach_absolute_time();
+		t = now - fFadeStart;
+	}
 
 	uint32_t level = to;
 	bool more = false;
@@ -405,6 +539,243 @@ AppleARMBacklight::step(void)
 	apply(level, !more);
 	if (more) {
 		fTimer->setTimeoutMS(BL_STEP_MS);
+	}
+}
+
+/*
+ * The display off (the work loop, after DBV 0): the panel into sleep with the boot loader's own term sequence (its
+ * DSITermSequence, the same as the device tree's qcom,mdss-dsi-off-command): 0x28 set_display_off, 21 ms, 0x10
+ * enter_sleep_mode, 101 ms. In sleep the panel sends no TE, so the controller's auto-refresh stops by itself. The
+ * framebuffer is told first: a flip it starts now would never be taken (MiniIOMobileFramebuffer's fb_flip would give up
+ * after 100 ms), so until the wake its frames go into the panel's own memory; 20 ms let a flip already started be taken.
+ */
+void
+AppleARMBacklight::sleepPanel(void)
+{
+	uint64_t began = mach_absolute_time(), ns;
+	uint8_t off = 0x28, enter = 0x10;
+	int rc;
+
+	hakios_fb_panel_asleep(true);
+	IOSleep(20);
+	rc = dsi_packet(0x05, &off, 1, true);
+	IOSleep(21);
+	rc = rc != 0 ? rc : dsi_packet(0x05, &enter, 1, true);
+	IOSleep(101);
+	fAsleep = true;
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	bl_say("backlight: display off: panel asleep in %llu ms (DCS 0x28 0x10 %s)\n", ns / NSEC_PER_MSEC, rc == 0 ? "ok" : "FAILED");
+}
+
+/* Each entry: TYPE LEN BYTES... (the DSI data type), or 0xff MS (a wait). Made from the XML by devices/negroni/tools/panel-on-table.py. */
+/* the boot loader's panel file (Mu-Silicium Binaries/negroni/RawFiles/Panel_samsung_amb670yf08_1440_3216_dsc_cmd.xml), <DSIInitSequence>: 101 packets, 7 waits */
+static const uint8_t kPanelOn[720] = {
+	0x39, 0x81, 0x9e, 0x12, 0x00, 0x00, 0xab, 0x30, 0x80, 0x09, 0x6c, 0x04, 0x38, 0x00, 0x24, 0x02, 0x1c, 0x02, 0x1c,
+	0x02, 0x00, 0x02, 0x3b, 0x00, 0x20, 0x03, 0x35, 0x00, 0x07, 0x00, 0x0e, 0x03, 0x34, 0x02, 0xd4, 0x18, 0x00, 0x10,
+	0xf0, 0x07, 0x10, 0x20, 0x00, 0x06, 0x0f, 0x0f, 0x33, 0x0e, 0x1c, 0x2a, 0x38, 0x46, 0x54, 0x62, 0x69, 0x70, 0x77,
+	0x79, 0x7b, 0x7d, 0x7e, 0x02, 0x02, 0x22, 0x00, 0x2a, 0x40, 0x2a, 0xbe, 0x3a, 0xfc, 0x3a, 0xfa, 0x3a, 0xf8, 0x3b,
+	0x38, 0x3b, 0x78, 0x3b, 0xb6, 0x4b, 0xb6, 0x4b, 0xf4, 0x4b, 0xf4, 0x6c, 0x34, 0x84, 0x74, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x15, 0x02, 0x9d, 0x01,
+	0x05, 0x01, 0x11,
+	0xff, 0x0c,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x39, 0x04, 0xb0, 0x00, 0x31, 0xc5,
+	0x39, 0x22, 0xc5, 0x29, 0x14, 0x00, 0x00, 0x00, 0x11, 0x10, 0x50, 0x05, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84,
+	0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca, 0x84, 0xca,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x05, 0x01, 0x2c,
+	0x05, 0x01, 0x00,
+	0xff, 0x11,
+	0x05, 0x01, 0x2c,
+	0x05, 0x01, 0x00,
+	0xff, 0x11,
+	0x05, 0x01, 0x2c,
+	0x05, 0x01, 0x00,
+	0xff, 0x11,
+	0x05, 0x01, 0x2c,
+	0x05, 0x01, 0x00,
+	0xff, 0x11,
+	0x05, 0x01, 0x2c,
+	0x05, 0x01, 0x00,
+	0xff, 0x19,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x39, 0x04, 0xb0, 0x00, 0x22, 0xb9,
+	0x39, 0x03, 0xb9, 0xa1, 0xb1,
+	0x39, 0x04, 0xb0, 0x00, 0x3a, 0xb9,
+	0x15, 0x02, 0xb9, 0x02,
+	0x39, 0x04, 0xb0, 0x00, 0x26, 0xb9,
+	0x39, 0x03, 0xb9, 0x00, 0x00,
+	0x15, 0x02, 0xf7, 0x0f,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x39, 0x04, 0xb0, 0x00, 0x24, 0xb9,
+	0x15, 0x02, 0xb9, 0x21,
+	0x39, 0x04, 0xb0, 0x00, 0x38, 0xb9,
+	0x15, 0x02, 0xb9, 0x02,
+	0x39, 0x04, 0xb0, 0x00, 0x2a, 0xb9,
+	0x39, 0x03, 0xb9, 0x00, 0x00,
+	0x15, 0x02, 0xf7, 0x0f,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0xff, 0x79,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x39, 0x04, 0xb0, 0x00, 0x16, 0xf2,
+	0x39, 0x03, 0xf2, 0x1b, 0x50,
+	0x39, 0x04, 0xb0, 0x00, 0x08, 0xcb,
+	0x15, 0x02, 0xcb, 0x24,
+	0x15, 0x02, 0x60, 0x00,
+	0x39, 0x03, 0xbd, 0x23, 0x02,
+	0x39, 0x04, 0xb0, 0x00, 0x10, 0xbd,
+	0x15, 0x02, 0xbd, 0x00,
+	0x39, 0x04, 0xb0, 0x00, 0x16, 0xbd,
+	0x15, 0x02, 0xbd, 0x77,
+	0x39, 0x04, 0xb0, 0x00, 0x14, 0xbd,
+	0x15, 0x02, 0xbd, 0x00,
+	0x15, 0x02, 0xf7, 0x0f,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x39, 0x03, 0xf2, 0x00, 0x01,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x15, 0x02, 0x35, 0x00,
+	0x15, 0x02, 0xb9, 0x00,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x39, 0x05, 0x2a, 0x00, 0x00, 0x04, 0x37,
+	0x39, 0x05, 0x2b, 0x00, 0x00, 0x09, 0x6b,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x15, 0x02, 0xc3, 0x89,
+	0x39, 0x04, 0xb0, 0x00, 0x24, 0xc3,
+	0x39, 0x12, 0xc3, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00, 0xfd, 0x00,
+	0xfd,
+	0x39, 0x04, 0xb0, 0x00, 0x3a, 0xc3,
+	0x39, 0x12, 0xc3, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00, 0xb0, 0x00,
+	0xb0,
+	0x39, 0x04, 0xb0, 0x00, 0x50, 0xc3,
+	0x39, 0x12, 0xc3, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00, 0x43, 0x00,
+	0x43,
+	0x39, 0x04, 0xb0, 0x00, 0x61, 0xc3,
+	0x39, 0x17, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xc0, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe,
+	0x00, 0xfe, 0x00, 0xfe, 0x00, 0xfe,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x39, 0x04, 0xb0, 0x00, 0x2b, 0xf6,
+	0x39, 0x04, 0xf6, 0x60, 0x63, 0x69,
+	0x15, 0x02, 0xf7, 0x0f,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x39, 0x04, 0xb0, 0x00, 0x46, 0xf4,
+	0x15, 0x02, 0xf4, 0x08,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x39, 0x04, 0xb0, 0x00, 0x18, 0xb1,
+	0x39, 0x02, 0xb1, 0x05,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x39, 0x04, 0xb0, 0x00, 0x0d, 0x63,
+	0x15, 0x02, 0x63, 0x01,
+	0x39, 0x04, 0xb0, 0x00, 0x0c, 0x63,
+	0x15, 0x02, 0x63, 0x20,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x15, 0x02, 0x53, 0x28,
+	0x15, 0x02, 0xf7, 0x0f,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x15, 0x02, 0x55, 0x00,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x39, 0x03, 0xf0, 0x5a, 0x5a,
+	0x39, 0x04, 0xb0, 0x00, 0x52, 0x1f,
+	0x15, 0x02, 0x1f, 0x02,
+	0x39, 0x04, 0xb0, 0x00, 0x54, 0x1f,
+	0x15, 0x02, 0x1f, 0x00,
+	0x39, 0x03, 0xf0, 0xa5, 0xa5,
+	0x05, 0x01, 0x29,
+};
+#define PANEL_ON_PACKETS 101
+
+/*
+ * The display on: the panel woken with the whole sequence the boot loader started it with (not 0x11 and 0x29 alone:
+ * iOSPlus10's 0258 woke this panel so, and it stayed black with a purple strip, 26 October), with the auto-refresh
+ * paused while it goes out: Samsung's PPS (9E, 129 bytes, from memory), compression on (9D 01), 0x11 and its waits with
+ * the boot loader's empty write_memory_start frames, the panel's registers, TE on (35 00), the window (2A, 2B), 53 28,
+ * 0x29. Android sends its on-command so too, after a reset of the panel this does not do. Then the auto-refresh back on,
+ * its frames counted for 50 ms, and the framebuffer may flip again.
+ */
+void
+AppleARMBacklight::wakePanel(void)
+{
+	uint64_t began = mach_absolute_time(), ns;
+	uint32_t autorefresh = intf_rd(INTF_TEAR_AUTOREFRESH_CONFIG), sent = 0, failed = 0, i = 0, j;
+	int first = 0;
+
+	if (autorefresh & (1u << 31)) {
+		intf_wr(INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh & ~(1u << 31));
+	}
+	while (i + 2 <= sizeof(kPanelOn)) {
+		uint8_t type = kPanelOn[i], len = kPanelOn[i + 1];
+
+		if (type == 0xff) {
+			IOSleep(len);
+			i += 2;
+			continue;
+		}
+		if (i + 2 + len > sizeof(kPanelOn)) {
+			break;
+		}
+		int rc = dsi_packet(type, &kPanelOn[i + 2], len, true);
+		if (rc == 0) {
+			sent++;
+		} else {
+			failed++;
+			first = first != 0 ? first : rc;
+		}
+		i += 2 + len;
+	}
+	if (autorefresh & (1u << 31)) {
+		intf_wr(INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh);
+	}
+	uint32_t frames0 = intf_rd(INTF_FRAME_COUNT);
+	IOSleep(50);
+	uint32_t frames = intf_rd(INTF_FRAME_COUNT) - frames0;
+	if (frames == 0 && (autorefresh & (1u << 31))) {
+		/* no frame: the auto-refresh off and on once, as a commit would (the tear check's TE count restarts at a wake) */
+		intf_wr(INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh & ~(1u << 31));
+		IODelay(100);
+		intf_wr(INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh);
+		frames0 = intf_rd(INTF_FRAME_COUNT);
+		IOSleep(50);
+		frames = intf_rd(INTF_FRAME_COUNT) - frames0;
+		j = 1;
+	} else {
+		j = 0;
+	}
+	fAsleep = false;
+	fKnown = false;                                 /* the level again, whatever the panel has after it */
+	hakios_fb_panel_asleep(false);
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	bl_say("backlight: display on: panel woken in %llu ms (%u of %u packets%s, error %d; auto-refresh %#x; in 50 ms "
+	    "%u frames%s)\n", ns / NSEC_PER_MSEC, sent, (uint32_t) PANEL_ON_PACKETS, failed ? " FAILED" : "", first,
+	    autorefresh, frames, j ? ", auto-refresh re-armed" : "");
+}
+
+/* RequestPowerChange (MiniIOMobileFramebuffer): does not wait for the panel */
+void
+AppleARMBacklight::displayPower(bool on)
+{
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fState);
+	bool changed = fDisplayOn != on;
+	fDisplayOn = on;
+	IOSimpleLockUnlockEnableInterrupt(fState, is);
+	if (changed) {
+		bl_say("backlight: display %s (RequestPowerChange)\n", on ? "on" : "off");
+		fTimer->setTimeoutUS(1);
+	}
+}
+
+void
+hakios_backlight_display(bool on)
+{
+	if (gBacklight != NULL) {
+		gBacklight->displayPower(on);
 	}
 }
 
@@ -508,13 +879,15 @@ AppleARMBacklight::setProperties(OSObject * properties)
 void
 hakios_backlight_start(IOService * display)
 {
-	uint64_t physical;
+	uint64_t physical, buffer, intf;
 
 	if (gBacklightSoC == 0 || gBacklight != NULL) {
 		return;
 	}
 	if (gBacklightSoC == 8450) {
 		physical = DSI0_SM8450;
+		buffer = DSI_CMD_BUFFER_SM8450;
+		intf = INTF1_SM8450;
 	} else {
 		bl_say("backlight: backlight=%u is not a SoC known here (8450); no brightness\n", gBacklightSoC);
 		return;
@@ -522,6 +895,8 @@ hakios_backlight_start(IOService * display)
 	if (!dsi_start(physical)) {
 		return;
 	}
+	dsi_buffer_start(buffer);
+	gIntf = (volatile uint32_t *) ml_io_map((vm_offset_t) intf, 0x1000);
 	AppleARMBacklight * bl = OSTypeAlloc(AppleARMBacklight);
 	if (bl == NULL || !bl->init()) {
 		OSSafeReleaseNULL(bl);
@@ -533,7 +908,7 @@ hakios_backlight_start(IOService * display)
 		bl->release();
 		return;
 	}
-	if (!bl->startBacklight()) {
+	if (!bl->startBacklight(gDSIBuffer != NULL && gIntf != NULL)) {
 		bl_say("backlight: no work loop; no brightness\n");
 		bl->detach(display);
 		bl->release();
