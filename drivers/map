@@ -28,6 +28,7 @@ gpu      bsd/dev/hakios.adreno.c
 gpu      bsd/dev/hakios.dcvs.h
 gpu      bsd/dev/hakios.ifpc.h
 gpu      iokit/Kernel/hakios.gpu.cpp
+gpu      iokit/Kernel/hakios.backlight.cpp
 
 camera   bsd/dev/hakios.camera.c
 camera   bsd/dev/hakios.torch.c

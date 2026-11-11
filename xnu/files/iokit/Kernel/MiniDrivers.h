@@ -18,4 +18,8 @@ void MiniIOMobileFramebufferStart(IOService * provider);
 void MiniAppleKeyStoreStart(void);
 void MiniIONetworkStackStart(void);
 
+/* drivers/gpu/hakios.backlight.cpp: the panel's brightness (backlight=SOC), started under the display */
+void hakios_backlight_start(IOService * display);
+int hakios_dsi_dcs_write(const uint8_t * buf, uint32_t len, bool lowPower);
+
 #endif /* _IOKIT_MINIDRIVERS_H */

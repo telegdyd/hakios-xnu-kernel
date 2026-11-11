@@ -55,6 +55,9 @@ apfs_write_path	k
 applog	k
 applog_name	k
 autounlock	u
+backlight	k
+backlight_max	k
+backlight_min	k
 battery	kl
 battery_log	k
 battery_poll	k

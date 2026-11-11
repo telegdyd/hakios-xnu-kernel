@@ -1,5 +1,14 @@
 # Changes on negroni-dev
 
+- Panel brightness (`drivers/gpu/hakios.backlight.cpp`, `CONFIG_HAKIOS_BACKLIGHT`, boot-arg
+  `backlight=8450`): an `AppleARMBacklight` service that CoreBrightness drives through its legacy
+  `IODisplayParameters` path, and DCS 0x51 writes to the OnePlus 10 Pro's panel through DSI0's command
+  DMA FIFO (from iOSPlus10's patch 0250, without its power-key fast-off). The slider's 1..2047 is
+  spread over `backlight_min`..2047 (default 24; `sysctl kern.hakios.backlight_min`), so its bottom is
+  not black; `brightness-nits` is ignored (CoreBrightness sends 0, which left the panel dark after
+  boot). Started from `MiniIOMobileFramebufferStart`; stand-ins in `hakios.stubs.cpp`. Installed and
+  checked on the phone; display sleep not yet.
+
 - A730 GPU power rollout measurements and validation (RAM only): independently
   exercise all eight runtime switch combinations, retained-buffer wake latency,
   shared-fence waiters, Metal and interface rendering, and isolated timeout,

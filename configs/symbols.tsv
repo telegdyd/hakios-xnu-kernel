@@ -54,6 +54,9 @@ APFS_WRITE_PATH	arg	apfs_write_path	Storage and APFS	k	hakios.apfs_check.c	the f
 APPLOG	arg	applog	CPU, memory and boot	k	(patch)	
 APPLOG_NAME	arg	applog_name	CPU, memory and boot	k	(patch)	
 AUTOUNLOCK	arg	autounlock	User space	u	inject_sb.c	
+BACKLIGHT	arg	backlight	GPU and display	k	hakios.backlight.cpp	
+BACKLIGHT_MAX	arg	backlight_max	GPU and display	k	hakios.backlight.cpp	
+BACKLIGHT_MIN	arg	backlight_min	GPU and display	k	hakios.backlight.cpp	
 BATTERY	arg	battery	Audio and battery	kl	hakios.adsp.c,hakios.battery.c,loader.c	
 BATTERY_LOG	arg	battery_log	Audio and battery	k	hakios.battery_bcl.c	a line with every reading, not only when something changes
 BATTERY_POLL	arg	battery_poll	Audio and battery	k	hakios.battery_bcl.c	how often (2 to 120; 10)

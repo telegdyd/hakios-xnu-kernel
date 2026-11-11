@@ -23,7 +23,7 @@ has to be in `docs/boot-args.md` (`python3 tools/boot-args.py --check`).
 |---|---|---|---|
 | `input/` | `hakios.goodix.c`, `hakios.input.c`, `hakios.buttons.c`, `hakios.virtio_input.c` | `touchscreen=` | the touch controller, the event queue behind `/dev/hakios-touch`, the buttons, QEMU's virtio input |
 | `storage/` | `hakios.ufs.c`, `hakios.ufshc.c/.h`, `hakios.sparse.c`, `hakios.image.c`, `hakios.apfs_check.c`, `hakios.virtio_blk.c` | `ufs=`, `ufs_write=`, `ufs_native=` | the phone's flash (UFS), the sparse and image devices, the checks of the APFS read path, QEMU's virtio-blk. **The only code of the kernel that may write to the phone**: see `tools/provenance.allow` |
-| `gpu/` | `hakios.adreno.c`, `hakios.gpu.cpp` | `gpu=`, `adreno=` | the Adreno GPU bring-up and the IOKit object user space talks to |
+| `gpu/` | `hakios.adreno.c`, `hakios.gpu.cpp`, `hakios.backlight.cpp` | `gpu=`, `adreno=`, `backlight=` | the Adreno GPU bring-up and the IOKit object user space talks to; the panel's brightness |
 | `camera/` | `hakios.camera.c`, `hakios.torch.c` | `cam=`, `torch=` | the camera sensors and ISP interface, the flashlight LED |
 | `haptic/` | `hakios.haptic.c` | `haptic=` | the vibration motor |
 | `audio/` | `hakios.adsp.c`, `hakios.audio.c`, `hakios.sound.c`, `hakios.guard.c`, `hakios.speaker.c`, `hakios.mic.c`, `hakios.virtio_sound.c` | `adsp=`, `sound=`, `mic=` | the audio DSP loader, `/dev/hakios-audio`, the speaker amplifiers and their guard (`hakios.guard.c`, until now in `storage/`), the microphone, QEMU's virtio sound |

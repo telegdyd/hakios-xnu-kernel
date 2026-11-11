@@ -2848,6 +2848,7 @@ MiniIOMobileFramebufferStart(IOService * provider)
 	if (fb->start(provider)) {
 		publishDisplayNode();
 		publishAccelerator(provider);
+		hakios_backlight_start(fb);
 	} else {
 		fb->detach(provider);
 	}
