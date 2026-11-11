@@ -900,14 +900,40 @@ micros(uint64_t absolute)
 	return absolute * timebase.numer / timebase.denom / 1000;
 }
 
+/*
+ * Tap to wake: with the display off only a tap wakes it -- one finger, down and up within
+ * TAP_MAX_US, moving no further than TAP_SLOP (of 65535 across the screen, about 2 mm) on the way.
+ * Apple's multitouch controller makes this choice on an iPhone; here nothing else does.
+ * A touch that lands within TAP_EDGE_SIDE of the left or right edge (the curved glass, about 6 mm)
+ * or TAP_EDGE_END of the top or bottom is not counted at all: it is the hand that holds the phone.
+ */
+#define TAP_MAX_US      200000
+#define TAP_SLOP        1500
+#define TAP_EDGE_SIDE   5900            /* 9% of the width */
+#define TAP_EDGE_END    2000            /* 3% of the height */
+
+struct wake_tap {
+	uint32_t finger, x, y;
+	uint64_t down;                  /* mach_absolute_time() of the landing */
+	bool spoiled;                   /* not a tap after all */
+};
+
+static uint32_t
+distance(uint32_t a, uint32_t b)
+{
+	return a > b ? a - b : b - a;
+}
+
 static void *
 input_thread(__unused void *arg)
 {
+	struct wake_tap tap = { .spoiled = true };
 	static const int types[] = { HID_CLIENT_SIMPLE, HID_CLIENT_RATE_CONTROLLED };
 	IOHIDEventSystemClientRef client = NULL;
 	IOHIDServiceClientRef screen = NULL, buttons = NULL;
 	struct hakios_touch t;
 	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
+	unsigned tapping = 0;                   /* of those, the ones away from the edges (see TAP_EDGE_SIDE) */
 	int device;
 
 	pthread_setname_np("redwood input");
@@ -960,18 +986,46 @@ input_thread(__unused void *arg)
 			}
 		} else if (t.type == HAKIOS_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL) {
 			/*
-			 * The display is off and a tap is to wake it. The lock button is what wakes it here:
-			 * press it for the finger, and keep the rest of this touch to ourselves.
+			 * The display is off and a tap is to wake it. Every touch now is ours, not the
+			 * window server's; whether it was a tap is known when it lifts (below).
 			 */
-			struct hakios_touch press = { .time = t.time, .type = HAKIOS_BUTTON_DOWN, .finger = HAKIOS_BUTTON_LOCK };
-
-			send_button(buttons, &press);
-			press.type = HAKIOS_BUTTON_UP;
-			send_button(buttons, &press);
+			if (t.x < TAP_EDGE_SIDE || t.x > 65535 - TAP_EDGE_SIDE || t.y < TAP_EDGE_END ||
+			    t.y > 65535 - TAP_EDGE_END) {
+				/* the curved glass under the hand that holds the phone: no tap, and no spoiler of one */
+			} else if (tapping == 0) {
+				tap = (struct wake_tap){ .finger = t.finger, .x = t.x, .y = t.y, .down = t.time, .spoiled = false };
+				tapping |= 1u << (t.finger & 31);
+			} else {
+				tap.spoiled = true;     /* a second finger: a palm or a grip, not a tap */
+				tapping |= 1u << (t.finger & 31);
+			}
 			waking |= 1u << (t.finger & 31);
 		} else if (waking & (1u << (t.finger & 31))) {
+			if (!(tapping & (1u << (t.finger & 31)))) {
+				if (t.type == HAKIOS_TOUCH_UP) {
+					waking &= ~(1u << (t.finger & 31));
+				}
+				continue;       /* an edge touch: kept from the window server, and nothing more */
+			}
+			if (t.type == HAKIOS_TOUCH_UP) {
+				tapping &= ~(1u << (t.finger & 31));
+			}
+			if (t.finger == tap.finger && !tap.spoiled &&
+			    (distance(t.x, tap.x) > TAP_SLOP || distance(t.y, tap.y) > TAP_SLOP)) {
+				tap.spoiled = true;     /* it moved: a swipe or a brush */
+			}
 			if (t.type == HAKIOS_TOUCH_UP) {
 				waking &= ~(1u << (t.finger & 31));
+				if (t.finger == tap.finger && !tap.spoiled && micros(t.time) - micros(tap.down) <= TAP_MAX_US) {
+					/* a tap: the lock button is what wakes the display here */
+					struct hakios_touch press = { .time = t.time, .type = HAKIOS_BUTTON_DOWN,
+						.finger = HAKIOS_BUTTON_LOCK };
+
+					send_button(buttons, &press);
+					press.type = HAKIOS_BUTTON_UP;
+					send_button(buttons, &press);
+				}
+				tap.spoiled = true;     /* one wake per tap, whichever finger lifts last */
 			}
 		} else {
 			send_touch(screen, &t);
