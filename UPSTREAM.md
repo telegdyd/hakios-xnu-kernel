@@ -124,6 +124,15 @@
 - `drivers/input/hakios.s3908.c`: a stray continuation packet is read past
   instead of failing the command, and the report config is asked for up to
   five times. Seen on the first boot with the root on flash.
+- `drivers/input/hakios.s3908.c`: boot-arg `touch_bus=` (0 default: the wires
+  by hand as before; 1: a read-only log of the bus hardware; 2: the bytes
+  through QUP0 SE4 and the QUP's GPI DMA, falling back to the wires on any
+  failure). Needs: GPII 0 (the one bound to SE 4), wired-IRQ mode (INTSET=1,
+  MSI base 0), an SMMU context of ours for both the GPI's stream 0x5b6 (rings)
+  and the QUP wrapper's 0x5a3 (the bytes), RPMh BCM votes QUP0/SN3/SN0, pins
+  16/17 to function 1. Measured on negroni (same kernel, RAM boots): a touch
+  report 947 us against 11,120 us by hand, 0 errors; chip setup 3.6 ms
+  against 54 ms. Lines also go to the loader's log (live USB log).
 - `xnuloader/loader.c`: a run with `usb_net=1` on another core (`bootcpu=N`)
   leaves the USB controller to the kernel: `run_on_other_cpu()` no longer
   polls it, and the loader restarts USB after the run (returned, hung or not

@@ -301,6 +301,7 @@ thermal_tm1	k
 torch	kl
 torch_max_s	k
 torch_secs	k
+touch_bus	k
 touch_flip	k
 touch_lat	ku
 touch_poll_us	k
