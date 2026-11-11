@@ -60,6 +60,10 @@
  * More boot-args:
  *   adreno_soc=8450    the OnePlus 10 Pro's (SM8450) Adreno 730 instead of the X5 Pro's GPU; all 22 steps
  *   gpu_irq=1         final-fence completion interrupt on the A730; default 0, polling retained
+ *   gpu_slumber=1     A730 experimental deeper idle collapse after 1 second; default 0
+ *   gpu_ifpc=1        A730 experimental inter-frame collapse, independent of DCVS; default 0
+ *   gpu_power_control=1  A730 runtime GPU/BW votes and 50 ms thermal worker; default 0;
+ *                      kern.hakios.gpu_dcvs enables auto after manual/busy validation
  *   adreno_only=K      step K alone (what steps 6 to 10 need, they check for themselves: within
  *                      one session of the loader, power and clocks stay as an earlier run left them)
  *   adreno_skip=MASK   leave out the steps whose bits are set (bit 2 = step 2)
@@ -98,7 +102,9 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
+#include <kern/locks.h>
 #include <pexpert/pexpert.h>
+#include "hakios.ifpc.h"
 #include <pexpert/arm64/board_config.h>
 #include <sys/hakios.input.h>
 #include <sys/stat.h>
@@ -121,6 +127,42 @@ static const char *fw_gmu = "a660_gmu.bin", *fw_sqe = "a660_sqe.fw", *fw_zap_mdt
 static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
 static void gpu_irq_quiesce(void);
+
+/* Boot ladder is single-threaded. Once published, every HFI/power operation must
+ * hold HakiosGPU's sleeping lock. IRQ and panic quiesce deliberately bypass it. */
+static bool gpu_runtime;
+extern void HakiosGPUAssertLocked(void);
+extern void HakiosGPUPowerLog(void);
+static uint64_t power_hfi_requests, power_hfi_failures, power_hfi_timeouts;
+static uint64_t power_hfi_us, power_hfi_max_us;
+static uint32_t power_hfi_id, power_hfi_verdict, power_hfi_answered;
+static uint32_t power_level, power_bw = 0xff;
+static uint32_t power_state, power_transitions, power_failures;
+static uint32_t power_control, dcvs_failed;
+static uint32_t ifpc_config, ifpc_on, ifpc_failed;
+static uint64_t ifpc_wakes, ifpc_wake_failures;
+static bool gpu_ifpc_boot(void);
+static bool gpu_gx_get(void);
+static void gpu_gx_ref(bool acquire);
+static void gpu_gx_put(void);
+static uint32_t power_quiescing;         /* panic path never takes the sleeping lock */
+static uint64_t dcvs_votes;
+static uint32_t dcvs_on, dcvs_manual = 3, dcvs_limit = 3, dcvs_cap = 3;
+static uint32_t busy_valid, busy_pct, busy_use;
+static uint64_t busy_ticks, busy_previous, busy_sample_ns, busy_rejected;
+static unsigned long long dcvs_last_load;
+static uint64_t dcvs_last_submit;
+static uint32_t slumber_config, slumber_on, slumber_failed;
+static uint64_t slumber_idle_ns, slumber_suspends, slumber_resumes;
+static uint64_t slumber_suspend_us, slumber_resume_us;
+static bool slumber_stream1, slumber_irq;
+static bool gpu_runtime_suspend(void);
+static bool gpu_runtime_resume(void);
+static void gpu_counter_start(void);
+static void gpu_times(void);
+static uint64_t gpu_power_ns(void);
+static void gpu_dcvs_submit(void);
+static void gpu_dcvs_stop(void);
 
 /*
  * The kernel's log reaches the loader when a run is over, and a run that ends in a reset
@@ -2003,7 +2045,7 @@ step_gmu_start(void)
 	if (!cx_ready() || !gmu_space_is_on) {
 		return false;
 	}
-	hfi = (volatile struct hfi_table *)block_uncached(&gmu_hfi);
+	if (hfi == NULL) hfi = (volatile struct hfi_table *)block_uncached(&gmu_hfi);
 	if (hfi == NULL) {
 		printf("adreno: %u: the page for the messages is not in one piece\n", step);
 		return false;
@@ -2035,6 +2077,7 @@ step_gmu_start(void)
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 2);
 		if (!wait_for(&gmu, GMU_RSCC_CONTROL_ACK, 2, 2, 100) || !wait_for(&rscc, RSCC_SEQ_BUSY_DRV0, ~0u, 0, 100)) {
 			printf("adreno: %u: the GMU's RPMh channel does not wake\n", step);
+			if (gpu_runtime) return false;
 		}
 		get(&gmu, "rscc_control_ack", GMU_RSCC_CONTROL_ACK);
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
@@ -2336,11 +2379,22 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 {
 	volatile struct hfi_queue *queue = &hfi->queue[0];
 	volatile uint32_t *data = (volatile uint32_t *)((vm_offset_t)hfi + HFI_QUEUE_AT(0));
-	uint32_t at = queue->write % HFI_QUEUE_WORDS, number = ++hfi_number & 0xfff, verdict = 0, waiting = 0;
+	uint32_t at, number, verdict = 0, waiting = 0;
 	bool answered = false;
+	uint64_t began = mach_absolute_time(), ns;
+
+	if (gpu_runtime) {
+		HakiosGPUAssertLocked();
+	}
+	at = queue->write % HFI_QUEUE_WORDS;
+	number = ++hfi_number & 0xfff;
+	power_hfi_requests++;
+	power_hfi_id = id;
 
 	message[0] = id | words << 8 | number << 20;
-	printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	if (!gpu_runtime) {
+		printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	}
 	snprintf(last_write, sizeof(last_write), "step %u sent the GMU message %u (%s)", step, id, what);
 	hold(true);
 	for (uint32_t i = 0; i < (words + 3) / 4 * 4; i++) {
@@ -2362,7 +2416,18 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 		}
 	}
 	hfi_receive(2, ~0u, &waiting);
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	power_hfi_us += ns / NSEC_PER_USEC;
+	if (ns / NSEC_PER_USEC > power_hfi_max_us) {
+		power_hfi_max_us = ns / NSEC_PER_USEC;
+	}
+	power_hfi_answered = answered;
+	power_hfi_verdict = answered ? verdict : ~0u;
 	if (!answered || verdict != 0) {
+		power_hfi_failures++;
+		if (!answered) {
+			power_hfi_timeouts++;
+		}
 		printf("adreno: %u: the GMU %s (%#x) to %s; fw_init_result %#x, gmu2host_intr_info %#x\n", step,
 		    answered ? "says no" : "does not answer", verdict, what, rd(gmu.base + GMU_CM3_FW_INIT_RESULT),
 		    rd(gmu.base + GMU_GMU2HOST_INTR_INFO));
@@ -2373,7 +2438,13 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 		}
 		return false;
 	}
-	printf("adreno: %u: the GMU accepts %s\n", step, what);
+	if (id == HFI_GX_BW_PERF_VOTE && words == 4) {
+		power_level = message[2];
+		power_bw = message[3];
+	}
+	if (!gpu_runtime) {
+		printf("adreno: %u: the GMU accepts %s\n", step, what);
+	}
 	return true;
 }
 
@@ -2418,6 +2489,26 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
  * (a6xx_hfi.c: adreno_7c3_build_bw_table); "start"; and the speed wanted now. Then the request
  * to keep the 3D core powered while we use it (a6xx_gmu_oob_set), and its registers can be read.
  */
+/* Feature 9, message 11: {header, feature, enable, hysteresis}; before
+ * CORE_FW_START, matching the phone's gen7 firmware protocol. */
+static bool
+gpu_ifpc_boot(void)
+{
+	if (adreno_soc != 8450) return true;
+	PE_parse_boot_argn("gpu_ifpc", &ifpc_config, sizeof(ifpc_config));
+	if (!ifpc_config) return true;
+	ifpc_config = 1;
+	/* Retain the boot reference until restore memory, IRQ and runtime are ready. */
+	gpu_gx_ref(true);
+	uint32_t feature[4] = { 0, 9, 1, 0x1680 };
+	if (!hfi_send("IFPC feature", 11, feature, 4)) {
+		ifpc_failed = 1;
+		return false;
+	}
+	ifpc_on = 1;
+	return true;
+}
+
 static bool
 step_core_power(void)
 {
@@ -2511,6 +2602,7 @@ step_core_power(void)
 	    "from here on it casts votes in RPMh by itself");
 	if (!hfi_send("the table of speeds", HFI_PERF_TABLE, &perf.header, sizeof(perf) / 4) ||
 	    !hfi_send("the table of bus votes", HFI_BW_TABLE, &bw.header, sizeof(bw) / 4) ||
+	    !gpu_ifpc_boot() ||
 	    !hfi_send("\"start the core firmware\"", HFI_CORE_FW_START, core_start, 2) ||
 	    /* SM8450: "start" before the vote and the 3D core's power, as Linux (a6xx_hfi_start) and slop have it */
 	    (adreno_soc == 8450 && !hfi_send("\"start\"", HFI_START, start, 1)) ||
@@ -2580,6 +2672,7 @@ step_core_power(void)
 #define CORE_RING_SIZE          0x8000u         /* Linux's; 8192 words */
 #define CORE_SQE_ADDRESS        0x01100000u
 #define CORE_SCRATCH_ADDRESS    0x01200000u
+#define CORE_RESTORE_ADDRESS    0x01300000u     /* separate from scratch timings at +0x400 */
 #define CORE_TARGET_ADDRESS     0x10000000u
 #define CORE_NOWHERE            0x7f000000u     /* never given anything */
 
@@ -2656,11 +2749,94 @@ static struct gpu_space second_space = {
 };
 #define SECOND_MATCH            2
 static bool second_space_is_on, second_stream_is_on;
-static struct gpu_block core_ring, core_sqe, core_scratch, core_target;
+static struct gpu_block core_ring, core_sqe, core_scratch, core_target, core_restore;
 static bool core_space_is_on, core_runs, zap_is_loaded;
 #define RING_WORDS              (CORE_RING_SIZE / 4)
 static uint32_t ring_at;                /* where the next word goes: the ring goes round */
 static uint32_t ring_sent;              /* up to where the core has been told to read */
+
+#define IFPC_KEEPALIVE GMU_WORD(0x50c3)
+#define IFPC_GFX_STATUS GMU_WORD(0x50d0)
+#define IFPC_COUNT_LO GMU_WORD(0x504c)
+#define IFPC_COUNT_HI GMU_WORD(0x504d)
+/* Only this short register/reference update is IRQ serialized. No firmware,
+ * sleeps or GX accesses under the spin lock; IRQ never takes gGPULock. */
+extern boolean_t ml_set_interrupts_enabled(boolean_t);
+static LCK_GRP_DECLARE(gpu_ifpc_group, "gpu-ifpc");
+static LCK_SPIN_DECLARE(gpu_ifpc_lock, &gpu_ifpc_group);
+static uint32_t gx_users;
+
+static void
+gpu_gx_ref(bool acquire)
+{
+	boolean_t ints = ml_set_interrupts_enabled(FALSE);
+	lck_spin_lock(&gpu_ifpc_lock);
+	if (acquire) gx_users++;
+	else { assert(gx_users != 0); gx_users--; }
+	wr(gmu.base + IFPC_KEEPALIVE, gx_users ? 1 : 0);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	lck_spin_unlock(&gpu_ifpc_lock);
+	ml_set_interrupts_enabled(ints);
+}
+
+static bool
+gpu_gx_get(void)
+{
+	if (!ifpc_config) return true;
+	gpu_gx_ref(true);
+	/* WPTR is a fenced wake doorbell, unlike ordinary GX registers. Reissue
+	 * the last published position, never an unflushed software ring pointer. */
+	for (unsigned i = 0; i < 10000; i++) {
+		if (rd(gmu.base + GMU_AO_AHB_FENCE_CTRL) == 0 &&
+		    !(rd(gmu.base + IFPC_GFX_STATUS) & 3)) {
+			ifpc_wakes++;
+			return true;
+		}
+		wr(gpu.base + CP_RB_WPTR, ring_sent);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		delay(1);
+	}
+	ifpc_wake_failures++;
+	ifpc_failed = 1;
+	gpu_gx_ref(false);
+	return false;
+}
+
+static void
+gpu_gx_put(void)
+{
+	if (ifpc_config) gpu_gx_ref(false);
+}
+
+static uint32_t
+ring_read_position(void)
+{
+	if (!ifpc_config) return rd(gpu.base + CP_RB_RPTR);
+	/* Hardware writes this even when GX subsequently collapses. */
+	to_memory(core_scratch.memory + 0x80, 64);
+	return *(volatile uint32_t *)(core_scratch.memory + 0x80) % RING_WORDS;
+}
+
+static void
+core_restore_list(void)
+{
+	uint32_t *out = (uint32_t *)core_restore.memory;
+	unsigned only = sizeof(ifpc_only) / sizeof(ifpc_only[0]);
+	unsigned shared = sizeof(ifpc_shared) / sizeof(ifpc_shared[0]);
+	/* Firmware's 16-byte cpu_gpu_lock: three zero lock words, then counts
+	 * packed as u8 IFPC, u8 shared, u16 dynamic. Never edited while CP runs. */
+	bzero(out, 4096);
+	out[3] = only | (shared << 8);
+	unsigned at = 4;
+	for (unsigned i = 0; i < only + shared; i++) {
+		uint32_t reg = i < only ? ifpc_only[i] : ifpc_shared[i - only];
+		out[at++] = reg;
+		out[at++] = rd(gpu.base + GPU_WORD(reg));
+	}
+	assert(at * 4 <= 4096);
+	to_memory(core_restore.memory, 4096);
+}
+
 
 static uint32_t
 odd_parity(uint32_t v)
@@ -2691,7 +2867,7 @@ ring_register(uint32_t number, uint32_t value)
 }
 
 /* What has been written to the ring since the last time: out to memory, and the core told how far to read. */
-static void
+static bool
 ring_send(void)
 {
 	if (ring_at >= ring_sent) {
@@ -2702,6 +2878,18 @@ ring_send(void)
 	}
 	ring_sent = ring_at;
 	wr(gpu.base + CP_RB_WPTR, ring_at);
+	if (ifpc_config) {
+		for (unsigned i = 0; i < 10000; i++) {
+			__asm__ volatile ("dsb sy" ::: "memory");
+			if (!(rd(gmu.base + GMU_AHB_FENCE_STATUS) & 1)) return true;
+			delay(1);
+			wr(gpu.base + CP_RB_WPTR, ring_at);
+		}
+		ifpc_failed = 1;
+		ifpc_wake_failures++;
+		return false;
+	}
+	return true;
 }
 
 /* Let the 3D core have what is in the ring, and wait until it has taken all of it and rests. */
@@ -2713,7 +2901,7 @@ ring_run(const char *what)
 	printf("adreno: %u: about to have the 3D core %s: the ring up to word %u\n", step, what, ring_at);
 	snprintf(last_write, sizeof(last_write), "step %u had the 3D core %s", step, what);
 	hold(true);
-	ring_send();
+	if (!ring_send()) return false;
 	for (int i = 0; i < 20000 && (taken != ring_at || (status & ~1u)); i++) {
 		sleep_us(100);
 		taken = rd(gpu.base + CP_RB_RPTR);
@@ -2758,6 +2946,7 @@ step_core_space(void)
 	    !block_new(&core_space, &core_scratch, CORE_SCRATCH_ADDRESS, 4096, PTE_CORE)) {
 		return false;
 	}
+	if (ifpc_config && !block_new(&core_space, &core_restore, CORE_RESTORE_ADDRESS, 4096, PTE_CORE)) return false;
 	memcpy((void *)core_sqe.memory, microcode + 4, size - 4);       /* the file's first word is not microcode */
 	to_memory(core_sqe.memory, core_sqe.size);
 
@@ -2915,12 +3104,13 @@ step_core_start(void)
 	PE_parse_boot_argn("adreno_blind", &blind, sizeof(blind));
 	put64(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE, blind ? CORE_NOWHERE : CORE_SQE_ADDRESS);
 	put64(&gpu, "cp_rb_base", CP_RB_BASE, CORE_RING_ADDRESS);
-	put(&gpu, "cp_rb_cntl", CP_RB_CNTL, CP_RB_CNTL_VALUE);
+	put(&gpu, "cp_rb_cntl", CP_RB_CNTL, ifpc_config ? CP_RB_CNTL_VALUE & ~(1u << 27) : CP_RB_CNTL_VALUE);
 	if (adreno_soc == 8450) {
 		/* (not written to while CP_RB_CNTL says not to, but the A7xx's two threads are given a place, as slop did) */
 		put64(&gpu, "cp_rb_rptr_addr", CP_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x80);
 		put64(&gpu, "cp_bv_rb_rptr_addr", CP_BV_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x100);
 	}
+	if (ifpc_config) core_restore_list();
 	return core_start_after(blind);
 }
 
@@ -3002,6 +3192,12 @@ core_registers_a730(void)
 	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 0x6f);        /* BR: as the BV and LPAC, and the crash dumper's */
 	put(&gpu, "cp_bv_apriv_cntl", CP_BV_APRIV_CNTL, 0xf);   /* microcode, ring, ring's commands, read position */
 	put(&gpu, "cp_lpac_apriv_cntl", CP_LPAC_APRIV_CNTL, 0xf);
+	if (ifpc_config) {
+		for (unsigned i = 0; i < sizeof(gen7_0_0_hwcg_regs) / sizeof(gen7_0_0_hwcg_regs[0]); i++)
+			wr(gpu.base + GPU_WORD(gen7_0_0_hwcg_regs[i][0]), gen7_0_0_hwcg_regs[i][1]);
+		for (unsigned i = 0; i < sizeof(gen7_0_0_ao_hwcg_regs) / sizeof(gen7_0_0_ao_hwcg_regs[0]); i++)
+			wr(gmu.base + GMU_WORD(gen7_0_0_ao_hwcg_regs[i][0] - 0x1a800), gen7_0_0_ao_hwcg_regs[i][1]);
+	}
 	/* non-UBWC reads may not pass writes */
 	put(&gpu, "rb_cmp_dbg_eco_cntl", RB_CMP_DBG_ECO_CNTL, rd(gpu.base + RB_CMP_DBG_ECO_CNTL) | 1u << 11);
 }
@@ -3045,13 +3241,13 @@ core_start_after(uint32_t blind)
 		ring_command(CP_THREAD_CONTROL, 1);
 		ring(1u << 27);                         /* the BR thread only */
 		ring_command(CP_ME_INIT, 7);
-		ring(1u << 0 | 1u << 1 | 1u << 3 | 1u << 6);    /* hardware contexts, error detection, default reset state, no counters' save */
+		ring(1u << 0 | 1u << 1 | 1u << 3 | 1u << 6 | (ifpc_config ? 1u << 8 : 0));    /* hardware contexts, error detection, default reset state, no counters' save */
 		ring(0x00000003);                       /* several hardware contexts */
 		ring(0x20000000);                       /* error detection */
 		ring(0x00000002);                       /* operation mode */
+		ring(ifpc_config ? CORE_RESTORE_ADDRESS : 0);
 		ring(0);
-		ring(0);
-		ring(0);
+		ring(ifpc_config ? 1u << 31 : 0); /* dynamic-list entries are triplets; count is zero */
 		if (!ring_run("initialize its command processor")) {
 			return false;
 		}
@@ -3349,11 +3545,13 @@ core_bus_halt(bool for_good)
 
 static bool core_stuck;                 /* the 3D core has not finished what it was given, and is not waited for */
 
-static void
-gpu_block_stop(void)
+static bool
+gpu_block_suspend(bool runtime)
 {
-	uint32_t slumber[3] = { 0, 0, 0 };
-	bool power_off = false;
+	/* Gen7 requires a nonzero performance entry and a valid DDR index,
+	 * unlike Linux's older zero-filled placeholder. Use the lowest supported pair. */
+	uint32_t slumber[3] = { 0, adreno_soc == 8450 ? 2u : 0u, adreno_soc == 8450 ? 1u : 0u };
+	bool power_off = false, ok = true;
 
 	step = 0;
 	newest_step = ~0u;
@@ -3372,9 +3570,18 @@ gpu_block_stop(void)
 		core_is_on = false;
 	}
 	if (gmu_talks) {
-		hfi_send("\"slumber\"", HFI_PREPARE_SLUMBER, slumber, 3);
+		if (ifpc_config && gx_users) gpu_gx_put();
+		/* Gen7 accepts PREPARE_SLUMBER only after its requested lowest
+		 * idle state, not immediately after the host releases keepalive. */
+		bool idle = true;
+		if (ifpc_config) {
+			idle = wait_for(&gmu, GMU_RPMH_POWER_STATE, 0xf, 3, 100) &&
+			    wait_for(&gmu, IFPC_GFX_STATUS, 3, 3, 100);
+		}
+		if (!idle || !hfi_send("\"slumber\"", HFI_PREPARE_SLUMBER, slumber, 3)) ok = false;
 		if (!wait_for(&gmu, GMU_AO_GPU_CX_BUSY_STATUS, 1u << 23, 0, 100)) {
 			get(&gmu, "ao_gpu_cx_busy_status", GMU_AO_GPU_CX_BUSY_STATUS);
+			ok = false;
 		}
 		get(&gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK_STATUS);
 		get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
@@ -3385,7 +3592,7 @@ gpu_block_stop(void)
 		gmu_runs = false;
 		gx_off();                               /* (a GMU that has slumbered has done it itself) */
 	}
-	if (zap_is_loaded) {
+	if (zap_is_loaded && !runtime) {
 		/* the next kernel loads its own: see step_zap_load() */
 		printf("adreno: %u: the zap shader: %s\n", step, zap_unload() ? "TrustZone has given it up" :
 		    "TRUSTZONE DOES NOT GIVE IT UP; the next kernel will find it there");
@@ -3396,6 +3603,7 @@ gpu_block_stop(void)
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 1);
 		if (!wait_for(&rscc, RSCC_RSC_STATUS0_DRV0, RSCC_ASLEEP, RSCC_ASLEEP, 100)) {
 			printf("adreno: %u: the GMU's RPMh channel does not go to sleep\n", step);
+			ok = false;
 		}
 		get(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0);
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
@@ -3436,6 +3644,14 @@ gpu_block_stop(void)
 		get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
 		cx_off = !cx_is_on();
 	}
+	core_runs = false;
+	return ok && cx_off && !(rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON);
+}
+
+static void
+gpu_block_stop(void)
+{
+	(void)gpu_block_suspend(false);
 }
 
 /*
@@ -3446,6 +3662,7 @@ gpu_block_stop(void)
 void
 hakios_adreno_quiesce(void)
 {
+	__atomic_store_n(&power_quiescing, 1, __ATOMIC_RELEASE);
 	gpu_irq_quiesce();
 	if (cx_off) {
 		return;
@@ -3455,7 +3672,7 @@ hakios_adreno_quiesce(void)
 		gmu_runs = false;
 	}
 	if (core_runs) {
-		core_bus_halt(true);
+		core_bus_halt(!ifpc_config);
 		core_runs = false;
 	}
 	if (gmu_space_is_on) {
@@ -3513,6 +3730,8 @@ static uint32_t gpu_fence;              /* the number of the last submission */
 static uint32_t gpu_timed;              /* ... of the last whose times have been added up */
 static uint64_t gpu_ticks;              /* how long the core has worked on the submissions added up */
 static uint32_t gpu_timed_count;
+/* Lifetime totals are separate from the interval counters consumed by worked(). */
+static uint64_t power_work_ticks, power_timed, power_timing_lost, power_submitted;
 static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25, 0.5, 1, 2, 4 ms, and longer */
 static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
 uint32_t gpu_log;                       /* boot-arg gpu_log=1: a line for every submission and the time the core spent on it */
@@ -3579,14 +3798,15 @@ gpu_irq_arrived(__unused void *context, uint32_t intid)
 		goto disable;
 	}
 	/* KGSL gen7_irq_handler: keep GX reachable, then check the GMU's AHB fence. */
-	wr(gmu.base + GPU_IRQ_KEEPALIVE, 1);
+	gpu_gx_ref(true);
 	__asm__ volatile ("dsb sy" ::: "memory");
-	for (i = 0; i < 100 && rd(gmu.base + GMU_AO_AHB_FENCE_CTRL) != 0; i++) {
+	for (i = 0; i < 100 && (rd(gmu.base + GMU_AO_AHB_FENCE_CTRL) != 0 ||
+	    (ifpc_config && (rd(gmu.base + IFPC_GFX_STATUS) & 3))); i++) {
 		delay(1);
 	}
 	if (i == 100 || !(rd(gpucc.base + GPUCC_GX_GDSCR) & (1u << 31))) {
 		__atomic_fetch_add(&gpu_irq_unsafe, 1, __ATOMIC_RELAXED);
-		wr(gmu.base + GPU_IRQ_KEEPALIVE, 0);
+		gpu_gx_ref(false);
 		goto disable;
 	}
 	status = rd(gpu.base + RBBM_INT_0_STATUS);
@@ -3597,7 +3817,7 @@ gpu_irq_arrived(__unused void *context, uint32_t intid)
 		__asm__ volatile ("dsb sy" ::: "memory");
 		__atomic_fetch_add(&gpu_irq_completions, 1, __ATOMIC_RELAXED);
 	}
-	wr(gmu.base + GPU_IRQ_KEEPALIVE, 0);
+	gpu_gx_ref(false);
 	if (!(status & GPU_IRQ_COMPLETION)) {
 		goto disable;
 	}
@@ -3671,8 +3891,10 @@ gpu_irq_stop(void)
 		gpu_irq_quiesce();
 		gic_v3_spi_detach(GPU_IRQ_INTID);
 		gpu_irq_attached = false;
-		wr(gpu.base + GPU_IRQ_MASK, gpu_irq_old_mask);
-		wr(gpu.base + GPU_IRQ_CLEAR, GPU_IRQ_COMPLETION);
+		if (!ifpc_config || !ifpc_failed) {
+			wr(gpu.base + GPU_IRQ_MASK, gpu_irq_old_mask);
+			wr(gpu.base + GPU_IRQ_CLEAR, GPU_IRQ_COMPLETION);
+		}
 		__asm__ volatile ("dsb sy" ::: "memory");
 		thread_wakeup((event_t)&hakios_gpu_fence_event);
 	}
@@ -3691,9 +3913,26 @@ gpu_irq_stop(void)
 void
 hakios_gpu_stop(void)
 {
+	if (gpu_runtime) {
+		HakiosGPUAssertLocked();
+	}
 	if (gpu_kept) {
 		uint32_t waited = 0;
+		uint64_t failures = power_hfi_failures;
 
+		if (cx_off) {
+			gpu_kept = false;
+			if (zap_is_loaded) {
+				if (!zap_unload()) { power_failures++; slumber_failed = 1; }
+				zap_is_loaded = false;
+			}
+			power_state = slumber_failed ? 4 : 3;
+			power_transitions++;
+			return;
+		}
+		power_state = 2;                       /* final stop */
+		gpu_dcvs_stop();
+		power_transitions++;
 		gpu_kept = false;                       /* (nothing more is taken) */
 		quiet = false;
 		/*
@@ -3706,10 +3945,21 @@ hakios_gpu_stop(void)
 			waited++;
 		}
 		core_stuck = !hakios_gpu_done(gpu_fence);
+		bool gx_access = gpu_gx_get();
+		if (!gx_access) { core_stuck = true; core_runs = false; }
 		gpu_irq_stop();
 		printf("adreno: the run is about to end: the GPU is given back (%s after %u us)\n",
 		    core_stuck ? "STILL AT WORK" : "it had finished what it was given", 100 * waited);
 		gpu_block_stop();
+		if (core_stuck || power_hfi_failures != failures || !cx_off) {
+			power_failures++;
+			power_state = 4;               /* final stop failed */
+		} else {
+			power_state = 3;               /* final stop completed */
+		}
+		power_transitions++;
+		printf("adreno: power stop state=%u transitions=%u transition_failures=%u hfi_failures=%llu\n",
+		    power_state, power_transitions, power_failures, power_hfi_failures);
 	}
 }
 
@@ -3749,7 +3999,8 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = gpu_chip_id | (uint64_t)speed_bin << 32;
 		return true;
 	case 0x04:                              /* MAX_FREQ */
-		*value = core_khz * 1000ull;
+		/* Runtime votes must not change the advertised frequency range. */
+		*value = (adreno_soc == 8450 ? 492000 : core_khz) * 1000ull;
 		return true;
 	case 0x05:                              /* TIMESTAMP */
 		*value = mach_absolute_time();
@@ -3843,6 +4094,7 @@ hakios_gpu_unmap(uint64_t address, uint64_t size)
 		space_map(&core_space, address + offset, 0, 0);
 	}
 	space_commit(&core_space);
+	if (!core_space_is_on) return; /* resume installs these tables and flushes TLBs */
 	wr(smmu.base + context + SMMU_CB_TLBIASID, core_space.context);
 	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
 	for (int i = 0; i < 1000 && (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1); i++) {
@@ -3892,6 +4144,7 @@ gpu_times(void)
 	to_memory(core_scratch.memory, 4096);
 	done = *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
 	if (done - gpu_timed > GPU_TIMES) {
+		power_timing_lost += done - gpu_timed - GPU_TIMES;
 		gpu_timed = done - GPU_TIMES;           /* (the older ones have been written over) */
 	}
 	while (gpu_timed != done) {
@@ -3913,6 +4166,10 @@ gpu_times(void)
 			gpu_timed_by[by]++;
 			gpu_ticks += ticks;
 			gpu_timed_count++;
+			power_work_ticks += ticks;
+			power_timed++;
+		} else if (gpu_timed != 0) {
+			power_timing_lost++;
 		}
 	}
 }
@@ -3945,8 +4202,18 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 {
 	uint32_t wanted = (adreno_soc == 8450 ? 60 : 26) + 4 * count, room = 0;
 
+	HakiosGPUAssertLocked();
+	if (!gpu_kept || ifpc_failed || slumber_failed ||
+	    __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
+		return 0;
+	}
+	if (power_state == 6 && !gpu_runtime_resume()) return 0;
+	slumber_idle_ns = 0;
+	gpu_dcvs_submit();
+	if (dcvs_failed) return 0;
+
 	for (int i = 0; i < 20000; i++) {
-		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
+		room = (ring_read_position() + RING_WORDS - ring_at - 1) % RING_WORDS;
 		if (room >= wanted) {
 			break;
 		}
@@ -3960,7 +4227,9 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 		gpu_fence = 1;
 	}
 	if (adreno_soc == 8450) {
-		return gpu_submit_a730(addresses, words, count);
+		uint32_t fence = gpu_submit_a730(addresses, words, count);
+		if (fence) power_submitted++;
+		return fence;
 	}
 	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
@@ -3984,6 +4253,7 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	ring(0);
 	ring(gpu_fence);
 	ring_send();
+	power_submitted++;
 	return gpu_fence;
 }
 
@@ -4015,7 +4285,7 @@ gpu_submit_a730(const uint64_t *addresses, const uint32_t *words, uint32_t count
 	ring_command(CP_THREAD_CONTROL, 1);
 	ring(CP_SET_THREAD_BOTH);
 	ring_command(CP_SET_MARKER, 1);
-	ring(0x101);                            /* no power collapse between frames (there is none here yet) */
+	ring(0x101);                            /* IFPC inhibited inside this submission, enabled by its final 0x100 marker */
 	ring_command(CP_SET_MARKER, 1);
 	ring(0x00d);                            /* the submission's buffers begin */
 	ring_time(gpu_fence, 0);
@@ -4053,7 +4323,7 @@ gpu_submit_a730(const uint64_t *addresses, const uint32_t *words, uint32_t count
 	ring(CP_SET_THREAD_BOTH);
 	ring_command(CP_SET_MARKER, 1);
 	ring(0x100);
-	ring_send();
+	if (!ring_send()) return 0;
 	return gpu_fence;
 }
 
@@ -4062,6 +4332,20 @@ void
 hakios_gpu_report(const char *why)
 {
 	uint32_t context = smmu_context(&core_space);
+	if (power_state != 1) {
+		printf("adreno: gpu: %s: power state %u, slumber failure %u; hardware diagnostics suppressed\n",
+		    why, power_state, slumber_failed);
+		return;
+	}
+	if (ifpc_config) {
+		printf("adreno: gpu: %s: IFPC path: last fence %u, completed %u, shadow rptr %u, wptr %u, "
+		    "GX status %#x, RPMh %#x, fence %#x, failed %u; GX diagnostics suppressed\n", why,
+		    gpu_fence, *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT), ring_read_position(), ring_at,
+		    rd(gmu.base + IFPC_GFX_STATUS), rd(gmu.base + GMU_RPMH_POWER_STATE),
+		    rd(gmu.base + GMU_AO_AHB_FENCE_CTRL), ifpc_failed);
+		space_faulted(&core_space);
+		return;
+	}
 
 	printf("adreno: gpu: %s: submission %u is the last, the core has done %u; ring: read up to %u, written up to %u; status "
 	    "%#x, interrupts %#x; command processor: fault %#x, interrupts %#x, protection %#x\n", why, gpu_fence,
@@ -4093,37 +4377,466 @@ static bool(*const steps[])(void) = {
  * The SoC's temperature sensors report by themselves, in a block that is always on (dt: tsens1,
  * whose readings are at 0xc265000; Linux's tsens-v2.c): a status word a sensor, the last reading
  * in its low 12 bits, signed, in tenths of a degree, and bit 21 when there is one. Sensors 1 and
- * 2 sit at the GPU (dt: gpuss-0, gpuss-1). Read, never written: once a minute while the GPU is
- * kept, for the line beside the kernel's line about memory (osfmk/arm64/loader_return.c). A
- * sensor caught between two readings has none for a moment and is asked again; one that still
- * has none is put down as -273.0.
+ * 2 sit at SC7280's GPU; SM8450 uses TSENS0 sensors 14 and 15 (gpuss-0/gpuss-1).
+ * Read, never written, under the GPU lock for the snapshot and minute log. Retry a
+ * sensor caught between readings; temp_valid distinguishes missing data from 0 C.
  */
-static struct block tsens = { "tsens1", 0x0c265000, 0x200 };
+static struct block tsens = { "tsens", 0x0c265000, 0x200 };
 #define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
 #define TSENS_VALID             (1u << 21)
+#include "hakios.dcvs.h"
+
+/* Linux v6.12 a6xx_gpu.c hw_init/gpu_busy, a6xx_gmu.xml. GMU
+ * offsets here are relative to kgsl_gmu_reg (XML word address - 0x1a800).
+ * This counter counts masked GX busy at XO/19.2 MHz, independent of DVFS. */
+#define GMU_POWER_ENABLE        GMU_WORD(0x5040)
+#define GMU_POWER_SELECT        GMU_WORD(0x5041)
+#define GMU_BUSY_LO             GMU_WORD(0x5044)
+#define GMU_BUSY_HI             GMU_WORD(0x5045)
+#define GMU_BUSY_MASK           GMU_WORD(0x930e)
+
+static uint64_t
+gpu_power_ns(void)
+{
+	uint64_t ns;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
+
+static uint32_t
+gpu_temperatures(int32_t mc[2])
+{
+	uint32_t valid = 0;
+	need(&tsens);
+	if (tsens.base == 0) return 0;
+	for (unsigned i = 0; i < 2; i++) {
+		for (unsigned again = 0; again < 16; again++) {
+			uint32_t s = rd(tsens.base + TSENS_STATUS((adreno_soc == 8450 ? 14 : 1) + i));
+			if (s & TSENS_VALID) {
+				mc[i] = ((int32_t)(s << 20) >> 20) * 100;
+				if (mc[i] >= -40000 && mc[i] <= 125000) valid |= 1u << i;
+				break;
+			}
+		}
+	}
+	return valid;
+}
+
+static void
+gpu_busy_sample(uint64_t ns)
+{
+	uint32_t hi, lo, check;
+	busy_valid = 0;
+	for (unsigned i = 0; i < 4; i++) {
+		hi = rd(gmu.base + GMU_BUSY_HI);
+		lo = rd(gmu.base + GMU_BUSY_LO);
+		check = rd(gmu.base + GMU_BUSY_HI);
+		if (hi == check) {
+			uint64_t ticks = (uint64_t)hi << 32 | lo;
+			uint64_t elapsed = ns - busy_sample_ns;
+			uint64_t delta = ticks - busy_previous;
+			/* Reject resets, torn reads, long gaps, and impossible deltas.
+			 * 1% tolerance covers host/counter sampling skew. */
+			if (busy_sample_ns && elapsed >= 1000000 && elapsed <= 1000000000 &&
+			    ticks >= busy_previous && delta <= elapsed * 192 / 10000 + elapsed * 192 / 1000000) {
+				busy_pct = (uint32_t)(delta * 1000000 / (elapsed * 192));
+				if (busy_pct > 100) busy_pct = 100;
+				busy_valid = 1;
+			} else if (busy_sample_ns) {
+				busy_rejected++;
+			}
+			busy_ticks = ticks;
+			busy_previous = ticks;
+			busy_sample_ns = ns;
+			return;
+		}
+	}
+	busy_rejected++;
+}
+
+/* Runtime control is opt-in on SM8450, with the existing three performance
+ * entries only. Captured live.dts: 220/317 MHz bus-freq 2, 492 MHz bus-freq 6.
+ * A failed exchange latches control off: the applied hardware state is unknown. */
+static int
+gpu_vote(int level)
+{
+	static const uint32_t khz[] = { 0, 220000, 317000, 492000 };
+	static const uint32_t bw[] = { 0, 2, 2, 6 };
+	uint32_t vote[4] = { 0, 1, (uint32_t)level, 0 };
+
+	HakiosGPUAssertLocked();
+	if (level < 1 || level > 3) {
+		return -EINVAL;
+	}
+	if (!power_control || !gpu_kept || power_state != 1 || dcvs_failed || ifpc_failed ||
+	    __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
+		return -ENXIO;
+	}
+	vote[3] = bw[level];
+	if (power_level == (uint32_t)level && power_bw == vote[3]) {
+		return 0;
+	}
+	dcvs_votes++;
+	if (!hfi_send("runtime GPU/BW vote", HFI_GX_BW_PERF_VOTE, vote, 4)) {
+		dcvs_failed = 1;
+		return -EIO;
+	}
+	core_khz = khz[level];
+	return 0;
+}
+
+/* kind: 0 manual level (also disables auto), 1 auto enable, 2 upper level,
+ * 3 use audited busy counter. Caller copies sysctl data outside the lock. */
+int
+hakios_gpu_control(unsigned kind, int value, bool write)
+{
+	int32_t mc[2] = { 0, 0 };
+	HakiosGPUAssertLocked();
+	if (!write) {
+		switch (kind) {
+		case 0: return power_level;
+		case 1: return dcvs_on;
+		case 2: return dcvs_limit;
+		case 3: return busy_use;
+		case 4: return ifpc_on;
+		case 5: return slumber_on;
+		default: return -EINVAL;
+		}
+	}
+	if (kind == 5) {
+		if (value < 0 || value > 1) return -EINVAL;
+		if (!slumber_config || !gpu_kept || slumber_failed ||
+		    __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) return -ENXIO;
+		if (!value && power_state == 6 && !gpu_runtime_resume()) return -EIO;
+		slumber_on = value;
+		slumber_idle_ns = 0;
+		return 0;
+	}
+	/* Writes wake first; reads remain passive. Reject invalid input before waking. */
+	if (kind > 4 || ((kind == 1 || kind == 3 || kind == 4) ?
+	    (value < 0 || value > 1) : (value < 1 || value > 3))) return -EINVAL;
+	if (power_state == 6 && !gpu_runtime_resume()) return -EIO;
+	if (kind == 4) {
+		if (value < 0 || value > 1) return -EINVAL;
+		if (!ifpc_config || !gpu_kept || power_state != 1 || ifpc_failed ||
+		    __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) return -ENXIO;
+		if ((uint32_t)value == ifpc_on) return 0;
+		/* This firmware acknowledges FEATURE_CTRL disable but continues to
+		 * collapse. Keep the boot feature configured and use the verified OOB
+		 * GPU hold as the effective runtime inhibit instead. */
+		if (!value) {
+			wr(gmu.base + GMU_GMU2HOST_INTR_CLR, GMU_CORE_GRANTED);
+			wr(gmu.base + GMU_HOST2GMU_INTR_SET, GMU_CORE_REQUEST);
+			bool granted = false;
+			for (unsigned i = 0; i < 5000; i++) {
+				if (rd(gmu.base + GMU_GMU2HOST_INTR_INFO) & GMU_CORE_GRANTED) {
+					granted = true;
+					break;
+				}
+				sleep_us(100);
+			}
+			wr(gmu.base + GMU_GMU2HOST_INTR_CLR, GMU_CORE_GRANTED);
+			if (!granted) {
+				ifpc_failed = 1;
+				ifpc_wake_failures++;
+				return -EIO;
+			}
+		} else {
+			wr(gmu.base + GMU_HOST2GMU_INTR_SET, 1u << 31);
+		}
+		ifpc_on = value;
+		return 0;
+	}
+	if (kind > 3 || ((kind == 1 || kind == 3) ? (value < 0 || value > 1) : (value < 1 || value > 3))) return -EINVAL;
+	if (!power_control || !gpu_kept || power_state != 1 || dcvs_failed || ifpc_failed ||
+	    __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) return -ENXIO;
+	uint32_t valid = gpu_temperatures(mc);
+	dcvs_cap = gpu_thermal_cap(dcvs_cap, valid, mc[0], mc[1]);
+	unsigned cap = dcvs_cap < dcvs_limit ? dcvs_cap : dcvs_limit;
+	if (kind == 3) { busy_use = value; return 0; }
+	if (kind == 0) {
+		int error = gpu_vote((unsigned)value > cap ? cap : (unsigned)value);
+		if (!error) { dcvs_manual = value; dcvs_on = 0; }
+		return error;
+	}
+	if (kind == 2) {
+		/* Apply a lower ceiling before publishing it; raising it is handled
+		 * by the worker or the next submission. */
+		unsigned ceiling = (unsigned)value < dcvs_cap ? (unsigned)value : dcvs_cap;
+		if (power_level > ceiling) {
+			int error = gpu_vote(ceiling);
+			if (error) return error;
+		}
+		dcvs_limit = value;
+	} else {
+		dcvs_on = value;
+		dcvs_manual = power_level;
+		dcvs_last_load = gpu_power_ns();
+	}
+	return 0;
+}
+
+bool
+hakios_gpu_power_tick(void)
+{
+	int32_t mc[2] = { 0, 0 };
+	HakiosGPUAssertLocked();
+	if (!gpu_kept || slumber_failed || dcvs_failed || ifpc_failed ||
+	    __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) return false;
+	if (power_state == 6) return true; /* do not access powered-off CX/GMU */
+	if (power_state != 1) return false;
+	uint64_t ns = gpu_power_ns();
+	if (slumber_on && gpu_irq_state != 2 && hakios_gpu_done(gpu_fence)) {
+		if (!slumber_idle_ns) slumber_idle_ns = ns;
+		if (ns - slumber_idle_ns >= 1000000000ull) {
+			return gpu_runtime_suspend();
+		}
+	} else slumber_idle_ns = 0;
+	if (!power_control) return slumber_config != 0;
+	gpu_busy_sample(ns);
+	uint32_t valid = gpu_temperatures(mc);
+	dcvs_cap = gpu_thermal_cap(dcvs_cap, valid, mc[0], mc[1]);
+	unsigned cap = dcvs_cap < dcvs_limit ? dcvs_cap : dcvs_limit;
+	unsigned target = dcvs_manual > cap ? cap : dcvs_manual;
+	if (dcvs_on) {
+		target = gpu_dcvs_target(power_level, cap, busy_valid && busy_use, busy_pct,
+		    !hakios_gpu_done(gpu_fence), ns - dcvs_last_submit < 200000000,
+		    ns, &dcvs_last_load);
+	}
+	gpu_vote(target);
+	return !dcvs_failed;
+}
+
+static void
+gpu_dcvs_submit(void)
+{
+	if (!power_control || !dcvs_on || dcvs_failed || ifpc_failed) return;
+	uint64_t ns = gpu_power_ns();
+	/* New burst or queued work: boost before publishing the ring pointer.
+	 * Completion timestamps are not converted into utilization. */
+	if (ns - dcvs_last_submit >= 200000000 || !hakios_gpu_done(gpu_fence)) {
+		unsigned cap = dcvs_cap < dcvs_limit ? dcvs_cap : dcvs_limit;
+		gpu_vote(cap);
+		dcvs_last_load = ns;
+	}
+	dcvs_last_submit = ns;
+}
+
+static void
+gpu_dcvs_stop(void)
+{
+	dcvs_on = 0;
+	busy_valid = 0;
+	if (power_control || ifpc_config) wr(gmu.base + GMU_POWER_ENABLE, 0);
+}
+
+/* Called under HakiosGPU's lock, once the single-threaded ladder has finished. */
+void
+hakios_gpu_power_start(void)
+{
+	HakiosGPUAssertLocked();
+	gpu_runtime = true;
+	power_state = 1;
+	power_transitions++;
+	if (adreno_soc == 8450) {
+		PE_parse_boot_argn("gpu_power_control", &power_control, sizeof(power_control));
+	}
+	if (adreno_soc == 8450) {
+		PE_parse_boot_argn("gpu_slumber", &slumber_config, sizeof(slumber_config));
+		slumber_config = slumber_config != 0;
+		slumber_on = slumber_config;
+	}
+	if (power_control) dcvs_manual = power_level;
+	gpu_counter_start();
+}
+
+static void
+gpu_counter_start(void)
+{
+	busy_valid = 0;
+	busy_sample_ns = 0;
+	if (ifpc_config) {
+		wr(gmu.base + GMU_WORD(0x5042), (rd(gmu.base + GMU_WORD(0x5042)) & ~0xffu) | 4);
+		wr(gmu.base + GMU_POWER_ENABLE, 1);
+		/* Release the boot OOB GPU hold; keepalive alone cannot permit IFPC
+		 * while the firmware still owns this request. */
+		if (ifpc_on) wr(gmu.base + GMU_HOST2GMU_INTR_SET, 1u << 31);
+		gpu_gx_put();
+	}
+	if (power_control) {
+		wr(gmu.base + GMU_BUSY_MASK, 0xff000000);
+		wr(gmu.base + GMU_POWER_SELECT, (rd(gmu.base + GMU_POWER_SELECT) & ~0xffu) | (1u << 5));
+		wr(gmu.base + GMU_POWER_ENABLE, 1);
+		dcvs_last_load = gpu_power_ns();
+	}
+}
+
+/* Runtime operations retain the service, client mappings, completed fences and
+ * secure firmware. They never invoke final stop or reset fence numbering.
+ * Lock is held throughout; IRQ detach drains handlers before CX goes away. */
+static bool
+gpu_runtime_suspend(void)
+{
+	HakiosGPUAssertLocked();
+	uint64_t began = gpu_power_ns(), failures = power_hfi_failures;
+	power_state = 5;
+	power_transitions++;
+	slumber_stream1 = second_stream_is_on;
+	slumber_irq = gpu_irq_attached;
+	bool gx_access = gpu_gx_get();
+	core_stuck = !gx_access;
+	if (gx_access) core_stuck = !ring_run("drain before runtime suspend");
+	else core_runs = false; /* never touch GX after a failed wake */
+	gpu_times();
+	busy_valid = 0;
+	if (power_control || ifpc_config) wr(gmu.base + GMU_POWER_ENABLE, 0);
+	gpu_irq_stop();
+	bool off = gpu_block_suspend(true);
+	slumber_suspend_us = (gpu_power_ns() - began) / 1000;
+	power_transitions++;
+	if (!off || core_stuck || power_hfi_failures != failures) {
+		slumber_failed = 1;
+		power_failures++;
+		power_state = 8;
+		return false;
+	}
+	power_state = 6;
+	slumber_suspends++;
+	return true;
+}
+
+static bool
+gpu_runtime_resume(void)
+{
+	HakiosGPUAssertLocked();
+	if (power_state != 6 || slumber_failed ||
+	    __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) return false;
+	uint64_t began = gpu_power_ns();
+	uint32_t saved_ifpc = ifpc_on;
+	power_state = 7;
+	power_transitions++;
+	/* Mark potentially on before the first power write, including partial failure. */
+	cx_off = false;
+	if (!step_cx_power() || !step_clocks()) goto failed;
+	gmu_space_is_on = true;
+	if (!space_on(&gmu_space, GMU_MATCH, GMU_STREAM)) goto failed;
+	/* No new allocations: firmware blocks, queue mapping and page tables persist. */
+	for (unsigned i = 0; i < gmu_block_count; i++) {
+		bzero((void *)gmu_blocks[i].memory, gmu_blocks[i].size);
+		to_memory(gmu_blocks[i].memory, gmu_blocks[i].size);
+	}
+	for (unsigned i = 0; i < gmu_hfi.size / 4; i++) ((volatile uint32_t *)hfi)[i] = 0;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (!step_gmu_firmware() || !step_gmu_start() || !step_gmu_queues() ||
+	    !step_core_power()) goto failed;
+	/* The boot handshake acquires a keepalive and temporarily permits IFPC. */
+	ifpc_on = saved_ifpc;
+	core_space_is_on = true;
+	if (!space_on(&core_space, CORE_MATCH, CORE_STREAM)) goto failed;
+	if (slumber_stream1) {
+		second_stream_is_on = true;
+		if (!space_stream(&core_space, SECOND_MATCH, 1)) goto failed;
+	}
+	/* Nothing is pending. Restart an empty ring; retain all fence/timing words. */
+	ring_at = ring_sent = 0;
+	bzero((void *)core_ring.memory, core_ring.size);
+	to_memory(core_ring.memory, core_ring.size);
+	*(volatile uint32_t *)(core_scratch.memory + 0x80) = 0;
+	*(volatile uint32_t *)(core_scratch.memory + 0x100) = 0;
+	to_memory(core_scratch.memory + 0x80, 0x84);
+	if (!step_core_start() || !step_core_commands()) goto failed;
+	if (slumber_irq) {
+		gpu_irq_start();
+		if (!gpu_irq_attached) goto failed;
+	}
+	gpu_counter_start();
+	power_state = 1;
+	/* Restore policy and thermal ceiling before the next user command. */
+	if (power_control) {
+		int32_t mc[2] = { 0, 0 };
+		uint32_t valid = gpu_temperatures(mc);
+		dcvs_cap = gpu_thermal_cap(dcvs_cap, valid, mc[0], mc[1]);
+		unsigned cap = dcvs_cap < dcvs_limit ? dcvs_cap : dcvs_limit;
+		unsigned target = dcvs_on ? cap : (dcvs_manual < cap ? dcvs_manual : cap);
+		if (gpu_vote(target)) goto failed;
+	}
+	slumber_idle_ns = 0;
+	slumber_resumes++;
+	slumber_resume_us = (gpu_power_ns() - began) / 1000;
+	power_transitions++;
+	return true;
+failed:
+	/* One bounded attempt. Quiesce partial initialization; never retry or claim recovery. */
+	if (core_is_on && !gpu_gx_get()) core_runs = false;
+	gpu_irq_stop();
+	core_stuck = true;
+	(void)gpu_block_suspend(true);
+	slumber_failed = 1;
+	busy_valid = 0;
+	power_failures++;
+	power_state = 8;
+	power_transitions++;
+	slumber_resume_us = (gpu_power_ns() - began) / 1000;
+	return false;
+}
+
+/* Read-only, on demand; no GX registers and no HFI messages. Submission elapsed
+ * time is not hardware busy time and is not used here to infer utilization.
+ * Lifetime timing can undercount when the 64-entry timestamp ring overruns. */
+void
+hakios_gpu_power_line(char *line, size_t size)
+{
+	int32_t mc[2] = { 0, 0 };
+	uint32_t valid = 0, completed = 0, pending = 0;
+	uint64_t ns, ifpc_count = 0;
+	uint32_t ifpc_count_valid = 0, gx_status = 0, rpmh = 0;
+
+	HakiosGPUAssertLocked();
+	if (gpu_kept && core_scratch.memory != 0) {
+		gpu_times();
+		completed = *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+		pending = (int32_t)(completed - gpu_fence) < 0;
+	}
+	if (gpu_kept) valid = gpu_temperatures(mc);
+	if (gpu_kept && power_state == 1 && ifpc_config) {
+		gx_status = rd(gmu.base + IFPC_GFX_STATUS);
+		rpmh = rd(gmu.base + GMU_RPMH_POWER_STATE);
+		for (unsigned i = 0; i < 4; i++) {
+			uint32_t hi = rd(gmu.base + IFPC_COUNT_HI), lo = rd(gmu.base + IFPC_COUNT_LO);
+			if (hi == rd(gmu.base + IFPC_COUNT_HI)) {
+				ifpc_count = (uint64_t)hi << 32 | lo;
+				ifpc_count_valid = 1;
+				break;
+			}
+		}
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	snprintf(line, size, "v=1 state=%u transitions=%u transition_failures=%u sample_ns=%llu "
+	    "requested_khz=%u level=%u bw_index=%u last_fence=%u completed_fence=%u pending=%u submitted=%llu "
+	    "submission_us=%llu timed=%llu timing_lost=%llu exact=%u busy_valid=%u "
+	    "temp_valid=%u temp0_mc=%d temp1_mc=%d hfi_requests=%llu hfi_failures=%llu hfi_noack=%llu "
+	    "hfi_us=%llu hfi_max_us=%llu hfi_last_id=%u hfi_answered=%u hfi_verdict=%u "
+	    "control=%u dcvs_failed=%u dcvs_votes=%llu dcvs=%u max_level=%u thermal_cap=%u "
+	    "busy_use=%u busy_pct=%u busy_ticks=%llu busy_sample_ns=%llu busy_rejected=%llu "
+	    "ifpc_config=%u ifpc=%u ifpc_failed=%u ifpc_count_valid=%u ifpc_count=%llu "
+	    "gx_status=%u rpmh_state=%u ifpc_wakes=%llu ifpc_wake_failures=%llu "
+	    "slumber_config=%u slumber=%u slumber_failed=%u slumber_suspends=%llu slumber_resumes=%llu "
+	    "slumber_suspend_us=%llu slumber_resume_us=%llu cx_off=%u",
+	    power_state, power_transitions, power_failures, ns, core_khz, power_level, power_bw,
+	    gpu_fence, completed, pending, power_submitted, power_work_ticks * 10 / 192,
+	    power_timed, power_timing_lost, gpu_exact, busy_valid, valid, mc[0], mc[1], power_hfi_requests,
+	    power_hfi_failures, power_hfi_timeouts, power_hfi_us, power_hfi_max_us,
+	    power_hfi_id, power_hfi_answered, power_hfi_verdict, power_control, dcvs_failed, dcvs_votes,
+	    dcvs_on, dcvs_limit, dcvs_cap, busy_use, busy_pct, busy_ticks, busy_sample_ns, busy_rejected,
+	    ifpc_config, ifpc_on, ifpc_failed, ifpc_count_valid, ifpc_count, gx_status, rpmh, ifpc_wakes, ifpc_wake_failures,
+	    slumber_config, slumber_on, slumber_failed, slumber_suspends, slumber_resumes,
+	    slumber_suspend_us, slumber_resume_us, cx_off);
+}
 
 void
 hakios_adreno_minute(void)
 {
-	int32_t tenths[2];
-
-	if (!gpu_kept) {
-		return;
-	}
-	need(&tsens);
-	for (unsigned i = 0; i < 2; i++) {
-		tenths[i] = -2730;
-		for (unsigned again = 0; again < 16 && tenths[i] == -2730; again++) {
-			uint32_t status = rd(tsens.base + TSENS_STATUS(1 + i));
-
-			if (status & TSENS_VALID) {
-				tenths[i] = (int32_t)(status << 20) >> 20;
-			}
-		}
-	}
-	printf("adreno: the GPU's sensors read %d.%d and %d.%d degrees; its clock is set to %u MHz\n", tenths[0] / 10,
-	    tenths[0] % 10 < 0 ? -(tenths[0] % 10) : tenths[0] % 10, tenths[1] / 10,
-	    tenths[1] % 10 < 0 ? -(tenths[1] % 10) : tenths[1] % 10, core_khz / 1000);
+	HakiosGPUPowerLog();
 }
 
 /* ---- beside the steps: what the firmware left the display doing (boot-arg display_probe=1) ---------------- */
@@ -4378,6 +5091,8 @@ adreno_soc_8450(void)
 	rscc.phys = 0x03d50000;
 	smmu.size = 0x40000;
 	fw_gmu = "gmu_gen70000.bin";
+	/* SM8450 DT gpuss-0/gpuss-1: TSENS0 sensors 14/15, not SC7280's TSENS1 1/2. */
+	tsens.phys = 0x0c263000;
 	fw_sqe = "a730_sqe.fw";
 	fw_zap_mdt = "a730_zap.mdt";
 	fw_zap_image = "a730_zap.b01";    /* the A730's load segment (p_paddr 0x1000, the lowest): b02 is its hashes */

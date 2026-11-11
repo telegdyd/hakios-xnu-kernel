@@ -152,10 +152,13 @@ GLWAIT	arg	glwait	GPU and display	u	eagl.c
 GLYES	arg	glyes	User space	u	inject.c	the renderer is made to answer that it has those functions after all
 GPU_CACHED	arg	gpu_cached	GPU and display	k	hakios.gpu.cpp	
 GPU_EXACT	arg	gpu_exact	GPU and display	k	hakios.adreno.c	
+GPU_IFPC	arg	gpu_ifpc	GPU and display	k	hakios.adreno.c	A730 experimental inter-frame collapse, independent of DCVS; default 0
 GPU_IRQ	arg	gpu_irq	GPU and display	k	hakios.adreno.c	final-fence completion interrupt on the A730; default 0, polling retained
 GPU_IRQ_WAIT	arg	gpu_irq_wait	GPU and display	k	hakios.gpu.cpp	sleep for completion IRQs; gpu_irq=1 alone verifies delivery while polling
 GPU_KEEP	arg	gpu_keep	GPU and display	k	hakios.gpu.cpp	
 GPU_LOG	arg	gpu_log	GPU and display	k	hakios.adreno.c	
+GPU_POWER_CONTROL	arg	gpu_power_control	GPU and display	k	hakios.adreno.c	A730 runtime GPU/BW votes and 50 ms thermal worker; default 0; kern.hakios.gpu_dcvs enables auto after manual/busy validation
+GPU_SLUMBER	arg	gpu_slumber	GPU and display	k	hakios.adreno.c	A730 experimental deeper idle collapse after 1 second; default 0
 HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
 LOADER_STAY	arg	loader_stay	Loader	l	loader.c	
 M2V_UTRACE	arg	m2v_utrace	User space	u	HakiosMetalCA.m	Turnip's GPU trace of every render pass (u_trace) into a file, printed during the run

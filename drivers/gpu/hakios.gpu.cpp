@@ -39,6 +39,7 @@
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <mach/mach_time.h>
 #include <mach/vm_param.h>
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
@@ -68,6 +69,12 @@ uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
 void hakios_gpu_stop(void);
+void hakios_gpu_power_start(void);
+void hakios_gpu_power_line(char * line, size_t size);
+int hakios_gpu_control(unsigned kind, int value, bool write);
+bool hakios_gpu_power_tick(void);
+void HakiosGPUAssertLocked(void);
+void HakiosGPUPowerLog(void);
 
 void HakiosGPUStart(void);
 void HakiosGPUStop(void);
@@ -186,6 +193,8 @@ struct hakios_show {
 #define GPU_PUSH_AGAIN_MS       4               /* a surface is pushed out of the cache again for a submission this long after the last */
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
+static thread_call_t gGPUPowerCall;
+static bool gGPUPowerRunning;
 static bool gGPUReported;
 /* gpu_irq_wait=1: sleep for completion IRQs; gpu_irq=1 alone verifies delivery while polling. */
 static TUNABLE(uint32_t, gGPUIRQWait, "gpu_irq_wait", 0);
@@ -195,6 +204,93 @@ static TUNABLE(uint32_t, gCopyGuard, "fb_copy_guard", 0);
 static uint32_t gCopyWaits;
 static uint32_t gCopyReads, gCopyTimeouts;
 SYSCTL_DECL(_kern_hakios);
+
+/* Lock order: sysctl -> gGPULock -> HFI/power operation. Never copy out while
+ * holding the GPU lock. IRQ handlers never acquire this sleeping lock. Future
+ * DCVS and suspend workers must use this same lock, not a separate HFI lock. */
+void
+HakiosGPUAssertLocked(void)
+{
+	assert(gGPULock != NULL);
+	IOLockAssert(gGPULock, kIOLockAssertOwned);
+}
+
+static int
+gpuPowerSysctl(struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	char line[2048];
+
+	if (gGPULock == NULL) {
+		strlcpy(line, "v=1 state=unavailable", sizeof(line));
+	} else {
+		IOLockLock(gGPULock);
+		hakios_gpu_power_line(line, sizeof(line));
+		IOLockUnlock(gGPULock);
+	}
+	return sysctl_handle_string(oidp, line, 0, req);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_power, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, gpuPowerSysctl, "A", "GPU power snapshot; requested clocks, submission time (not utilization)");
+
+static int
+gpuLevelSysctl(struct sysctl_oid * oidp, __unused void * arg1, int arg2, struct sysctl_req * req)
+{
+	if (gGPULock == NULL) return ENXIO;
+	IOLockLock(gGPULock);
+	int level = hakios_gpu_control(arg2, 0, false);
+	IOLockUnlock(gGPULock);
+	int error = sysctl_handle_int(oidp, &level, 0, req);
+	if (error || req->newptr == 0) return error;
+	IOLockLock(gGPULock);
+	error = -hakios_gpu_control(arg2, level, true);
+	IOLockUnlock(gGPULock);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_level, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 0, gpuLevelSysctl, "I", "Manual GPU level 1..3; requires gpu_power_control=1");
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_dcvs, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 1, gpuLevelSysctl, "I", "Automatic scaling 0/1; manual votes disable it");
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_max_level, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 2, gpuLevelSysctl, "I", "GPU upper level 1..3; thermal ceiling still applies");
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_busy_use, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 3, gpuLevelSysctl, "I", "Use busy deltas only after load/idle validation, 0/1");
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_ifpc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 4, gpuLevelSysctl, "I", "IFPC enable 0/1; requires gpu_ifpc=1 boot preparation");
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_slumber, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 5, gpuLevelSysctl, "I", "Deep idle collapse 0/1; requires gpu_slumber=1, idle 1 second");
+
+static void
+gpuPowerTick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	IOLockLock(gGPULock);
+	if (gGPUPowerRunning && hakios_gpu_power_tick()) {
+		uint64_t deadline;
+		clock_interval_to_deadline(50, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(gGPUPowerCall, deadline);
+	}
+	IOLockUnlock(gGPULock);
+}
+
+void
+HakiosGPUPowerLog(void)
+{
+	char line[2048];
+
+	if (gGPULock == NULL) {
+		return;
+	}
+	IOLockLock(gGPULock);
+	bool ready = hakios_gpu_ready();
+	if (ready) {
+		hakios_gpu_power_line(line, sizeof(line));
+	}
+	IOLockUnlock(gGPULock);
+	if (ready) {
+		IOLog("HakiosGPU: power %s\n", line);
+	}
+}
 SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_sleeps, CTLFLAG_RD | CTLFLAG_LOCKED, &gGPUIRQSleeps, 0, "GPU interrupt sleeps");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_wakeups, CTLFLAG_RD | CTLFLAG_LOCKED, &gGPUIRQWakeups, 0, "GPU interrupt wait wakeups (recheck fence)");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_fallbacks, CTLFLAG_RD | CTLFLAG_LOCKED, &gGPUIRQFallbacks, 0, "GPU fences completed on timed fallback checks");
@@ -980,6 +1076,27 @@ HakiosGPUStart(void)
 
 	gGPUCached = PE_parse_boot_argn("gpu_cached", &cached, sizeof(cached)) && cached != 0;
 	gGPULock = IOLockAlloc();
+	if (gGPULock == NULL) {
+		IOLog("HakiosGPU: cannot allocate the GPU lock\n");
+		return;
+	}
+	IOLockLock(gGPULock);
+	hakios_gpu_power_start();
+	if (hakios_gpu_power_tick()) {
+		gGPUPowerCall = thread_call_allocate(gpuPowerTick, NULL);
+		if (gGPUPowerCall != NULL) {
+			gGPUPowerRunning = true;
+			uint64_t deadline;
+			clock_interval_to_deadline(50, NSEC_PER_MSEC, &deadline);
+			thread_call_enter_delayed(gGPUPowerCall, deadline);
+		} else {
+			/* Control cannot be exposed without periodic thermal checks. */
+			hakios_gpu_stop();
+			IOLockUnlock(gGPULock);
+			return;
+		}
+	}
+	IOLockUnlock(gGPULock);
 	gpu = OSTypeAlloc(HakiosGPU);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
 		OSSafeReleaseNULL(gpu);
@@ -997,6 +1114,16 @@ HakiosGPUStart(void)
 void
 HakiosGPUStop(void)
 {
+	if (gGPULock == NULL) {
+		/* Lock allocation failed before the service was published: no clients. */
+		hakios_gpu_stop();
+		return;
+	}
+	IOLockLock(gGPULock);
+	gGPUPowerRunning = false;
+	IOLockUnlock(gGPULock);
+	/* Wait without the mutex: a dispatched worker may be waiting to take it. */
+	if (gGPUPowerCall != NULL) thread_call_cancel_wait(gGPUPowerCall);
 	IOLockLock(gGPULock);
 	hakios_gpu_stop();
 	IOLockUnlock(gGPULock);

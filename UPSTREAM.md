@@ -1,5 +1,34 @@
 # Changes on negroni-dev
 
+- A730 GPU power rollout measurements and validation (RAM only): independently
+  exercise all eight runtime switch combinations, retained-buffer wake latency,
+  shared-fence waiters, Metal and interface rendering, and isolated timeout,
+  resume-failure and missing-notification paths. Controlled screen-on idle:
+  3.002 -> 2.735 W reported USB input (8.9% lower); unplugged off/on/on/off
+  comparison: 342.4 -> 312.7 mA discharge (8.7% lower). SpringBoard and vmd were
+  paused during controlled idle and resumed afterward; no battery-life claim.
+  Deeper-slumber first-submission latency is about 29 ms. Evidence, conditions,
+  remaining thermal/visual/long-run gates: `docs/negroni-gpu-rollout.md`.
+  Driver/ABI and installed defaults unchanged; no partition flashed.
+
+- A730 deeper idle slumber (experimental `gpu_slumber=1`, default off): a
+  one-second completed-work idle interval uses explicit runtime suspend/resume
+  under the existing GPU mutex. Preserve client allocations, mappings, completed
+  fences and numbering; restore GMU firmware/HFI, SMMU streams, empty ring/CP,
+  interrupts and policy before publishing work. Share hardware shutdown primitives
+  with final stop while retaining secure firmware during runtime sleep. Diagnostics
+  avoid powered-off register blocks; mapping changes defer hardware invalidation.
+  A failed transition latches submissions off, without retry or hang recovery.
+  Independent of DCVS/IFPC, with root `kern.hakios.gpu_slumber` control and additive
+  power telemetry. Audit and RAM evidence: `docs/negroni-gpu-slumber.md`.
+  Three final RAM configurations pass 75,000 short exact submissions, retained
+  buffers across 32 additional sleeps, repeated Metal suites and 78 suspend/resume
+  pairs; zero transition/HFI failures, timing loss or IRQ fallbacks. Independent
+  slumber-only and IFPC+slumber boots work without DCVS. Installed iOS restored
+  and verified after each.
+  No installed defaults changed and no partitions flashed; no power-savings claim.
+
+
 - A730 completion interrupts (enabled by negroni's device configuration): `gpu_irq=1` attaches GIC INTID 332
   (the phone's DT SPI 300, level high) and enables CACHE_CLEAN_TS only. The final BR
   EVENT_WRITE7 requests an IRQ after the existing BV fence wait; BV never requests one.
@@ -230,3 +259,46 @@
   `drawSuite()`, every kernel by the chip, `--case draws [--sections 9a,9b,...]`. On the OnePlus 10
   Pro (10 November): 167 checks of section 9 pass, 0 fail; GMEM stays refused on the A730 (its GMEM
   lines are printed, not judged). The A6xx path is unchanged.
+- GPU power preparation (11 November): read-only `kern.hakios.gpu_power` snapshot
+  under HakiosGPU's existing sleeping lock, shared with submit and orderly stop;
+  runtime HFI asserts the same lock. Lifetime submission timing is separate from
+  worked()'s interval counters, with overwritten timing slots counted; it is not
+  hardware busy utilization. Record accepted vote indices, requested clock, HFI
+  acknowledgement failures/latency and final-stop state/failures. Correct SM8450
+  GPU temperatures to TSENS0 sensors 14/15 and route minute logging through the
+  same lock. No frequency/governor/collapse change. Parent GPU-POWER-PLAN.md records
+  the staged plan and validation status. Kernel build and OnePlus 10 Pro RAM
+  test pass: 3,000 exact submissions, six snapshots, both GPU sensors valid,
+  no HFI/unsafe-IRQ/unexpected-IRQ/UFS errors; installed iOS restored. Hardware
+  busy utilization remains explicitly unavailable pending its DCVS-stage audit.
+- A730 DCVS (11 November): opt-in `gpu_power_control=1`, manual runtime
+  levels 220/317/492 MHz and captured-DT bandwidth indices 2/2/6; root sysctls
+  select manual/auto, an upper level, and validated busy-counter use. A 50 ms
+  worker shares the submission/stop mutex; burst/backlog boosts precede ring
+  publication, low-load downshifts use 200 ms hysteresis, and GPU TSENS sensors
+  impose 75/85 C ceilings with 70/80 C recovery (missing sensors: lowest level).
+  GMU XO busy deltas follow upstream Linux's counter selection, with bounded
+  coherent reads and invalid-delta rejection; submission elapsed time remains
+  separate. Firmware failure latches control/submissions off, no recovery
+  claimed. Normal stop cancels/drains the worker without holding its mutex;
+  panic quiesce inhibits subsequent control without taking a sleeping lock.
+  Manual votes were RAM-verified before adding auto. Host policy scenarios and
+  the kernel build pass; parent GPU-POWER-PLAN.md records final RAM evidence and
+  limitations. No frequency-range expansion, IFPC/slumber, installed-default
+  changes or flashing.
+
+- A730 IFPC (11 November): independent opt-in `gpu_ifpc=1`, separate CP restore
+  storage at GPU VA 0x01300000, audited gen7_0_0 clock gating and firmware
+  feature handshake before CORE_FW_START. Release the boot OOB GPU hold once
+  runtime setup is ready. Shadow RPTR accounting and bounded fenced WPTR
+  publication permit sleeping GX; shared IRQ-safe keepalive ownership protects
+  register access without taking the sleeping GPU mutex in IRQ. Power and hang
+  diagnostics avoid GX; final shutdown wakes before GX accesses and panic
+  quiesce avoids the sleeping GX bus side. Root `kern.hakios.gpu_ifpc` uses a
+  verified OOB power hold to inhibit collapse: this firmware acknowledges a
+  FEATURE_CTRL disable without actually stopping it. RAM validation observes
+  749 collapses, GX power-off/state-3 snapshots, stable counters while inhibited,
+  36,000 short exact submissions, sustained CP load, 47 texture and 172 draw
+  checks, and auto DCVS. Installed iOS restored, no flashing/default changes.
+  See `docs/negroni-gpu-ifpc.md` for references, evidence and limitations;
+  deeper idle slumber remains separate.

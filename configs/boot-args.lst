@@ -162,10 +162,13 @@ glyes	u
 gpu	k
 gpu_cached	k
 gpu_exact	k
+gpu_ifpc	k
 gpu_irq	k
 gpu_irq_wait	k
 gpu_keep	k
 gpu_log	k
+gpu_power_control	k
+gpu_slumber	k
 hakios_kver	k
 haptic	k
 haptic_effect	k
