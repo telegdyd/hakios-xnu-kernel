@@ -2779,11 +2779,12 @@ static uint32_t batt_shift = 1;         /* 0 on SM8450 (adsp_soc_8450()) */
  * until the operating system raises it, and a phone running iOS takes about that much itself: the battery stays where
  * it is. Android's oplus_battery_sm8450.c (oplus_chg_set_input_current) raises USB_INPUT_CURR_LIMIT step by step to
  * the device tree's limit for the adapter (SDP 500 mA, CDP 1500, a charger 2000) and steps back when VBUS falls under
- * 4.5 V (4.55 V above 4.1 V a cell), then sets BATT_CHG_EN. So is it here, once per plug and type, with at most 5
- * tries; a computer's port (SDP) and an unknown type are left as the PD has them. Nothing above 2000 mA is written.
+ * 4.5 V (4.55 V above 4.1 V a cell), sets BATT_CHG_EN and the charge current (1100 mA). So is it here, once per plug
+ * and type, with at most 5 tries; an unknown type is left as the PD has it. Nothing above 2000 mA is written.
  */
 static const uint32_t battmgr_icl_steps[] = { 500, 900, 1200, 1350, 1500, 1750, 2000 };
 #define BATTMGR_ICL_MAX_MA      2000
+#define BATTMGR_FCC_MA          1100
 
 struct battmgr_message {
 	uint32_t owner, type, opcode;
@@ -2904,17 +2905,15 @@ battmgr_charge(uint32_t usb, uint32_t usb_type, uint32_t pack_uv)
 			    battmgr_get(BATTMGR_BATTERY_SET, BATT_CHG_EN, &v) ? "done" : "NO ANSWER");
 		}
 	}
-	switch (usb_type) {
-	case 0:                 /* unknown (the PD may still be finding out) */
-	case 1:                 /* a computer's port: the PD's own limit stays */
-		return;
-	case 3:
-		target = 1500;
-		break;
-	default:
-		target = BATTMGR_ICL_MAX_MA;
-		break;
+	if (usb_type == 0) {
+		return;         /* unknown (the PD may still be finding out) */
 	}
+	/*
+	 * Every known type, a computer's port too: Android does the same on this phone (2026-11-11, a PC's USB 3 port,
+	 * charger_type 17: 100 mA, then 500 .. 2000, AICL at 4.5 V, 1.85 A in). The PD reads 2000 mA before anything is
+	 * written, but until it is written the hardware stays at the port's default (USB_CURR_MAX 900 mA): ~4.4 W in.
+	 */
+	target = BATTMGR_ICL_MAX_MA;
 	if (done_ma != 0) {
 		/* (set before: put back only if the PD has lowered it since) */
 		if (!battmgr_get(BATTMGR_USB_GET, USB_INPUT_CURR_LIMIT, &icl) || icl + 50000 >= done_ma * 1000) {
@@ -2926,6 +2925,16 @@ battmgr_charge(uint32_t usb, uint32_t usb_type, uint32_t pack_uv)
 		return;
 	}
 	tries++;
+	/* the battery's charge current as Android sets it in the normal band (dt temp_normal_fastchg_current_ma) */
+	if (battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_CTRL_LIM, &fcc) && fcc > BATTMGR_FCC_MA * 1000) {
+		v = BATTMGR_FCC_MA * 1000;
+		tell("adsp: battmgr: charge: charge limit %u uA to %u mA: %s\n", fcc, BATTMGR_FCC_MA,
+		    battmgr_get(BATTMGR_BATTERY_SET, BATT_CHG_CTRL_LIM, &v) ? "done" : "NO ANSWER");
+	}
+	/* (100 mA first, as Android: the PD then programs the hardware on every step) */
+	v = 100000;
+	(void)battmgr_get(BATTMGR_USB_SET, USB_INPUT_CURR_LIMIT, &v);
+	sleep_ms(25);
 	for (i = 0; i < sizeof(battmgr_icl_steps) / sizeof(battmgr_icl_steps[0]) && battmgr_icl_steps[i] <= target; i++) {
 		v = battmgr_icl_steps[i] * 1000;
 		if (!battmgr_get(BATTMGR_USB_SET, USB_INPUT_CURR_LIMIT, &v)) {
