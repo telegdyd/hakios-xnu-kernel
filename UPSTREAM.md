@@ -1,5 +1,30 @@
 # Changes on negroni-dev
 
+- A730 completion interrupts (enabled by negroni's device configuration): `gpu_irq=1` attaches GIC INTID 332
+  (the phone's DT SPI 300, level high) and enables CACHE_CLEAN_TS only. The final BR
+  EVENT_WRITE7 requests an IRQ after the existing BV fence wait; BV never requests one.
+  The handler checks GMU AHB/GX reachability, acknowledges completion, and wakes waiters
+  without taking the GPU mutex. Unsafe, unexpected or storm interrupts mask the line and
+  retain polling. `gpu_irq_wait=1` registers a scheduler wait before rechecking the fence,
+  drops the GPU mutex while sleeping, and keeps a 10 ms timed fallback bounded by the
+  original deadline. The memory fence remains authoritative. Normal shutdown masks and
+  detaches/drains before GX teardown; panic quiesce only masks, without waiting for CPUs.
+  Read-only `kern.hakios.gpu_irq_*` counters expose delivery and wait behaviour. Negroni's
+  defaults set both switches; A6xx and boots without these arguments retain polling.
+  Kernel build and boot-argument checks pass;
+  OnePlus 10 Pro RAM boots: count-only and sleeping waits each pass 9,000 exact submissions
+  with repeated client open/close. Sleeping run: 9,024 completion IRQs, 319 sleeps,
+  294 wakeups and one completion found on a timed fallback during the measured interval;
+  no unsafe/unexpected IRQs. Forty consecutive idle flip-buffer pixel checks pass 256/256
+  within 4. Host requests were launched concurrently, but overlapping GPU client execution
+  was not established; this is not a dedicated multiple-waiters-on-one-fence test. No
+  motion sign-off, hang/storm injection or power-collapse validation is claimed.
+  Installed on the OnePlus 10 Pro (11 November): the already RAM-tested kernel, menu image
+  `3f3a30f8…`, boot_a only, preflight and exact readback passed. Ordinary installed startup:
+  IRQ state 1, 795 completions, 655 sleeps / 647 wakeups, 0 fallback completions,
+  0 unsafe/unexpected IRQs; DPU flip active, native UFS errors 0. Device defaults enable
+  `gpu_irq=1 gpu_irq_wait=1`; manifest pins the device configuration commit.
+
 - A730 Metal activation: device-aware C API compile entry points and CoreAnimation plug-in callers
   target HakiosGPU's chip; specialization retains the base program's chip. The A635 legacy API
   default is preserved. Admit FD730 with GMEM still off. Expose the RAM image's Metal bundle on a

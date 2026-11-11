@@ -21,7 +21,8 @@
  * them. Linux hands such memory around as file descriptors; here it has a name already. That
  * memory is ordinary, cached memory, which everybody else reads and writes as such.
  *
- * Not here yet: interrupts (waiting is asking again five times a millisecond), more than one
+ * Completion interrupts are opt-in on the A730 (gpu_irq=1, gpu_irq_wait=1); otherwise waiting
+ * asks again five times a millisecond. Not here yet: more than one
  * program's worth of care (every client's buffers are in the one address space; a client that
  * goes takes its own away), recovery of a GPU that has stopped answering (it is reported, see
  * hakios_gpu_report(), and stays stopped), fences and buffers as file descriptors.
@@ -36,6 +37,8 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
+#include <kern/thread.h>
 #include <mach/mach_time.h>
 #include <mach/vm_param.h>
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
@@ -59,6 +62,8 @@ void hakios_gpu_to_memory(void * start, uint64_t size);
 uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
 extern uint32_t gpu_log;
 bool hakios_gpu_done(uint32_t fence);
+bool hakios_gpu_irq_active(void);
+extern uint32_t hakios_gpu_fence_event;
 uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
@@ -182,11 +187,17 @@ struct hakios_show {
 
 static IOLock * gGPULock;                       /* around everything that is the GPU's (hakios_gpu_...) */
 static bool gGPUReported;
+/* gpu_irq_wait=1: sleep for completion IRQs; gpu_irq=1 alone verifies delivery while polling. */
+static TUNABLE(uint32_t, gGPUIRQWait, "gpu_irq_wait", 0);
+static uint32_t gGPUIRQSleeps, gGPUIRQWakeups, gGPUIRQFallbacks;
 static bool gGPUCached;                         /* boot-arg gpu_cached=1 */
 static TUNABLE(uint32_t, gCopyGuard, "fb_copy_guard", 0);
 static uint32_t gCopyWaits;
 static uint32_t gCopyReads, gCopyTimeouts;
 SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_sleeps, CTLFLAG_RD | CTLFLAG_LOCKED, &gGPUIRQSleeps, 0, "GPU interrupt sleeps");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_wakeups, CTLFLAG_RD | CTLFLAG_LOCKED, &gGPUIRQWakeups, 0, "GPU interrupt wait wakeups (recheck fence)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_fallbacks, CTLFLAG_RD | CTLFLAG_LOCKED, &gGPUIRQFallbacks, 0, "GPU fences completed on timed fallback checks");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_copy_reads, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyReads, 0, "protected framebuffer reads");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_copy_waits, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyWaits, 0, "GPU submissions delayed by a framebuffer read");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_copy_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &gCopyTimeouts, 0, "framebuffer ownership waits that timed out");
@@ -205,22 +216,60 @@ static bool
 gpuWait(uint32_t fence, uint64_t milliseconds)
 {
 	uint64_t began = mach_absolute_time(), patience;
+	bool fallback = false;
 
 	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
 	for (bool waited = false;; waited = true) {
 		if (hakios_gpu_done(fence)) {
+			if (fallback) {
+				gGPUIRQFallbacks++;
+			}
 			if (waited) {
 				gGPUStat.waits++;
 				gGPUStat.waiting += mach_absolute_time() - began;
 			}
 			return true;
 		}
+		/* Stop can run while this waiter has dropped the lock; do not sleep on dead hardware. */
+		if (!hakios_gpu_ready()) {
+			return false;
+		}
 		if (mach_absolute_time() - began >= patience || gGPUReported) {
 			break;                  /* (a GPU that has stopped answering is not waited for again) */
 		}
-		IOLockUnlock(gGPULock);
-		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
-		IOLockLock(gGPULock);
+		fallback = false;
+		if (gGPUIRQWait && hakios_gpu_irq_active()) {
+			uint64_t interval, deadline;
+			nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &interval);
+			deadline = began + patience;
+			uint64_t now = mach_absolute_time();
+			if (now >= deadline) {
+				break;
+			}
+			if (deadline - now > interval) {
+				deadline = now + interval;
+			}
+			/* Register BEFORE the predicate check: IRQs do not take gGPULock. */
+			wait_result_t result = assert_wait_deadline((event_t)&hakios_gpu_fence_event, THREAD_UNINT, deadline);
+			if (result == THREAD_WAITING) {
+				if (hakios_gpu_done(fence) || !hakios_gpu_irq_active()) {
+					clear_wait(current_thread(), THREAD_AWAKENED);
+					continue;
+				}
+				gGPUIRQSleeps++;
+				IOLockUnlock(gGPULock);
+				result = thread_block(THREAD_CONTINUE_NULL);
+				IOLockLock(gGPULock);
+				fallback = result == THREAD_TIMED_OUT;
+				if (result == THREAD_AWAKENED) {
+					gGPUIRQWakeups++;
+				}
+			}
+		} else {
+			IOLockUnlock(gGPULock);
+			delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
+			IOLockLock(gGPULock);
+		}
 	}
 	if (milliseconds >= 1000 && !gGPUReported) {
 		gGPUReported = true;

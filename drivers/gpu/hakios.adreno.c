@@ -59,6 +59,7 @@
  *
  * More boot-args:
  *   adreno_soc=8450    the OnePlus 10 Pro's (SM8450) Adreno 730 instead of the X5 Pro's GPU; all 22 steps
+ *   gpu_irq=1         final-fence completion interrupt on the A730; default 0, polling retained
  *   adreno_only=K      step K alone (what steps 6 to 10 need, they check for themselves: within
  *                      one session of the loader, power and clocks stay as an earlier run left them)
  *   adreno_skip=MASK   leave out the steps whose bits are set (bit 2 = step 2)
@@ -93,13 +94,16 @@
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
  */
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/arm64/board_config.h>
 #include <sys/hakios.input.h>
 #include <sys/stat.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -116,6 +120,7 @@ static uint32_t steps_ported;           /* on SM8450: the steps that have its nu
 static const char *fw_gmu = "a660_gmu.bin", *fw_sqe = "a660_sqe.fw", *fw_zap_mdt = "a660_zap.mdt", *fw_zap_image = "a660_zap.b02";
 static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
+static void gpu_irq_quiesce(void);
 
 /*
  * The kernel's log reaches the loader when a run is over, and a run that ends in a reset
@@ -3441,6 +3446,7 @@ gpu_block_stop(void)
 void
 hakios_adreno_quiesce(void)
 {
+	gpu_irq_quiesce();
 	if (cx_off) {
 		return;
 	}
@@ -3521,6 +3527,159 @@ extern void HakiosGPUStop(void);       /* takes the clients' lock, then calls ha
 static void gpu_block_stop(void);
 
 /*
+ * A730 completion IRQ, opt-in. DT kgsl_3d0_irq: SPI 300, level high -> GIC INTID 332.
+ * KGSL gen7_reg.h / adreno_gen7_ringbuffer.c: CACHE_CLEAN_TS bit 20, EVENT_WRITE7
+ * IRQ bit 31. Only the final BR fence requests it, after BR has waited for BV.
+ * The fence word, not this notification, remains the completion authority.
+ */
+#define GPU_IRQ_INTID           332u
+#define GPU_IRQ_COMPLETION      (1u << 20)
+#define GPU_EVENT_IRQ           (1u << 31)
+#define GPU_IRQ_CLEAR           GPU_WORD(0x0037)
+#define GPU_IRQ_MASK            GPU_WORD(0x0038)
+#define GPU_IRQ_KEEPALIVE       GMU_WORD(0x50c3) /* KGSL GPU-relative word 0x1f8c3 minus GMU's 0x1a800 */
+#define GPU_IRQ_STORM           20000u          /* maximum interrupts in one second */
+
+uint32_t hakios_gpu_fence_event;                /* address used as a scheduler event; no payload */
+static uint32_t gpu_irq_state;                 /* 0 off, 1 armed, 2 disabled after an unsafe/storm IRQ */
+static uint32_t gpu_irq_count, gpu_irq_completions, gpu_irq_unexpected, gpu_irq_unsafe, gpu_irq_status;
+static bool gpu_irq_attached;
+static uint32_t gpu_irq_old_mask, gpu_irq_period_count;
+static uint64_t gpu_irq_period, gpu_irq_second;
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_state, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_irq_state, 0, "GPU IRQ: 0 off, 1 armed, 2 disabled");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_count, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_irq_count, 0, "GPU interrupts received");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_completions, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_irq_completions, 0, "GPU completion interrupts");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_unexpected, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_irq_unexpected, 0, "GPU unexpected or storm interrupts");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_unsafe, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_irq_unsafe, 0, "GPU IRQ register access refused");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, gpu_irq_status, CTLFLAG_RD | CTLFLAG_LOCKED, &gpu_irq_status, 0, "GPU interrupt status bits observed");
+
+#if defined(GENERIC_GIC_V3_IRQ)
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_detach(uint32_t intid);
+
+static void
+gpu_irq_arrived(__unused void *context, uint32_t intid)
+{
+	uint32_t status, i;
+	uint64_t now = mach_absolute_time();
+
+	__atomic_fetch_add(&gpu_irq_count, 1, __ATOMIC_RELAXED);
+	if (__atomic_load_n(&gpu_irq_state, __ATOMIC_ACQUIRE) != 1) {
+		gic_v3_spi_mask(intid);
+		return;
+	}
+	if (now - gpu_irq_period >= gpu_irq_second) {
+		gpu_irq_period = now;
+		gpu_irq_period_count = 0;
+	}
+	if (++gpu_irq_period_count > GPU_IRQ_STORM) {
+		goto disable;
+	}
+	/* KGSL gen7_irq_handler: keep GX reachable, then check the GMU's AHB fence. */
+	wr(gmu.base + GPU_IRQ_KEEPALIVE, 1);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (i = 0; i < 100 && rd(gmu.base + GMU_AO_AHB_FENCE_CTRL) != 0; i++) {
+		delay(1);
+	}
+	if (i == 100 || !(rd(gpucc.base + GPUCC_GX_GDSCR) & (1u << 31))) {
+		__atomic_fetch_add(&gpu_irq_unsafe, 1, __ATOMIC_RELAXED);
+		wr(gmu.base + GPU_IRQ_KEEPALIVE, 0);
+		goto disable;
+	}
+	status = rd(gpu.base + RBBM_INT_0_STATUS);
+	__atomic_fetch_or(&gpu_irq_status, status, __ATOMIC_RELAXED);
+	/* Leave fault bits for the existing hang report; only completion is enabled by us. */
+	if (status & GPU_IRQ_COMPLETION) {
+		wr(gpu.base + GPU_IRQ_CLEAR, GPU_IRQ_COMPLETION);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		__atomic_fetch_add(&gpu_irq_completions, 1, __ATOMIC_RELAXED);
+	}
+	wr(gmu.base + GPU_IRQ_KEEPALIVE, 0);
+	if (!(status & GPU_IRQ_COMPLETION)) {
+		goto disable;
+	}
+	thread_wakeup((event_t)&hakios_gpu_fence_event);
+	return;
+disable:
+	gic_v3_spi_mask(intid);
+	__atomic_store_n(&gpu_irq_state, 2, __ATOMIC_RELEASE);
+	__atomic_fetch_add(&gpu_irq_unexpected, 1, __ATOMIC_RELAXED);
+	thread_wakeup((event_t)&hakios_gpu_fence_event);
+}
+#endif
+
+bool
+hakios_gpu_irq_active(void)
+{
+	return __atomic_load_n(&gpu_irq_state, __ATOMIC_ACQUIRE) == 1;
+}
+
+static void
+gpu_irq_start(void)
+{
+	uint32_t enabled = 0;
+
+	/* gpu_irq=1: A730 final-fence interrupt and counters; default keeps the old path. */
+	PE_parse_boot_argn("gpu_irq", &enabled, sizeof(enabled));
+	if (!enabled || adreno_soc != 8450) {
+		return;
+	}
+#if defined(GENERIC_GIC_V3_IRQ)
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &gpu_irq_second);
+	gpu_irq_old_mask = rd(gpu.base + GPU_IRQ_MASK);
+	wr(gpu.base + GPU_IRQ_MASK, 0);
+	wr(gpu.base + GPU_IRQ_CLEAR, GPU_IRQ_COMPLETION);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	/* attach enables the GIC line: handler state and device masking must be ready first. */
+	__atomic_store_n(&gpu_irq_state, 1, __ATOMIC_RELEASE);
+	if (gic_v3_spi_attach(GPU_IRQ_INTID, false, gpu_irq_arrived, NULL) != KERN_SUCCESS) {
+		__atomic_store_n(&gpu_irq_state, 0, __ATOMIC_RELEASE);
+		wr(gpu.base + GPU_IRQ_MASK, gpu_irq_old_mask);
+		printf("adreno: GPU completion IRQ attach failed; polling retained\n");
+		return;
+	}
+	gpu_irq_attached = true;
+	wr(gpu.base + GPU_IRQ_MASK, GPU_IRQ_COMPLETION);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	printf("adreno: GPU completion IRQ armed on GIC INTID %u\n", GPU_IRQ_INTID);
+#else
+	printf("adreno: GPU completion IRQ needs GICv3; polling retained\n");
+#endif
+}
+
+/* Panic path: no sleeping, lock acquisition or waiting on a potentially stopped CPU. */
+static void
+gpu_irq_quiesce(void)
+{
+#if defined(GENERIC_GIC_V3_IRQ)
+	if (gpu_irq_attached) {
+		__atomic_store_n(&gpu_irq_state, 0, __ATOMIC_RELEASE);
+		gic_v3_spi_mask(GPU_IRQ_INTID);
+	}
+#endif
+}
+
+/* Thread context, before any GX/GMU teardown: detach drains an in-flight handler. */
+static void
+gpu_irq_stop(void)
+{
+#if defined(GENERIC_GIC_V3_IRQ)
+	if (gpu_irq_attached) {
+		gpu_irq_quiesce();
+		gic_v3_spi_detach(GPU_IRQ_INTID);
+		gpu_irq_attached = false;
+		wr(gpu.base + GPU_IRQ_MASK, gpu_irq_old_mask);
+		wr(gpu.base + GPU_IRQ_CLEAR, GPU_IRQ_COMPLETION);
+		__asm__ volatile ("dsb sy" ::: "memory");
+		thread_wakeup((event_t)&hakios_gpu_fence_event);
+	}
+#endif
+}
+
+/*
  * A run that ends in order -- its time is up, the host asks for the end, five fingers on the
  * screen, a halt: whoever is about to call loader_return() for one of these calls
  * hakios_adreno_stop() first, from a thread that may wait -- gives the GPU back as the steps'
@@ -3547,6 +3706,7 @@ hakios_gpu_stop(void)
 			waited++;
 		}
 		core_stuck = !hakios_gpu_done(gpu_fence);
+		gpu_irq_stop();
 		printf("adreno: the run is about to end: the GPU is given back (%s after %u us)\n",
 		    core_stuck ? "STILL AT WORK" : "it had finished what it was given", 100 * waited);
 		gpu_block_stop();
@@ -3832,7 +3992,8 @@ static void
 ring_fence_a730(uint32_t at, uint32_t fence)
 {
 	ring_command(CP_EVENT_WRITE, 4);
-	ring(EVENT_CACHE_CLEAN | EVENT_WRITE_ENABLED);
+	ring(EVENT_CACHE_CLEAN | EVENT_WRITE_ENABLED |
+	    (at == GPU_FENCE_AT && hakios_gpu_irq_active() ? GPU_EVENT_IRQ : 0));
 	ring(CORE_SCRATCH_ADDRESS + at);
 	ring(0);
 	ring(fence);
@@ -4323,6 +4484,7 @@ hakios_adreno_init(void)
 			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
 			PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
 			gpu_kept = true;
+			gpu_irq_start();
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
 			HakiosGPUStart();
