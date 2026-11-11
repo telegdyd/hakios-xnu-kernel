@@ -3465,6 +3465,52 @@ index 050f34a53c49..c58ff62cd419 100644
  ifneq (,$(wildcard $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)))
  DOCONFDEPS += $(MASTERCONFDIR)/MASTER.$(DOCONF_ARCH_CONFIG_LC).$(CURRENT_MACHINE_CONFIG_LC)
  endif
+diff --git a/pexpert/gen/bootargs.c b/pexpert/gen/bootargs.c
+index c94c0ebe1224..8f41b50cc98f 100644
+--- a/pexpert/gen/bootargs.c
++++ b/pexpert/gen/bootargs.c
+@@ -57,6 +57,17 @@ struct i24 {
+ #define NUM     0
+ #define STR     1
+ 
++/* HakiOS: the device configuration's arguments, built in (tools/hakios-config.py kernel writes the header). One the
++ * command line does not name is taken from here, so a feature is on by default and a word there (gpu_slumber=0)
++ * turns it off. */
++#include "hakios.defaults.h"
++#ifndef HAKIOS_DEFAULT_ARGS
++#define HAKIOS_DEFAULT_ARGS ""
++#endif
++/* "hakios_defaults=" then the words: host tools (make-standalone.py) read a kernel file's defaults from it. */
++static char hakios_default_tagged[] __attribute__((used)) = "hakios_defaults=" HAKIOS_DEFAULT_ARGS;
++#define hakios_default_args (hakios_default_tagged + sizeof("hakios_defaults=") - 1)
++
+ static boolean_t
+ PE_parse_boot_argn_internal(
+ 	char *args,
+@@ -193,7 +204,10 @@ PE_parse_boot_argn(
+ 	void            *arg_ptr,
+ 	int                     max_len)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE);
++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, max_len, FALSE)) {
++		return TRUE;
++	}
++	return PE_parse_boot_argn_internal(hakios_default_args, arg_string, arg_ptr, max_len, FALSE);
+ }
+ 
+ boolean_t
+@@ -202,7 +216,10 @@ PE_parse_boot_arg_str(
+ 	char            *arg_ptr,
+ 	int                     strlen)
+ {
+-	return PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE);
++	if (PE_parse_boot_argn_internal(PE_boot_args(), arg_string, arg_ptr, strlen, TRUE)) {
++		return TRUE;
++	}
++	return PE_parse_boot_argn_internal(hakios_default_args, arg_string, arg_ptr, strlen, TRUE);
+ }
+ 
+ #if defined(CONFIG_XNUPOST)
 diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
 index d9f0723244e5..53fe4f371d7f 100644
 --- a/pexpert/pexpert/arm64/BCM2837.h

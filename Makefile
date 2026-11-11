@@ -43,7 +43,7 @@ SECS ?= 600
 ARGS_OPEN ?= $(shell tools/hakios-config.py args --defconfig defconfig)
 ifneq ($(wildcard .config),)
 # a .config is the kernel's arguments; the runner then does not add its own four (cores, clock, storage): they are in it
-ARGS ?= $(shell tools/hakios-config.py args)
+ARGS ?= $(shell tools/hakios-config.py args --line)
 RUNNER_BASE = BASE_ARGS=
 else
 ARGS ?= touchscreen=1 gpu=1 adsp=1 sound=4 wifi=1 haptic=5 modem=1 modem_again=1 modem_buffer=0xa8000000

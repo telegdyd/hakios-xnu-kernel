@@ -419,6 +419,27 @@ def known_args(root=None):
     return {line.split("\t")[0].strip() for line in open(path, encoding="utf-8") if line.strip()}
 
 
+def arg_layers(root=None):
+    """{argument: layers} from configs/boot-args.lst: k kernel, l loader, u user space (tools/boot-args.py --lst)."""
+    path = os.path.join(root or os.path.dirname(HERE), "configs", "boot-args.lst")
+    if not os.path.isfile(path):
+        return {}
+    out = {}
+    for line in open(path, encoding="utf-8"):
+        f = line.rstrip("\n").split("\t")
+        if len(f) >= 2:
+            out[f[0].strip()] = f[1].strip()
+    return out
+
+
+def command_line(args, root=None):
+    """The words a run still has to carry: the kernel has the configuration's arguments built in
+    (pexpert/gen/hakios.defaults.h, written by `kernel`), so only what the loader or user space reads stays on the line.
+    An argument whose readers are unknown stays too."""
+    layers = arg_layers(root)
+    return [w for w in args if layers.get(w.partition("=")[0], "?") != "k"]
+
+
 def config_dir(root):
     return os.path.join(root, "configs")
 
@@ -560,7 +581,7 @@ def check(config):
         if arg in seen:
             problems.append("CONFIG_BOOTARGS: %s twice" % arg)
         seen.add(arg)
-    length = len(" ".join(args))
+    length = len(" ".join(command_line(args)))     # the rest is built into the kernel
     if length > KERNEL_LINE - RUN_OVERHEAD:
         problems.append("the boot-arguments take %d characters; a run adds about %d of its own and the kernel's command line holds %d: "
                         "the end of it would be lost" % (length, RUN_OVERHEAD, KERNEL_LINE))
@@ -682,13 +703,24 @@ def cmd_args(a):
         for p in problems:
             print("hakios-config: PROBLEM: " + p, file=sys.stderr)
         return 1
+    builtin = set(args)
     try:
         args = override_args(args, a.set, a.root)
     except ConfigError as e:
         print("hakios-config: PROBLEM: %s" % e, file=sys.stderr)
         return 1
+    if a.line:
+        # what a run passes: a kernel-only word the kernel already has built in is left off; a --set one stays
+        line = set(command_line(args, a.root))
+        args = [w for w in args if w in line or w not in builtin]
     print(" ".join(args))
     return 0
+
+
+def defaults_header(args, sources):
+    return ("/* The kernel's built-in boot-arguments: made by tools/hakios-config.py kernel from %s. Not part of the patch.\n"
+            " * PE_parse_boot_argn reads them when the command line does not name the argument: one there\n"
+            " * (gpu_slumber=0) overrides. */\n#define HAKIOS_DEFAULT_ARGS \"%s\"\n" % (sources, " ".join(args)))
 
 
 def override_args(args, sets, root=None):
@@ -1051,6 +1083,9 @@ def cmd_kernel(a):
         changed.append("config/MASTER.hakios")
     if write_if_changed(os.path.join(tree, "bsd", "dev", "hakios.drivers.h"), drivers_header(built, sources)):
         changed.append("bsd/dev/hakios.drivers.h")
+    default_args = check(config)[1] if os.path.isfile(a.config) else []
+    if write_if_changed(os.path.join(tree, "pexpert", "gen", "hakios.defaults.h"), defaults_header(default_args, sources)):
+        changed.append("pexpert/gen/hakios.defaults.h")
     removed = stale_objects(tree) if choice_changed and os.path.isdir(os.path.join(tree, "BUILD", "obj")) else 0
     on = [d.name.lower() for d in DRIVERS if built[d.symbol]]
     off = [d.name.lower() for d in DRIVERS if not built[d.symbol]]
@@ -1090,6 +1125,8 @@ def main():
     p.set_defaults(fn=cmd_merge)
     p = sub.add_parser("args", parents=[common], help="the kernel's boot-arguments")
     p.add_argument("--force", action="store_true", help="print them even if the check finds a problem")
+    p.add_argument("--line", action="store_true",
+                   help="only the words a run's command line carries: the kernel has the rest built in (`kernel`)")
     p.add_argument("--defconfig", help="the arguments of this defconfig (and --fragment) instead of the .config's")
     p.add_argument("--fragment", action="append", default=[], help="a fragment over it; more than one is allowed")
     p.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",

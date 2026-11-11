@@ -1,5 +1,14 @@
 # Changes on negroni-dev
 
+- Built-in boot-argument defaults: `tools/hakios-config.py kernel` writes the `.config`'s arguments to
+  `pexpert/gen/hakios.defaults.h` (generated, not in the patch), and `PE_parse_boot_argn` /
+  `PE_parse_boot_arg_str` read them when the command line does not name the argument. The command line
+  wins, so `gpu_slumber=0` there turns a default off. The kernel carries the string tagged
+  `hakios_defaults=` (read by `make-standalone.py`'s checks). `hakios-config.py args --line` prints only
+  what the loader and user space read; the length check counts that. negroni: 126 characters instead of
+  ~500. `negroni.config` now holds the installed frame, Metal, root-volume and A730 power arguments
+  (`gpu_power_control`, `gpu_ifpc`, `gpu_slumber` on). Installed with `gpu-power-policy`.
+
 - Display sleep (`hakios.backlight.cpp`): the display's `RequestPowerChange` now reaches the backlight.
   Off: DBV 0, then the boot loader's term sequence (DCS 0x28, 21 ms, 0x10, 101 ms): no TE, no frames
   while locked. On: the boot loader's whole 101-packet init sequence (from its panel XML,
