@@ -286,6 +286,7 @@ static TUNABLE(uint32_t, gGPUPresentMode, "fb_gpu", 0);
 #define PRESENT_SLOTS           16             /* submissions of ours the GPU may be at, at most */
 #define PRESENT_SLOT_WORDS      512             /* commands of one; its last 4 words: the GPU's clock at its start and end */
 #define PRESENT_MAPS            6               /* surfaces kept in the GPU's address space */
+#define PRESENT_TARGETS         3               /* memories frames are put into: the panel's, fb_flip's two */
 #define PRESENT_IDLE_MS         1000            /* ... one not shown for so long is let go */
 #define PRESENT_WAIT_MS         200             /* for a slot or a mapping the GPU is still at */
 
@@ -334,7 +335,10 @@ static struct {
 	uint64_t                commandAddress;
 	uint32_t                slotFence[PRESENT_SLOTS];
 	unsigned                next;
-	uint64_t                panelPhys, panelAddress, panelSize;
+	struct {
+		uint64_t        phys, address, size;
+	}                       targets[PRESENT_TARGETS];
+	uint64_t                panelAddress;   /* the present's target (one of targets[]) */
 	IOBufferMemoryDescriptor * staging;     /* the frame scaled, rows of stagingPitch bytes (NULL: scaled onto the panel itself) */
 	uint64_t                stagingAddress;
 	uint32_t                stagingPitch;
@@ -437,37 +441,17 @@ presentUnmap(struct present_map * m)
 	bzero(m, sizeof(*m));
 }
 
-/* With the lock held: the command memory, the panel (and the GPU's own copy of it) in the GPU's address space, once. */
+/* With the lock held: the command memory in the GPU's address space, once. */
 static bool
-presentSetUp(uint64_t panelPhys, uint32_t panelRowBytes, uint32_t panelWidth, uint32_t panelHeight)
+presentSetUp(void)
 {
 	uint64_t chip = 0;
 	uint64_t size = (uint64_t) PRESENT_SLOTS * PRESENT_SLOT_WORDS * 4;
-	uint64_t panelSize = (uint64_t) panelRowBytes * panelHeight;
 
 	if (gPresent.tried) {
-		return gPresent.ready && gPresent.panelPhys == panelPhys && gPresent.panelSize >= panelSize;
+		return gPresent.ready;
 	}
 	gPresent.tried = true;
-	/* rows the 2D engine cannot write one by one: two at a time (see above), from a copy of the GPU's own */
-	if ((panelRowBytes & 63) != 0) {
-		uint64_t stagingSize;
-
-		if ((panelRowBytes & 3) != 0 || ((2 * panelRowBytes) & 63) != 0 || panelRowBytes / 4 + panelWidth > 16384) {
-			IOLog("HakiosGPU: fb_gpu: the panel's rows of %u bytes cannot be written by the 2D engine\n", panelRowBytes);
-			gPresentState = 5;
-			return false;
-		}
-		gPresent.stagingPitch = (panelWidth * 4 + 63) & ~63u;
-		stagingSize = round_page_64((uint64_t) gPresent.stagingPitch * panelHeight);
-		gPresent.staging = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMapWriteCombineCache,
-		    (vm_size_t) stagingSize, PAGE_SIZE);
-		if (gPresent.staging == NULL || (gPresent.stagingAddress = presentMapMemory(gPresent.staging, 0, 0, stagingSize, false)) == 0) {
-			IOLog("HakiosGPU: fb_gpu: no memory for the GPU's copy of the panel (%llu bytes)\n", stagingSize);
-			gPresentState = 3;
-			return false;
-		}
-	}
 	if (!hakios_gpu_parameter(0x03, &chip) || (chip >> 24 & 0xff) != 7) {
 		IOLog("HakiosGPU: fb_gpu: the GPU (chip %#llx) is not an A7XX: the processor puts frames on the panel\n", chip & 0xffffffff);
 		gPresentState = 2;
@@ -481,19 +465,75 @@ presentSetUp(uint64_t panelPhys, uint32_t panelRowBytes, uint32_t panelWidth, ui
 		return false;
 	}
 	gPresent.commandAddress = presentMapMemory(gPresent.commands, 0, 0, size, false);     /* (the GPU writes its times there) */
-	gPresent.panelSize = (panelSize + 4095) & ~4095ull;
-	gPresent.panelAddress = presentMapMemory(NULL, 0, panelPhys, gPresent.panelSize, false);
-	if (gPresent.commandAddress == 0 || gPresent.panelAddress == 0) {
-		IOLog("HakiosGPU: fb_gpu: the commands or the panel's memory (%#llx, %llu bytes) cannot be entered into the GPU's "
-		    "address space\n", panelPhys, panelSize);
+	if (gPresent.commandAddress == 0) {
+		IOLog("HakiosGPU: fb_gpu: the commands cannot be entered into the GPU's address space\n");
 		gPresentState = 4;
 		return false;
 	}
-	gPresent.panelPhys = panelPhys;
 	gPresent.ready = true;
 	gPresentState = 1;
-	IOLog("HakiosGPU: fb_gpu: frames go to the panel by the GPU's 2D engine: the panel's memory %#llx (%llu bytes) at %#llx%s\n",
-	    panelPhys, gPresent.panelSize, gPresent.panelAddress, gPresent.staging ? ", by a copy of the GPU's own with rows of 64-byte units" : "");
+	return true;
+}
+
+/*
+ * With the lock held: memory frames are put into (the panel's, or one of fb_flip's buffers: PANELPHYS, rows of
+ * PANELROWBYTES) in the GPU's address space, once each, and the GPU's own copy of it when its rows are not a multiple of 64
+ * bytes; gPresent.panelAddress is then its GPU address. False when it cannot be.
+ */
+static bool
+presentTarget(uint64_t panelPhys, uint32_t panelRowBytes, uint32_t panelWidth, uint32_t panelHeight)
+{
+	uint64_t panelSize = round_page_64((uint64_t) panelRowBytes * panelHeight);
+	unsigned free = PRESENT_TARGETS;
+
+	for (unsigned i = 0; i < PRESENT_TARGETS; i++) {
+		if (gPresent.targets[i].phys == panelPhys && gPresent.targets[i].size >= panelSize) {
+			gPresent.panelAddress = gPresent.targets[i].address;
+			return true;
+		}
+		free = gPresent.targets[i].phys == 0 && free == PRESENT_TARGETS ? i : free;
+	}
+	if (free == PRESENT_TARGETS) {
+		return false;
+	}
+	/* rows the 2D engine cannot write one by one: two at a time (see above), from a copy of the GPU's own */
+	if ((panelRowBytes & 63) != 0 && gPresent.staging == NULL) {
+		uint64_t stagingSize;
+
+		if ((panelRowBytes & 3) != 0 || ((2 * panelRowBytes) & 63) != 0 || panelRowBytes / 4 + panelWidth > 16384) {
+			IOLog("HakiosGPU: fb_gpu: the panel's rows of %u bytes cannot be written by the 2D engine\n", panelRowBytes);
+			gPresentState = 5;
+			return false;
+		}
+		gPresent.stagingPitch = (panelWidth * 4 + 63) & ~63u;
+		stagingSize = round_page_64((uint64_t) gPresent.stagingPitch * panelHeight);
+		gPresent.staging = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMapWriteCombineCache,
+		    (vm_size_t) stagingSize, PAGE_SIZE);
+		if (gPresent.staging == NULL || (gPresent.stagingAddress = presentMapMemory(gPresent.staging, 0, 0, stagingSize, false)) == 0) {
+			IOLog("HakiosGPU: fb_gpu: no memory for the GPU's copy of the panel (%llu bytes)\n", stagingSize);
+			OSSafeReleaseNULL(gPresent.staging);
+			gPresentState = 3;
+			return false;
+		}
+	}
+	if ((panelRowBytes & 63) != 0 && (gPresent.stagingPitch < panelWidth * 4 ||
+	    (uint64_t) gPresent.stagingPitch * panelHeight > gPresent.staging->getLength())) {
+		return false;
+	}
+	uint64_t address = presentMapMemory(NULL, 0, panelPhys, panelSize, false);
+
+	if (address == 0) {
+		IOLog("HakiosGPU: fb_gpu: the memory at %#llx (%llu bytes) cannot be entered into the GPU's address space\n", panelPhys,
+		    panelSize);
+		gPresentState = 4;
+		return false;
+	}
+	gPresent.targets[free].phys = panelPhys;
+	gPresent.targets[free].size = panelSize;
+	gPresent.targets[free].address = address;
+	gPresent.panelAddress = address;
+	IOLog("HakiosGPU: fb_gpu: frames go to %#llx (%llu bytes, rows of %u) by the GPU's 2D engine, at %#llx%s\n", panelPhys,
+	    panelSize, panelRowBytes, address, (panelRowBytes & 63) ? ", by a copy of the GPU's own with rows of 64-byte units" : "");
 	return true;
 }
 
@@ -648,7 +688,7 @@ MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned c
 		IOLockUnlock(gGPULock);
 		return 0;
 	}
-	if (!presentSetUp(panelPhys, panelRowBytes, panelWidth, panelHeight)) {
+	if (!presentSetUp() || !presentTarget(panelPhys, panelRowBytes, panelWidth, panelHeight)) {
 		IOLockUnlock(gGPULock);
 		return 0;
 	}
@@ -707,8 +747,9 @@ MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned c
 		pm4Reg(&st, R2D_TPL1_SRC_CNTL_A7XX, R2D_TEX_2D);
 	}
 	/* each layer scaled into the GPU's copy of the panel, or into the panel itself when its rows allow */
-	uint64_t target = gPresent.staging != NULL ? gPresent.stagingAddress : gPresent.panelAddress;
-	uint32_t targetPitch = gPresent.staging != NULL ? gPresent.stagingPitch : panelRowBytes;
+	bool staged = (panelRowBytes & 63) != 0;
+	uint64_t target = staged ? gPresent.stagingAddress : gPresent.panelAddress;
+	uint32_t targetPitch = staged ? gPresent.stagingPitch : panelRowBytes;
 
 	for (unsigned i = 0; i < count; i++) {
 		const struct MiniIOSurfacePresentLayer * l = &layers[i];
@@ -719,7 +760,7 @@ MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned c
 	}
 	pm4BlitBarrier(&st);
 	/* ... and from the copy onto the panel, each layer's rectangle, by rows of two */
-	if (gPresent.staging != NULL) {
+	if (staged) {
 		for (unsigned i = 0; i < count; i++) {
 			pm4PanelRows(&st, layers[i].dx, layers[i].dy, layers[i].dw, layers[i].dh, panelRowBytes, panelHeight);
 		}

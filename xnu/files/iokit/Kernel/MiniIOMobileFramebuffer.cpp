@@ -310,6 +310,276 @@ panelInterface(void)
 	return physical != 0 ? ml_io_map((vm_offset_t) (physical & ~0x3fffULL), 0x4000) + (vm_offset_t) (physical & 0x3fffULL) : 0;
 }
 
+/*
+ * Boot-arg fb_mdss=PHYSICAL: the display controller (MDSS) of an SM8450 (waipio) at this address, 0x0ae00000 on the
+ * OnePlus 10 Pro; 0 (the default) for none. Then sysctl kern.hakios.fb_dpu reads its state each time it is asked, for
+ * the DPU flip (GPU-PRESENT-PLAN.md step 4): each source pipe's address, size, crop, stride and format, each CTL's
+ * layers, flush and interfaces, and the DSI interface's (INTF_1) counters, tear check and auto-refresh. Reads only.
+ * The offsets are SM8450's (Linux's dpu_hw_catalog sm8450, the phone's live DT qcom,sde-sspp-off/ctl-off/intf-off);
+ * another SoC's are somebody else's registers.
+ */
+static TUNABLE(uint64_t, gMDSSPhysical, "fb_mdss", 0);
+#define MDSS_WINDOW_FIRST       0x04000                 /* what is mapped of it: the pipes, the CTLs, INTF_1 */
+#define MDSS_WINDOW_END         0x38000
+#define MDSS_INTF1              0x36000                 /* the DSI interface the panel is on */
+#define SSPP_SRC_SIZE           0x00
+#define SSPP_SRC_XY             0x08
+#define SSPP_OUT_SIZE           0x0c
+#define SSPP_OUT_XY             0x10
+#define SSPP_SRC0_ADDR          0x14
+#define SSPP_SRC_YSTRIDE0       0x24
+#define SSPP_SRC_FORMAT         0x30
+#define SSPP_SRC_UNPACK         0x34
+#define SSPP_SRC_OP_MODE        0x38
+#define CTL_LAYER0              0x00                    /* LM0..LM4 at 0x00..0x10, LM5 at 0x24 */
+#define CTL_TOP                 0x14
+#define CTL_FLUSH               0x18
+#define CTL_START               0x1c
+#define CTL_INTF_ACTIVE         0xf4
+#define CTL_FETCH_PIPE_ACTIVE   0xfc
+#define INTF_STATUS             0x26c
+#define INTF_TEAR_TEAR_CHECK_EN 0x284
+#define INTF_TEAR_SYNC_CONFIG_VSYNC 0x288
+#define INTF_TEAR_SYNC_CONFIG_HEIGHT 0x28c
+#define INTF_TEAR_INT_COUNT_VAL 0x298                   /* frame count << 16 | line */
+#define INTF_TEAR_START_POS     0x2a0
+#define INTF_TEAR_RD_PTR_IRQ    0x2a4
+#define INTF_TEAR_LINE_COUNT    0x2b0
+#define INTF_TEAR_AUTOREFRESH_CONFIG 0x2b4              /* bit 31 on, [15:0] frames per refresh */
+static const struct {
+	const char *    name;
+	uint32_t        offset;
+	uint8_t         flush;                          /* its bit in CTL_FLUSH (Linux's sde_hw_ctl.c sspp table) */
+} kSM8450Pipes[] = {
+	{ "VIG0", 0x05000, 0 }, { "VIG1", 0x07000, 1 }, { "VIG2", 0x09000, 2 }, { "VIG3", 0x0b000, 18 },
+	{ "DMA0", 0x25000, 11 }, { "DMA1", 0x27000, 12 }, { "DMA2", 0x29000, 24 }, { "DMA3", 0x2b000, 25 },
+};
+static const uint32_t kSM8450CTLs[] = { 0x16000, 0x17000, 0x18000, 0x19000, 0x1a000, 0x1b000 };
+static vm_offset_t gMDSS;                       /* where MDSS_WINDOW_FIRST is mapped (0: not yet) */
+
+static inline uint32_t
+mdssRead(uint32_t offset)
+{
+	return *(volatile uint32_t *)(gMDSS + offset - MDSS_WINDOW_FIRST);
+}
+
+/* the registers mapped, once (false: no fb_mdss) */
+static bool
+mdssMapped(void)
+{
+	if (gMDSSPhysical == 0 || (gMDSSPhysical & 0x3fffULL) != 0) {
+		return false;
+	}
+	if (gMDSS == 0) {
+		vm_offset_t mapped = ml_io_map((vm_offset_t) gMDSSPhysical + MDSS_WINDOW_FIRST, MDSS_WINDOW_END - MDSS_WINDOW_FIRST);
+
+		/* (mapped by another caller meanwhile: this mapping stays unused; rare, and small) */
+		__sync_bool_compare_and_swap(&gMDSS, 0, mapped);
+	}
+	return true;
+}
+
+static int
+sysctl_fb_dpu SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	const size_t size = 4096;
+	char *text;
+	size_t used = 0;
+	uint32_t frames, lines[12], tears[12];
+	int error;
+
+	if (!mdssMapped()) {
+		return SYSCTL_OUT(req, "fb_mdss not given\n", 19);
+	}
+	text = (char *) IOMalloc(size);
+	if (text == NULL) {
+		return ENOMEM;
+	}
+#define SAY(...) (used += (size_t) snprintf(text + used, used < size ? size - used : 0, __VA_ARGS__), used = used < size ? used : size)
+	for (unsigned p = 0; p < sizeof(kSM8450Pipes) / sizeof(kSM8450Pipes[0]); p++) {
+		uint32_t b = kSM8450Pipes[p].offset;
+		SAY("%s addr %#x size %#x xy %#x out %#x at %#x stride %#x format %#x unpack %#x op %#x (flush bit %u)\n",
+		    kSM8450Pipes[p].name, mdssRead(b + SSPP_SRC0_ADDR), mdssRead(b + SSPP_SRC_SIZE), mdssRead(b + SSPP_SRC_XY),
+		    mdssRead(b + SSPP_OUT_SIZE), mdssRead(b + SSPP_OUT_XY), mdssRead(b + SSPP_SRC_YSTRIDE0),
+		    mdssRead(b + SSPP_SRC_FORMAT), mdssRead(b + SSPP_SRC_UNPACK), mdssRead(b + SSPP_SRC_OP_MODE),
+		    kSM8450Pipes[p].flush);
+	}
+	for (unsigned c = 0; c < sizeof(kSM8450CTLs) / sizeof(kSM8450CTLs[0]); c++) {
+		uint32_t b = kSM8450CTLs[c];
+		SAY("CTL%u layers %#x %#x %#x %#x %#x %#x top %#x flush %#x start %#x intf %#x fetch %#x\n", c,
+		    mdssRead(b + CTL_LAYER0), mdssRead(b + CTL_LAYER0 + 4), mdssRead(b + CTL_LAYER0 + 8),
+		    mdssRead(b + CTL_LAYER0 + 12), mdssRead(b + CTL_LAYER0 + 16), mdssRead(b + 0x24), mdssRead(b + CTL_TOP),
+		    mdssRead(b + CTL_FLUSH), mdssRead(b + CTL_START), mdssRead(b + CTL_INTF_ACTIVE),
+		    mdssRead(b + CTL_FETCH_PIPE_ACTIVE));
+	}
+	uint32_t i = MDSS_INTF1;
+	SAY("INTF1 timing %#x status %#x tearcheck %#x vsync %#x height %#x start %#x rdptr %#x autorefresh %#x\n",
+	    mdssRead(i + INTF_TIMING_ENGINE_EN), mdssRead(i + INTF_STATUS), mdssRead(i + INTF_TEAR_TEAR_CHECK_EN),
+	    mdssRead(i + INTF_TEAR_SYNC_CONFIG_VSYNC), mdssRead(i + INTF_TEAR_SYNC_CONFIG_HEIGHT),
+	    mdssRead(i + INTF_TEAR_START_POS), mdssRead(i + INTF_TEAR_RD_PTR_IRQ), mdssRead(i + INTF_TEAR_AUTOREFRESH_CONFIG));
+	/* the counters, every 700 us for about one refresh at 120 Hz; then how many frames in 100 ms */
+	for (unsigned s = 0; s < 12; s++) {
+		lines[s] = mdssRead(i + INTF_LINE_COUNT);
+		tears[s] = mdssRead(i + INTF_TEAR_INT_COUNT_VAL);
+		IODelay(700);
+	}
+	SAY("INTF1 line_count");
+	for (unsigned s = 0; s < 12; s++) {
+		SAY(" %u", lines[s]);
+	}
+	SAY("\nINTF1 tear frame:line");
+	for (unsigned s = 0; s < 12; s++) {
+		SAY(" %u:%u", tears[s] >> 16, tears[s] & 0xffff);
+	}
+	frames = mdssRead(i + INTF_FRAME_COUNT);
+	uint32_t tear = mdssRead(i + INTF_TEAR_INT_COUNT_VAL) >> 16;
+	IOSleep(100);
+	SAY("\nINTF1 in 100 ms: frame_count +%u, tear frames +%u, tear line_count %u\n", mdssRead(i + INTF_FRAME_COUNT) - frames,
+	    ((mdssRead(i + INTF_TEAR_INT_COUNT_VAL) >> 16) - tear) & 0xffff, mdssRead(i + INTF_TEAR_LINE_COUNT));
+#undef SAY
+	error = SYSCTL_OUT(req, text, used);
+	IOFree(text, size);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, fb_dpu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_fb_dpu, "A",
+    "fb_mdss: the display controller's state, read now");
+
+static inline void
+mdssWrite(uint32_t offset, uint32_t value)
+{
+	*(volatile uint32_t *)(gMDSS + offset - MDSS_WINDOW_FIRST) = value;
+}
+
+/*
+ * Boot-arg fb_smmu=PHYSICAL: the SMMU the display controller fetches through (SM8450's apps SMMU, 0x15000000: the live
+ * DT's apps-smmu, qcom,handoff-smrs <0x2800 0x402>, the stream the boot loader handed over). Then sysctl
+ * kern.hakios.fb_smmu reads, now, the stream matches that take stream 0x2800, what each does with it, and for a context
+ * bank that translates, where its tables put the panel's memory and the memory after it (where fb_flip's buffers are):
+ * whether the controller may read there. Reads only (SMMUv2's registers: SMR 0x800, S2CR 0xc00, IDR0/IDR1; a context
+ * bank's SCTLR, TTBR0, TCR).
+ */
+static TUNABLE(uint64_t, gSMMUPhysical, "fb_smmu", 0);
+#define DISPLAY_STREAM          0x2800
+extern "C" unsigned long long ml_phys_read_double_64(addr64_t paddr64);
+
+static int
+sysctl_fb_smmu SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	static vm_offset_t global;
+	const size_t size = 4096;
+	char *text;
+	size_t used = 0;
+	int error;
+
+	if (gSMMUPhysical == 0 || (gSMMUPhysical & 0x3fffULL) != 0 || gPanelPhys == 0) {
+		return SYSCTL_OUT(req, "fb_smmu not given\n", 19);
+	}
+	if (global == 0) {
+		global = ml_io_map((vm_offset_t) gSMMUPhysical, 0x4000);
+	}
+	text = (char *) IOMalloc(size);
+	if (text == NULL) {
+		return ENOMEM;
+	}
+#define SAY(...) (used += (size_t) snprintf(text + used, used < size ? size - used : 0, __VA_ARGS__), used = used < size ? used : size)
+	volatile uint32_t * g = (volatile uint32_t *) global;
+	uint32_t cr0 = g[0], idr0 = g[0x20 / 4], idr1 = g[0x24 / 4], smrs = idr0 & 0xff;
+	uint32_t pageSize = (idr1 >> 31) ? 0x10000 : 0x1000, pages = 1u << (((idr1 >> 28) & 7) + 1);
+
+	SAY("sCR0 %#x IDR0 %#x IDR1 %#x: %u stream matches, context banks from +%#x, %#x apart\n", cr0, idr0, idr1, smrs,
+	    pages * pageSize, pageSize);
+	for (uint32_t n = 0; n < smrs && n < 128; n++) {
+		uint32_t smr = g[(0x800 + 4 * n) / 4], s2cr = g[(0xc00 + 4 * n) / 4];
+		uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
+
+		if (!(smr & 0x80000000u) || ((id ^ DISPLAY_STREAM) & ~mask & 0x7fff) != 0) {
+			continue;
+		}
+		uint32_t type = (s2cr >> 16) & 3, bank = s2cr & 0xff;
+
+		SAY("SMR%u %#x (stream %#x mask %#x) S2CR %#x: %s", n, smr, id, mask, s2cr,
+		    type == 0 ? "translated" : type == 1 ? "BYPASS" : "FAULT");
+		if (type != 0) {
+			SAY("\n");
+			continue;
+		}
+		uint64_t cbPhys = gSMMUPhysical + (uint64_t) pages * pageSize + (uint64_t) bank * pageSize;
+		vm_offset_t cb = ml_io_map((vm_offset_t) (cbPhys & ~0x3fffULL), 0x4000) + (vm_offset_t) (cbPhys & 0x3fffULL);
+		volatile uint32_t * c = (volatile uint32_t *) cb;
+		uint32_t sctlr = c[0], tcr = c[0x30 / 4];
+		uint64_t ttbr0 = (uint64_t) c[0x20 / 4] | (uint64_t) c[0x24 / 4] << 32;
+
+		SAY(" by bank %u: SCTLR %#x TCR %#x TTBR0 %#llx\n", bank, sctlr, tcr, ttbr0);
+		if (!(sctlr & 1)) {
+			SAY("  (the bank's translation is off)\n");
+			continue;
+		}
+		/* the tables, 4 KB granule (TG0 0), from the level T0SZ starts at */
+		uint32_t t0sz = tcr & 0x3f, bits = 64 - t0sz;
+		int level = bits > 39 ? 0 : bits > 30 ? 1 : 2;
+		if (((tcr >> 14) & 3) != 0) {
+			SAY("  (not a 4 KB granule: not walked)\n");
+			continue;
+		}
+		const uint64_t probes[] = { gPanelPhys, gPanelPhys + 0x9f0000, gPanelPhys + 0xa00000, gPanelPhys + 0x1404000,
+			                    gPanelPhys + 0x1e04000, gPanelPhys + 0x2afc000 };
+		for (unsigned k = 0; k < sizeof(probes) / sizeof(probes[0]); k++) {
+			uint64_t va = probes[k], table = ttbr0 & 0x0000fffffffff000ULL, d = 0;
+			int l;
+
+			for (l = level; l <= 3; l++) {
+				d = ml_phys_read_double_64((addr64_t) (table + ((va >> (39 - 9 * l)) & 0x1ff) * 8));
+				if ((d & 1) == 0 || l == 3 || (d & 3) == 1) {
+					break;
+				}
+				table = d & 0x0000fffffffff000ULL;
+			}
+			if ((d & 1) == 0 || (l == 3 && (d & 3) != 3)) {
+				SAY("  %#llx: not mapped (level %d, %#llx)\n", va, l, d);
+			} else {
+				uint64_t span = 1ULL << (39 - 9 * l), out = (d & 0x0000fffffffff000ULL & ~(span - 1)) | (va & (span - 1));
+
+				SAY("  %#llx: at %#llx (level %d, %#llx)\n", va, out, l, d);
+			}
+		}
+	}
+#undef SAY
+	error = SYSCTL_OUT(req, text, used);
+	IOFree(text, size);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, fb_smmu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_fb_smmu, "A",
+    "fb_smmu: how the display controller's stream is translated, read now");
+
+/*
+ * Boot-arg fb_flip=1 (or sysctl kern.hakios.fb_flip=1 at any time; 0 back): with fb_gpu=1 and fb_mdss, frames go into two
+ * buffers of the panel's size after the panel's own memory, in turn, and the display controller is pointed at the one
+ * written once the GPU is done with it (both of its pipes' source address and stride, then CTL0's flush): it takes the
+ * new address when it starts its next frame, so it never reads a buffer being written, and their rows (4352 bytes, a
+ * multiple of 64) the 2D engine writes as they are, with no copy of the GPU's own. The buffer it showed is written again
+ * only once the flush is seen taken. A frame the GPU cannot take, or that does not cover the whole panel, goes into
+ * the panel's own memory as before, and the controller back to it. If a flush is not taken in 100 ms, the controller
+ * goes back to the panel's memory and fb_flip is off. GPU-PRESENT-PLAN.md step 4.
+ */
+static TUNABLE_WRITEABLE(uint32_t, gFlip, "fb_flip", 0);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_flip, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlip, 0, "fb_flip: frames shown by flipping between two buffers");
+#define FLIP_SPLASH             0x2b00000               /* SM8450: the boot loader's display memory (live DT cont_splash_region) */
+#define FLIP_SPLASH_KEEP        0x4000                  /* ... the end of it is the boot loader's DSI command buffer */
+#define FLIP_CTL                0                       /* CTL0, which drives INTF_1 (kern.hakios.fb_dpu) */
+#define FLIP_TAKEN_MS           100
+#define FLIP_TIMED              16                      /* the first so many flips are timed to when they are taken */
+static uint32_t gFlipState;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_flip_state, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipState, 0,
+    "fb_flip: 0 not tried, 1 ready, 2 no fb_mdss, 3 the controller not as expected, 4 no room, 5 not mapped, 6 a flush not taken");
+/* the scan position: the tear check's read pointer, from INTF_TEAR_START_POS at the TE on */
+static inline uint32_t
+flipLine(void)
+{
+	return mdssRead(MDSS_INTF1 + INTF_TEAR_INT_COUNT_VAL) & 0xffff;
+}
+
 static void
 measurePanel(__unused void * arg, __unused wait_result_t wr)
 {
@@ -384,6 +654,26 @@ public:
 	struct MiniIOSurfacePresentLayer fGPUFirst;     /* the last such frame's first layer, and how many it had */
 	unsigned        fGPULayers;
 	uint64_t        fStatCPUTime;           /* (mach_absolute_time, summed over the threads, settle()'s redraws included) */
+	uint8_t *       fGPUBase;               /* where the GPU put the last such frame (the panel or an fb_flip buffer), for the check */
+	uint32_t        fGPURowBytes;
+	/* fb_flip (GPU-PRESENT-PLAN.md step 4) */
+	uint64_t        fFlipPhys[2];
+	IOMemoryDescriptor * fFlipMemory[2];
+	IOMemoryMap *   fFlipMap[2];
+	uint8_t *       fFlipBase[2];
+	uint32_t        fFlipRowBytes;
+	int             fFlipShown;             /* the buffer the controller is pointed at: 0, 1; -1 the panel's own memory */
+	bool            fFlipTried;
+	bool            fFlipPending;           /* a flush written, not seen taken yet */
+	unsigned        fFlipPipeCount;
+	uint32_t        fFlipPipe[2];           /* the pipes that fetch the panel (their registers' offsets) */
+	uint32_t        fFlipHomeStride[2];
+	uint32_t        fFlipFlush;             /* their bits and the CTL's in CTL_FLUSH */
+	uint64_t        fFlipWritten;
+	uint32_t        fFlipWrittenLine;
+	uint32_t        fFlipCount;
+	uint32_t        fStatFlips, fStatFlipsHome, fStatFlipWaited, fStatFlipNotFull;
+	uint64_t        fStatFlipWait;
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
 	MiniIOSurface * fDefaultSurface;
@@ -467,7 +757,11 @@ public:
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
-	bool showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces);
+	bool showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, int * target);
+	bool flipSetUp(void);
+	bool flipTaken(uint32_t milliseconds);
+	void flipTo(int buffer);
+	void flipOff(const char * why);
 	void checkOnGPU(void);
 	void panelForProcessor(void);
 	void settle(const uint8_t * swap, MiniIOSurface ** surfaces);
@@ -1495,8 +1789,9 @@ IOMobileFramebuffer::settle(const uint8_t * swap, MiniIOSurface ** surfaces)
  * no submission has named (drawn == 0) is one the processor drew: what it wrote may be in its cache yet, not in memory.
  */
 bool
-IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces)
+IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, int * target)
 {
+	bool full = false;
 	struct MiniIOSurfacePresentLayer layers[SWAP_LAYERS];
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	unsigned count = 0;
@@ -1569,18 +1864,29 @@ IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces)
 		layers[count].dy = (uint32_t) qy0;
 		layers[count].dw = (uint32_t) (qx1 - qx0);
 		layers[count].dh = (uint32_t) (qy1 - qy0);
+		full = full || (qx0 == 0 && qy0 == 0 && qx1 == fPanelWidth && qy1 == fPanelHeight);
 		count++;
 	}
 	if (count == 0) {
 		fStatRefused[kRefusedNothing]++;
 		return false;
 	}
-	fence = MiniIOSurfacePresent(layers, count, fPanelPhys, fRowBytes, fPanelWidth, fPanelHeight);
+	/* (fb_flip: a frame into a buffer of its own only when it covers all of it; what was there is two frames old) */
+	if (*target >= 0 && !full) {
+		*target = -1;
+		fStatFlipNotFull++;
+	}
+	uint64_t phys = *target >= 0 ? fFlipPhys[*target] : fPanelPhys;
+	uint32_t rowBytes = *target >= 0 ? fFlipRowBytes : fRowBytes;
+
+	fence = MiniIOSurfacePresent(layers, count, phys, rowBytes, fPanelWidth, fPanelHeight);
 	if (fence == 0) {
 		fStatRefused[kRefusedByGPU]++;
 		return false;
 	}
 	gLastPresent = fence;
+	fGPUBase = *target >= 0 ? fFlipBase[*target] : fBase;
+	fGPURowBytes = rowBytes;
 	fGPUFirst = layers[0];
 	fGPULayers = count;
 	fGPUFrames++;
@@ -1612,7 +1918,7 @@ IOMobileFramebuffer::checkOnGPU(void)
 		uint32_t c1 = c0 + 1 < l->sw ? c0 + 1 : c0, r1 = r0 + 1 < l->sh ? r0 + 1 : r0;
 		const uint8_t * upper = s->pixels() + (size_t) (l->sy + r0) * s->info.bytesPerRow + (size_t) l->sx * 4;
 		const uint8_t * lower = s->pixels() + (size_t) (l->sy + r1) * s->info.bytesPerRow + (size_t) l->sx * 4;
-		uint32_t * panel = (uint32_t *) (fBase + (size_t) y * fRowBytes) + x;
+		uint32_t * panel = (uint32_t *) (fGPUBase + (size_t) y * fGPURowBytes) + x;
 
 		/* (what the processor's cache may hold of either is older than memory, where the GPU read and wrote) */
 		flush_dcache64((addr64_t) (uintptr_t) (upper + c0 * 4), 8, FALSE);
@@ -1647,6 +1953,150 @@ IOMobileFramebuffer::checkOnGPU(void)
 	    "pixels %u within 4 of the processors' bilinear, %u within 32, %u further; the worst %u at %u,%u (%#x, the "
 	    "processors' %#x)\n", fGPUFrames, s->sid, l->sw, l->sh, l->sx, l->sy, l->dw, l->dh, l->dx, l->dy, close, near, far,
 	    worst, wx, wy, got, expect);
+}
+
+/*
+ * fb_flip: the controller as the boot loader left it (kern.hakios.fb_dpu: VIG0 and VIG1 fetch the panel's memory, its
+ * left and right half, for CTL0 and INTF_1), and two buffers after the panel's memory in the boot loader's display memory.
+ */
+bool
+IOMobileFramebuffer::flipSetUp(void)
+{
+	uint32_t ctl = kSM8450CTLs[FLIP_CTL];
+	uint64_t size, first;
+
+	fFlipTried = true;
+	fFlipShown = -1;
+	if (!mdssMapped()) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: no display controller (fb_mdss=): off\n");
+		gFlipState = 2;
+		return false;
+	}
+	fFlipFlush = 1u << 17;
+	for (unsigned p = 0; p < sizeof(kSM8450Pipes) / sizeof(kSM8450Pipes[0]); p++) {
+		uint32_t b = kSM8450Pipes[p].offset;
+
+		if (mdssRead(b + SSPP_SRC0_ADDR) != (uint32_t) fPanelPhys || fFlipPipeCount == 2) {
+			continue;
+		}
+		fFlipHomeStride[fFlipPipeCount] = mdssRead(b + SSPP_SRC_YSTRIDE0);
+		fFlipPipe[fFlipPipeCount++] = b;
+		fFlipFlush |= 1u << kSM8450Pipes[p].flush;
+	}
+	if (fFlipPipeCount == 0 || (fPanelPhys >> 32) != 0 || (fFlipHomeStride[0] & 0xffff) != fRowBytes ||
+	    !(mdssRead(ctl + CTL_INTF_ACTIVE) & 2) || mdssRead(ctl + CTL_FLUSH) != 0 ||
+	    !(mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH_CONFIG) & 0x80000000u)) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: the controller is not as expected (%u pipes at %#llx, stride %#x; CTL%u "
+		    "interfaces %#x flush %#x; auto-refresh %#x): off\n", fFlipPipeCount, fPanelPhys, fFlipHomeStride[0], FLIP_CTL,
+		    mdssRead(ctl + CTL_INTF_ACTIVE), mdssRead(ctl + CTL_FLUSH), mdssRead(MDSS_INTF1 + INTF_TEAR_AUTOREFRESH_CONFIG));
+		gFlipState = 3;
+		return false;
+	}
+	fFlipRowBytes = (fPanelWidth * 4 + 63) & ~63u;
+	size = round_page_64((uint64_t) fFlipRowBytes * fPanelHeight);
+	first = (fPanelPhys + (uint64_t) fRowBytes * fPanelHeight + 0xfffff) & ~0xfffffULL;
+	if (first + 2 * size > fPanelPhys + FLIP_SPLASH - FLIP_SPLASH_KEEP) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: no room for two buffers of %llu bytes after the panel's memory: off\n", size);
+		gFlipState = 4;
+		return false;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		fFlipPhys[i] = first + i * size;
+		fFlipMemory[i] = IOMemoryDescriptor::withAddressRange(fFlipPhys[i], size, kIODirectionInOut | kIOMemoryMapperNone, NULL);
+		fFlipMap[i] = fFlipMemory[i] != NULL ? fFlipMemory[i]->createMappingInTask(kernel_task, 0,
+		    kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
+		if (fFlipMap[i] == NULL) {
+			IOLog("MiniIOMobileFramebuffer: fb_flip: the buffer at %#llx cannot be mapped: off\n", fFlipPhys[i]);
+			gFlipState = 5;
+			return false;
+		}
+		fFlipBase[i] = (uint8_t *) fFlipMap[i]->getVirtualAddress();
+	}
+	gFlipState = 1;
+	IOLog("MiniIOMobileFramebuffer: fb_flip: frames into %#llx and %#llx (rows of %u bytes) in turn; %u pipes, CTL%u flush "
+	    "bits %#x\n", fFlipPhys[0], fFlipPhys[1], fFlipRowBytes, fFlipPipeCount, FLIP_CTL, fFlipFlush);
+	return true;
+}
+
+/* Whether the last flush has been taken, waiting so long at most. */
+bool
+IOMobileFramebuffer::flipTaken(uint32_t milliseconds)
+{
+	uint32_t ctl = kSM8450CTLs[FLIP_CTL];
+	uint64_t began = mach_absolute_time(), until;
+	bool waited = false;
+
+	if (!fFlipPending) {
+		return true;
+	}
+	nanoseconds_to_absolutetime((uint64_t) milliseconds * NSEC_PER_MSEC, &until);
+	until += began;
+	while ((mdssRead(ctl + CTL_FLUSH) & fFlipFlush) != 0) {
+		if (mach_absolute_time() >= until) {
+			return false;
+		}
+		waited = true;
+		IODelay(20);
+	}
+	if (waited) {
+		fStatFlipWaited++;
+		fStatFlipWait += mach_absolute_time() - began;
+	}
+	fFlipPending = false;
+	return true;
+}
+
+/* The controller pointed at a buffer (-1: the panel's own memory), taken when it starts its next frame. */
+void
+IOMobileFramebuffer::flipTo(int buffer)
+{
+	uint32_t ctl = kSM8450CTLs[FLIP_CTL];
+	uint64_t phys = buffer >= 0 ? fFlipPhys[buffer] : fPanelPhys;
+	uint32_t stride = buffer >= 0 ? fFlipRowBytes : fRowBytes;
+
+	for (unsigned i = 0; i < fFlipPipeCount; i++) {
+		mdssWrite(fFlipPipe[i] + SSPP_SRC0_ADDR, (uint32_t) phys);
+		mdssWrite(fFlipPipe[i] + SSPP_SRC_YSTRIDE0, (fFlipHomeStride[i] & 0xffff0000u) | stride);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	mdssWrite(ctl + CTL_FLUSH, fFlipFlush);
+	fFlipWritten = mach_absolute_time();
+	fFlipWrittenLine = flipLine();
+	fFlipShown = buffer;
+	fFlipPending = true;
+	fFlipCount++;
+	fStatFlips++;
+	fStatFlipsHome += buffer < 0;
+	if (fFlipCount <= FLIP_TIMED) {
+		/* the first ones: when the flush is taken, and where the scan is then (a frame's start: at INTF_TEAR_START_POS) */
+		uint64_t took, until;
+		uint32_t line;
+		bool taken;
+
+		nanoseconds_to_absolutetime((uint64_t) FLIP_TAKEN_MS * NSEC_PER_MSEC, &until);
+		until += fFlipWritten;
+		while ((mdssRead(ctl + CTL_FLUSH) & fFlipFlush) != 0 && mach_absolute_time() < until) {
+		}
+		took = mach_absolute_time();
+		line = flipLine();
+		taken = (mdssRead(ctl + CTL_FLUSH) & fFlipFlush) == 0;
+		IOLog("MiniIOMobileFramebuffer: fb_flip: flip %u to %d (%#llx): written at line %u, %s after %llu us at line %u "
+		    "(start %u)\n", fFlipCount, buffer, phys, fFlipWrittenLine, taken ? "taken" : "NOT taken",
+		    micros(took - fFlipWritten), line, mdssRead(MDSS_INTF1 + INTF_TEAR_START_POS));
+		fFlipPending = !taken;
+	}
+}
+
+/* fb_flip off: the controller back at the panel's own memory. */
+void
+IOMobileFramebuffer::flipOff(const char * why)
+{
+	IOLog("MiniIOMobileFramebuffer: fb_flip: off: %s (CTL%u flush %#x, line %u, %u flips)\n", why, FLIP_CTL,
+	    mdssRead(kSM8450CTLs[FLIP_CTL] + CTL_FLUSH), flipLine(), fFlipCount);
+	gFlip = 0;
+	gFlipState = 6;
+	flipTo(-1);
+	fFlipPending = false;
 }
 
 /* Before the processors write the panel: the GPU done with what it was given to write there (it would write over them). */
@@ -1720,8 +2170,18 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 * fb_gpu: the frame into the GPU's ring before the swap after it is taken (and with it, CoreAnimation's leave to draw
 	 * into this frame's surfaces again): whatever it draws there next is behind this in the ring.
 	 */
+	int target = -1;
+
+	if (gGPUPresent && gFlip && fPanelPhys != 0 && (fFlipTried ? gFlipState == 1 : flipSetUp())) {
+		/* the buffer not shown, once the controller has left it */
+		if (fFlipPending && !flipTaken(FLIP_TAKEN_MS)) {
+			flipOff("a flush not taken in 100 ms");
+		} else {
+			target = fFlipShown == 0 ? 1 : 0;
+		}
+	}
 	if (gGPUPresent) {
-		onGPU = showOnGPU(swap, surfaces);
+		onGPU = showOnGPU(swap, surfaces, &target);
 	}
 	if (!onGPU) {
 		panelForProcessor();
@@ -1742,6 +2202,17 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fSwapsWaiting--;
 	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 	IOLockUnlock(fSwapLock);
+	/*
+	 * fb_flip: the controller pointed at the buffer once the GPU is done (or back at the panel's own memory). After the
+	 * swap is handed on: CoreAnimation draws the next frame meanwhile (behind this one in the GPU's ring).
+	 */
+	if (onGPU && fFlipTried && target != fFlipShown) {
+		if (MiniIOSurfacePresentDone(gLastPresent, FLIP_TAKEN_MS)) {
+			flipTo(target);
+		} else {
+			flipOff("the GPU not done with a frame in 100 ms");
+		}
+	}
 	IOLockLock(fLock);
 	if (fLastFrame != 0) {
 		absolutetime_to_nanoseconds(began - fLastFrame, &nanos);
@@ -1811,6 +2282,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
+	if (!onGPU && fFlipTried && fFlipShown >= 0) {
+		flipTo(-1);             /* (drawn into the panel's own memory by the processors) */
+	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
@@ -1870,6 +2344,14 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			    fStatRefused[kRefusedNotGPUDrawn], fStatRefused[kRefusedNothing], fStatRefused[kRefusedByGPU]);
 			fStatCPUFrames = fStatGPUFrames = 0;
 			bzero(fStatRefused, sizeof(fStatRefused));
+			if (fFlipTried && (gFlipState == 1 || fStatFlips != 0)) {
+				IOLog("MiniIOMobileFramebuffer: fb_flip: %u flips (%u back to the panel's memory), %u frames not covering the "
+				    "panel; %u waited for the last flush to be taken, %llu us each; shown now %d\n", fStatFlips,
+				    fStatFlipsHome, fStatFlipNotFull, fStatFlipWaited,
+				    fStatFlipWaited ? micros(fStatFlipWait) / fStatFlipWaited : 0, fFlipShown);
+				fStatFlips = fStatFlipsHome = fStatFlipNotFull = fStatFlipWaited = 0;
+				fStatFlipWait = 0;
+			}
 		}
 		if (fBeamIntf != 0) {
 			char shares[8 * 24] = "";

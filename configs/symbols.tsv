@@ -98,12 +98,15 @@ FB_CA_HZ	arg	fb_ca_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	the refresh 
 FB_COPY_GUARD	arg	fb_copy_guard	GPU and display	k	hakios.gpu.cpp	
 FB_DIFF	arg	fb_diff	GPU and display	k	MiniIOMobileFramebuffer.cpp	which pixels of the panel each frame changed (it costs: the panel's memory is slow to read)
 FB_FILTER	arg	fb_filter	GPU and display	k	MiniIOMobileFramebuffer.cpp	the picture is scaled to the panel nearest neighbour, as it once was
+FB_FLIP	arg	fb_flip	GPU and display	k	MiniIOMobileFramebuffer.cpp	the controller pointed at the buffer once the GPU is done (or back at the panel's own memory)
 FB_GPU	arg	fb_gpu	GPU and display	k	MiniIOMobileFramebuffer.cpp,hakios.gpu.cpp	the frame's layers onto the panel by the GPU, all of them or none (then the processors draw it, show())
 FB_HZ	arg	fb_hz	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_INTF	arg	fb_intf	GPU and display	k	MiniIOMobileFramebuffer.cpp	the registers of the display interface the panel is on, for a port
+FB_MDSS	arg	fb_mdss	GPU and display	k	MiniIOMobileFramebuffer.cpp	the display controller (MDSS) of an SM8450 (waipio) at this address, 0x0ae00000 on the OnePlus 10 Pro; 0 (the default) for none
 FB_MEASURE	arg	fb_measure	GPU and display	k	MiniIOMobileFramebuffer.cpp	how often the panel is really refreshed
 FB_PRI	arg	fb_pri	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_QUEUE	arg	fb_queue	GPU and display	k	MiniIOMobileFramebuffer.cpp	
+FB_SMMU	arg	fb_smmu	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FB_THREADS	arg	fb_threads	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FBHEIGHT	arg	fbheight	GPU and display	k	MiniIOMobileFramebuffer.cpp	
 FBSCALE	arg	fbscale	GPU and display	k	MiniIOMobileFramebuffer.cpp	the same 375 x 812 points drawn at two pixels a point instead of three
