@@ -2724,7 +2724,8 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
  * answer, or 2, a notice; an opcode) and its words; a property is asked for with opcode 0x30 (the
  * battery's) or 0x32 (the USB port's), the battery's number (0), the property's number and a word
  * that a get does not use, and is answered with the property's number, its value and a result (0:
- * good). Only gets are sent from here: nothing is set, no limit, no current, no notice asked for.
+ * good). Mostly gets: on the 10 Pro the port is set to sink only and the charger's input limit is raised for a
+ * charger (battmgr_charge()); no notice is asked for.
  * With adsp=1 (battmgr=0: not) it is asked every BATTMGR_SECONDS while the DSP runs, and what it says
  * goes to drivers/power/hakios.battery.c (hakios_battery_report()), and from there to the power source
  * that Darwin reads (drivers/power/hakios.battery.cpp). battmgr=2: every property once, for the log.
@@ -2740,6 +2741,7 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 #define BATTMGR_REQUEST         1
 #define BATTMGR_NOTICE          2
 #define BATTMGR_BATTERY_GET     0x30
+#define BATTMGR_BATTERY_SET     0x31
 #define BATTMGR_USB_GET         0x32
 #define BATTMGR_USB_SET         0x33
 #define BATT_STATUS             0               /* Linux's POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
@@ -2765,7 +2767,23 @@ static uint32_t batt_shift = 1;         /* 0 on SM8450 (adsp_soc_8450()) */
 #define USB_ONLINE              0
 #define USB_OTG_SWITCH          15              /* the 10 Pro's firmware (OPLUS): 0 OTG off */
 #define USB_TYPEC_MODE          19              /* the 10 Pro's firmware (OPLUS): set 0 DRP, 1 sink only; read 0 sink */
+#define USB_INPUT_CURR_LIMIT    5               /* uA: the charger's input limit */
+#define USB_ADAP_TYPE           7
+#define USB_SUSPEND_PMIC        26              /* the 10 Pro's firmware (OPLUS): 1 input suspended */
+#define BATT_CHG_CTRL_LIM       10              /* uA: the battery's charge current limit (FCC) */
+#define BATT_CHG_EN             24              /* the 10 Pro's firmware (OPLUS): 1 charging allowed */
 #define BATTMGR_SECONDS         10
+
+/*
+ * Charging on the 10 Pro (adsp_soc=8450, battmgr_charge=0: not). The charger PD keeps its input limit at about 1 A
+ * until the operating system raises it, and a phone running iOS takes about that much itself: the battery stays where
+ * it is. Android's oplus_battery_sm8450.c (oplus_chg_set_input_current) raises USB_INPUT_CURR_LIMIT step by step to
+ * the device tree's limit for the adapter (SDP 500 mA, CDP 1500, a charger 2000) and steps back when VBUS falls under
+ * 4.5 V (4.55 V above 4.1 V a cell), then sets BATT_CHG_EN. So is it here, once per plug and type, with at most 5
+ * tries; a computer's port (SDP) and an unknown type are left as the PD has them. Nothing above 2000 mA is written.
+ */
+static const uint32_t battmgr_icl_steps[] = { 500, 900, 1200, 1350, 1500, 1750, 2000 };
+#define BATTMGR_ICL_MAX_MA      2000
 
 struct battmgr_message {
 	uint32_t owner, type, opcode;
@@ -2813,8 +2831,8 @@ battmgr_input(const uint8_t *data, uint32_t length)
 static bool
 battmgr_get(uint32_t opcode, uint32_t property, uint32_t *value)
 {
-	struct battmgr_message q = { BATTMGR_OWNER, BATTMGR_REQUEST, opcode,
-		                     { 0, property, opcode == BATTMGR_USB_SET ? *value : 0 } };
+	bool set = opcode == BATTMGR_USB_SET || opcode == BATTMGR_BATTERY_SET;
+	struct battmgr_message q = { BATTMGR_OWNER, BATTMGR_REQUEST, opcode, { 0, property, set ? *value : 0 } };
 	uint32_t before = os_atomic_load(&battmgr.answers, acquire);
 
 	if (glink_send(&glink.channel[CHANNEL_PMIC], &q, sizeof(q)) != 0) {
@@ -2835,6 +2853,110 @@ battmgr_get(uint32_t opcode, uint32_t property, uint32_t *value)
 		sleep_ms(1);
 	}
 	return false;
+}
+
+/*
+ * One round's look at the charging (the block comment at battmgr_icl_steps): usb the USB_ONLINE value, usb_type
+ * Linux's POWER_SUPPLY_USB_TYPE_* (0 unknown, 1 SDP, 2 DCP, 3 CDP; the rest counts as a charger, as Android has it),
+ * pack_uv the battery's voltage (both cells).
+ */
+static void
+battmgr_charge(uint32_t usb, uint32_t usb_type, uint32_t pack_uv)
+{
+	static uint32_t wanted = ~0u, last_type = ~0u, done_ma, tries;
+	uint32_t target, icl = 0, vbus = 0, ibus = 0, en = ~0u, susp = ~0u, fcc = 0, adap = 0, v;
+	uint32_t aicl_uv = pack_uv / 2 > 4100000 ? 4550000 : 4500000;
+	unsigned i, step = 0;
+
+	if (wanted == ~0u) {
+		wanted = 1;
+		PE_parse_boot_argn("battmgr_charge", &wanted, sizeof(wanted));
+	}
+	if (wanted == 0 || adsp_soc != 8450) {
+		return;
+	}
+	if (!usb) {
+		if (last_type != ~0u) {
+			tell("adsp: battmgr: charge: unplugged\n");
+		}
+		last_type = ~0u;
+		done_ma = tries = 0;
+		return;
+	}
+	if (usb_type != last_type) {
+		last_type = usb_type;
+		done_ma = tries = 0;
+		(void)battmgr_get(BATTMGR_USB_GET, USB_INPUT_CURR_LIMIT, &icl);
+		(void)battmgr_get(BATTMGR_USB_GET, USB_ADAP_TYPE, &adap);
+		(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_CTRL_LIM, &fcc);
+		(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_EN, &en);
+		(void)battmgr_get(BATTMGR_USB_GET, USB_SUSPEND_PMIC, &susp);
+		tell("adsp: battmgr: charge: plugged, type %u (adapter %u): input limit %u uA, charge limit %u uA, charging "
+		    "enabled %d, input suspended %d\n", usb_type, adap, icl, fcc, (int)en, (int)susp);
+		if (susp != 0 && susp != ~0u) {
+			v = 0;
+			tell("adsp: battmgr: charge: input un-suspended: %s\n",
+			    battmgr_get(BATTMGR_USB_SET, USB_SUSPEND_PMIC, &v) ? "done" : "NO ANSWER");
+		}
+		if (en != 1) {
+			v = 1;
+			tell("adsp: battmgr: charge: charging enabled: %s\n",
+			    battmgr_get(BATTMGR_BATTERY_SET, BATT_CHG_EN, &v) ? "done" : "NO ANSWER");
+		}
+	}
+	switch (usb_type) {
+	case 0:                 /* unknown (the PD may still be finding out) */
+	case 1:                 /* a computer's port: the PD's own limit stays */
+		return;
+	case 3:
+		target = 1500;
+		break;
+	default:
+		target = BATTMGR_ICL_MAX_MA;
+		break;
+	}
+	if (done_ma != 0) {
+		/* (set before: put back only if the PD has lowered it since) */
+		if (!battmgr_get(BATTMGR_USB_GET, USB_INPUT_CURR_LIMIT, &icl) || icl + 50000 >= done_ma * 1000) {
+			return;
+		}
+		tell("adsp: battmgr: charge: the input limit reads %u uA, not %u mA: set again\n", icl, done_ma);
+	}
+	if (tries >= 5) {
+		return;
+	}
+	tries++;
+	for (i = 0; i < sizeof(battmgr_icl_steps) / sizeof(battmgr_icl_steps[0]) && battmgr_icl_steps[i] <= target; i++) {
+		v = battmgr_icl_steps[i] * 1000;
+		if (!battmgr_get(BATTMGR_USB_SET, USB_INPUT_CURR_LIMIT, &v)) {
+			tell("adsp: battmgr: charge: input limit %u mA: NO ANSWER\n", battmgr_icl_steps[i]);
+			return;         /* (tried again next round) */
+		}
+		sleep_ms(i < 2 ? 50 : 90);
+		if (battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &vbus) && vbus < aicl_uv) {
+			/* the adapter gives no more: the step before (the first one if it was the first) */
+			tell("adsp: battmgr: charge: VBUS %u uV at %u mA, under %u: back a step\n", vbus, battmgr_icl_steps[i],
+			    aicl_uv);
+			if (step == 0) {
+				step = battmgr_icl_steps[0];
+			}
+			v = step * 1000;
+			(void)battmgr_get(BATTMGR_USB_SET, USB_INPUT_CURR_LIMIT, &v);
+			break;
+		}
+		step = battmgr_icl_steps[i];
+	}
+	if (step == 0) {
+		return;
+	}
+	done_ma = step;
+	sleep_ms(200);
+	icl = vbus = ibus = 0;
+	(void)battmgr_get(BATTMGR_USB_GET, USB_INPUT_CURR_LIMIT, &icl);
+	(void)battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &vbus);
+	(void)battmgr_get(BATTMGR_USB_GET, USB_CURR_NOW, &ibus);
+	tell("adsp: battmgr: charge: input limit set to %u mA (try %u, aim %u): reads %u uA; VBUS %u uV, %u uA in\n", step,
+	    tries, target, icl, vbus, ibus);
 }
 
 static void
@@ -2918,6 +3040,7 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 				(void)battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &usb_volt);
 				(void)battmgr_get(BATTMGR_USB_GET, USB_CURR_NOW, &usb_curr);
 			}
+			battmgr_charge(usb, usb_type, volt);
 			if (round % 30 == 0 || full == 0) {
 				(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_FULL, &full);
 				(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_FULL_DESIGN, &design);

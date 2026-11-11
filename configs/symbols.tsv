@@ -60,6 +60,7 @@ BATTERY_POLL	arg	battery_poll	Audio and battery	k	hakios.battery_bcl.c	how often
 BATTERY_SOC	arg	battery_soc	Audio and battery	k	hakios.battery_bcl.c	
 BATTERY_STORE	arg	battery_store	Audio and battery	k	hakios.battery_bcl.c	neither read nor write the file
 BATTMGR	arg	battmgr	Audio and battery	k	hakios.adsp.c	every property once, for the log (which number is which on this phone's firmware)
+BATTMGR_CHARGE	arg	battmgr_charge	Audio and battery	k	hakios.adsp.c	
 BATTMGR_SINK	arg	battmgr_sink	Audio and battery	k	hakios.adsp.c	
 BT	arg	bt	User space	k	hakios.bt.c	
 BT_AGAIN	arg	bt_again	User space	k	hakios.bt.c	the second look this many seconds later (0: no second look; 30)

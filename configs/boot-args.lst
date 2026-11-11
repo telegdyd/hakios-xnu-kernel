@@ -64,6 +64,7 @@ battery_stop	k
 battery_stop_poll	k
 battery_store	k
 battmgr	k
+battmgr_charge	k
 battmgr_sink	k
 bootcpu	kl
 bt	k
