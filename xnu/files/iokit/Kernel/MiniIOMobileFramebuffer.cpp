@@ -213,6 +213,10 @@ SYSCTL_QUAD(_kern_hakios, OID_AUTO, fb_console_phys, CTLFLAG_RD | CTLFLAG_LOCKED
  */
 #define GPU_CHECK_FIRST         60
 #define GPU_CHECK_EVERY         1800
+/* sysctl kern.hakios.fb_gpu_check=N: the next N frames the GPU puts on the panel are checked as well */
+static uint32_t gCheckNext;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_gpu_check, CTLFLAG_RW | CTLFLAG_LOCKED, &gCheckNext, 0,
+    "fb_gpu: so many of the next frames checked against the processors' bilinear");
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" vm_offset_t ml_vtophys(vm_offset_t vaddr);
 /* why frames went to the processors under fb_gpu, counted for the 5-second line */
@@ -652,6 +656,7 @@ public:
 	uint32_t        fGPUFrames;             /* frames the GPU has put on the panel, for the check */
 	uint32_t        fStatRefused[kRefusedKinds];
 	struct MiniIOSurfacePresentLayer fGPUFirst;     /* the last such frame's first layer, and how many it had */
+	uint32_t        fGPUDrawn;              /* ... its surface's last GPU submission when the frame was handed to the GPU */
 	unsigned        fGPULayers;
 	uint64_t        fStatCPUTime;           /* (mach_absolute_time, summed over the threads, settle()'s redraws included) */
 	uint8_t *       fGPUBase;               /* where the GPU put the last such frame (the panel or an fb_flip buffer), for the check */
@@ -1888,6 +1893,7 @@ IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, 
 	fGPUBase = *target >= 0 ? fFlipBase[*target] : fBase;
 	fGPURowBytes = rowBytes;
 	fGPUFirst = layers[0];
+	fGPUDrawn = layers[0].surface->drawn;
 	fGPULayers = count;
 	fGPUFrames++;
 	return true;
@@ -1899,7 +1905,7 @@ IOMobileFramebuffer::checkOnGPU(void)
 {
 	const struct MiniIOSurfacePresentLayer * l = &fGPUFirst;
 	MiniIOSurface * s = l->surface;
-	uint32_t drawn = s->drawn, close = 0, near = 0, far = 0, worst = 0, wx = 0, wy = 0, expect = 0, got = 0;
+	uint32_t drawn = fGPUDrawn, close = 0, near = 0, far = 0, worst = 0, wx = 0, wy = 0, expect = 0, got = 0;
 
 	if (fGPULayers != 1 || !MiniIOSurfacePresentDone(gLastPresent, 100)) {
 		IOLog("MiniIOMobileFramebuffer: fb_gpu: check: frame %u not checked (%u layers, or the GPU not done)\n", fGPUFrames,
@@ -2289,7 +2295,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	if (recorded != NULL) {
 		record(recorded);
 	}
-	if (onGPU && (fGPUFrames == GPU_CHECK_FIRST || (fGPUFrames > GPU_CHECK_FIRST && (fGPUFrames - GPU_CHECK_FIRST) % GPU_CHECK_EVERY == 0))) {
+	if (onGPU && (fGPUFrames == GPU_CHECK_FIRST || (fGPUFrames > GPU_CHECK_FIRST && (fGPUFrames - GPU_CHECK_FIRST) % GPU_CHECK_EVERY == 0) ||
+	    gCheckNext != 0)) {
+		gCheckNext -= gCheckNext != 0;
 		checkOnGPU();
 	}
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
