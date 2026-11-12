@@ -35,14 +35,19 @@
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <machine/machine_routines.h>
+#include <mach/vm_param.h>
+#include <vm/memory_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/hakios.pcie.h>
 #include <sys/hakios.wifi.h>
 #include <sys/systm.h>
 
-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
-extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+/* From the kernel's own map, as redwood's Wi-Fi does: the io_submap of plain I/O mappings holds 8 MB in all and is
+ * full by the time the chain runs; a mapping that does not fit there panics (KMA_NOFAIL), which reset the phone in
+ * round 1 (2026-11-12). */
+extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, unsigned int);
+#define MAP_IO(pa, size) ml_io_map_unmappable((pa), (size), VM_WIMG_IO)
 extern lck_mtx_t hakios_rsc_lock;
 extern int hakios_mmio_try_read32(const volatile void *, unsigned *) __attribute__((weak));
 extern int hakios_mmio_try_write32(volatile void *, unsigned) __attribute__((weak));
@@ -62,9 +67,12 @@ extern void loader_log_putc(char) __attribute__((weak));
 #define RSC_PA 0x17a20000UL
 #define TCS_BASE 0xd00u
 #define TCS_STRIDE 0x2a0u
-#define TCS_SLOT 2u
-#define TCS_BIT (1u << TCS_SLOT)
-#define TCS(reg) (TCS_BASE + TCS_SLOT * TCS_STRIDE + (reg))
+#define TCS_OWN_SLOT 2u
+#define TCS_SHARED_SLOT 0u
+static unsigned tcs_slot = TCS_OWN_SLOT;
+#define TCS_SLOT tcs_slot
+#define TCS_BIT (1u << tcs_slot)
+#define TCS(reg) (TCS_BASE + tcs_slot * TCS_STRIDE + (reg))
 #define GDSCR 0x7b004
 #define PIPE_MUX 0x7b060
 #define RCHNG 0x7b048
@@ -75,7 +83,27 @@ extern void loader_log_putc(char) __attribute__((weak));
 #define PIN(n) ((n) * 0x1000u)
 #define CHECK(call) do { int e_ = (call); if (e_) return e_; } while (0)
 
-static vm_offset_t gcc, tlmm, parf, phy, dbi, cfg, db, rsc, bar;
+static vm_offset_t gcc_vote, gcc_pcie, gcc_clkref, tlmm, parf, phy, dbi, cfg, db, rsc, bar;
+/*
+ * GCC is mapped only where this file touches it, as the other drivers do (speaker/goodix: the first 0x60000,
+ * touch: single pages): mapping the whole 1 MiB block reset the phone at once in round 1 (2026-11-12, the
+ * last line "pcie: step 0a map GCC"). Three windows: the APCS vote words (0x62000/0x62008), PCIe0's block and
+ * its PHY reset (0x7b000-0x7c020), the CLKREF (0x9c004). An offset outside them is a bug: it gives 0, which
+ * the guarded accessors refuse (EINVAL), and says so.
+ */
+#define GCC_VOTE_WIN 0x60000u
+#define GCC_PCIE_WIN 0x78000u
+#define GCC_CLKREF_WIN 0x9c000u
+static void say(const char *format, ...) __printflike(1, 2);
+static vm_offset_t
+G(unsigned off)
+{
+	if (off >= GCC_VOTE_WIN && off < GCC_VOTE_WIN + 0x4000u && gcc_vote) return gcc_vote + (off - GCC_VOTE_WIN);
+	if (off >= GCC_PCIE_WIN && off < GCC_PCIE_WIN + 0x8000u && gcc_pcie) return gcc_pcie + (off - GCC_PCIE_WIN);
+	if (off >= GCC_CLKREF_WIN && off < GCC_CLKREF_WIN + 0x1000u && gcc_clkref) return gcc_clkref + (off - GCC_CLKREF_WIN);
+	say("pcie: GCC offset %#x is outside the mapped windows\n", off);
+	return 0;
+}
 static unsigned generation = 2, ncpt, rail_count;
 static bool started, linked, endpoint, tcs_owned, tcs_poisoned;
 /* mask 0: restore the whole old word. mask != 0: a shared vote word (GCC VOTE0/VOTE2,
@@ -262,19 +290,46 @@ gpio(unsigned pin, bool high)
 	return wr(tlmm + PIN(pin), (7u << 6) | (1u << 9) |
 	    ((config & (1u << 11)) ? (1u << 12) : 0));
 }
+/*
+ * pcie_pause=MS: a line before each group of accesses of stage 1, then that long a wait, so that the last line
+ * reaches the USB log before a reset the group may cause (default 0: no lines, no waits).
+ */
+static unsigned step_pause_ms;
+static void
+step(const char *format, ...) __printflike(1, 2);
+static void
+step(const char *format, ...)
+{
+	char line[200];
+	va_list ap;
+	if (!step_pause_ms) return;
+	va_start(ap, format);
+	vsnprintf(line, sizeof(line), format, ap);
+	va_end(ap);
+	say("pcie: step %s\n", line);
+	delay(step_pause_ms * 1000);
+}
 static int
 map_blocks(void)
 {
 	/* Map only on up. Cached mappings survive down; borrowed BAR access does not. */
-	if (!gcc) gcc = ml_io_map(GCC_PA, 0x100000);
-	if (!tlmm) tlmm = ml_io_map(TLMM_PA, 0x100000);
-	if (!parf) parf = ml_io_map(PARF_PA, 0x3000);
-	if (!phy) phy = ml_io_map(PHY_PA, 0x2000);
-	if (!dbi) dbi = ml_io_map(DBI_PA, 0x2000);
-	if (!cfg) cfg = ml_io_map(CFG_PA, 0x1000);
-	if (!rsc) rsc = ml_io_map(RSC_PA, 0x10000);
-	if (!db) db = ml_io_map_wcomb(DB_PA, DB_SIZE);
-	return gcc && tlmm && parf && phy && dbi && cfg && rsc && db ? 0 : ENOMEM;
+	step("0a map GCC: votes, PCIe0, CLKREF windows");
+	if (!gcc_vote) gcc_vote = MAP_IO(GCC_PA + GCC_VOTE_WIN, 0x4000);
+	if (!gcc_pcie) gcc_pcie = MAP_IO(GCC_PA + GCC_PCIE_WIN, 0x8000);
+	if (!gcc_clkref) gcc_clkref = MAP_IO(GCC_PA + GCC_CLKREF_WIN, 0x1000);
+	step("0b map TLMM");
+	if (!tlmm) tlmm = MAP_IO(TLMM_PA, 0x100000);
+	step("0c map PARF, PHY, DBI, config");
+	if (!parf) parf = MAP_IO(PARF_PA, 0x3000);
+	if (!phy) phy = MAP_IO(PHY_PA, 0x2000);
+	if (!dbi) dbi = MAP_IO(DBI_PA, 0x2000);
+	if (!cfg) cfg = MAP_IO(CFG_PA, 0x1000);
+	step("0d map RSC");
+	if (!rsc) rsc = MAP_IO(RSC_PA, 0x10000);
+	step("0e map cmd-db");
+	if (!db) db = ml_io_map_unmappable(DB_PA, DB_SIZE, VM_WIMG_WCOMB);
+	step("0f all mapped");
+	return gcc_vote && gcc_pcie && gcc_clkref && tlmm && parf && phy && dbi && cfg && rsc && db ? 0 : ENOMEM;
 }
 static int
 db16(unsigned off, unsigned *v)
@@ -314,15 +369,21 @@ resource(const char *name, unsigned *address)
 static int
 tcs_idle(unsigned slot)
 {
-	unsigned base = TCS_BASE + slot * TCS_STRIDE, idle, control, enabled;
+	unsigned base = TCS_BASE + slot * TCS_STRIDE, idle, control, enabled, waited;
 	CHECK(rd(rsc + base + 0x18, &idle));
 	CHECK(rd(rsc + base + 0x14, &control));
 	CHECK(rd(rsc + base + 0x1c, &enabled));
-	if (!idle || idle == ~0u || (control & (1u << 24)) || (enabled >> ncpt)) return EBUSY;
+	CHECK(rd(rsc + base + 0x10, &waited));
+	/* ABL leaves completed ACTIVE requests triggered (idle=1). Unwaited
+	 * commands have status 0x101, not the waited response's 0x10101. The
+	 * no-delay boot reaches this before touch/audio have recycled TCS0.
+	 * Keep refusing armed sleep/wake requests and incomplete responses. */
+	if (!idle || idle == ~0u || ((control & (1u << 24)) && !(control & (1u << 16))) || (enabled >> ncpt)) return EBUSY;
 	for (unsigned c = 0; c < ncpt; c++) if (enabled & (1u << c)) {
 		unsigned status;
 		CHECK(rd(rsc + base + 0x3c + 20 * c, &status));
-		if (status == ~0u || (status & 0x10100) != 0x10100) return EBUSY;
+		unsigned complete = waited & (1u << c) ? 0x10100u : 0x100u;
+		if (status == ~0u || (status & complete) != complete) return EBUSY;
 	}
 	return 0;
 }
@@ -365,14 +426,48 @@ tcs_sync(unsigned off, unsigned v)
 	}
 	return ETIMEDOUT;
 }
+static int vote_slot(unsigned index, bool on);
+/*
+ * TCS 0 is the one the audio driver (hakios.adsp.c) and UEFI use, under hakios_rsc_lock: taken here with a bounded
+ * try (100 ms), never by blocking, because hakios_pcie_down() runs on the panic path too; not had, the vote is not made.
+ */
 static int
 vote(unsigned index, bool on)
+{
+	int error;
+	if (tcs_slot != TCS_SHARED_SLOT) return vote_slot(index, on);
+	for (unsigned tries = 0; !lck_mtx_try_lock(&hakios_rsc_lock); tries++) {
+		if (tries == 1000) {
+			say("pcie: TCS 0 sequencer lock busy for 100 ms\n");
+			return EBUSY;
+		}
+		delay(100);
+	}
+	error = vote_slot(index, on);
+	lck_mtx_unlock(&hakios_rsc_lock);
+	return error;
+}
+/* What the sequencer shows for the slot, on a vote that did not finish (all reads). */
+static void
+tcs_dump(const char *why)
+{
+	unsigned v[9] = { 0 };
+	(void)rd(rsc + TCS_BASE + 0, &v[0]); (void)rd(rsc + TCS_BASE + 4, &v[1]);
+	(void)rd(rsc + TCS(0x10), &v[2]); (void)rd(rsc + TCS(0x14), &v[3]); (void)rd(rsc + TCS(0x18), &v[4]);
+	(void)rd(rsc + TCS(0x1c), &v[5]); (void)rd(rsc + TCS(0x30), &v[6]); (void)rd(rsc + TCS(0x3c), &v[7]);
+	(void)rd(rsc + TCS(0x3c + 20), &v[8]);
+	say("pcie: TCS %u %s: irq enable %#x status %#x; wait %#x control %#x idle %#x enabled %#x; cmd0 msgid %#x status %#x, cmd1 status %#x\n",
+	    tcs_slot, why, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
+}
+static int
+vote_slot(unsigned index, bool on)
 {
 	unsigned address = rails[index].address, count = on ? 2 : 1;
 	unsigned offsets[2] = { on ? 0u : 4u, 4u }, values[2] = { on ? rails[index].mv : 0u, 1u };
 	unsigned irq, idle, status, mask = (1u << count) - 1;
 	if (!tcs_owned || tcs_poisoned) return EBUSY;
-	CHECK(tcs_idle(TCS_SLOT));
+	int ready = tcs_idle(TCS_SLOT);
+	if (ready) { tcs_dump("not reusable"); return ready; }
 	tcs_poisoned = true; /* do not recycle an uncertain transaction */
 	CHECK(tcs_sync(TCS(0x14), 0));
 	CHECK(tcs_sync(TCS(0x1c), 0));
@@ -403,7 +498,7 @@ vote(unsigned index, bool on)
 		if (done) break;
 		delay(50);
 	}
-	if (!done) return ETIMEDOUT;
+	if (!done) { tcs_dump("timed out"); return ETIMEDOUT; }
 	CHECK(tcs_sync(TCS(0x14), 0));
 	CHECK(tcs_sync(TCS(0x1c), 0));
 	CHECK(tcs_sync(TCS(0x10), 0));
@@ -415,43 +510,68 @@ static int
 power(void)
 {
 	unsigned v;
-	CHECK(gpio(94, false)); CHECK(gpio(80, false));
+	step("1 gpio 94 (PERST) low");
+	CHECK(gpio(94, false));
+	step("2 gpio 80 (WLAN_EN) low");
+	CHECK(gpio(80, false));
+	step("3 gpio 81 (BT_EN) low");
 	CHECK(gpio(81, false)); /* Bluetooth bring-up is separate; assert off. */
+	step("4 gpio 95 (CLKREQ) function");
 	CHECK(rd(tlmm + PIN(95), &v));
 	CHECK(save_write(tlmm + PIN(95), 1u << 2 | 3u | ((v & (1u << 11)) ? 1u << 12 : 0)));
+	step("5 cmd-db: the six rails");
 	for (unsigned i = 0; i < 6; i++) CHECK(resource(rails[i].name, &rails[i].address));
+	for (unsigned i = 0; i < 6; i++) step("5 %s at %#x", rails[i].name, rails[i].address);
+	step("6 claim TCS %u", TCS_SLOT);
 	lck_mtx_lock(&hakios_rsc_lock);
 	int error = claim_tcs();
 	lck_mtx_unlock(&hakios_rsc_lock);
 	if (error) return error;
 	for (unsigned i = 0; i < 6; i++) {
+		step("7 vote %s %u mV on (TCS %u, %u commands per slot)", rails[i].name, rails[i].mv, TCS_SLOT, ncpt);
 		rail_count = i + 1; /* uncertain enable is still ours to remove */
-		CHECK(vote(i, true));
+		int verror = vote(i, true);
+		if (verror == ETIMEDOUT && tcs_slot == TCS_OWN_SLOT) {
+			say("pcie: TCS %u did not finish the vote: TCS %u from here on, under the sequencer lock (as hakios.adsp.c)\n",
+			    TCS_OWN_SLOT, TCS_SHARED_SLOT);
+			tcs_slot = TCS_SHARED_SLOT;
+			tcs_poisoned = false;
+			verror = vote(i, true);
+		}
+		CHECK(verror);
 	}
+	step("8 rails voted; gpio 204 (XO_CLK) low");
 	delay(100000);
 	CHECK(gpio(204, false)); delay(10000);
+	step("9 XO_CLK pulse, gpio 80 (WLAN_EN) high");
 	CHECK(gpio(204, true)); delay(200);
 	CHECK(gpio(80, true)); delay(6000);
 	CHECK(gpio(204, false)); delay(50000);
+	step("10 power sequence done");
 	return 0;
 }
 static int
 clocks_phy(void)
 {
-	CHECK(bits(gcc + GDSCR, 1, 0));
-	CHECK(wait_bits(gcc + GDSCR, 1u << 31, 1u << 31, 10000));
-	CHECK(save_write(gcc + PIPE_MUX, 2));
-	CHECK(save_write(gcc + RCHNG + 4, 1u << 8 | 11));
-	CHECK(bits(gcc + RCHNG, 0, 1)); CHECK(wait_bits(gcc + RCHNG, 1, 0, 10000));
-	CHECK(save_write(gcc + AUX + 4, 1));
-	CHECK(bits(gcc + AUX, 0, 1)); CHECK(wait_bits(gcc + AUX, 1, 0, 10000));
-	CHECK(vote_bits(gcc + VOTE0, VOTE0_BITS));
-	CHECK(vote_bits(gcc + VOTE2, 0x2f));
-	CHECK(bits(gcc + 0x9c004, 0, 1)); delay(100);
-	CHECK(wait_bits(gcc + 0x7b030, 1u << 31, 0, 10000));
-	CHECK(wait_bits(gcc + 0x7b034, 1u << 31, 0, 10000));
-	CHECK(save_write(gcc + 0x7b000, 1)); delay(1000);
-	CHECK(save_write(gcc + 0x7b000, 0)); delay(1000);
+	step("11 GCC PCIe0 GDSC on");
+	CHECK(bits(G(GDSCR), 1, 0));
+	CHECK(wait_bits(G(GDSCR), 1u << 31, 1u << 31, 10000));
+	step("12 GCC pipe mux, RCHNG, AUX rate");
+	CHECK(save_write(G(PIPE_MUX), 2));
+	CHECK(save_write(G(RCHNG + 4), 1u << 8 | 11));
+	CHECK(bits(G(RCHNG), 0, 1)); CHECK(wait_bits(G(RCHNG), 1, 0, 10000));
+	CHECK(save_write(G(AUX + 4), 1));
+	CHECK(bits(G(AUX), 0, 1)); CHECK(wait_bits(G(AUX), 1, 0, 10000));
+	step("13 GCC clock votes 0x62000/0x62008");
+	CHECK(vote_bits(G(VOTE0), VOTE0_BITS));
+	CHECK(vote_bits(G(VOTE2), 0x2f));
+	step("14 CLKREF, BCR reset pulse");
+	CHECK(bits(G(0x9c004), 0, 1)); delay(100);
+	CHECK(wait_bits(G(0x7b030), 1u << 31, 0, 10000));
+	CHECK(wait_bits(G(0x7b034), 1u << 31, 0, 10000));
+	CHECK(save_write(G(0x7b000), 1)); delay(1000);
+	CHECK(save_write(G(0x7b000), 0)); delay(1000);
+	step("15 PARF");
 	CHECK(save_write(parf + 0x1000, 4));
 	CHECK(bits(parf + 0x40, 1, 0));
 	/* Consistent vendor decode recipe, not Linux addresses mixed with vendor size. */
@@ -461,18 +581,20 @@ clocks_phy(void)
 	CHECK(bits(parf + 0x174, 0, 1u << 4));
 	CHECK(bits(parf + 0x20, 1u << 5, 0));
 	CHECK(bits(parf + 0x1a8, 0, 1u << 31));
-	CHECK(save_write(gcc + 0x7c01c, 1));
-	CHECK(save_write(gcc + 0x7c020, 1)); delay(300);
-	CHECK(save_write(gcc + 0x7c01c, 0));
+	step("16 PHY reset and init table");
+	CHECK(save_write(G(0x7c01c), 1));
+	CHECK(save_write(G(0x7c020), 1)); delay(300);
+	CHECK(save_write(G(0x7c01c), 0));
 	for (unsigned i = 0; i < sizeof(phy_sequence) / sizeof(phy_sequence[0]); i++) {
 		/* The final DT SW_RESET/START writes follow NOCSR reset release below. */
-		if (phy_sequence[i][0] == 0x200) CHECK(save_write(gcc + 0x7c020, 0));
+		if (phy_sequence[i][0] == 0x200) CHECK(save_write(G(0x7c020), 0));
 		CHECK(save_write(phy + phy_sequence[i][0], phy_sequence[i][1]));
 		if (phy_sequence[i][2]) delay(phy_sequence[i][2]);
 	}
 	delay(1200);
-	CHECK(save_write(gcc + PIPE_MUX, 0)); CHECK(vote_bits(gcc + VOTE2, 1u << 4));
+	CHECK(save_write(G(PIPE_MUX), 0)); CHECK(vote_bits(G(VOTE2), 1u << 4));
 	CHECK(wait_bits(phy + 0x214, 1u << 6, 0, 20000));
+	step("17 DBI first read");
 	unsigned id;
 	CHECK(rd(dbi, &id));
 	return id == ~0u ? ENODEV : 0;
@@ -491,6 +613,7 @@ static int
 train(struct hakios_pcie_link *link)
 {
 	unsigned status = 0, sys = 0;
+	step("18 DBI root port setup, iATU");
 	CHECK(bits(dbi + 0x8bc, 0, 1));
 	CHECK(bits(dbi + 8, ~0xffu, 0x0604u << 16));
 	CHECK(bits(dbi + 0x84, 1u << 6, 0));
@@ -508,6 +631,7 @@ train(struct hakios_pcie_link *link)
 	CHECK(bits(dbi + 0xa0, 15, generation));
 	CHECK(atu(0, 4, CFG_PA, CFG_PA + 0xfffff, 1u << 24));
 	CHECK(atu(1, 0, 0x60300000, 0x63ffffff, 0x60300000));
+	step("19 PERST high, LTSSM");
 	for (unsigned t = 0; t < 3; t++) {
 		delay(100000); CHECK(gpio(94, true)); delay(1000);
 		CHECK(bits(parf + 0x1b0, 0, 1u << 8));
@@ -524,6 +648,37 @@ train(struct hakios_pcie_link *link)
 		CHECK(bits(parf + 0x1b0, 1u << 8, 0)); CHECK(gpio(94, false));
 	}
 	return ETIMEDOUT;
+}
+
+/*
+ * The controller's BDF-to-SID table (Android: pci-msm.c msm_pcie_config_sid, on every link enable; iOSPlus10 0325):
+ * the core reset of clocks_phy() leaves it in its reset state, BYPASS on, and the chip's DMA then carries no SID our
+ * context matches -- round 1 (2026-11-12) reset the phone at the chip's first read of host memory, the BHI image.
+ * BYPASS off (journaled), the 256 entries cleared, BDF 0x0100 -> SID offset 1 (0x1c00 + 1 = 0x1c01, iommu-map) at
+ * crc8(BDF big endian, poly 0x07). The entries are not journaled: down leaves BYPASS on again, which ignores them.
+ */
+#define PARF_BDF_TO_SID_TABLE 0x2000u
+#define PARF_BDF_TO_SID_CFG 0x2c00u
+static int
+bdf_to_sid(void)
+{
+	const unsigned bdf = 0x0100u;
+	unsigned char crc = 0, bytes[2] = { bdf >> 8, bdf & 0xff };
+	unsigned value = bdf << 16 | 1u << 8, got, cfg;
+	for (unsigned b = 0; b < 2; b++) {
+		crc ^= bytes[b];
+		for (int i = 0; i < 8; i++) crc = (unsigned char)((crc & 0x80) ? (crc << 1) ^ 0x07 : crc << 1);
+	}
+	CHECK(rd(parf + PARF_BDF_TO_SID_CFG, &cfg));
+	CHECK(save_write(parf + PARF_BDF_TO_SID_CFG, cfg & ~1u));
+	for (unsigned i = 0; i < 256; i++) CHECK(wr(parf + PARF_BDF_TO_SID_TABLE + 4 * i, 0));
+	CHECK(wr(parf + PARF_BDF_TO_SID_TABLE + 4 * crc, value));
+	__asm__ volatile ("dsb sy" ::: "memory");
+	CHECK(rd(parf + PARF_BDF_TO_SID_TABLE + 4 * crc, &got));
+	CHECK(rd(parf + PARF_BDF_TO_SID_CFG, &cfg));
+	say("pcie: BDF-to-SID: entry %#x = %#x, CFG %#x%s\n", (unsigned)crc, got, cfg,
+	    got == value && !(cfg & 1u) ? " (BDF 0x100 -> SID 0x1c01)" : " - DID NOT TAKE: the chip may carry SID 0x1c00");
+	return 0;
 }
 
 /* Config accesses are serialized by their caller, same as up/down. Only bus0
@@ -617,7 +772,7 @@ enumerate(struct hakios_pcie_link *link)
 	CHECK(hakios_pcie_cfg_read(0, 0x100, 0x10, 4, &mask));
 	CHECK(hakios_pcie_cfg_read(0, 0x100, 4, 2, &command));
 	if ((mask & ~15u) != BAR_PA || (command & 6) != 6) return EIO;
-	if (!bar) bar = ml_io_map(BAR_PA, BAR_SIZE);
+	if (!bar) bar = MAP_IO(BAR_PA, BAR_SIZE);
 	if (!bar) return ENOMEM;
 	endpoint = true;
 	link->vendor = id & 0xffff; link->device = id >> 16;
@@ -685,6 +840,9 @@ hakios_pcie_up(unsigned rc, struct hakios_pcie_link *link)
 	if (!hakios_mmio_try_read32 || !hakios_mmio_try_write32) { error = ENOTSUP; goto failed; }
 	/* RC0 is explicitly selected by the caller; no redwood auto-detection. */
 	if (tcs_poisoned) { error = EBUSY; goto failed; }
+	step_pause_ms = 0;
+	if (PE_parse_boot_argn("pcie_pause", &step_pause_ms, sizeof(step_pause_ms)) && step_pause_ms > 10000) step_pause_ms = 10000;
+	step("0 C2 up: rc 0, pcie_gen %u", generation);
 	if ((error = map_blocks())) goto failed;
 	started = true;
 	if ((error = power())) goto failed;
@@ -693,6 +851,7 @@ hakios_pcie_up(unsigned rc, struct hakios_pcie_link *link)
 	if ((error = clocks_phy()) || (error = train(link))) goto failed;
 	hakios_wifi_stage(2, "link", true, "pcie: link up gen %u x%u", link->gen, link->width);
 	stage = 3;
+	if ((error = bdf_to_sid())) goto failed;
 	if ((error = enumerate(link))) goto failed;
 	hakios_wifi_stage(3, "endpoint", true, "pcie: 17cb:1103 BAR0 %#llx + %#lx decode + master", link->bar0_pa, link->bar0_size);
 	return 0;

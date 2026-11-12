@@ -145,6 +145,40 @@ pieces(void)
 }
 
 static void
+group_keys(void)
+{
+	unsigned char kde[40] = { 0xdd, 38, 0, 0x0f, 0xac, 1, 1, 0 };
+	const unsigned char counter[8] = { 1, 2, 3, 4, 5, 6, 0, 0 };
+	struct lx_wpa wpa = { 0 }, saved;
+
+	for (unsigned i = 0; i < 32; i++) {
+		kde[8 + i] = (unsigned char)i;
+	}
+	wpa.group_cipher = 2;
+	check(group_key(&wpa, kde, sizeof(kde), counter) == 0 && wpa.group_length == 32 &&
+	    hex_is(wpa.group, 32, "000102030405060708090a0b0c0d0e0f18191a1b1c1d1e1f1011121314151617"),
+	    "TKIP keeps TK and swaps the two Michael MIC halves", 0);
+	saved = wpa;
+	for (unsigned length = 0; length < sizeof(kde); length++) {
+		check(group_key(&wpa, kde, length, counter) == -1 && memcmp(&wpa, &saved, sizeof(wpa)) == 0,
+		    "truncated TKIP KDE leaves the previous key untouched", (int)length);
+	}
+	kde[1] = 22;
+	check(group_key(&wpa, kde, 24, counter) == -1, "16-byte GTK refused for negotiated TKIP", 0);
+	wpa.group_cipher = 4;
+	kde[1] = 38;
+	check(group_key(&wpa, kde, sizeof(kde), counter) == -1, "32-byte GTK refused for negotiated CCMP", 0);
+	wpa.group_cipher = 2;
+	kde[6] = 0;
+	check(group_key(&wpa, kde, sizeof(kde), counter) == -1, "GTK cannot use the pairwise key index", 0);
+	kde[6] = 3;
+	check(group_key(&wpa, kde, sizeof(kde), counter) == 0 && wpa.group_index == 3 &&
+	    memcmp(wpa.group_counter, counter, sizeof(counter)) == 0, "TKIP index 3 and replay sequence retained", 0);
+	wpa.group_cipher = 8;
+	check(group_key(&wpa, kde, sizeof(kde), counter) == -1, "unknown negotiated group cipher refused", 0);
+}
+
+static void
 whole(void)
 {
 	for (unsigned n = 0; n < sizeof(handshakes) / sizeof(handshakes[0]); n++) {
@@ -162,6 +196,7 @@ whole(void)
 		memcpy(wpa.own_nonce, h->snonce, 32);
 		wpa.rsn = h->rsn;
 		wpa.rsn_length = (unsigned)h->rsn_length;
+		wpa.group_cipher = h->rsn[7];
 
 		/* a signed message before any message 1 */
 		check(lx_wpa_message(&wpa, h->m3, (unsigned)h->m3_length, reply, &length, &why) == LX_WPA_BAD, "message 3 first is refused",
@@ -180,7 +215,7 @@ whole(void)
 
 		check(lx_wpa_message(&wpa, h->m3, (unsigned)h->m3_length, reply, &length, &why) == LX_WPA_KEYS &&
 		    length == h->m4_length && memcmp(reply, h->m4, length) == 0, "message 4 is the reference's", (int)n);
-		check(wpa.group_length == 16 && memcmp(wpa.group, h->group, 16) == 0 && wpa.group_index == h->group_index,
+		check(wpa.group_length == h->group_length && memcmp(wpa.group, h->group, h->group_length) == 0 && wpa.group_index == h->group_index,
 		    "the group key and its number are the reference's", (int)n);
 		check(memcmp(wpa.group_counter, h->m3 + AT_RSC, 8) == 0, "the group key's packet number is message 3's", (int)n);
 
@@ -192,7 +227,7 @@ whole(void)
 		check(lx_wpa_message(&wpa, h->g1, (unsigned)h->g1_length, reply, &length, &why) == LX_WPA_GROUP &&
 		    length == h->g2_length && memcmp(reply, h->g2, length) == 0, "the answer to a new group key is the reference's",
 		    (int)n);
-		check(memcmp(wpa.group, h->group2, 16) == 0 && wpa.group_index == h->group_index % 3 + 1,
+		check(wpa.group_length == h->group2_length && memcmp(wpa.group, h->group2, h->group2_length) == 0 && wpa.group_index == h->group_index % 3 + 1,
 		    "the new group key and its number are the reference's", (int)n);
 
 		/* a network that wants another kind of key management says so in the descriptor's version */
@@ -212,6 +247,7 @@ int
 main(void)
 {
 	pieces();
+	group_keys();
 	whole();
 	printf("%u checks, %u failed\n", checks, failed);
 	return failed != 0;

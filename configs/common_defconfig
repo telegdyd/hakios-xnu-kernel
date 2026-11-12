@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 423 symbols in 18 groups; 37 are set, 28 of them drivers built in.
+# 428 symbols in 18 groups; 37 are set, 28 of them drivers built in.
 #
 
 #
@@ -772,7 +772,7 @@ CONFIG_SOUND=4
 # CONFIG_VIRTIO_SOUND is not set
 
 #
-# Wi-Fi (39)
+# Wi-Fi (44)
 #
 
 # Wi-Fi: the radio, its driver, a connection (also fw-wifi/mac and fw-wifi/network) [needs fw-wifi/ from the phone]
@@ -784,6 +784,9 @@ CONFIG_WIFI=y
 # the highest link generation, 1 or 2; default 2
 # CONFIG_PCIE_GEN is not set
 
+# a line before each group of accesses of stage 1, then that long a wait, so that the last line
+# CONFIG_PCIE_PAUSE is not set
+
 # start the DSP although the one before it was shut down without having acknowledged a stop: THAT HAS RESET THE PHONE, ...
 # CONFIG_WIFI_AGAIN is not set
 
@@ -793,11 +796,20 @@ CONFIG_WIFI=y
 # read by lx_80211.c (kernel)
 # CONFIG_WIFI_BA is not set
 
+# read by lx_pci.c (kernel)
+# CONFIG_WIFI_BAR_PAUSE is not set
+
+# read by lx_pci.c (kernel)
+# CONFIG_WIFI_BAR_TRACE is not set
+
 # the board data file of fw/ for ath11k's board.bin, a plain name; default: chosen by the QMI board id
 # CONFIG_WIFI_BOARD is not set
 
 # read by hakios.wlfw.c (kernel)
 # CONFIG_WIFI_CAL is not set
+
+# the chain waits S seconds before stage 1, so that a reset it causes comes after the USB log is up; default 0
+# CONFIG_WIFI_DELAY is not set
 
 # read by hakios.wifi.c (kernel)
 # CONFIG_WIFI_DIRTY is not set
@@ -810,6 +822,9 @@ CONFIG_WIFI=y
 
 # read by lx_bus.c (kernel)
 # CONFIG_WIFI_HOLD is not set
+
+# read by lx_bus.c (kernel)
+# CONFIG_WIFI_HOSTCAP_ATH is not set
 
 # read by lx_bus.c (kernel)
 # CONFIG_WIFI_IRQ is not set

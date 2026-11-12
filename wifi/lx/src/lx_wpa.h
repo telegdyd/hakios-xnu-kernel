@@ -19,6 +19,7 @@ struct lx_wpa {
 	unsigned char own_nonce[32];		/* 32 bytes nobody can guess, fresh for every handshake */
 	const unsigned char *rsn;		/* the station's RSN element as its association request had it ... */
 	unsigned rsn_length;			/* ... which goes into message 2 */
+	unsigned group_cipher;			/* negotiated RSN suite type: 2 TKIP or 4 CCMP (0: legacy CCMP caller) */
 	/* from here on: lx_wpa.c's */
 	unsigned char peer_nonce[32];
 	unsigned char kck[16], kek[16];		/* the keys the handshake's own messages are signed and ciphered with */

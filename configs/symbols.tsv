@@ -231,6 +231,7 @@ MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
 PCIE	arg	pcie	Wi-Fi	k	hakios.wifi.pci.c	only the link test, C2 up and down without Wi-Fi (hakios.pcie.c); it excludes wifi=1
 PCIE_GEN	arg	pcie_gen	Wi-Fi	k	hakios.wifi.pci.c	the highest link generation, 1 or 2; default 2
+PCIE_PAUSE	arg	pcie_pause	Wi-Fi	k	hakios.pcie.c,hakios.wifi.pci.c	a line before each group of accesses of stage 1, then that long a wait, so that the last line
 PMIC_LIST	arg	pmic_list	Chip, thermal and PMIC	k	hakios.pmic.c	only the clock, not the inventory of every block
 PRESS_POWER	arg	press_power	Touch and buttons	k	hakios.buttons.c	a short press of the power key that many seconds after boot, and another ten seconds later, given to Darwin as the key's own are (hakios_touch_post):
 PRESS_POWER_MS	arg	press_power_ms	Touch and buttons	k	hakios.buttons.c	
@@ -327,12 +328,16 @@ WALLPAPER_FREEZE	arg	wallpaper_freeze	User space	u	inject_sb.c	the wallpaper as 
 WIFI_AGAIN	arg	wifi_again	Wi-Fi	k	hakios.wifi.c	start the DSP although the one before it was shut down without having acknowledged a stop: THAT HAS RESET THE PHONE, twice of two
 WIFI_ASK	arg	wifi_ask	Wi-Fi	k	hakios.wifi.c	step 14 also asks that service a question (its capabilities) and writes down the beginning of an answer
 WIFI_BA	arg	wifi_ba	Wi-Fi	k	lx_80211.c	
+WIFI_BAR_PAUSE	arg	wifi_bar_pause	Wi-Fi	k	lx_pci.c	
+WIFI_BAR_TRACE	arg	wifi_bar_trace	Wi-Fi	k	lx_pci.c	
 WIFI_BOARD	arg	wifi_board	Wi-Fi	k	hakios.wifi.pci.c	the board data file of fw/ for ath11k's board.bin, a plain name; default: chosen by the QMI board id
 WIFI_CAL	arg	wifi_cal	Wi-Fi	k	hakios.wlfw.c	
+WIFI_DELAY	arg	wifi_delay	Wi-Fi	k	hakios.wifi.pci.c	the chain waits S seconds before stage 1, so that a reset it causes comes after the USB log is up; default 0
 WIFI_DIRTY	arg	wifi_dirty	Wi-Fi	k	hakios.wifi.c	
 WIFI_FILE	arg	wifi_file	Wi-Fi	k	hakios.wifi.c	with wifi=1: the network of fw/network is not joined at the start
 WIFI_FINE	arg	wifi_fine	Wi-Fi	k	hakios.wifi.c	such a step waits like that before every single write and call
 WIFI_HOLD	arg	wifi_hold	Wi-Fi	k	lx_bus.c	
+WIFI_HOSTCAP_ATH	arg	wifi_hostcap_ath	Wi-Fi	k	lx_bus.c	
 WIFI_IRQ	arg	wifi_irq	Wi-Fi	k	lx_bus.c	
 WIFI_JOIN	arg	wifi_join	Wi-Fi	k	hakios.wifi.pci.c,lx_bus.c	after the scan, join the network of wifi_ssid and wifi_psk (or of fw/network); default 0
 WIFI_KEEP	arg	wifi_keep	Wi-Fi	k	hakios.wifi.c,hakios.wifi.pci.c,lx_bus.c	when the steps are over the DSP and the link stay up while the system runs, for whoever uses sys/hakios.qrtr.h; stopped when the run ends

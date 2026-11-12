@@ -37,6 +37,7 @@
  *   pcie_gen=1         the highest link generation, 1 or 2; default 2
  *   wifi_msi=1         one message-signalled interrupt vector instead of the 32 that are enabled before MHI powers up (lx_pci.c)
  *   wifi_board=NAME    the board data file of fw/ for ath11k's board.bin, a plain name; default: chosen by the QMI board id
+ *   wifi_delay=S       the chain waits S seconds before stage 1, so that a reset it causes comes after the USB log is up; default 0
  * and, on this path, wifi_smmu=translate (default) or bypass (a diagnosis: exact-SID bypass for SID 0x1c01), a string.
  */
 #ifdef KERNEL
@@ -718,12 +719,28 @@ op_stage(__unused void *ctx, unsigned n, int ok, const char *detail)
 	hakios_wifi_stage(n, stage_name(n), ok, "%s", detail);
 }
 
+/* pcie_pause=MS (hakios.pcie.c) here too: a line before each look into the small image, then that long a wait */
+static void
+look_pause(const char *name)
+{
+	unsigned pause = 0;
+
+	if (PE_parse_boot_argn("pcie_pause", &pause, sizeof(pause)) && pause != 0) {
+		hakios_wifi_tell("wifi: chain: looking for fw/%s in the small image\n", name);
+		delay_for_interval(pause > 10000 ? 10000 : pause, NSEC_PER_MSEC);
+	}
+}
+
 static bool
 op_file_there(__unused void *ctx, const char *name)
 {
 	uint64_t size = 0;
+	bool there;
 
-	return hakios_image_file("fw", name, &size, NULL) != NULL;
+	look_pause(name);
+	there = hakios_image_file("fw", name, &size, NULL) != NULL;
+	look_pause(there ? "(found)" : "(not found)");
+	return there;
 }
 
 static bool
@@ -731,6 +748,7 @@ op_network_there(__unused void *ctx)
 {
 	uint64_t size = 0;
 
+	look_pause("network");
 	return hakios_image_file("fw", "network", &size, NULL) != NULL;
 }
 
@@ -763,7 +781,9 @@ op_smmu_up(__unused void *ctx, bool bypass)
 		}
 		return error;
 	}
-	pci.smmu = hakios_smmu_claim(WIFI_SID, 0, HAKIOS_WIFI_IOVA_BASE, HAKIOS_WIFI_POOL_SIZE, "wifi");
+	/* mask 1: 0x1c00 and 0x1c01, so that the chip's DMA matches even if the BDF-to-SID table (hakios.pcie.c) did not
+	 * take and it carries the root port's SID (iOSPlus10 0325) */
+	pci.smmu = hakios_smmu_claim(WIFI_SID, 1, HAKIOS_WIFI_IOVA_BASE, HAKIOS_WIFI_POOL_SIZE, "wifi");
 	if (pci.smmu == NULL) {
 		return EBUSY;                   /* (the claim said why) */
 	}
@@ -812,6 +832,7 @@ op_scan(__unused void *ctx, unsigned *bss)
 {
 	struct hakios_sta_scan what;
 	struct hakios_sta_bss *one;
+	uint64_t generation = hakios_sta_scan_generation();
 	int error;
 
 	bzero(&what, sizeof(what));
@@ -822,10 +843,12 @@ op_scan(__unused void *ctx, unsigned *bss)
 	if ((error = hakios_sta_ask_scan(&what)) != 0) {
 		return error;
 	}
-	for (unsigned waited = 0; hakios_sta_busy() && waited < 600; waited++) {
+	/* wifid can queue another scan immediately from SCAN_DONE. Global busy
+	 * may then never go false; wait for a completed result snapshot instead. */
+	for (unsigned waited = 0; hakios_sta_scan_generation() == generation && waited < 600; waited++) {
 		delay_for_interval(100, NSEC_PER_MSEC);
 	}
-	if (hakios_sta_busy()) {
+	if (hakios_sta_scan_generation() == generation) {
 		return ETIMEDOUT;
 	}
 	if ((one = kalloc_type(struct hakios_sta_bss, Z_WAITOK | Z_ZERO)) == NULL) {
@@ -913,9 +936,29 @@ static void
 pci_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint64_t began, now;
+	uint32_t wait_s;
 	int stage;
 
+	/* wifi_delay=S: nothing is touched before S seconds have gone by (at most an hour) */
+	if ((wait_s = hakios_wifi_option("wifi_delay")) != 0) {
+		if (wait_s > 3600) {
+			wait_s = 3600;
+		}
+		hakios_wifi_tell("wifi: wifi_delay=%u: stage 1 begins in %u s\n", wait_s, wait_s);
+		for (uint32_t left = wait_s; left > 0;) {
+			uint32_t now_wait = left > 10 ? 10 : left;
+
+			delay_for_interval(now_wait * 1000, NSEC_PER_MSEC);
+			left -= now_wait;
+			absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+			hakios_wifi_tell("wifi: wifi_delay: %u s left (uptime %llu s)\n", left, now / 1000000000ull);
+		}
+		hakios_wifi_tell("wifi: wifi_delay over: stage 1 begins now\n");
+	}
 	absolutetime_to_nanoseconds(mach_absolute_time(), &began);
+	if (wait_s != 0) {
+		hakios_wifi_tell("wifi: chain: the firmware files and the network are looked for, then C2 up\n");
+	}
 	stage = hakios_wifi_pci_start(&pci.words, &real_ops, &pci.run);
 	if (stage == 0) {
 		absolutetime_to_nanoseconds(mach_absolute_time(), &now);
@@ -945,6 +988,8 @@ pci_thread(__unused void *parameter, __unused wait_result_t result)
  * run, whatever else is given); false when it is absent. With wifi=1 the chain starts on a thread of its own, beside the
  * system's start; words that are not understood are said as their stage's FAILED line and nothing is powered.
  */
+extern int hakios_lx_pool_reserve(bool bypass);         /* hakios.lx.c */
+
 bool
 hakios_wifi_pci_init(void)
 {
@@ -974,6 +1019,10 @@ hakios_wifi_pci_init(void)
 	hakios_qmi_set_transport(&hakios_qrtr_router_ops);
 	hakios_wifi_whole_mode(hakios_wifi_option("wifi_loud") != 0);
 	hakios_lx_net_early();
+	/* the DMA pool now, while 64 MiB in one piece are still to be had (stage 4 only maps it) */
+	if (hakios_lx_pool_reserve(pci.words.bypass) != 0) {
+		hakios_wifi_tell("wifi: no 64 MiB in one piece for the radio at the start: stage 4 will try again\n");
+	}
 	pci.running = true;
 	if (kernel_thread_start(pci_thread, NULL, &thread) != KERN_SUCCESS) {
 		pci.running = false;

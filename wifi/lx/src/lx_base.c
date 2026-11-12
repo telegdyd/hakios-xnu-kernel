@@ -844,15 +844,32 @@ linux_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle
 	size = roundup2(size, pci_pool() ? 4096 : 64);
 	lx_os_lock();
 	at = pool.rings_used;
+	/*
+	 * On the PCIe path a large piece starts where Linux's IOMMU allocator would put it: aligned to its size rounded up
+	 * to a power of two (dma-iommu, alloc_iova size_aligned). The firmware's memory segments of QMI REQUEST_MEM (6 MB
+	 * and 3.6 MB on this chip) are mapped by the firmware's own MMU with large pages; at 4 KiB alignment it stopped with
+	 * SYS_ERR right after RESPOND_MEM (round 1, 2026-11-12). Up to 32 MiB of alignment; small pieces as before.
+	 */
+	if (pci_pool() && size >= (1u << 20)) {
+		uint32_t align = 1u << 20;
+
+		while (align < size && align < (32u << 20)) {
+			align <<= 1;
+		}
+		at = roundup2(at, align);
+	}
 	if (pool.memory == NULL || size > pool.ring_limit || at > pool.ring_limit - size) {
 		lx_os_unlock();
 		printf("lx: no room for %zu more bytes of rings\n", size);
 		return (NULL);
 	}
-	pool.rings_used += size;
+	pool.rings_used = at + size;
 	lx_os_unlock();
 	bzero(pool.memory + at, size);
 	*dma_handle = pool.address + at;
+	if (pci_pool() && size >= (1u << 20)) {
+		printf("lx: %zu bytes for the radio at %#llx\n", size, (unsigned long long)*dma_handle);
+	}
 	return (pool.memory + at);
 }
 

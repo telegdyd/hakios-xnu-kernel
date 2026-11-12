@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+	<!-- Same MobileWiFi keychain identity as wifipw_test. -->
+	<key>application-identifier</key><string>com.apple.wifid</string>
+	<key>com.apple.private.system-keychain</key><true/>
+	<key>com.apple.wifi.manager-access</key><true/>
+</dict></plist>

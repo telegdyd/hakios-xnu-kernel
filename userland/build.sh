@@ -82,6 +82,8 @@
 #   CHECK=1          check every image (every container) as it is made: apfsck has to find it clean and
 #                    the kernel's apfs_lib has to read every volume back as the directory it was made of
 #                    (../tools/apfs/check-image.sh; the system image takes a few minutes more)
+#   ROOT_ONLY=1      build root.apfs and stop; FLASHBOOT still selects the installed job list,
+#                    but flashboot.apfs and system.apfs are not rebuilt (Wi-Fi gate recipe).
 set -e
 # a copy of a tree that shares its files' data: hard links (Linux), clones of the files (macOS's APFS, whose cp has no -l)
 linkcopy() { if [ "$(uname)" = Darwin ]; then cp -cRp "$1" "$2"; else cp -al "$1" "$2"; fi; }
@@ -306,12 +308,16 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			echo "build.sh: HakiosMetal for CoreAnimation (src/HakiosMetalCA.m)"
 			# M2V=1: with UniXNU's Metal on Vulkan inside, the device boot-arg metal_m2v=1 gives the window server
 			M2V_OBJS=
+			# Optional weak imports still need ld64's explicit allowance when the
+			# native bridge is absent (the ordinary CoreAnimation configuration).
+			M2V_OPTIONAL="-Wl,-U,_native_bridge_metal_open,-U,_native_bridge_metal_first_problem,-U,_native_bridge_metal_status,-U,_native_bridge_metal_formats,-U,_native_bridge_metal_variant_hook"
 			if [ -n "${M2V:-}" ] && [ -f ../xnu-deps/build/m2v/out/frontend.o ]; then
 				M2V_OBJS="../xnu-deps/build/m2v/out/frontend.o ../xnu-deps/build/m2v/out/libadreno_metal_bridge.a -framework CoreFoundation -lc++ -Wl,-dead_strip"
+				M2V_OPTIONAL=
 				echo "build.sh: with UniXNU's Metal on Vulkan (metal_m2v=1)"
 			fi
 			$DYN -bundle -framework Foundation -framework IOKit -framework IOSurface -framework Metal -lobjc \
-				-I$HM/include -o obj/HakiosMetal src/HakiosMetalCA.m $METAL_GPU $M2V_OBJS
+				-I$HM/include -o obj/HakiosMetal src/HakiosMetalCA.m $METAL_GPU $M2V_OBJS $M2V_OPTIONAL
 		else
 		$DYN -bundle -framework Foundation -framework Metal -lobjc -I$METAL_SRC -o obj/HakiosMetal $METAL_SRC/HakiosMetal.m \
 			$METAL_SRC/hakios_metallib.c $METAL_GPU
@@ -606,6 +612,7 @@ done
 # as it is, which the kernel's drivers use where it lies in memory (drivers/storage/hakios.image.c)
 python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
 [ -z "$CHECK" ] || ../tools/apfs/check-image.sh root.apfs redwood=root
+[ "${ROOT_ONLY:-0}" != 1 ] || exit 0
 
 # --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.apfs --------------------------------
 # With the Darwin volume on the phone's flash as the root, all that has to come from RAM is what is not

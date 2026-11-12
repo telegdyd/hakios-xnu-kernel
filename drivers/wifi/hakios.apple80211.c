@@ -302,12 +302,16 @@ get(struct apple80211req *request)
 		/*
 		 * What the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*): the 13 bytes are the
 		 * bits alone, from the first (the framework hands in a buffer that begins after the old
-		 * header's version word). AES, AES-CCM, power management, short slot and preamble, WPA2, WME,
+		 * header's version word). TKIP with Michael MIC (for the WPA2 group key), AES, AES-CCM,
+		 * power management, short slot and preamble, WPA2, WME,
 		 * short guard interval at 20 MHz. Read wrong, the framework sees no WPA2 and builds no join
 		 * for a WPA2 network ("Unable to join").
 		 */
 		uint8_t bits[13] = { 0 };
-		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
+		/* APPLE80211_CAP_TKIP=1, TKIPMIC=12, WPA2=14 (apple80211_var.h).
+		 * Without TKIP, wifid can reject a TKIP-group RSN before ASSOCIATE,
+		 * even though the station can now install that group key. */
+		static const uint8_t has[] = { 1, 2, 3, 6, 9, 10, 12, 14, 17, 19 };
 
 		for (unsigned i = 0; i < sizeof(has); i++) {
 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
@@ -726,7 +730,7 @@ hakios_apple80211_ioctl(u_long command, void *data)
 	error = is_set ? set(request, what, sizeof(what)) : get(request);
 	note(request, is_set, error);
 	/* (a request that is repeated for ever is said a few hundred times) */
-	if (said < 800) {
+	if (said < 800 || (is_set && (request->req_type == 20 || request->req_type == 22))) {
 		said++;
 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==

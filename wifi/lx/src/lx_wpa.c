@@ -417,6 +417,11 @@ answer(const struct lx_wpa *wpa, const uint8_t *message, unsigned info, const ui
 static int
 group_key(struct lx_wpa *wpa, const uint8_t *data, unsigned length, const uint8_t *counter)
 {
+	unsigned wanted = wpa->group_cipher == 2 ? 32 : 16;
+
+	if (wpa->group_cipher != 0 && wpa->group_cipher != 2 && wpa->group_cipher != 4) {
+		return (-1);
+	}
 	for (unsigned at = 0; at + 2 <= length && at + 2 + data[at + 1] <= length; at += 2 + data[at + 1]) {
 		const uint8_t *e = data + at;
 
@@ -424,15 +429,21 @@ group_key(struct lx_wpa *wpa, const uint8_t *data, unsigned length, const uint8_
 			break;				/* (padding from here on) */
 		}
 		/*
-		 * Only a CCMP group key is joined (protection() in lx_80211.c), so the key is 16 bytes -- the length key_set() copies --
+		 * Match the negotiated cipher's exact key length (CCMP 16, TKIP 32),
 		 * and its number is 1 to 3 (IEEE 802.11-2020, 12.7.2: number 0 is the pairwise key's): a KDE of another length or number
 		 * is not installed with stale bytes of `group` filling it out.
 		 */
 		if (e[0] == 0xdd && e[1] >= 6 + 5 && e[2] == 0x00 && e[3] == 0x0f && e[4] == 0xac && e[5] == 1 &&
-		    e[1] - 6u == 16 && (e[6] & 3) != 0) {
+		    e[1] - 6u == wanted && (e[6] & 3) != 0) {
 			wpa->group_index = e[6] & 3;
 			wpa->group_length = e[1] - 6u;
 			memcpy(wpa->group, e + 8, wpa->group_length);
+			if (wpa->group_cipher == 2) {
+				/* GTK is in the authenticator's order. mac80211 expects our TX MIC then RX MIC.
+				 * Same conversion as wpa_supplicant_install_gtk(): TK | AP RX MIC | AP TX MIC. */
+				memcpy(wpa->group + 16, e + 8 + 24, 8);
+				memcpy(wpa->group + 24, e + 8 + 16, 8);
+			}
 			memcpy(wpa->group_counter, counter, 8);
 			return (0);
 		}

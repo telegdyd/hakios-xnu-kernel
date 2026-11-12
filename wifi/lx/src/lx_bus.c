@@ -374,6 +374,24 @@ int
 lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi_txn *txn, int msg_id, size_t largest,
     const struct qmi_elem_info *ei, const void *structure)
 {
+#ifdef CONFIG_ATH11K_PCI
+	/*
+	 * Host capabilities on the OnePlus 10 Pro: ath11k tells a WCN6855 that it runs on a non-Qualcomm platform and is to
+	 * use its internal sleep clock (nm_modem: HOST_CSTATE, SLEEP_CLOCK_SELECT_INTERNAL, PCIE_GLOBAL_RESET, PME_D3COLD).
+	 * Here the host is a Qualcomm SoC that feeds the chip its sleep clock, and Android's cnss2 sends no nm_modem at all
+	 * (iOSPlus10 0263, t21: HOST_CAP without it, all of QMI passed). Round 1 (2026-11-12): with it, SYS_ERR right after
+	 * RESPOND_MEM. So the word is left out, as cnss2 does; wifi_hostcap_ath=1 sends ath11k's own.
+	 */
+	if (msg_id == QMI_WLANFW_HOST_CAP_REQ_V01 && lx_os_option("wifi_soc") == 8450 && !lx_os_option("wifi_hostcap_ath")) {
+		struct qmi_wlanfw_host_cap_req_msg_v01 req = *(const struct qmi_wlanfw_host_cap_req_msg_v01 *)structure;
+
+		lx_tell("lx: host capabilities as Android's cnss2 sends them: nm_modem %#x left out (wifi_hostcap_ath=1 keeps it)\n",
+		    req.nm_modem_valid ? req.nm_modem : 0);
+		req.nm_modem_valid = 0;
+		req.nm_modem = 0;
+		return (qmi_send_request(qmi, sq, txn, msg_id, largest, ei, &req));
+	}
+#endif
 	if (msg_id == QMI_WLANFW_WLAN_MODE_REQ_V01) {
 		u32 mode = ((const struct qmi_wlanfw_wlan_mode_req_msg_v01 *)structure)->mode;
 
@@ -815,6 +833,9 @@ lx_start(void)
 	#ifdef CONFIG_ATH11K_PCI
  if (lx_os_option("wifi_soc") == 8450) {
   if ((ret = lx_prepare()) != 0) return ret;
+  /* as the AHB path below: what the driver says about QMI, its boot, WMI, regulatory and mac80211, unless wifi_quiet */
+  ath11k_debug_mask = lx_os_option("wifi_quiet") ? 0 :
+      ATH11K_DBG_QMI | ATH11K_DBG_BOOT | ATH11K_DBG_PCI | ATH11K_DBG_WMI | ATH11K_DBG_REG | ATH11K_DBG_MAC;
   ath11k_frame_mode = ATH11K_HW_TXRX_ETHERNET;
   ret = lx_pci_driver_init();
   if (ret) return -ret;

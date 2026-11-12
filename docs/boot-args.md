@@ -2,7 +2,7 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **398 arguments**: 326 read by the kernel, 16 by the loader, 68 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **403 arguments**: 331 read by the kernel, 16 by the loader, 68 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
@@ -111,22 +111,27 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 |---|---|---|---|---|
 | `privs` | K | `kern_minimac.c` | `CONFIG_PRIVS` |  |
 
-## Wi-Fi (39)
+## Wi-Fi (44)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
 | `pcie` | K | `hakios.wifi.pci.c` | `CONFIG_PCIE` |  |
 | `pcie_gen` | K | `hakios.wifi.pci.c` | `CONFIG_PCIE_GEN` |  |
+| `pcie_pause` | K | `hakios.pcie.c`, `hakios.wifi.pci.c` | `CONFIG_PCIE_PAUSE` |  |
 | `wifi` | K | `hakios.wifi.c`, `hakios.wifi.pci.c` | `CONFIG_WIFI` |  |
 | `wifi_again` | K | `hakios.wifi.c` | `CONFIG_WIFI_AGAIN` |  |
 | `wifi_ask` | K | `hakios.wifi.c` | `CONFIG_WIFI_ASK` |  |
 | `wifi_ba` | K | `lx_80211.c` | `CONFIG_WIFI_BA` | implied by wifi=1 |
+| `wifi_bar_pause` | K | `lx_pci.c` | `CONFIG_WIFI_BAR_PAUSE` |  |
+| `wifi_bar_trace` | K | `lx_pci.c` | `CONFIG_WIFI_BAR_TRACE` |  |
 | `wifi_board` | K | `hakios.wifi.pci.c` | `CONFIG_WIFI_BOARD` |  |
 | `wifi_cal` | K | `hakios.wlfw.c` | `CONFIG_WIFI_CAL` |  |
+| `wifi_delay` | K | `hakios.wifi.pci.c` | `CONFIG_WIFI_DELAY` |  |
 | `wifi_dirty` | K | `hakios.wifi.c` | `CONFIG_WIFI_DIRTY` |  |
 | `wifi_file` | K | `hakios.wifi.c` | `CONFIG_WIFI_FILE` |  |
 | `wifi_fine` | K | `hakios.wifi.c` | `CONFIG_WIFI_FINE` |  |
 | `wifi_hold` | K | `lx_bus.c` | `CONFIG_WIFI_HOLD` |  |
+| `wifi_hostcap_ath` | K | `lx_bus.c` | `CONFIG_WIFI_HOSTCAP_ATH` |  |
 | `wifi_irq` | K | `lx_bus.c` | `CONFIG_WIFI_IRQ` | implied by wifi=1 |
 | `wifi_join` | K | `hakios.wifi.pci.c`, `lx_bus.c` | `CONFIG_WIFI_JOIN` |  |
 | `wifi_keep` | K | `hakios.wifi.c`, `hakios.wifi.pci.c`, `lx_bus.c` | `CONFIG_WIFI_KEEP` | implied by wifi=1 |

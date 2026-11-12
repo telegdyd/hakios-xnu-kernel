@@ -251,6 +251,7 @@ net_names	k
 net_trace	k
 pcie	k
 pcie_gen	k
+pcie_pause	k
 pmic	k
 pmic_list	k
 press_power	k
@@ -362,12 +363,16 @@ wifi	k
 wifi_again	k
 wifi_ask	k
 wifi_ba	k
+wifi_bar_pause	k
+wifi_bar_trace	k
 wifi_board	k
 wifi_cal	k
+wifi_delay	k
 wifi_dirty	k
 wifi_file	k
 wifi_fine	k
 wifi_hold	k
+wifi_hostcap_ath	k
 wifi_irq	k
 wifi_join	k
 wifi_keep	k

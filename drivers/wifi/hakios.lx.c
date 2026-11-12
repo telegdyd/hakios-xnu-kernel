@@ -717,6 +717,29 @@ lx_pool_allocate(unsigned long size)
 	return 0;
 }
 
+/*
+ * The pool's memory taken at the kernel's start (hakios_wifi_pci_init, before the chain's thread): 64 MiB in one piece is
+ * there then, and not three minutes later (round 1, 2026-11-12: stage 4 errno 12 after wifi_delay=120). The context
+ * comes later (stage 4); lx_os_dma_pool() then finds the memory allocated and only maps it. bypass: as wifi_smmu=bypass.
+ */
+int
+hakios_lx_pool_reserve(bool bypass)
+{
+	int error = 0;
+
+	lck_mtx_lock(&lx_pool_lock);
+	if (!lx_pool.allocated) {
+		lx_pool.bypass = bypass;
+		error = lx_pool_allocate(HAKIOS_WIFI_POOL_SIZE);
+		if (error == 0) {
+			say("lx: the radio's memory, %lu MiB in one piece, taken at the start (physical %#llx)\n",
+			    HAKIOS_WIFI_POOL_SIZE >> 20, (unsigned long long)lx_pool.physical);
+		}
+	}
+	lck_mtx_unlock(&lx_pool_lock);
+	return error;
+}
+
 int
 lx_os_dma_pool(unsigned long size, void **va, unsigned long long *iova)
 {

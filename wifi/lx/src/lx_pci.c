@@ -112,11 +112,34 @@ static bool in_bar(const volatile void *va)
  uintptr_t a=(uintptr_t)va, base=(uintptr_t)endpoint.link.bar0_va;
  return endpoint.linked && a>=base && a-base<=endpoint.link.bar0_size-4;
 }
+/*
+ * wifi_bar_trace=N: the first N accesses of BAR0 said before they are made (offset, value), each followed by a wait of
+ * wifi_bar_pause=MS (a spin: some callers hold locks), so that the line of an access that resets the phone reaches the
+ * USB log first (it reads the log every 100 ms). Default 0: nothing said. The read's value is said after it.
+ */
+static unsigned trace_left=~0u, trace_pause_ms;
+static bool bar_trace(const char *what,const volatile void *va,u32 v)
+{
+ if (trace_left==~0u) {
+  trace_left=lx_os_option("wifi_bar_trace"); trace_pause_ms=lx_os_option("wifi_bar_pause");
+  if (trace_pause_ms>1000) trace_pause_ms=1000;
+ }
+ if (!trace_left) return false;
+ trace_left--;
+ lx_tell("pci: BAR %s %#lx = %#x\n",what,(unsigned long)((uintptr_t)va-(uintptr_t)endpoint.link.bar0_va),v);
+ if (trace_pause_ms) {
+  unsigned long long until=lx_os_nanoseconds()+trace_pause_ms*1000000ull;
+  while (lx_os_nanoseconds()<until) ;
+ }
+ return true;
+}
 u32 lx_pci_read32(const volatile void *va)
 {
  unsigned v=~0u;
  if (in_bar(va)) {
+  bool traced=bar_trace("read ",va,0);
   if (lx_os_pcie_try_read32(va,&v)) lx_tell("pci: BAR read refused at %p\n",va);
+  if (traced) lx_tell("pci: BAR read gave %#x\n",v);
   return v;
  }
  /* AHB retains its existing access semantics in a combined-bus build. */
@@ -126,6 +149,7 @@ u32 lx_pci_read32(const volatile void *va)
 void lx_pci_write32(u32 v,volatile void *va)
 {
  if (in_bar(va)) {
+  bar_trace("write",va,v);
   if (lx_os_pcie_try_write32(va,v)) lx_tell("pci: BAR write refused at %p\n",va);
  } else if (lx_os_option("wifi_soc")!=8450) { (writel)(v,va); }
  else lx_tell("pci: out-of-range BAR write %p\n",va);

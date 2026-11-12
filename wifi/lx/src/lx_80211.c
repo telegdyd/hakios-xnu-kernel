@@ -930,6 +930,13 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 	const struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
 
 	radio->frames++;
+	if (status->flag & RX_FLAG_MMIC_ERROR) {
+		/* ath11k detected a Michael MIC failure. Never deliver the corrupt packet or
+		 * implement a second countermeasure state machine beside the firmware. */
+		lx_tell("lx: MICHAEL_MIC_FAILURE: firmware RX status, packet dropped\n");
+		dev_kfree_skb_any(skb);
+		return;
+	}
 	if (status->flag & RX_FLAG_8023) {
 		ethernet_received(radio, skb);
 	} else if (skb->len >= 36 && (skb->data[0] == 0x80 || skb->data[0] == 0x50)) {	/* a beacon, an answer to a probe */
@@ -1355,7 +1362,7 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
 /*
  * What kind of protection the access point offers (its RSN element: version, the group's
  * cipher, the ciphers and the kinds of key management it takes, capabilities). NULL if we can
- * join it -- CCMP, a passphrase's key (kind 2), management frames unprotected --, and
+ * join it -- CCMP pairwise, CCMP or TKIP group, a passphrase's key (kind 2), management frames unprotected --, and
  * *group_cipher is then what it ciphers frames to everybody with; else what stands in the way.
  */
 static const char *
@@ -1371,12 +1378,15 @@ protection(const struct lx_target *target, unsigned *group_cipher)
 	}
 	at = rsn + 2;
 	end = at + rsn[1];
-	if (end - at < 8 || at[2] != 0x00 || at[3] != 0x0f || at[4] != 0xac) {
+	if (end - at < 8 || at[0] != 1 || at[1] != 0 || at[2] != 0x00 || at[3] != 0x0f || at[4] != 0xac) {
 		return ("its RSN element is not one this reads");
 	}
 	*group_cipher = at[5];
 	count = at[6] | at[7] << 8;
 	at += 8;
+	if (count == 0 || count > (unsigned)(end - at) / 4) {
+		return ("its RSN pairwise cipher list is truncated or empty");
+	}
 	for (; count != 0 && end - at >= 4; count--, at += 4) {
 		ccmp |= at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] == 4;
 	}
@@ -1385,11 +1395,14 @@ protection(const struct lx_target *target, unsigned *group_cipher)
 	}
 	count = at[0] | at[1] << 8;
 	at += 2;
+	if (count == 0 || count > (unsigned)(end - at) / 4) {
+		return ("its RSN key management list is truncated or empty");
+	}
 	for (; count != 0 && end - at >= 4; count--, at += 4) {
 		passphrase |= at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] == 2;
 	}
-	if (*group_cipher != 4) {
-		return ("it ciphers frames to everybody with something other than CCMP (TKIP, for old stations), which is not done here");
+	if (*group_cipher != 4 && *group_cipher != 2) {
+		return ("its group cipher is neither CCMP nor TKIP");
 	}
 	if (!ccmp) {
 		return ("it does not offer CCMP");
@@ -1403,24 +1416,26 @@ protection(const struct lx_target *target, unsigned *group_cipher)
 	return (NULL);
 }
 
-/* A key for the driver to give the firmware: CCMP, for frames between us and the access point or for the group's. */
+/* Pairwise stays CCMP; the negotiated group key can also be TKIP. */
 static struct ieee80211_key_conf *
 key_set(struct lx_radio *radio, const uint8_t *key, unsigned index, bool pairwise, int *error)
 {
-	struct ieee80211_key_conf *conf = kzalloc(sizeof(*conf) + 16, GFP_KERNEL);
+	bool tkip = !pairwise && radio->wpa.group_cipher == 2;
+	unsigned length = tkip ? 32 : 16;
+	struct ieee80211_key_conf *conf = kzalloc(sizeof(*conf) + length, GFP_KERNEL);
 
 	if (conf == NULL) {
 		*error = -ENOMEM;
 		return (NULL);
 	}
-	conf->cipher = WLAN_CIPHER_SUITE_CCMP;
+	conf->cipher = tkip ? WLAN_CIPHER_SUITE_TKIP : WLAN_CIPHER_SUITE_CCMP;
 	conf->keyidx = (uint8_t)index;
-	conf->keylen = 16;
+	conf->keylen = length;
 	conf->iv_len = 8;
-	conf->icv_len = 8;
+	conf->icv_len = tkip ? 4 : 8;
 	conf->flags = pairwise ? IEEE80211_KEY_FLAG_PAIRWISE : 0;
 	conf->link_id = -1;
-	memcpy(conf->key, key, 16);
+	memcpy(conf->key, key, length);
 	mutex_lock(&radio->wiphy->mtx);
 	*error = radio->ops->set_key(&radio->hw, SET_KEY, radio->vif, pairwise ? radio->sta : NULL, conf);
 	mutex_unlock(&radio->wiphy->mtx);
@@ -1434,7 +1449,7 @@ key_drop(struct lx_radio *radio, struct ieee80211_key_conf **conf, bool pairwise
 		mutex_lock(&radio->wiphy->mtx);
 		radio->ops->set_key(&radio->hw, DISABLE_KEY, radio->vif, pairwise ? radio->sta : NULL, *conf);
 		mutex_unlock(&radio->wiphy->mtx);
-		explicit_bzero((*conf)->key, 16);
+		explicit_bzero((*conf)->key, (*conf)->keylen);
 		kfree(*conf);
 		*conf = NULL;
 	}
@@ -1457,13 +1472,19 @@ group_rekey(struct work_struct *work)
 		 * new configuration, which key_set() returns even then, is wiped and freed; nothing was installed to disable.
 		 */
 		if (fresh != NULL) {
-			explicit_bzero(fresh->key, 16);
+			explicit_bzero(fresh->key, fresh->keylen);
 			kfree(fresh);
 		}
 		return;
 	}
 	radio->group_key = fresh;
-	key_drop(radio, &old, false);
+	if (old != NULL && old->keyidx == fresh->keyidx) {
+		/* SET_KEY already replaced this firmware slot. DISABLE_KEY would erase the fresh GTK. */
+		explicit_bzero(old->key, old->keylen);
+		kfree(old);
+	} else {
+		key_drop(radio, &old, false);
+	}
 }
 
 /* One step of the station's state as the driver is told of it (mac80211: drv_sta_state()). */
@@ -1708,6 +1729,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	get_random_bytes(radio->wpa.own_nonce, sizeof(radio->wpa.own_nonce));
 	radio->wpa.rsn = radio->rsn;
 	radio->wpa.rsn_length = 22;
+	radio->wpa.group_cipher = group_cipher;
 	radio->handshake = LX_WPA_NOTHING;
 	printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes; 0: the key itself was given) is there: %llu ms\n",
 	    name_length, what->passphrase_length, (lx_os_nanoseconds() - began) / 1000000ull);

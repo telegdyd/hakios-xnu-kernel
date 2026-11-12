@@ -42,7 +42,11 @@ def case(n):
     ap, station = bytes([2] + [rnd.randrange(256) for _ in range(5)]), bytes([2] + [rnd.randrange(256) for _ in range(5)])
     anonce, snonce = rnd.randbytes(32), rnd.randbytes(32)
     rsn = bytes.fromhex('30140100000fac040100000fac040100000fac020000')      # CCMP, CCMP, PSK, no capabilities
-    group, group_index, group2 = rnd.randbytes(16), rnd.randint(1, 3), rnd.randbytes(16)
+    # Alternate the original CCMP case with the owner's mixed-mode RSN: CCMP pairwise, TKIP group.
+    tkip = bool(n % 2)
+    if tkip:
+        rsn = rsn[:7] + b'\x02' + rsn[8:]
+    group, group_index, group2 = rnd.randbytes(32 if tkip else 16), rnd.randint(1, 3), rnd.randbytes(32 if tkip else 16)
     version = rnd.choice([1, 2])
     counter = rnd.randrange(1 << 40)
     replay = lambda k: struct.pack('>Q', counter + k)
@@ -70,9 +74,11 @@ def case(n):
     other_ptk = prf(other, b'Pairwise key expansion', min(ap, station) + max(ap, station) + min(anonce, snonce) + max(anonce, snonce), 48)
     m3_wrong = key_message(version, 0x13ca, replay(1), anonce, rsc, aes_key_wrap(other_ptk[16:32], bytes(24)), other_ptk[:16])
 
+    # mac80211's station-side order is TK | TX MIC | RX MIC, the reverse of the AP's MIC halves.
+    station_key = lambda key: key[:16] + key[24:32] + key[16:24] if tkip else key
     text = ''.join(c_bytes('c%d_%s' % (n, k), v) for k, v in (
         ('passphrase', passphrase), ('name', name), ('ap', ap), ('station', station), ('snonce', snonce), ('rsn', rsn),
-        ('pmk', pmk), ('tk', tk), ('group', group), ('group2', group2), ('m1', m1), ('m2', m2), ('m3', m3), ('m4', m4),
+        ('pmk', pmk), ('tk', tk), ('group', station_key(group)), ('group2', station_key(group2)), ('m1', m1), ('m2', m2), ('m3', m3), ('m4', m4),
         ('g1', g1), ('g2', g2), ('m3_wrong', m3_wrong)))
     entry = '{ %s, %d }' % (', '.join('c%d_%s, sizeof(c%d_%s)' % (n, k, n, k) for k in (
         'passphrase', 'name', 'ap', 'station', 'snonce', 'rsn', 'pmk', 'tk', 'group', 'group2', 'm1', 'm2', 'm3', 'm4', 'g1',

@@ -51,6 +51,7 @@ static struct hakios_sta_join fallback;        /* ... as it was before a join th
 
 static struct hakios_sta_bss *heard;           /* by the last scan that came to an end */
 static unsigned heard_count;
+static uint64_t scan_generation;
 static struct hakios_sta_channel channels[CHANNELS_MOST];
 static unsigned channel_count;
 
@@ -146,6 +147,9 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			heard_count = 0;
 			lck_mtx_unlock(&sta_lock);
 			ops->heard(heard_one, NULL);
+			lck_mtx_lock(&sta_lock);
+			scan_generation++;
+			lck_mtx_unlock(&sta_lock);
 			hakios_apple80211_event(HAKIOS_STA_SCAN_DONE, error);
 		}
 
@@ -325,6 +329,16 @@ hakios_sta_heard(unsigned index, struct hakios_sta_bss *bss)
 	}
 	lck_mtx_unlock(&sta_lock);
 	return there;
+}
+
+uint64_t
+hakios_sta_scan_generation(void)
+{
+	uint64_t generation;
+	lck_mtx_lock(&sta_lock);
+	generation = scan_generation;
+	lck_mtx_unlock(&sta_lock);
+	return generation;
 }
 
 void

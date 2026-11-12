@@ -107,6 +107,7 @@ int      hakios_sta_ask_join(const struct hakios_sta_join *what);
 int      hakios_sta_ask_join_standing(const struct hakios_sta_join *what);
 int      hakios_sta_ask_leave(void);
 bool     hakios_sta_busy(void);                                        /* something asked for is not over yet */
+uint64_t hakios_sta_scan_generation(void);                              /* completed scan snapshots, independent of other queued work */
 bool     hakios_sta_powered(void);
 /* the `index`th access point the last scan heard: true, or false when there are not that many */
 bool     hakios_sta_heard(unsigned index, struct hakios_sta_bss *bss);

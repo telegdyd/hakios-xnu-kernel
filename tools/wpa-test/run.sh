@@ -13,3 +13,4 @@ mkdir -p "$B"
 ${CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
 	-I"$B" -I"$ROOT/wifi/lx/src" -o "$B/test" "$HERE/test_wpa.c"
 "$B/test"
+python3 "$HERE/station.py"
