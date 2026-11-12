@@ -1,8 +1,8 @@
 /* Join the saved Wi-Fi networks through MobileWiFi/wifid, never kernel boot words.
- * wifid here does not auto-join by itself (its iOS 16 known-network store is never
- * made), so this job stays running in System and does it: at boot, after Wi-Fi is
- * turned back on, and after the link is lost. It only asks while Wi-Fi is on and has
- * been unjoined for two looks in a row, and backs off when no saved network joins.
+ * wifid auto-joins by itself once its known-network store exists (migrate_if_needed) and the
+ * driver answers RSSI_BOUNDS (WIFI-PLAN.md I1). This job stays in System as the fallback: when
+ * Wi-Fi is on and no network has been joined for 30 s (wifid's own try comes first, and a join
+ * this job asks for cancels wifid's), it joins the saved networks itself, then backs off.
  * No names, addresses or passwords are logged. A password readable here is handed to
  * MobileWiFi; one stored by a Settings join is not, and wifid then uses its own.
  * Private API signatures: ios-reversed-headers/MobileWiFi (Cykey), as used by
@@ -30,8 +30,42 @@ static Boolean (*WiFiNetworkRequiresPassword)(CFTypeRef);
 static void (*WiFiNetworkSetPassword)(CFTypeRef, CFStringRef);
 static int (*WiFiDeviceClientAssociateAsync)(CFTypeRef, CFTypeRef,
     void (*)(CFTypeRef, CFTypeRef, CFDictionaryRef, int, const void *), CFDictionaryRef);
+static int (*WiFiManagerClientMigrateList)(CFTypeRef);
 
 static int finished, association_error;
+
+/*
+ * iOS 16's wifid joins from its known-network store (com.apple.wifi.known-networks.plist), which it fills
+ * from the legacy list in com.apple.wifi.plist only once isWiFiPNLMigrationComplete there is false: the
+ * OS installer's data migrator sets that, and it never runs here, so the key is missing and wifid never
+ * migrates (its maintenance task is scheduled only for false). Ask for the migration (wifid's
+ * _wifi_manager_migrate_list) whenever the key is not true; wifid sets it true itself.
+ */
+static void
+migrate_if_needed(CFTypeRef manager)
+{
+	static const char path[] = "/private/var/preferences/SystemConfiguration/com.apple.wifi.plist";
+	CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, sizeof(path) - 1, false);
+	CFReadStreamRef stream = url ? CFReadStreamCreateWithFile(NULL, url) : NULL;
+	CFPropertyListRef prefs = NULL;
+	Boolean done = false;
+
+	if (stream && CFReadStreamOpen(stream)) {
+		prefs = CFPropertyListCreateWithStream(NULL, stream, 0, kCFPropertyListImmutable, NULL, NULL);
+		CFReadStreamClose(stream);
+	}
+	if (prefs && CFGetTypeID(prefs) == CFDictionaryGetTypeID()) {
+		CFTypeRef value = CFDictionaryGetValue(prefs, CFSTR("isWiFiPNLMigrationComplete"));
+		done = value && CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue(value);
+	}
+	if (prefs) CFRelease(prefs);
+	if (stream) CFRelease(stream);
+	if (url) CFRelease(url);
+	if (!done && WiFiManagerClientMigrateList) {
+		WiFiManagerClientMigrateList(manager);
+		puts("wifi_start: asked wifid to move its saved networks into the iOS 16 store");
+	}
+}
 
 static void
 associated(CFTypeRef device, CFTypeRef network, CFDictionaryRef info, int error, const void *context)
@@ -129,15 +163,18 @@ main(void)
 	LOAD(WiFiNetworkSetPassword, void, (CFTypeRef, CFStringRef));
 	LOAD(WiFiDeviceClientAssociateAsync, int, (CFTypeRef, CFTypeRef,
 	    void (*)(CFTypeRef, CFTypeRef, CFDictionaryRef, int, const void *), CFDictionaryRef));
+	WiFiManagerClientMigrateList = (int (*)(CFTypeRef))dlsym(library, "WiFiManagerClientMigrateList");
 	CFTypeRef manager = WiFiManagerClientCreate(NULL, 0);
 	if (!manager) { puts("wifi_start: no native manager"); return 1; }
+	migrate_if_needed(manager);
 	/* The client's view of the device (attached, power, network) is kept current by wifid's notifications, which
 	 * arrive only while its run loop runs: so the waits below run it, and it stays scheduled for the session. */
 	WiFiManagerClientScheduleWithRunLoop(manager, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
 
-	/* unjoined: consecutive 5 s looks with Wi-Fi on and no network (two before asking, so a
-	 * join someone else has started is left alone; at boot it may ask at once). */
-	unsigned unjoined = 1, backoff = 0, wait = 0;
+	/* unjoined: consecutive 5 s looks with Wi-Fi on and no network; ask after LOOKS of them, so
+	 * wifid's auto-join (a few seconds) and a join someone else has started are left alone. */
+	enum { LOOKS = 6 };
+	unsigned unjoined = 0, backoff = 0, wait = 0;
 	int was = -2;	/* last reported state: -1 off, 0 unjoined, 1 joined */
 	for (;;) {
 		CFArrayRef devices = WiFiManagerClientCopyDevices(manager);
@@ -150,7 +187,7 @@ main(void)
 		if (state != 0) {
 			unjoined = 0;
 			backoff = wait = 0;
-		} else if (++unjoined >= 2 && wait == 0) {
+		} else if (++unjoined >= LOOKS && wait == 0) {
 			int r = join_saved(manager, device);
 			if (r == 0) {
 				backoff = 0;

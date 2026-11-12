@@ -60,7 +60,9 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
 #include <sys/hakios.input.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -187,6 +189,7 @@ struct peripheral {
 };
 static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
 static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1; named by the layout */
+static struct peripheral rtc = { .name = "the PMK8350's real-time clock", .id = 0x061 };         /* registers 0x6100 of slave 0 */
 
 /* How the reads have gone: said once a minute. */
 static struct {
@@ -419,6 +422,34 @@ identify(const struct peripheral *p, uint8_t type, uint8_t subtype_from, uint8_t
 	return true;
 }
 
+/*
+ * kern.hakios.rtc_counter: the PMK8350's real-time clock as it reads now (four bytes at 0x6148, little-endian, as
+ * Linux's rtc-pm8xxx.c reads them), or -1 when the clock was not found (step 3) or the read fails. It is a counter
+ * of seconds that goes on while the phone is off, not a date (drivers/power/hakios.pmic.c: on the X5 Pro it read
+ * as 1971): Android keeps the offset to real time in a file of its own, and so does hakios (userland/src/
+ * clock_keep.c, WIFI-PLAN.md I8). Read here because this driver has the arbiter of either phone mapped already;
+ * like the keys, only read: nothing is written to the clock.
+ */
+static bool rtc_known;
+
+static int
+rtc_counter_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int64_t value = -1;
+	uint8_t b[4];
+
+	if (req->newptr != USER_ADDR_NULL) {
+		return EPERM;
+	}
+	if (rtc_known && spmi_read(&rtc, 0x48, b, 4) == NULL) {
+		value = (int64_t)(b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
+	}
+	return SYSCTL_OUT(req, &value, sizeof(value));
+}
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, rtc_counter, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, rtc_counter_sysctl, "Q",
+    "the PMIC real-time clock's seconds counter as it reads now (not a date); -1: not found or not read");
+
 /* Step 4 for the power-on block: nothing to check but what it says now; its interrupt setup goes to the log. */
 static void
 pon_inputs(void)
@@ -523,6 +554,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	printf("buttons: step 2: look through the arbiter's table for the channels of the two peripherals\n");
 	find_channel(&pon, channels);
 	find_channel(&pin, channels);
+	find_channel(&rtc, channels);
 	if (steps < 3) {
 		goto out;
 	}
@@ -530,6 +562,15 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
 	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
 	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
+	rtc_known = identify(&rtc, 0x07, 0x01, 0x01);   /* the clock's "write" block (pmic.c: type 0x07, subtype 0x01) */
+	if (rtc_known) {
+		uint8_t b[4];
+
+		if (spmi_read(&rtc, 0x48, b, 4) == NULL) {
+			printf("buttons: %s counts %u s (kern.hakios.rtc_counter)\n", rtc.name,
+			    b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
+		}
+	}
 	if (steps < 4) {
 		goto out;
 	}

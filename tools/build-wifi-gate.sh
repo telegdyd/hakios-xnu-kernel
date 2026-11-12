@@ -45,6 +45,9 @@ xnu-clang -arch arm64 -isysroot "$THEOS/sdks/iPhoneOS16.5.sdk" -O2 -Wall -Wextra
 xnu-clang -arch arm64 -isysroot "$THEOS/sdks/iPhoneOS16.5.sdk" -O2 -Wall -Wextra -Werror \
   -framework CoreFoundation -o "$OUT/wifi_start" userland/src/wifi_start.c
 "$SIGN" -Suserland/src/wifi_start.entitlements "$OUT/wifi_start"
+# The date from the PMIC clock's counter and a kept offset (WIFI-PLAN.md I8).
+xnu-clang -arch arm64 -isysroot "$THEOS/sdks/iPhoneOS16.5.sdk" -O2 -Wall -Wextra -Werror   -o "$OUT/clock_keep" userland/src/clock_keep.c
+"$SIGN" -S "$OUT/clock_keep"
 STAGE=$(mktemp -d "$OUT/root.XXXXXX")
 cp -a userland/root/. "$STAGE/"
 # The flash-boot launchd creates a user/501 namespace as well as System.
@@ -70,12 +73,14 @@ PY
 install -m 0755 "$OUT/gpu-power-policy" "$STAGE/bin/gpu-power-policy"
 install -m 0755 "$OUT/wifi_start" "$STAGE/bin/wifi_start"
 install -m 0644 userland/com.hakios.gpu-power.plist "$STAGE/LaunchDaemons/"
+install -m 0755 "$OUT/clock_keep" "$STAGE/bin/clock_keep"
+install -m 0644 userland/com.hakios.clock.plist "$STAGE/LaunchDaemons/"
 for f in amss.bin amss20.bin m3.bin regdb.bin bdwlang.b0e; do
   cmp "fw-wifi/$f" "$STAGE/fw/$f"
 done
 test ! -e "$STAGE/fw/network"
 for f in sbin/init lib/HakiosMetal.bundle/HakiosMetal lib/libOSMesa.8.dylib lib/libhakios.gl.dylib \
-         bin/net_test bin/sweetd bin/wifi_start LaunchDaemons/com.hakios.wifi.plist \
+         bin/net_test bin/sweetd bin/wifi_start bin/clock_keep LaunchDaemons/com.hakios.wifi.plist LaunchDaemons/com.hakios.clock.plist \
          LaunchDaemons/com.apple.wifid.plist LaunchDaemons/com.apple.securityd.plist \
          LaunchDaemons/com.apple.configd.plist; do
   test -s "$STAGE/$f" || { echo "build-wifi-gate: missing staged $f" >&2; exit 1; }
@@ -88,5 +93,5 @@ printf '%s\n' "$STAGE" > "$OUT/staged-root.txt"
 sha256sum tools/build-wifi-gate.sh userland/build.sh userland/src/init.c \
   userland/src/HakiosMetalCA.m userland/src/gpu_power_policy.c \
   userland/src/wifi_start.c userland/src/wifi_start.entitlements \
-  userland/com.hakios.gpu-power.plist sysimage/rootfs.slt fw-wifi/* "$OUT/gate.apfs" > "$OUT/SHA256SUMS"
+  userland/src/clock_keep.c userland/com.hakios.clock.plist   userland/com.hakios.gpu-power.plist sysimage/rootfs.slt fw-wifi/* "$OUT/gate.apfs" > "$OUT/SHA256SUMS"
 echo "build-wifi-gate: $OUT/gate.apfs (sources rebuilt; APFS check passed)"

@@ -81,6 +81,9 @@ struct hakios_sta_ops {
 	int (*leave)(void);
 	void (*state)(struct hakios_sta_state *state);         /* on any thread; does not sleep */
 	unsigned (*channels)(struct hakios_sta_channel *channels, unsigned most);      /* what the radio may tune to */
+	/* asked (two letters, or NULL only to read): the radio into that country, returning once its domain is in
+	 * force; now (or NULL): the country of the domain in force, two letters (zero: none yet) */
+	int (*country)(const char *asked, char *now);
 	uint8_t address[6];
 };
 
@@ -106,6 +109,8 @@ int      hakios_sta_ask_join(const struct hakios_sta_join *what);
 /* ... and joined again whenever the radio is turned on, until some other network is asked for */
 int      hakios_sta_ask_join_standing(const struct hakios_sta_join *what);
 int      hakios_sta_ask_leave(void);
+int      hakios_sta_ask_country(const char *code);                     /* two letters; the channels follow it */
+bool     hakios_sta_country(char *code);                               /* the country in force: two letters, or false */
 bool     hakios_sta_busy(void);                                        /* something asked for is not over yet */
 uint64_t hakios_sta_scan_generation(void);                              /* completed scan snapshots, independent of other queued work */
 bool     hakios_sta_powered(void);

@@ -368,6 +368,23 @@ get(struct apple80211req *request)
 		kfree_data(answer, sizeof(*answer));
 		return error;
 	}
+	case 106: {
+		/*
+		 * The signal range, in dBm: a version, then RSSI_MIN, RSSI_MAX and RSSI_THRESHOLD (int32 each; the
+		 * layout as iOSPlus10 read it from IO80211.framework of 20H392). wifid takes RSSI_THRESHOLD as the
+		 * weakest network auto-join may pick (its own stricter -70/-65 for moving and crowded networks
+		 * apply on top); refused, it stays 0 and every network is "Below minimum RSSI threshold".
+		 * The values are not measured: min < threshold < max, -80 the usual auto-join floor.
+		 */
+		static const int32_t bounds[4] = { 1, -90, -40, -80 };
+
+		return give(request, bounds, sizeof(bounds));
+	}
+	case 51: {                              /* the country the radio is in: its two letters and a zero */
+		char code[3] = { 0 };
+
+		return hakios_sta_country(code) ? give(request, code, sizeof(code)) : ENXIO;
+	}
 	case 21:                                /* how the last join went (0: not over yet) */
 		lck_mtx_lock(&apple80211_lock);
 		request->req_val = (int32_t)join_result;
@@ -593,6 +610,37 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	case 383: {                             /* Apple80211SetProperty: { key: value } as an XML property list, after a */
+		char data[384];                 /* version and its length; nothing here takes one, the key is said */
+		const char *key, *end;          /* (after the XML header and DOCTYPE, ~175 bytes) */
+
+		if (request->req_len >= 8 + 16 && copyin(request->req_data + 8, data, MIN(sizeof(data) - 1, request->req_len - 8)) == 0) {
+			data[sizeof(data) - 1] = 0;
+			if ((key = strnstr(data, "<key>", sizeof(data))) != NULL && (end = strnstr(key, "</key>", sizeof(data) -
+			    (size_t)(key - data))) != NULL) {
+				snprintf(said, said_size, " (a property: %.*s)", (int)MIN(end - key - 5, 60), key + 5);
+			}
+		}
+		return EOPNOTSUPP;
+	}
+	case 51: {                              /* the country (wifid: from the beacons' country elements); a version, then */
+		struct {                        /* the letters (APPLE80211_MAX_CC_LEN 3) */
+			uint32_t version;
+			char code[4];
+		} asked;
+		int error;
+
+		if (request->req_len < 6 || request->req_len > sizeof(asked)) {
+			return EINVAL;
+		}
+		bzero(&asked, sizeof(asked));
+		if ((error = copyin(request->req_data, &asked, request->req_len)) != 0) {
+			return error;
+		}
+		snprintf(said, said_size, " (the country: version %u, \"%c%c\")", asked.version, asked.code[0] >= ' ' && asked.code[0] < 127 ?
+		    asked.code[0] : '?', asked.code[1] >= ' ' && asked.code[1] < 127 ? asked.code[1] : '?');
+		return hakios_sta_ask_country(asked.code);
+	}
 	default:
 		return EOPNOTSUPP;
 	}
@@ -676,9 +724,11 @@ static struct {
 } kinds[96];
 static unsigned kind_count;
 
-static void
+/* true: the first of its kind, or the first answer of a kind refused so far, or the first refusal of one answered */
+static bool
 note(const struct apple80211req *request, bool is_set, int error)
 {
+	bool first = false;
 	unsigned i;
 
 	lck_mtx_lock(&apple80211_lock);
@@ -688,11 +738,14 @@ note(const struct apple80211req *request, bool is_set, int error)
 		if (i == kind_count) {
 			kinds[kind_count++] = (typeof(kinds[0])) { .type = request->req_type, .set = is_set };
 		}
+		first = kinds[i].times == 0 || (error == 0 && kinds[i].answered == 0) ||
+		    (error != 0 && kinds[i].last_error == 0);
 		kinds[i].times++;
 		kinds[i].answered += error == 0;
 		kinds[i].last_error = error != 0 ? error : kinds[i].last_error;
 	}
 	lck_mtx_unlock(&apple80211_lock);
+	return first;
 }
 
 void
@@ -728,9 +781,10 @@ hakios_apple80211_ioctl(u_long command, void *data)
 	}
 	proc_selfname(who, sizeof(who));
 	error = is_set ? set(request, what, sizeof(what)) : get(request);
-	note(request, is_set, error);
-	/* (a request that is repeated for ever is said a few hundred times) */
-	if (said < 800 || (is_set && (request->req_type == 20 || request->req_type == 22))) {
+	/* (a request that is repeated for ever is said a few hundred times; after that only what is new of a kind, joins,
+	 * leaves and the country) */
+	if (note(request, is_set, error) || said < 800 || (is_set && (request->req_type == 20 || request->req_type == 22 ||
+	    request->req_type == 51))) {
 		said++;
 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==

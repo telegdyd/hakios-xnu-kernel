@@ -346,6 +346,7 @@ linuxkpi_regulatory_set_wiphy_regd_sync(struct wiphy *wiphy, struct linuxkpi_iee
 	lx_os_lock();
 	radio->applying--;
 	lx_os_wakeup(&radio->applying);
+	lx_os_wakeup(&radio->regd);		/* (boundary_country() waits for the firmware's new domain) */
 	lx_os_unlock();
 	kfree(old);
 	return (0);
@@ -2130,7 +2131,71 @@ boundary_channels(struct hakios_sta_channel *channels, unsigned most)
 	return (count);
 }
 
+/*
+ * The country the radio is in (two letters, ISO 3166-1), as iOS has worked it out (wifid: from the
+ * country elements of the beacons it hears). Asked of the driver the way Linux's cfg80211 asks it
+ * for a user's hint: its reg_notifier, which hands the firmware the country (WMI
+ * SET_CURRENT_COUNTRY on WCN6855, INIT_COUNTRY on the others); the firmware answers with the domain
+ * of that country, which comes to linuxkpi_regulatory_set_wiphy_regd_sync() above and changes
+ * the channels. Waits for that domain: 0 once the radio is in the country, ETIMEDOUT if the
+ * firmware never says so, EINVAL for a code that is not two letters, ENXIO without a radio.
+ * `now` (may be NULL) gets the domain's two letters in either case.
+ */
+static int
+boundary_country(const char *asked, char *now)
+{
+	struct lx_radio *radio = the_radio;
+	struct regulatory_request request;
+	unsigned long long began;
+	char want[2];
+	int error = 0;
+
+	if (radio == NULL || !radio->registered) {
+		return (ENXIO);
+	}
+	if (asked != NULL) {
+		for (int i = 0; i < 2; i++) {
+			if (!((asked[i] >= 'A' && asked[i] <= 'Z') || (asked[i] >= 'a' && asked[i] <= 'z'))) {
+				return (EINVAL);
+			}
+			want[i] = asked[i] & ~0x20;	/* (upper case, as the firmware's domains have it) */
+		}
+		lx_os_lock();
+		error = radio->regd != NULL && memcmp(radio->regd->alpha2, want, 2) == 0 ? -1 : 0;
+		lx_os_unlock();
+		if (error == 0 && radio->wiphy->reg_notifier == NULL) {
+			error = EOPNOTSUPP;
+		} else if (error == 0) {
+			bzero(&request, sizeof(request));
+			memcpy(request.alpha2, want, 2);
+			request.initiator = NL80211_REGDOM_SET_BY_USER;
+			request.user_reg_hint_type = NL80211_USER_REG_HINT_USER;
+			began = lx_os_nanoseconds();
+			radio->wiphy->reg_notifier(radio->wiphy, &request);
+			lx_os_lock();
+			while ((radio->regd == NULL || memcmp(radio->regd->alpha2, want, 2) != 0) &&
+			    lx_os_nanoseconds() - began < 5000000000ull) {
+				lx_os_sleep(&radio->regd, 100 * 1000000ull);
+			}
+			error = radio->regd != NULL && memcmp(radio->regd->alpha2, want, 2) == 0 ? 0 : ETIMEDOUT;
+			lx_os_unlock();
+			lx_tell("lx: the country %c%c is asked of the firmware: %s in %llu ms\n", want[0], want[1], error == 0 ?
+			    "its domain has come" : "NO DOMAIN of it has come", (lx_os_nanoseconds() - began) / 1000000ull);
+		} else {
+			error = 0;		/* (the radio is in it already) */
+		}
+	}
+	if (now != NULL) {
+		lx_os_lock();
+		now[0] = radio->regd != NULL ? radio->regd->alpha2[0] : 0;
+		now[1] = radio->regd != NULL ? radio->regd->alpha2[1] : 0;
+		lx_os_unlock();
+	}
+	return (error);
+}
+
 static struct hakios_sta_ops boundary = {
+	.country = boundary_country,
 	.power = boundary_power,
 	.scan = boundary_scan,
 	.heard = boundary_heard,

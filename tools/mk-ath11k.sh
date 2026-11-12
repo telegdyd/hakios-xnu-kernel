@@ -39,6 +39,7 @@ set -e
 VERSION=7.0.14
 SHA256=de9999b784d2293f00d39c62d8f92a08ab8a54bc4e80ffd250a0c09cb07a0f98
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+SELF=$(readlink -f "$0")		# (an object older than this script, whose flags it holds, is made again: after the cd below too)
 B=${ATH11K_BUILD_DIR:-$ROOT/xnu-deps/build/ath11k}
 ATH=drivers/net/wireless/ath
 mkdir -p "$B"
@@ -136,8 +137,10 @@ CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fn
 	-I$W/include -Igen -I$S -I$S/contrib/ck/include
 	-I$S/compat/linuxkpi/common/include -I$S/compat/linuxkpi/dummy/include
 	-include $S/compat/linuxkpi/common/include/linux/kconfig.h -DLINUXKPI_VERSION=70000"
+# CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS: ath11k_reg_notifier() hands the firmware the country iOS asks for (lx_80211.c,
+# boundary_country); without it the notifier only says "Country Setting is not allowed".
 DFLAGS="-Isrc/ath11k -Isrc -include $W/include/lx_prelude.h -DCONFIG_ATH11K_AHB -DCONFIG_ATH11K_DEBUG
-	-DKBUILD_MODNAME=\"ath11k\""
+	-DCONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS -DKBUILD_MODNAME=\"ath11k\""
 # two headers are the kernel's: what it offers this object (wifi/lx/include/lx_os.h), and its QMI
 # helpers (wifi/lx/include/linux/soc/qcom/qmi.h)
 source "$ROOT/xnu-env.sh"
@@ -157,7 +160,7 @@ rm -f obj/*.err
 compile() {		# compile SOURCE OBJECT [FLAGS]: only when the object is older than anything it was made of
 	local src=$1 obj=$2
 	shift 2
-	if [ -f "$obj" ] && [ -f "$obj.d" ] && [ -z "$(find $(sed -e 's/^[^:]*://' -e 's/\\$//' "$obj.d") "$0" -newer "$obj" 2>/dev/null | head -1)" ]; then
+	if [ -f "$obj" ] && [ -f "$obj.d" ] && [ -z "$(find $(sed -e 's/^[^:]*://' -e 's/\\$//' "$obj.d") "$SELF" -newer "$obj" 2>/dev/null | head -1)" ]; then
 		return
 	fi
 	$CC $CFLAGS "$@" -MMD -MF "$obj.d" -c "$src" -o "$obj" 2> "$obj.err" || rm -f "$obj"

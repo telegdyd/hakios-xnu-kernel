@@ -17,6 +17,7 @@
  * another network -- as Darwin itself rejoins the networks it knows. If that other network cannot
  * be joined (a wrong passphrase), the standing one is joined again.
  */
+#include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
@@ -43,7 +44,11 @@ static unsigned sta_reads;                      /* ... and so many others are in
 static bool sta_on;                             /* the radio's power, as last asked for */
 
 /* what has been asked for and not begun */
-static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
+static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave, asked_country;
+static char asked_country_what[2];
+static char country_now[2];                     /* of the domain in force, as the station side last said (zero: none) */
+static unsigned country_done;                   /* country requests carried out (whoever asked waits for it to move) */
+static int country_error;                       /* ... and how the last one went */
 static struct hakios_sta_scan asked_scan_what;
 static struct hakios_sta_join asked_join_what;
 static struct hakios_sta_join standing;        /* the network joined whenever the radio comes on (ssid_length 0: none) */
@@ -74,11 +79,12 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 
 	for (;;) {
 		const struct hakios_sta_ops *ops;
-		bool power = false, power_on = false, leave = false, do_join = false, do_scan = false;
+		bool power = false, power_on = false, leave = false, do_join = false, do_scan = false, country = false;
+		char code[2] = { 0 };
 		int error = 0;
 
 		lck_mtx_lock(&sta_lock);
-		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan)) {
+		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan || asked_country)) {
 			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
 		}
 		ops = sta_ops;
@@ -87,6 +93,10 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			power = true;
 			power_on = asked_power_on;
 			asked_power = false;
+		} else if (asked_country) {     /* (before a scan or a join: they are to use the country's channels) */
+			country = true;
+			memcpy(code, asked_country_what, sizeof(code));
+			asked_country = false;
 		} else if (asked_leave) {
 			leave = true;
 			asked_leave = false;
@@ -123,6 +133,30 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 				asked_join = true;
 			}
 			lck_mtx_unlock(&sta_lock);
+		} else if (country) {
+			struct hakios_sta_channel *now = kalloc_data(CHANNELS_MOST * sizeof(*now), Z_WAITOK);
+			char in_force[2] = { 0 };
+			unsigned count = 0;
+
+			error = ops->country(code, in_force);
+			if (now != NULL) {
+				count = ops->channels(now, CHANNELS_MOST);
+			}
+			lck_mtx_lock(&sta_lock);
+			memcpy(country_now, in_force, sizeof(country_now));
+			if (now != NULL) {
+				memcpy(channels, now, count * sizeof(*now));
+				channel_count = count;
+			}
+			country_error = error;
+			country_done++;
+			lck_mtx_unlock(&sta_lock);
+			thread_wakeup((event_t)&country_done);
+			if (now != NULL) {
+				kfree_data(now, CHANNELS_MOST * sizeof(*now));
+			}
+			hakios_wifi_tell("wifi: the country %c%c: %s (in force: %c%c, %u channels)\n", code[0], code[1], error == 0 ? "done" :
+			    "NOT DONE", in_force[0] ? in_force[0] : '-', in_force[1] ? in_force[1] : '-', count);
 		} else if (leave) {
 			ops->leave();
 			hakios_apple80211_event(HAKIOS_STA_LINK, 0);
@@ -170,12 +204,16 @@ hakios_sta_attach(const struct hakios_sta_ops *ops)
 	if (ops == NULL) {
 		lck_mtx_lock(&sta_lock);
 		sta_ops = NULL;
-		asked_power = asked_scan = asked_join = asked_leave = false;
+		asked_power = asked_scan = asked_join = asked_leave = asked_country = false;
 		while (sta_calls || sta_reads != 0) {
 			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_calls, THREAD_UNINT);
 		}
 		heard_count = channel_count = 0;
+		bzero(country_now, sizeof(country_now));
+		country_error = ENXIO;
+		country_done++;                 /* (whoever waits for a country hears that there is no radio) */
 		lck_mtx_unlock(&sta_lock);
+		thread_wakeup((event_t)&country_done);
 		return;
 	}
 	if (heard == NULL) {
@@ -195,6 +233,7 @@ hakios_sta_attach(const struct hakios_sta_ops *ops)
 		sta_thread_made = true;
 	}
 	channel_count = ops->channels(channels, CHANNELS_MOST);
+	ops->country(NULL, country_now);
 	lck_mtx_lock(&sta_lock);
 	sta_ops = ops;
 	sta_on = true;
@@ -316,6 +355,52 @@ hakios_sta_ask_leave(void)
 	lck_mtx_unlock(&sta_lock);
 	thread_wakeup((event_t)&sta_ops);
 	return 0;
+}
+
+/*
+ * Unlike the others this waits for the outcome (at most 15 s: a scan under way comes first), because
+ * whoever sets a country goes by the answer: 0 once the radio is in it, or why not.
+ */
+int
+hakios_sta_ask_country(const char *code)
+{
+	uint64_t deadline;
+	unsigned ticket;
+	int error;
+
+	clock_interval_to_deadline(15, NSEC_PER_SEC, &deadline);
+	lck_mtx_lock(&sta_lock);
+	if (sta_ops == NULL) {
+		lck_mtx_unlock(&sta_lock);
+		return ENXIO;
+	}
+	memcpy(asked_country_what, code, sizeof(asked_country_what));
+	asked_country = true;
+	ticket = country_done;
+	thread_wakeup((event_t)&sta_ops);
+	while (country_done == ticket) {
+		if (lck_mtx_sleep_deadline(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&country_done, THREAD_UNINT, deadline) ==
+		    THREAD_TIMED_OUT) {
+			break;
+		}
+	}
+	error = country_done == ticket ? ETIMEDOUT : country_error;
+	lck_mtx_unlock(&sta_lock);
+	return error;
+}
+
+bool
+hakios_sta_country(char *code)
+{
+	bool known;
+
+	lck_mtx_lock(&sta_lock);
+	known = sta_ops != NULL && country_now[0] != 0;
+	if (known) {
+		memcpy(code, country_now, sizeof(country_now));
+	}
+	lck_mtx_unlock(&sta_lock);
+	return known;
 }
 
 bool
