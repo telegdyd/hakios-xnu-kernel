@@ -4,6 +4,7 @@
 
 int	lx_base_init(void);		/* lx_base.c: the thread that counts the ticks and runs the timers */
 int	lx_pool_init(void);		/* lx_base.c: the memory the radio reads and writes; 0, or an errno */
+int	lx_pool_window(unsigned long long *base, unsigned long *size);	/* lx_base.c: the pool's first radio address and its size; 0, or ENODEV before lx_pool_init */
 long	lx_stub(const char *name);	/* lx_base.c: what a function that is not there yet does */
 void	lx_tell(const char *format, ...) __printflike(1, 2);	/* lx_base.c: a line that is always said (printf: may be kept back) */
 void	lx_memory_say(void);		/* lx_base.c: what the layer holds of memory */

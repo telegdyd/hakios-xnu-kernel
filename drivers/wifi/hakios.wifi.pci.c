@@ -930,8 +930,12 @@ pci_thread(__unused void *parameter, __unused wait_result_t result)
 		    "was said on the way:\n", (unsigned)stage);
 		hakios_wifi_say_kept();
 	}
+	/* (both halves of the network: a name left without its passphrase would still count as given, and
+	 * hakios_wifi_network() would then never fall back to fw/network) */
 	wipe(pci.words.psk, sizeof(pci.words.psk));
 	pci.words.psk_length = 0;
+	wipe(pci.words.ssid, sizeof(pci.words.ssid));
+	pci.words.ssid_length = 0;
 	pci.running = false;
 	thread_terminate(current_thread());
 }

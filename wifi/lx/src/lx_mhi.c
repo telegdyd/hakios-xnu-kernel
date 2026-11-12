@@ -2936,10 +2936,19 @@ mhi_register_controller(struct mhi_controller *c, const struct mhi_controller_co
 		MHI_LOG("register: iova_stop below iova_start");
 		return -EINVAL;
 	}
-	/* C3's pool, cut by what the caller allows (ath11k gives the whole DMA mask, inclusive) */
-	p->win_lo = c->iova_start > HAKIOS_WIFI_IOVA_BASE ? c->iova_start : HAKIOS_WIFI_IOVA_BASE;
-	p->win_hi = c->iova_stop < HAKIOS_WIFI_IOVA_BASE + HAKIOS_WIFI_POOL_SIZE - 1 ?
-	    c->iova_stop : HAKIOS_WIFI_IOVA_BASE + HAKIOS_WIFI_POOL_SIZE - 1;
+	/* The pool's real radio addresses (C3's IOVA, or its physical address with wifi_smmu=bypass), cut by what
+	 * the caller allows (ath11k gives the whole DMA mask, inclusive) */
+	{
+		unsigned long long pool_lo;
+		unsigned long pool_size;
+
+		if (lx_pool_window(&pool_lo, &pool_size) != 0 || pool_size == 0 || pool_lo + pool_size - 1 < pool_lo) {
+			MHI_LOG("register: no DMA pool to give the chip");
+			return -ENODEV;
+		}
+		p->win_lo = c->iova_start > pool_lo ? c->iova_start : pool_lo;
+		p->win_hi = c->iova_stop < pool_lo + pool_size - 1 ? c->iova_stop : pool_lo + pool_size - 1;
+	}
 	if (p->win_lo > p->win_hi) {
 		MHI_LOG("register: the allowed IOVA range %#llx-%#llx does not meet C3's pool", (unsigned long long)c->iova_start,
 		    (unsigned long long)c->iova_stop);

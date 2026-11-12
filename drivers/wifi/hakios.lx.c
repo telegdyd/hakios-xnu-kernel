@@ -687,8 +687,9 @@ lx_pool_allocate(unsigned long size)
 	vm_offset_t cached = 0, uncached;
 	uint64_t physical;
 
-	/* (a bypass pool must lie below 4 GiB: its IOVA is its physical address; the limit is the highest page number) */
-	if (kmem_alloc_contig(kernel_map, &cached, size, 0, lx_pool.bypass ? 0xfffff : 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+	/* (a bypass pool must lie below 4 GiB: its IOVA is its physical address; the limit is the highest page number,
+	 * in ppnum_t units, which are 16 KiB pages on arm64, hence atop and not 0xfffff) */
+	if (kmem_alloc_contig(kernel_map, &cached, size, 0, lx_pool.bypass ? (ppnum_t)(atop(0x100000000ull) - 1) : 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
 	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 		say("lx: no %lu bytes of memory in one piece for the radio\n", size);
 		return ENOMEM;

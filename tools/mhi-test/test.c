@@ -21,6 +21,19 @@ static uint8_t pool[POOL_BYTES] __attribute__((aligned(4096)));
 static u32 pool_used;
 static unsigned dma_calls, dma_fail_at, dma_frees;
 static u64 pool_base = HAKIOS_WIFI_IOVA_BASE;
+static u64 window_base = HAKIOS_WIFI_IOVA_BASE;	/* what lx_base.c says the pool's radio address is */
+static bool window_none;
+
+int
+lx_pool_window(unsigned long long *base, unsigned long *size)
+{
+	if (window_none) {
+		return ENODEV;
+	}
+	*base = window_base;
+	*size = HAKIOS_WIFI_POOL_SIZE;
+	return 0;
+}
 
 void *
 test_dma_alloc(struct device *dev, size_t size, dma_addr_t *dma)
@@ -686,7 +699,8 @@ world(void)
 	chip_reset_all();
 	memset(status_cbs, 0, sizeof(status_cbs));
 	pool_used = 0;
-	pool_base = HAKIOS_WIFI_IOVA_BASE;
+	pool_base = window_base = HAKIOS_WIFI_IOVA_BASE;
+	window_none = false;
 	dma_calls = dma_fail_at = dma_frees = 0;
 	qlink = NULL;
 	qlink_ups = qlink_downs = qlink_fail = 0;
@@ -927,10 +941,10 @@ check_powered(struct mhi_controller *c, u32 expect_entries, size_t expect_total)
 	CHECK(reg64(R_ECABAP_LOWER, R_ECABAP_HIGHER) == p->er_ctx_dma);
 	CHECK(reg64(R_CRCBAP_LOWER, R_CRCBAP_HIGHER) == p->cmd_ctx_dma);
 	CHECK(((*breg(R_MHICFG) & MHICFG_NER_MASK) >> 16) == 2 && (*breg(R_MHICFG) >> 24) == 0);
-	CHECK(reg64(R_MHICTRLBASE_LOWER, R_MHICTRLBASE_HIGHER) == 0xa0000000ull);
-	CHECK(reg64(R_MHIDATABASE_LOWER, R_MHIDATABASE_HIGHER) == 0xa0000000ull);
-	CHECK(reg64(R_MHICTRLLIMIT_LOWER, R_MHICTRLLIMIT_HIGHER) == 0xa3ffffffull);
-	CHECK(reg64(R_MHIDATALIMIT_LOWER, R_MHIDATALIMIT_HIGHER) == 0xa3ffffffull);
+	CHECK(reg64(R_MHICTRLBASE_LOWER, R_MHICTRLBASE_HIGHER) == window_base);
+	CHECK(reg64(R_MHIDATABASE_LOWER, R_MHIDATABASE_HIGHER) == window_base);
+	CHECK(reg64(R_MHICTRLLIMIT_LOWER, R_MHICTRLLIMIT_HIGHER) == window_base + HAKIOS_WIFI_POOL_SIZE - 1);
+	CHECK(reg64(R_MHIDATALIMIT_LOWER, R_MHIDATALIMIT_HIGHER) == window_base + HAKIOS_WIFI_POOL_SIZE - 1);
 	/* order: BHI, contexts, event ring doorbells, M0, BHIe, channel commands */
 	i_bhi = find_write(BHI + BHI_IMGTXDB, 0, true, 0);
 	i_cc = find_write(R_CCABAP_LOWER, 0, true, 0);
@@ -1168,13 +1182,37 @@ test_window(void)
 	CHECK(dv.bhi_ok == 0 && PRIV(c)->pm == PM_DISABLE);
 	mhi_unprepare_after_power_down(c);
 	done(c);
-	/* a pool that is not at C3's address: nothing can be taken */
+	/* blocks that are not where the pool says it is: nothing can be taken */
 	world();
 	pool_base = 0x30000000ull;
 	c = mk();
 	MUST(mhi_register_controller(c, &cfg) == 0);
 	CHECK(mhi_prepare_for_power_up(c) == -ENOMEM);
 	CHECK(PRIV(c)->chan_ctx == NULL && PRIV(c)->er_ctx == NULL && !PRIV(c)->prepared);
+	done(c);
+	/* no pool yet: the controller is refused */
+	world();
+	window_none = true;
+	c = mk();
+	CHECK(mhi_register_controller(c, &cfg) == -ENODEV);
+	CHECK(lines_with("no DMA pool", 0) == 1);
+	mhi_free_controller(c);
+	window_none = false;
+	/* wifi_smmu=bypass (WP8 F2): the pool's radio address is its physical address, below 4 GiB but not
+	 * C3's IOVA; the window follows it and the whole path still runs */
+	world();
+	pool_base = window_base = 0x88000000ull;
+	c = mk();
+	MUST(mhi_register_controller(c, &cfg) == 0);
+	c->timeout_ms = 500;
+	CHECK(PRIV(c)->win_lo == 0x88000000ull && PRIV(c)->win_hi == 0x8bffffffull);
+	MUST(mhi_prepare_for_power_up(c) == 0);
+	poll_in_pause = true;
+	CHECK(mhi_sync_power_up(c) == 0);
+	check_powered(c, 12, IMG_BYTES);
+	CHECK(lines_with("outside the pool window", 0) == 0);
+	mhi_power_down(c, true);
+	mhi_unprepare_after_power_down(c);
 	done(c);
 	/* an allocation that fails in the middle of preparing leaves nothing half-made */
 	c = fresh();

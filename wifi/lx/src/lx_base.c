@@ -805,6 +805,18 @@ lx_pool_init(void)
 	return (0);
 }
 
+/* The radio's addresses of the pool: C3's IOVA (translate) or the physical address (wifi_smmu=bypass). */
+int
+lx_pool_window(unsigned long long *base, unsigned long *size)
+{
+	if (pool.memory == NULL) {
+		return (ENODEV);
+	}
+	*base = pool.address;
+	*size = pool.size;
+	return (0);
+}
+
 #ifdef CONFIG_ATH11K_PCI
 /* All device DMA and upstream workers have stopped; C4 retains ownership of
  * the physical mapping until WP6 releases it. Forget borrowed addresses so

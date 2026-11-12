@@ -17,7 +17,8 @@
  *  Endpoint BAR0 and decode/master: PCI config-space ABI; base/alignment from
  *   iOSPlus10 0261:306-359 and our live.dts:20788 ranges (2 MiB at 0x60400000).
  *  Failure host dump: iOSPlus10 0343:119-141. No read-clear chip registers.
- *  Down: reset pins first, disable decode/LTSSM, reverse register journal, then
+ *  Down: reset pins first, disable decode/LTSSM, reverse register journal (shared
+ *   GCC vote words: only the bits this driver set, re-read at down), then
  *   remove this client's rail enables in reverse order. Never restores GPIO
  *   output highs; never writes SMMU registers. Failed writes are journaled too.
  *
@@ -77,7 +78,9 @@ extern void loader_log_putc(char) __attribute__((weak));
 static vm_offset_t gcc, tlmm, parf, phy, dbi, cfg, db, rsc, bar;
 static unsigned generation = 2, ncpt, rail_count;
 static bool started, linked, endpoint, tcs_owned, tcs_poisoned;
-static struct { vm_offset_t address; unsigned old; } undo[512];
+/* mask 0: restore the whole old word. mask != 0: a shared vote word (GCC VOTE0/VOTE2,
+ * also set by touch and the GPU); down clears only these bits, with a fresh read. */
+static struct { vm_offset_t address; unsigned old, mask; } undo[512];
 static unsigned undo_count;
 static struct { const char *name; unsigned mv, address; } rails[] = {
 	{ "smpe2", 1012, 0 }, { "smpb11", 966, 0 }, { "smpb10", 1800, 0 },
@@ -205,8 +208,30 @@ save_write(vm_offset_t a, unsigned v)
 	CHECK(rd(a, &old));
 	if (undo_count == sizeof(undo) / sizeof(undo[0])) return ENOSPC;
 	undo[undo_count].address = a;
+	undo[undo_count].mask = 0;
 	undo[undo_count++].old = old;
 	return wr(a, v);
+}
+/* Shared vote words: journal only the bits that were 0 and that we set. [I] the
+ * read-modify-write is not locked against touch/GPU; their votes are one-shot. */
+static int
+vote_bits(vm_offset_t a, unsigned set)
+{
+	unsigned old, mine;
+	CHECK(rd(a, &old));
+	if (!(mine = set & ~old)) return 0;
+	if (undo_count == sizeof(undo) / sizeof(undo[0])) return ENOSPC;
+	undo[undo_count].address = a;
+	undo[undo_count].mask = mine;
+	undo[undo_count++].old = 0;
+	return wr(a, old | mine);
+}
+static int
+vote_clear(vm_offset_t a, unsigned mine)
+{
+	unsigned v;
+	CHECK(rd(a, &v));
+	return wr(a, v & ~mine);
 }
 static int
 bits(vm_offset_t a, unsigned clear, unsigned set)
@@ -420,8 +445,8 @@ clocks_phy(void)
 	CHECK(bits(gcc + RCHNG, 0, 1)); CHECK(wait_bits(gcc + RCHNG, 1, 0, 10000));
 	CHECK(save_write(gcc + AUX + 4, 1));
 	CHECK(bits(gcc + AUX, 0, 1)); CHECK(wait_bits(gcc + AUX, 1, 0, 10000));
-	CHECK(bits(gcc + VOTE0, 0, VOTE0_BITS));
-	CHECK(bits(gcc + VOTE2, 0, 0x2f));
+	CHECK(vote_bits(gcc + VOTE0, VOTE0_BITS));
+	CHECK(vote_bits(gcc + VOTE2, 0x2f));
 	CHECK(bits(gcc + 0x9c004, 0, 1)); delay(100);
 	CHECK(wait_bits(gcc + 0x7b030, 1u << 31, 0, 10000));
 	CHECK(wait_bits(gcc + 0x7b034, 1u << 31, 0, 10000));
@@ -446,7 +471,7 @@ clocks_phy(void)
 		if (phy_sequence[i][2]) delay(phy_sequence[i][2]);
 	}
 	delay(1200);
-	CHECK(save_write(gcc + PIPE_MUX, 0)); CHECK(bits(gcc + VOTE2, 0, 1u << 4));
+	CHECK(save_write(gcc + PIPE_MUX, 0)); CHECK(vote_bits(gcc + VOTE2, 1u << 4));
 	CHECK(wait_bits(phy + 0x214, 1u << 6, 0, 20000));
 	unsigned id;
 	CHECK(rd(dbi, &id));
@@ -477,6 +502,7 @@ train(struct hakios_pcie_link *link)
 	CHECK(rd(dbi + 4, &old_command));
 	if (undo_count == sizeof(undo) / sizeof(undo[0])) return ENOSPC;
 	undo[undo_count].address = dbi + 4;
+	undo[undo_count].mask = 0;
 	undo[undo_count++].old = old_command & 0xffff;
 	CHECK(hakios_pcie_cfg_write(0, 0, 4, 2, (old_command & 0xffff) | 6));
 	CHECK(bits(dbi + 0xa0, 15, generation));
@@ -635,7 +661,8 @@ hakios_pcie_down(unsigned rc)
 	linked = endpoint = false;
 	while (undo_count) {
 		unsigned n = --undo_count;
-		errors += !!wr(undo[n].address, undo[n].old);
+		errors += !!(undo[n].mask ? vote_clear(undo[n].address, undo[n].mask) :
+		    wr(undo[n].address, undo[n].old));
 	}
 	while (rail_count) errors += !!vote(--rail_count, false);
 	if (!tcs_poisoned) tcs_owned = false;
