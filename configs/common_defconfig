@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 415 symbols in 18 groups; 37 are set, 28 of them drivers built in.
+# 423 symbols in 18 groups; 37 are set, 28 of them drivers built in.
 #
 
 #
@@ -103,7 +103,7 @@ CONFIG_HAKIOS_UFS=y
 # a disk image of the host as /dev/rvblk0 (virtio_blk=1). QEMU only [hakios.virtio_blk.c]
 CONFIG_HAKIOS_VIRTIO_BLK=y
 
-# Wi-Fi of the WCN6750 (wifi=1, wifi_step=N): the DSP that runs the radio's firmware, Linux's ath11k (its object, made ... [hakios.wifi.c, hakios.wlfw.c, hakios.lx.c, hakios.sta.c, hakios.apple80211.c, hakios.wlan.cpp; requires CONFIG_HAKIOS_QMI]
+# Wi-Fi of both phones, over Linux's ath11k (its object, made by tools/mk-ath11k.sh, is linked in only with this: the ... [hakios.wifi.c, hakios.wifi.stage.c, hakios.wifi.pci.c, hakios.pcie.c, hakios.wlfw.c, hakios.qrtr.c, hakios.lx.c, hakios.sta.c, hakios.apple80211.c, hakios.wlan.cpp; requires CONFIG_HAKIOS_QMI]
 CONFIG_HAKIOS_WIFI=y
 
 #
@@ -772,11 +772,17 @@ CONFIG_SOUND=4
 # CONFIG_VIRTIO_SOUND is not set
 
 #
-# Wi-Fi (31)
+# Wi-Fi (39)
 #
 
 # Wi-Fi: the radio, its driver, a connection (also fw-wifi/mac and fw-wifi/network) [needs fw-wifi/ from the phone]
 CONFIG_WIFI=y
+
+# only the link test, C2 up and down without Wi-Fi (hakios.pcie.c); it excludes wifi=1
+# CONFIG_PCIE is not set
+
+# the highest link generation, 1 or 2; default 2
+# CONFIG_PCIE_GEN is not set
 
 # start the DSP although the one before it was shut down without having acknowledged a stop: THAT HAS RESET THE PHONE, ...
 # CONFIG_WIFI_AGAIN is not set
@@ -786,6 +792,9 @@ CONFIG_WIFI=y
 
 # read by lx_80211.c (kernel)
 # CONFIG_WIFI_BA is not set
+
+# the board data file of fw/ for ath11k's board.bin, a plain name; default: chosen by the QMI board id
+# CONFIG_WIFI_BOARD is not set
 
 # read by hakios.wlfw.c (kernel)
 # CONFIG_WIFI_CAL is not set
@@ -805,7 +814,7 @@ CONFIG_WIFI=y
 # read by lx_bus.c (kernel)
 # CONFIG_WIFI_IRQ is not set
 
-# read by lx_bus.c (kernel)
+# after the scan, join the network of wifi_ssid and wifi_psk (or of fw/network); default 0
 # CONFIG_WIFI_JOIN is not set
 
 # when the steps are over the DSP and the link stay up while the system runs, for whoever uses sys/hakios.qrtr.h; ...
@@ -814,7 +823,7 @@ CONFIG_WIFI=y
 # how long step 14 waits for the Wi-Fi firmware's service (default 3)
 # CONFIG_WIFI_LISTEN is not set
 
-# read by hakios.wifi.c (kernel)
+# read by hakios.wifi.c, hakios.wifi.pci.c (kernel)
 # CONFIG_WIFI_LOUD is not set
 
 # read by hakios.wifi.c, lx_bus.c (kernel)
@@ -826,14 +835,23 @@ CONFIG_WIFI=y
 # the radio's own address for the driver (hakios_wifi_radio_address() below; xl takes it from a file that is not in ...
 # CONFIG_WIFI_MAC is not set
 
+# the registers the BHI/MHI keep of a failed or stalled boot (iOSPlus10 0339/0343)
+# CONFIG_WIFI_MHI_DUMP is not set
+
 # read by hakios.wlfw.c (kernel)
 # CONFIG_WIFI_MISSION is not set
+
+# one message-signalled interrupt vector instead of the 32 that are enabled before MHI powers up (lx_pci.c)
+# CONFIG_WIFI_MSI is not set
 
 # steps K and later have not been seen to work (default: the last one)
 # CONFIG_WIFI_NEW is not set
 
 # read by hakios.wifi.c (kernel)
 # CONFIG_WIFI_PAUSE is not set
+
+# its WPA2 passphrase, 8 to 63 bytes; it is said in no line of any log
+# CONFIG_WIFI_PSK is not set
 
 # read by lx_bus.c (kernel)
 # CONFIG_WIFI_QUIET is not set
@@ -852,6 +870,12 @@ CONFIG_WIFI=y
 
 # before any step: read what the boot chain has set up in the SMMU for the radio's stream (smmu_look() below; nothing ...
 # CONFIG_WIFI_SMMU is not set
+
+# the OnePlus 10 Pro's radio, on PCIe0: this file runs the Wi-Fi and redwood's WPSS steps are left out
+# CONFIG_WIFI_SOC is not set
+
+# the network to join, 1 to 32 bytes without spaces (a name with one goes in fw/network); with wifi_psk
+# CONFIG_WIFI_SSID is not set
 
 # read by lx_bus.c (kernel)
 # CONFIG_WIFI_STATION is not set
