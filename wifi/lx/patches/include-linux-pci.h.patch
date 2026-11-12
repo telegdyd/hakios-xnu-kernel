@@ -1,0 +1,11 @@
+--- a/sys/compat/linuxkpi/common/include/linux/pci.h
++++ b/sys/compat/linuxkpi/common/include/linux/pci.h
+@@ -301,6 +301,8 @@
+     module_driver(_drv, linux_pci_register_driver, linux_pci_unregister_driver)
+ 
+ struct msi_msg {
++	uint32_t			address_lo;
++	uint32_t			address_hi;
+ 	uint32_t			data;
+ };
+ 

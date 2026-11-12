@@ -43,6 +43,9 @@
 
 #include <lx_os.h>
 #include "lx.h"
+#ifdef CONFIG_ATH11K_PCI
+#include <linux/pci.h>
+#endif
 
 static struct {
 	unsigned how;				/* wifi_lx */
@@ -725,7 +728,32 @@ lx_start(void)
 	bool up;
 	int ret;
 
-	bus.how = lx_os_option("wifi_lx");
+	#ifdef CONFIG_ATH11K_PCI
+ if (lx_os_option("wifi_soc") == 8450) {
+  if ((ret = lx_prepare()) != 0) return ret;
+  ath11k_frame_mode = ATH11K_HW_TXRX_ETHERNET;
+  ret = lx_pci_driver_init();
+  if (ret) return -ret;
+  ab = lx_pci_base();
+  if (!ab) { lx_pci_driver_exit(); return EIO; }
+  began = lx_os_nanoseconds();
+  while (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) &&
+      !test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) &&
+      lx_os_nanoseconds() - began < 60000000000ull) lx_pause_ms(10);
+  if (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) ||
+      test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags)) {
+   lx_pci_driver_exit(); return EIO;
+  }
+  driver = ab;
+  say_radio(ab);
+  if (lx_os_option("wifi_station")) ret = lx_station_offer();
+  else if (lx_os_option("wifi_join")) ret = lx_station_join();
+  else ret = lx_os_option("wifi_scan") ? lx_station_scan() : 0;
+  if (ret || !lx_os_option("wifi_keep")) lx_stop();
+  return ret;
+ }
+#endif
+ bus.how = lx_os_option("wifi_lx");
 	if (lx_prepare() != 0) {
 		lx_tell("lx: no thread, or no memory the radio can be given\n");
 		return (ENOMEM);
@@ -852,8 +880,12 @@ lx_stop(void)
 	driver = NULL;
 	lx_station_withdraw();
 	lx_station_leave();
-	ath11k_core_deinit(ab);
-	lx_tell("lx: the driver is down again\n");
+	#ifdef CONFIG_ATH11K_PCI
+ if (lx_os_option("wifi_soc") == 8450) lx_pci_driver_exit();
+ else
+#endif
+ ath11k_core_deinit(ab);
+ lx_tell("lx: the driver is down again\n");
 }
 
 int

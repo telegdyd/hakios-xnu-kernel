@@ -39,7 +39,7 @@ set -e
 VERSION=7.0.14
 SHA256=de9999b784d2293f00d39c62d8f92a08ab8a54bc4e80ffd250a0c09cb07a0f98
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
-B=$ROOT/xnu-deps/build/ath11k
+B=${ATH11K_BUILD_DIR:-$ROOT/xnu-deps/build/ath11k}
 ATH=drivers/net/wireless/ath
 mkdir -p "$B"
 cd "$B"
@@ -115,8 +115,12 @@ fi
 
 # --- compile: the driver's files that are built so far, and ours
 DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p"
+# ATH11K_PCI=0 preserves the AHB-only build used for the redwood regression.
+ATH11K_PCI=${ATH11K_PCI:-1}
+case "$ATH11K_PCI" in 0|1) ;; *) echo "ATH11K_PCI must be 0 or 1" >&2; exit 1 ;; esac
+[ "$ATH11K_PCI" = 0 ] || DRIVER="$DRIVER pci pcic mhi"
 CC="clang -target arm64-apple-ios16.5"
-LD=$ROOT/xnu-deps/host/bin/ld64
+LD=${ATH11K_LD:-$ROOT/xnu-deps/host/bin/ld64}
 CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fno-strict-aliasing
 	-funsigned-char -nostdinc -std=gnu17 -O2 -g -w
 	-D__FreeBSD__=15 -D_KERNEL -DKLD_MODULE -DHAVE_KERNEL_OPTION_HEADERS -include opt_global.h
@@ -131,8 +135,13 @@ source "$ROOT/xnu-env.sh"
 for h in lx qmi; do
 	[ -f "$XNU_SRC/bsd/sys/hakios.$h.h" ] || { echo "mk-ath11k.sh: the kernel tree has no bsd/sys/hakios.$h.h" >&2; exit 1; }
 done
+[ "$ATH11K_PCI" = 0 ] || DFLAGS="$DFLAGS -DCONFIG_ATH11K_PCI"
 DFLAGS="$DFLAGS -DLX_HAKIOS_LX_H=\"$XNU_SRC/bsd/sys/hakios.lx.h\" -DLX_HAKIOS_QMI_H=\"$XNU_SRC/bsd/sys/hakios.qmi.h\""
 mkdir -p obj out
+if [ "$(cat obj/.pci 2>/dev/null)" != "$ATH11K_PCI" ]; then
+ rm -f obj/*.o obj/*.o.d
+ echo "$ATH11K_PCI" > obj/.pci
+fi
 rm -f obj/*.err
 compile() {		# compile SOURCE OBJECT [FLAGS]: only when the object is older than anything it was made of
 	local src=$1 obj=$2
@@ -142,7 +151,18 @@ compile() {		# compile SOURCE OBJECT [FLAGS]: only when the object is older than
 	fi
 	$CC $CFLAGS "$@" -MMD -MF "$obj.d" -c "$src" -o "$obj" 2> "$obj.err" || rm -f "$obj"
 }
-for f in $DRIVER; do compile src/ath11k/$f.c obj/ath11k_$f.o $DFLAGS & done
+# A wrapper exports init/exit of the unchanged upstream translation unit. Linux
+# module init sections are not run by XNU; lx_bus dispatches explicitly.
+cat > gen/ath11k_pci_entry.c <<'EOF'
+#include "pci.c"
+int lx_pci_driver_init(void) { return ath11k_pci_init(); }
+void lx_pci_driver_exit(void) { ath11k_pci_exit(); }
+EOF
+for f in $DRIVER; do
+ source=src/ath11k/$f.c
+ [ "$f" != pci ] || source=gen/ath11k_pci_entry.c
+ compile "$source" obj/ath11k_$f.o $DFLAGS &
+done
 for f in "$W"/src/*.c; do [ -f "$f" ] && compile "$f" obj/lx_$(basename "$f" .c).o $DFLAGS -I$W/src & done
 wait
 bad=
