@@ -17,4 +17,8 @@ int	lx_station_send(const unsigned char *frame, unsigned long length);	/* lx_802
 int	lx_station_offer(void);	/* lx_80211.c: the station given to the kernel to ask (sys/hakios.sta.h); 0, or an errno */
 void	lx_station_withdraw(void);	/* lx_80211.c: ... and taken back */
 
+unsigned	lx_mhi_serial(void);		/* lx_mhi.c: the chip's serial number over BHI, once the first image is sent; 0 if not known */
+int	lx_firmware_by_board(const void **data, unsigned long *size);	/* lx_bus.c: board.bin by the QMI board id (PCIe path, no wifi_board); 0, or ENOENT */
+const char	*lx_mac_source(void);		/* lx_bus.c: where the radio's address came from, in words (lx_policy.h); "" before it is known */
+
 #endif

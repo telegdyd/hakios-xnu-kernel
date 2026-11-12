@@ -249,6 +249,8 @@ modem_wait	k
 modem_wda_off	k
 net_names	k
 net_trace	k
+pcie	k
+pcie_gen	k
 pmic	k
 pmic_list	k
 press_power	k
@@ -360,6 +362,7 @@ wifi	k
 wifi_again	k
 wifi_ask	k
 wifi_ba	k
+wifi_board	k
 wifi_cal	k
 wifi_dirty	k
 wifi_file	k
@@ -373,15 +376,20 @@ wifi_loud	k
 wifi_lx	k
 wifi_lx_step	k
 wifi_mac	k
+wifi_mhi_dump	k
 wifi_mission	k
+wifi_msi	k
 wifi_new	k
 wifi_pause	k
+wifi_psk	k
 wifi_quiet	k
 wifi_radio_read	k
 wifi_ready	k
 wifi_return	k
 wifi_scan	k
 wifi_smmu	k
+wifi_soc	k
+wifi_ssid	k
 wifi_station	k
 wifi_step	k
 wifi_wait	k

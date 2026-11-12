@@ -179,6 +179,19 @@ extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
 extern void loader_return(void);
 extern kern_return_t thread_terminate(thread_t thread);
 
+/*
+ * wifi_soc=8450, the OnePlus 10 Pro: the radio is a PCIe chip, and none of the steps below (the DSP, SMEM, GLINK) applies. Its
+ * start, its stop and the panic's way back are drivers/wifi/hakios.wifi.pci.c's; the steps of this file are redwood's and
+ * stay what they were. Without wifi_soc nothing of that is looked at.
+ */
+extern bool hakios_wifi_pci_init(void);                 /* wifi_soc is given: the PCIe path took over (true) */
+extern bool hakios_wifi_pci_selected(void);
+extern bool hakios_wifi_pci_stop(void);
+extern bool hakios_wifi_pci_quiesce(void);
+extern int hakios_wifi_pci_firmware(const char *name, const uint8_t **data, uint64_t *size);
+extern bool hakios_wifi_pci_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);
+extern int hakios_wifi_mac_parse(const char *text, uint8_t *bytes);
+
 static LCK_GRP_DECLARE(wifi_lock_group, "hakios-wifi");
 
 /*
@@ -334,6 +347,20 @@ settle(void)
 static bool whole;                      /* wifi=1: all of it, by itself (see the top of this file) */
 static volatile bool whole_runs;        /* ... and the thread that does it is at work */
 
+/* For the PCIe path (hakios.wifi.pci.c): wifi=1 there says things the same way, and stands for the same options. */
+void
+hakios_wifi_whole_mode(bool loud)
+{
+	whole = true;
+	quiet = !loud;
+}
+
+void
+hakios_wifi_say_kept(void)
+{
+	say_kept();
+}
+
 /*
  * A number given to the kernel when it was started; with wifi=1 the ones that stands for are as if
  * given, unless given otherwise (wifi_irq=0: the rings looked at as before).
@@ -350,6 +377,9 @@ hakios_wifi_option(const char *name)
 
 	if (strcmp(name, "wifi_quiet") == 0) {
 		return quiet;
+	}
+	if (strcmp(name, "wifi_keep") == 0 && hakios_wifi_pci_selected()) {
+		return 1;                       /* (lx_start() leaves the driver up: hakios.wifi.pci.c scans, joins, and then keeps or stops) */
 	}
 	if (PE_parse_boot_argn(name, &value, sizeof(value))) {
 		return value;
@@ -3712,7 +3742,11 @@ hakios_wifi_driver_file(const char *name, uint64_t *size)
 {
 	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
 	const char *last = strrchr(name, '/');
+	const uint8_t *data = NULL;
 
+	if (hakios_wifi_pci_selected()) {
+		return hakios_wifi_pci_firmware(name, &data, size) == 0 ? data : NULL;
+	}
 	last = last == NULL ? name : last + 1;
 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
 		if (strcmp(last, files[i][0]) == 0) {
@@ -3734,32 +3768,13 @@ hakios_wifi_radio_address(uint8_t *address)
 {
 	char text[32] = "";
 	uint8_t bytes[6];
-	unsigned count = 0, digits = 0, value = 0;
 	bool good;
 
 	if (!PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || text[0] == 0) {
 		printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac)\n", step);
 		return false;
 	}
-	good = true;
-	for (const char *c = text;; c++) {
-		int digit = *c >= '0' && *c <= '9' ? *c - '0' : *c >= 'a' && *c <= 'f' ? *c - 'a' + 10 : *c >= 'A' && *c <= 'F' ?
-		    *c - 'A' + 10 : -1;
-
-		if (digit >= 0 && digits < 2) {
-			value = value << 4 | (unsigned)digit;
-			digits++;
-		} else if ((*c == ':' || *c == 0) && digits != 0 && count < 6) {
-			bytes[count++] = (uint8_t)value;
-			digits = value = 0;
-		} else {
-			good = false;
-		}
-		if (*c == 0 || !good) {
-			break;
-		}
-	}
-	good = good && count == 6 && !(bytes[0] & 1) && (bytes[0] | bytes[1] | bytes[2] | bytes[3] | bytes[4] | bytes[5]) != 0;
+	good = hakios_wifi_mac_parse(text, bytes) == 0;        /* (six bytes, no group address, not zero: hakios.wifi.pci.c) */
 	printf("wifi: %u: the driver asks for the radio's address: one was given, %lu characters, %s\n", step,
 	    (unsigned long)strlen(text), good ? "six bytes: it is the radio's for this run" : "WHICH IS NOT A STATION'S ADDRESS: "
 	    "not used");
@@ -3783,6 +3798,9 @@ hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, u
 	unsigned lengths[2] = { 0, 0 }, sizes[2] = { *name_length, *passphrase_length };
 	uint8_t *where[2] = { name, passphrase };
 
+	if (hakios_wifi_pci_network(name, name_length, passphrase, passphrase_length)) {
+		return true;                    /* (wifi_ssid and wifi_psk were given: they come before the file) */
+	}
 	if (file == NULL) {
 		printf("wifi: %u: which network to join: none was given (fw/network of the small image)\n", step);
 		return false;
@@ -3832,6 +3850,9 @@ hakios_wifi_stop(void)
 		sleep_ms(10);
 	}
 	hakios_apple80211_summary();
+	if (hakios_wifi_pci_stop()) {
+		return;                                 /* (wifi_soc=8450: the radio is a PCIe chip; there is no DSP of ours to stop) */
+	}
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started && !dirty) {
 		bool down = dsp_shutdown("the run is about to end");
@@ -3856,6 +3877,9 @@ void
 hakios_wifi_quiesce(void)
 {
 	hakios_apple80211_summary();           /* (also when the run is ended from the phone: five fingers) */
+	if (hakios_wifi_pci_quiesce()) {
+		return;                         /* (wifi_soc=8450: WLAN_EN low and the rails off, with no lock and no allocation) */
+	}
 	if (!dsp_started || dirty) {
 		return;
 	}
@@ -3991,6 +4015,9 @@ hakios_wifi_init(void)
 	uint64_t size = 0;
 	thread_t thread;
 
+	if (hakios_wifi_pci_init()) {
+		return;                         /* wifi_soc is given: the OnePlus 10 Pro's PCIe radio (hakios.wifi.pci.c), not these steps */
+	}
 	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
 		return;

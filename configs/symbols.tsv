@@ -229,6 +229,8 @@ MODEM_SIM_SWITCH_OFF	arg	modem_sim_switch_off	Cellular	k	hakios.mpss.c
 MODEM_STEP	arg	modem_step	Cellular	k	hakios.mpss.c	the steps once the root is there, then back to the loader if modem_return=1 says so
 MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c	
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
+PCIE	arg	pcie	Wi-Fi	k	hakios.wifi.pci.c	only the link test, C2 up and down without Wi-Fi (hakios.pcie.c); it excludes wifi=1
+PCIE_GEN	arg	pcie_gen	Wi-Fi	k	hakios.wifi.pci.c	the highest link generation, 1 or 2; default 2
 PMIC_LIST	arg	pmic_list	Chip, thermal and PMIC	k	hakios.pmic.c	only the clock, not the inventory of every block
 PRESS_POWER	arg	press_power	Touch and buttons	k	hakios.buttons.c	a short press of the power key that many seconds after boot, and another ten seconds later, given to Darwin as the key's own are (hakios_touch_post):
 PRESS_POWER_MS	arg	press_power_ms	Touch and buttons	k	hakios.buttons.c	
@@ -325,28 +327,34 @@ WALLPAPER_FREEZE	arg	wallpaper_freeze	User space	u	inject_sb.c	the wallpaper as 
 WIFI_AGAIN	arg	wifi_again	Wi-Fi	k	hakios.wifi.c	start the DSP although the one before it was shut down without having acknowledged a stop: THAT HAS RESET THE PHONE, twice of two
 WIFI_ASK	arg	wifi_ask	Wi-Fi	k	hakios.wifi.c	step 14 also asks that service a question (its capabilities) and writes down the beginning of an answer
 WIFI_BA	arg	wifi_ba	Wi-Fi	k	lx_80211.c	
+WIFI_BOARD	arg	wifi_board	Wi-Fi	k	hakios.wifi.pci.c	the board data file of fw/ for ath11k's board.bin, a plain name; default: chosen by the QMI board id
 WIFI_CAL	arg	wifi_cal	Wi-Fi	k	hakios.wlfw.c	
 WIFI_DIRTY	arg	wifi_dirty	Wi-Fi	k	hakios.wifi.c	
 WIFI_FILE	arg	wifi_file	Wi-Fi	k	hakios.wifi.c	with wifi=1: the network of fw/network is not joined at the start
 WIFI_FINE	arg	wifi_fine	Wi-Fi	k	hakios.wifi.c	such a step waits like that before every single write and call
 WIFI_HOLD	arg	wifi_hold	Wi-Fi	k	lx_bus.c	
 WIFI_IRQ	arg	wifi_irq	Wi-Fi	k	lx_bus.c	
-WIFI_JOIN	arg	wifi_join	Wi-Fi	k	lx_bus.c	
-WIFI_KEEP	arg	wifi_keep	Wi-Fi	k	hakios.wifi.c	when the steps are over the DSP and the link stay up while the system runs, for whoever uses sys/hakios.qrtr.h; stopped when the run ends
+WIFI_JOIN	arg	wifi_join	Wi-Fi	k	hakios.wifi.pci.c,lx_bus.c	after the scan, join the network of wifi_ssid and wifi_psk (or of fw/network); default 0
+WIFI_KEEP	arg	wifi_keep	Wi-Fi	k	hakios.wifi.c,hakios.wifi.pci.c,lx_bus.c	when the steps are over the DSP and the link stay up while the system runs, for whoever uses sys/hakios.qrtr.h; stopped when the run ends
 WIFI_LISTEN	arg	wifi_listen	Wi-Fi	k	hakios.wifi.c	how long step 14 waits for the Wi-Fi firmware's service (default 3)
-WIFI_LOUD	arg	wifi_loud	Wi-Fi	k	hakios.wifi.c	
+WIFI_LOUD	arg	wifi_loud	Wi-Fi	k	hakios.wifi.c,hakios.wifi.pci.c	
 WIFI_LX	arg	wifi_lx	Wi-Fi	k	hakios.wifi.c,lx_bus.c	
 WIFI_LX_STEP	arg	wifi_lx_step	Wi-Fi	k	lx_base.c	
-WIFI_MAC	arg	wifi_mac	Wi-Fi	k	hakios.wifi.c	the radio's own address for the driver (hakios_wifi_radio_address() below; xl takes it from a file that is not in the repository)
+WIFI_MAC	arg	wifi_mac	Wi-Fi	k	hakios.wifi.c,hakios.wifi.pci.c	the radio's own address for the driver (hakios_wifi_radio_address() below; xl takes it from a file that is not in the repository)
+WIFI_MHI_DUMP	arg	wifi_mhi_dump	Wi-Fi	k	hakios.wifi.pci.c,lx_mhi.c	the registers the BHI/MHI keep of a failed or stalled boot (iOSPlus10 0339/0343)
 WIFI_MISSION	arg	wifi_mission	Wi-Fi	k	hakios.wlfw.c	
+WIFI_MSI	arg	wifi_msi	Wi-Fi	k	hakios.wifi.pci.c,lx_pci.c	one message-signalled interrupt vector instead of the 32 that are enabled before MHI powers up (lx_pci.c)
 WIFI_NEW	arg	wifi_new	Wi-Fi	k	hakios.wifi.c	steps K and later have not been seen to work (default: the last one)
 WIFI_PAUSE	arg	wifi_pause	Wi-Fi	k	hakios.wifi.c	
+WIFI_PSK	arg	wifi_psk	Wi-Fi	k	hakios.wifi.pci.c	its WPA2 passphrase, 8 to 63 bytes; it is said in no line of any log
 WIFI_QUIET	arg	wifi_quiet	Wi-Fi	k	lx_bus.c	
 WIFI_RADIO_READ	arg	wifi_radio_read	Wi-Fi	k	hakios.wifi.c	step 16 does read (2: whatever mode the firmware is in)
 WIFI_READY	arg	wifi_ready	Wi-Fi	k	hakios.wlfw.c	
 WIFI_RETURN	arg	wifi_return	Wi-Fi	k	hakios.wifi.c	when all is over, go back to the loader instead of starting the system
 WIFI_SCAN	arg	wifi_scan	Wi-Fi	k	lx_bus.c	
-WIFI_SMMU	arg	wifi_smmu	Wi-Fi	k	hakios.wifi.c	before any step: read what the boot chain has set up in the SMMU for the radio's stream (smmu_look() below; nothing is written)
+WIFI_SMMU	arg	wifi_smmu	Wi-Fi	k	hakios.wifi.c,hakios.wifi.pci.c	before any step: read what the boot chain has set up in the SMMU for the radio's stream (smmu_look() below; nothing is written)
+WIFI_SOC	arg	wifi_soc	Wi-Fi	k	hakios.wifi.pci.c,lx_80211.c,lx_base.c,lx_bus.c,lx_pci.c	the OnePlus 10 Pro's radio, on PCIe0: this file runs the Wi-Fi and redwood's WPSS steps are left out
+WIFI_SSID	arg	wifi_ssid	Wi-Fi	k	hakios.wifi.pci.c	the network to join, 1 to 32 bytes without spaces (a name with one goes in fw/network); with wifi_psk
 WIFI_STATION	arg	wifi_station	Wi-Fi	k	lx_bus.c	
 WIFI_STEP	arg	wifi_step	Wi-Fi	k	hakios.wifi.c	
 WIFI_WAIT	arg	wifi_wait	Wi-Fi	k	hakios.wifi.c	how long step 11 watches for the DSP to say that it is up (default 10)

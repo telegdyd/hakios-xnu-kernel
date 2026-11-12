@@ -90,7 +90,7 @@ SET_BY = {
     # wifi=1 is "all of it, by itself": hakios_wifi_option() answers these as if they were given (wifi_lx=2 wifi_smmu=2
     # wifi_station=1 wifi_keep=1 wifi_irq=1 wifi_ba=1 wifi_wide=1) unless they are given otherwise
     "wifi_lx": "implied by wifi=1 (as 2)",
-    "wifi_smmu": "implied by wifi=1 (as 2)",
+    "wifi_smmu": "implied by wifi=1 (as 2); with wifi_soc=8450 a string: translate or bypass",
     "wifi_station": "implied by wifi=1",
     "wifi_keep": "implied by wifi=1",
     "wifi_irq": "implied by wifi=1",

@@ -43,6 +43,7 @@
 
 #include <lx_os.h>
 #include "lx.h"
+#include "lx_policy.h"
 #ifdef CONFIG_ATH11K_PCI
 #include <linux/pci.h>
 #endif
@@ -385,6 +386,20 @@ lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi
 		}
 		bus.mission = mode == ATH11K_FIRMWARE_MODE_NORMAL;
 		lx_tell("lx: the firmware is asked for mode %u (0: mission, 4: off, 7: calibration)\n", mode);
+#ifdef CONFIG_ATH11K_PCI
+		/*
+		 * WIFI-PLAN stage 8 (PCIe path): qmi.c has been through host capabilities, the firmware's memory, the board data,
+		 * the regulatory database and M3, and has the firmware's "ready"; asking for mission mode is core.c's next move.
+		 */
+		if (mode == ATH11K_FIRMWARE_MODE_NORMAL && lx_os_option("wifi_soc") == 8450) {
+			struct ath11k_base *ab = lx_pci_base();
+
+			if (ab != NULL) {
+				lx_os_stage(8, "qmi", 1, "qmi: host capabilities, memory, board data (board id %#x), regdb, M3, fw ready",
+				    ab->qmi.target.board_id);
+			}
+		}
+#endif
 	}
 	return (qmi_send_request(qmi, sq, txn, msg_id, largest, ei, structure));
 }
@@ -669,10 +684,74 @@ of_reserved_mem_region_to_resource(const struct device_node *np, unsigned int in
  * firmware says (mac.c: ath11k_mac_register()); this radio's firmware says none. The kernel has
  * it, if it was given one. Nothing here says the address.
  */
+static enum lx_mac_source mac_source;
+static bool mac_source_known;
+
 int
 linuxkpi_device_get_mac_address(struct device *dev, char *address)
 {
+#ifdef CONFIG_ATH11K_PCI
+	if (lx_os_option("wifi_soc") == 8450) {
+		/*
+		 * The PCIe path. ath11k asks after WMI's READY, and keeps its own order (per-radio addresses of the firmware, then
+		 * what is answered here, then READY's address): so this answers the kernel's wifi_mac, if there is one and the
+		 * firmware's per-radio addresses are not valid, and a derived locally administered address when all three are zero
+		 * (lx_policy.h). Which of them ended up the radio's is kept for stage 9: the source, never the address.
+		 */
+		struct ath11k_base *ab = lx_pci_base();
+		struct lx_mac_inputs in;
+		uint8_t answer[6];
+		bool valid;
+
+		if (ab != NULL) {
+			memset(&in, 0, sizeof(in));
+			in.radio_valid = ab->pdevs_macaddr_valid;
+			in.platform_valid = lx_os_radio_address(in.platform) != 0;
+			memcpy(in.ready, ab->mac_addr, 6);
+			in.seed[0] = lx_mhi_serial();
+			in.seed[1] = ab->qmi.target.chip_id;
+			in.seed[2] = ab->qmi.target.soc_id;
+			in.seed[3] = ab->qmi.target.board_id;
+			mac_source = lx_mac_choose(&in, answer, &valid);
+			mac_source_known = true;
+			explicit_bzero(in.platform, sizeof(in.platform));
+			if (valid) {
+				memcpy(address, answer, 6);
+				explicit_bzero(answer, sizeof(answer));
+				return (0);
+			}
+			return (-ENOENT);
+		}
+	}
+#endif
 	return (lx_os_radio_address((unsigned char *)address) ? 0 : -ENOENT);
+}
+
+/*
+ * lx_base.c, for a request of board.bin that the kernel answered with ENODEV (no wifi_board): the board data file chosen by the
+ * QMI board id, which is known by now (lx_policy.h, cnss2's rule). Its own answer: 0, or ENOENT (never another board's file).
+ */
+int
+lx_firmware_by_board(const void **data, unsigned long *size)
+{
+#ifdef CONFIG_ATH11K_PCI
+	struct ath11k_base *ab = lx_pci_base();
+	char board[24];
+
+	if (ab != NULL && lx_board_auto_name(ab->qmi.target.board_id, ab->qmi.target.chip_id, board, sizeof(board)) != 0) {
+		lx_tell("lx: no wifi_board: the board data is chosen by the QMI board id %#x and chip id %#x: %s\n",
+		    ab->qmi.target.board_id, ab->qmi.target.chip_id, board);
+		return (lx_os_firmware(board, data, size));
+	}
+#endif
+	return (ENOENT);
+}
+
+/* For stage 9 (lx_80211.c): which source the radio's address came from, in words; "" before it is known. */
+const char *
+lx_mac_source(void)
+{
+	return (mac_source_known ? lx_mac_source_name(mac_source) : "");
 }
 
 /* ---- what the firmware has said of the radio ------------------------------------------------------- */
@@ -688,9 +767,14 @@ say_radio(struct ath11k_base *ab)
 	    t->txrx_chainmask, t->max_num_scan_channels, t->max_supported_macs, (int)t->hw_min_tx_power, (int)t->hw_max_tx_power,
 	    t->phy_capability, t->ht_cap_info, t->vht_cap_info, t->vht_supp_mcs, t->sys_cap_info);
 	/* (the second number is from the same structure of "ready" as the address: it shows that was read) */
-	printf("lx: its address, by the firmware: %02x:%02x:%02x:%02x:%02x:%02x (and its check sum of the packet log's "
-	    "definitions: %#x)\n", ab->mac_addr[0], ab->mac_addr[1], ab->mac_addr[2], ab->mac_addr[3], ab->mac_addr[4],
-	    ab->mac_addr[5], ab->pktlog_defs_checksum);
+	if (lx_os_option("wifi_soc") == 8450) {
+		/* (the PCIe path never says an address, not the firmware's either; stage 9 names where the radio's came from) */
+		printf("lx: its check sum of the packet log's definitions: %#x\n", ab->pktlog_defs_checksum);
+	} else {
+		printf("lx: its address, by the firmware: %02x:%02x:%02x:%02x:%02x:%02x (and its check sum of the packet log's "
+		    "definitions: %#x)\n", ab->mac_addr[0], ab->mac_addr[1], ab->mac_addr[2], ab->mac_addr[3], ab->mac_addr[4],
+		    ab->mac_addr[5], ab->pktlog_defs_checksum);
+	}
 	for (unsigned i = 0; i < ab->num_radios && i < MAX_RADIOS; i++) {
 		const struct ath11k_hal_reg_capabilities_ext *r = &ab->hal_reg_cap[i];
 		const struct ath11k_pdev_cap *c = &ab->pdevs[i].cap;

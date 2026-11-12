@@ -72,6 +72,26 @@ lx_tell(const char *fmt, ...)
 		nlines++;
 	}
 }
+/* C1 stage lines said by the production file (WP6: stages 5 and 6): the order, the verdict and the first detail words */
+static struct {
+	unsigned n[32], count;
+	int ok[32];
+	char detail[32][96];
+} said;
+void
+lx_os_stage(unsigned n, const char *name, int ok, const char *fmt, ...)
+{
+	va_list ap;
+
+	if (said.count < 32) {
+		said.n[said.count] = n;
+		said.ok[said.count] = ok;
+		va_start(ap, fmt);
+		vsnprintf(said.detail[said.count], sizeof(said.detail[0]), fmt, ap);
+		va_end(ap);
+		said.count++;
+	}
+}
 static unsigned
 lines_with(const char *needle, unsigned from)
 {
@@ -960,9 +980,13 @@ test_power_up(void)
 	u32 cycle1_pool;
 	int cycle;
 
+	said.count = 0;
 	MUST(mhi_prepare_for_power_up(c) == 0);
 	poll_in_pause = true;	/* the polling thread runs while this one sleeps, as in lx_pci.c */
 	MUST(mhi_sync_power_up(c) == 0);
+	/* WP6: stage 5 (probe) when the chip is about to be powered, stage 6 (mhi: EE AMSS) when mission mode is reached: that order */
+	CHECK(said.count == 2 && said.n[0] == 5 && said.ok[0] == 1 && said.n[1] == 6 && said.ok[1] == 1);
+	CHECK(strstr(said.detail[1], "EE AMSS") != NULL);
 	check_powered(c, 12, IMG_BYTES);
 	CHECK(handler_calls > 0);
 	CHECK(mhi_get_mhi_state(c) == MHI_STATE_M0);
@@ -1063,8 +1087,10 @@ stall_case(enum stall s, const char *what)
 
 	option_dump = 1;
 	dv.stall = s;
+	said.count = 0;
 	MUST(mhi_prepare_for_power_up(c) == 0);
 	CHECK(mhi_sync_power_up(c) == -ETIMEDOUT);
+	CHECK(said.count == 2 && said.n[0] == 5 && said.ok[0] == 1 && said.n[1] == 6 && said.ok[1] == 0);	/* WP6: a stall is stage 6 FAILED */
 	spent = (now_ns - t0) / 1000000ull;
 	CHECK(spent >= 500 && spent < 4 * 500 + 200);	/* bounded: a few of the timeouts at most */
 	CHECK(p->pm == PM_DISABLE && p->ee == MHI_EE_DISABLE_TRANSITION);

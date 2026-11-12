@@ -199,6 +199,17 @@ linuxkpi_ieee80211_ifattach(struct ieee80211_hw *hw)
 	    "it has an address", hw->wiphy->max_scan_ssids, hw->wiphy->max_scan_ie_len);
 	radio->registered = true;
 	the_radio = radio;
+	/*
+	 * WIFI-PLAN stage 9 (PCIe path): the firmware has said "unified ready" (core.c waits for it before it registers the
+	 * radio) and mac.c has the radio's address, from the source named here (lx_bus.c; never the address itself).
+	 */
+	if (lx_os_option("wifi_soc") == 8450) {
+		if (is_zero_ether_addr(hw->wiphy->perm_addr)) {
+			lx_os_stage(9, "wmi", 0, "wmi: unified ready, but no address for the radio");
+		} else {
+			lx_os_stage(9, "wmi", 1, "wmi: unified ready, mac registered, address from %s", lx_mac_source());
+		}
+	}
 	return (0);
 }
 
