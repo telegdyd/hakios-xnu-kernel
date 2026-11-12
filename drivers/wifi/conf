@@ -4,6 +4,7 @@
 
 driver WIFI
 	file    bsd/dev/hakios.wifi.c
+	file    bsd/dev/hakios.wifi.stage.c
 	file    bsd/dev/hakios.wlfw.c
 	file    bsd/dev/hakios.lx.c
 	file    bsd/dev/hakios.sta.c

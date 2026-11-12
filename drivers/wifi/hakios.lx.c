@@ -109,6 +109,18 @@ lx_os_tell(const char *text)
 }
 
 void
+lx_os_stage(unsigned n, const char *name, int ok, const char *fmt, ...)
+{
+	char detail[256];
+	va_list args;
+
+	va_start(args, fmt);
+	vsnprintf(detail, sizeof(detail), fmt, args);
+	va_end(args);
+	hakios_wifi_stage(n, name, ok, "%s", detail);
+}
+
+void
 lx_os_panic(const char *text)
 {
 	panic("%s", text);

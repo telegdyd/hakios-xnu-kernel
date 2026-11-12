@@ -14,6 +14,9 @@
 #define _SYS_HAKIOS_LX_H_
 
 #include "hakios.sta.h"
+#include "hakios.pcie.h"
+#include "hakios.qrtr.h"
+#include "hakios.wifi.h"
 
 /* ---- memory ---- */
 void	*lx_os_alloc(unsigned long size);			/* zeroed; NULL when there is none */
@@ -26,6 +29,35 @@ void	 lx_os_free(void *memory, unsigned long size);
  */
 void	*lx_os_radio_memory(unsigned long size, unsigned long long *address);
 void	*lx_os_map_registers(unsigned long long physical, unsigned long size);	/* never unmapped */
+
+/* ---- PCI bus (C4); same types, return values and lifetime as C2 ----
+ * Declared in wave 0; hardware bodies belong to integration (WP6).
+ */
+int lx_os_pcie_up(unsigned rc, struct hakios_pcie_link *link);
+void lx_os_pcie_down(unsigned rc);
+int lx_os_pcie_cfg_read(unsigned rc, unsigned bdf, unsigned off, unsigned size, unsigned *value);
+int lx_os_pcie_cfg_write(unsigned rc, unsigned bdf, unsigned off, unsigned size, unsigned value);
+int lx_os_pcie_try_read32(const volatile void *va, unsigned *value);
+int lx_os_pcie_try_write32(volatile void *va, unsigned value);
+/* Reserve ONE contiguous, zeroed, DMA-coherent pool, mapped at 0xa0000000
+ * through SID 0x1c01. size is page-aligned, <=64 MiB. 0 or positive errno;
+ * failure sets *va=NULL, *iova=0. Repeating the same request returns the same
+ * pool; a different size while active returns EBUSY. lx owns suballocation,
+ * never calls lx_os_free on it. Kernel owns teardown after DMA has stopped.
+ * In diagnostic bypass mode reject inaccessible (>32-bit) physical memory.
+ */
+int lx_os_dma_pool(unsigned long size, void **va, unsigned long long *iova);
+struct hakios_qrtr_link;
+/* NULL detaches; otherwise installs borrowed C6 link via link_up (0/errno).
+ * Detach synchronously drains callbacks, before the lx link storage is freed.
+ * RX calls hakios_qrtr_receive via lx_os_qrtr_receive, avoiding an extra kernel
+ * symbol family in the standalone object's imports. WP6 supplies both bodies.
+ */
+int lx_os_qrtr_link(const struct hakios_qrtr_link *link);
+int lx_os_qrtr_receive(const struct hakios_qrtr_link *link, const void *packet, unsigned long len);
+/* Same C1 wire format; name/number from sys/hakios.wifi.h's table. */
+void lx_os_stage(unsigned n, const char *name, int ok, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
 
 /* ---- saying things ---- */
 void	 lx_os_print(const char *text);				/* for whoever looks for a fault: may be kept back */

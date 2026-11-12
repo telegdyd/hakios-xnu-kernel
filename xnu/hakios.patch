@@ -3636,3 +3636,106 @@ index 3ebc295117a3..de101eafc83b 100755
  def find_non_ascii(s):
      for c in s:
          if ord(c) >= 0x80: return True
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -171,6 +171,7 @@
+ typedef void (*abort_handler_t)(arm_saved_state_t *, uint32_t, vm_offset_t, fault_status_t, vm_prot_t, expected_fault_handler_t);
+ static void handle_user_abort(arm_saved_state_t *, uint32_t, vm_offset_t, fault_status_t, vm_prot_t, expected_fault_handler_t);
+ static void handle_kernel_abort(arm_saved_state_t *, uint32_t, vm_offset_t, fault_status_t, vm_prot_t, expected_fault_handler_t);
++static bool hakios_mmio_recover(arm_saved_state_t *);
+ 
+ static void handle_pc_align(arm_saved_state_t *ss) __dead2;
+ static void handle_sp_align(arm_saved_state_t *ss) __dead2;
+@@ -1533,6 +1534,13 @@
+ 	}
+ #endif
+ 
++	/* Only our two guarded MMIO instructions may recover a synchronous external
++	 * abort. Match PC rather than FAR so FnV aborts work; handle before the
++	 * interrupt-stack rejection so lock-free panic shutdown can use this too. */
++	if (fault_code == FSC_SYNC_EXT_ABORT && hakios_mmio_recover(state)) {
++		return;
++	}
++
+ 	if (ml_at_interrupt_context()) {
+ 		panic_with_thread_kernel_state("Unexpected abort while on interrupt stack.", state);
+ 	}
+@@ -2090,3 +2098,77 @@
+ 	panic_with_thread_kernel_state("Invalid kernel stack pointer (probable corruption).", &context->ss);
+ }
+ 
++
++/* Main-owned prerequisite for WP1/WP2. Appended to XNU's sleh.c.
++ * The raw instruction shape and Mach-O alt_entry annotations follow
++ * iOSPlus10 0297-negroni-mmio-try.patch (ldr/str with a real base register).
++ * Unlike its CONFIG_XNUPOST thread hook, recovery is restricted directly to
++ * these two instruction PCs and FSC_SYNC_EXT_ABORT in handle_kernel_abort.
++ * No FAR dependence (FnV is permitted), global armed state, locks, allocation,
++ * or test-only configuration dependency. Other faults retain XNU behavior.
++ */
++extern char hakios_mmio_load_instruction[], hakios_mmio_store_instruction[];
++uint64_t hakios_mmio_load_raw(uintptr_t address);
++uint64_t hakios_mmio_store_raw(uintptr_t address, uint64_t value);
++int hakios_mmio_try_read32(const volatile void *address, unsigned *value);
++int hakios_mmio_try_write32(volatile void *address, unsigned value);
++
++__asm__(
++    ".text\n"
++    ".align 2\n"
++    ".globl _hakios_mmio_load_raw\n"
++    "_hakios_mmio_load_raw:\n"
++    "mov x1, x0\n"
++    "mov x0, #-1\n"
++    ".globl _hakios_mmio_load_instruction\n"
++    ".alt_entry _hakios_mmio_load_instruction\n"
++    "_hakios_mmio_load_instruction:\n"
++    "ldr w0, [x1]\n"
++    "ret\n"
++    ".globl _hakios_mmio_store_raw\n"
++    "_hakios_mmio_store_raw:\n"
++    "mov x2, x0\n"
++    "mov x0, #0\n"
++    ".globl _hakios_mmio_store_instruction\n"
++    ".alt_entry _hakios_mmio_store_instruction\n"
++    "_hakios_mmio_store_instruction:\n"
++    "str w1, [x2]\n"
++    "dsb sy\n"
++    "ret\n"
++);
++
++static bool
++hakios_mmio_recover(arm_saved_state_t *state)
++{
++    uintptr_t pc = (uintptr_t)get_saved_state_pc(state);
++    if (pc != (uintptr_t)hakios_mmio_load_instruction &&
++        pc != (uintptr_t)hakios_mmio_store_instruction) {
++        return false;
++    }
++    set_saved_state_reg(state, 0, (register_t)~0ull);
++    add_saved_state_pc(state, 4);
++    return true;
++}
++
++int
++hakios_mmio_try_read32(const volatile void *address, unsigned *value)
++{
++    if (address == NULL || value == NULL || ((uintptr_t)address & 3)) {
++        return EINVAL;
++    }
++    uint64_t result = hakios_mmio_load_raw((uintptr_t)address);
++    if (result > 0xffffffffull) {
++        return EIO;
++    }
++    *value = (unsigned)result;
++    return 0;
++}
++
++int
++hakios_mmio_try_write32(volatile void *address, unsigned value)
++{
++    if (address == NULL || ((uintptr_t)address & 3)) {
++        return EINVAL;
++    }
++    return hakios_mmio_store_raw((uintptr_t)address, value) ? EIO : 0;
++}
