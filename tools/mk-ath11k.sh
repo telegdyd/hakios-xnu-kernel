@@ -115,8 +115,17 @@ fi
 
 # --- compile: the driver's files that are built so far, and ours
 DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p"
-# ATH11K_PCI=0 preserves the AHB-only build used for the redwood regression.
-ATH11K_PCI=${ATH11K_PCI:-1}
+# Which bus the object has, per device. The OnePlus 10 Pro's radio is a PCIe chip (ath11k's pci, pcic, mhi and our lx_pci.c,
+# lx_mhi.c: WIFI-PLAN.md), redwood's an AHB one; both are the same ath11k core and station. By default the device the tree is
+# configured for decides (CONFIG_DEVICE of .config, which `tools/hakios-config.py defconfig <device>` writes): negroni builds the
+# PCI+MHI object (AHB stays in it too, chosen at run time by wifi_soc), every other device, and a tree with no .config, the
+# AHB-only object that redwood has always had. ATH11K_PCI=0|1 in the environment overrides. The object directory is one for both:
+# a change of the bus compiles everything again (obj/.pci below), and xnu-build.sh links whichever object was made last, so
+# make the object after the .config, and the kernel after the object.
+if [ -z "${ATH11K_PCI+x}" ]; then
+	device=$(sed -n 's/^CONFIG_DEVICE="\(.*\)"$/\1/p' "$ROOT/.config" 2>/dev/null | head -n 1)
+	case "$device" in negroni) ATH11K_PCI=1 ;; *) ATH11K_PCI=0 ;; esac
+fi
 case "$ATH11K_PCI" in 0|1) ;; *) echo "ATH11K_PCI must be 0 or 1" >&2; exit 1 ;; esac
 [ "$ATH11K_PCI" = 0 ] || DRIVER="$DRIVER pci pcic mhi"
 CC="clang -target arm64-apple-ios16.5"
@@ -137,6 +146,8 @@ for h in lx qmi; do
 done
 [ "$ATH11K_PCI" = 0 ] || DFLAGS="$DFLAGS -DCONFIG_ATH11K_PCI"
 DFLAGS="$DFLAGS -DLX_HAKIOS_LX_H=\"$XNU_SRC/bsd/sys/hakios.lx.h\" -DLX_HAKIOS_QMI_H=\"$XNU_SRC/bsd/sys/hakios.qmi.h\""
+# the pool's window (C3) from the kernel's own header, where there is one, in place of lx_mhi.c's checked copy
+[ "$ATH11K_PCI" = 0 ] || [ ! -f "$XNU_SRC/bsd/sys/hakios.smmu.h" ] || DFLAGS="$DFLAGS -DLX_HAKIOS_SMMU_H=\"$XNU_SRC/bsd/sys/hakios.smmu.h\""
 mkdir -p obj out
 if [ "$(cat obj/.pci 2>/dev/null)" != "$ATH11K_PCI" ]; then
  rm -f obj/*.o obj/*.o.d

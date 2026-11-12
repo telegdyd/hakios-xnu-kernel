@@ -5,6 +5,7 @@
 driver WIFI
 	file    bsd/dev/hakios.wifi.c
 	file    bsd/dev/hakios.wifi.stage.c
+	file    bsd/dev/hakios.wifi.pci.c
 	file    bsd/dev/hakios.pcie.c
 	file    bsd/dev/hakios.wlfw.c
 	file    bsd/dev/hakios.qrtr.c
@@ -13,6 +14,9 @@ driver WIFI
 	file    bsd/dev/hakios.apple80211.c
 	file    iokit/Kernel/hakios.wlan.cpp iokitcpp
 	requires QMI
-	help    Wi-Fi of the WCN6750 (wifi=1, wifi_step=N): the DSP that runs the radio's firmware, Linux's ath11k
-	help    (its object, made by tools/mk-ath11k.sh, is linked in only with this), a station, and the Apple80211
-	help    surface Darwin's wifid talks to. Needs fw-wifi/ from the phone
+	help    Wi-Fi of both phones, over Linux's ath11k (its object, made by tools/mk-ath11k.sh, is linked in only with this: the AHB
+	help    one for redwood, the PCI one for negroni), a station, and the Apple80211 surface Darwin's wifid talks to. Redwood's
+	help    radio is a WCN6750 that runs on a DSP of the SoC, started by wifi=1 (wifi_step=N goes the first N steps of that); needs
+	help    fw-wifi/ from the phone. The OnePlus 10 Pro's is a QCA6490 on PCIe0: wifi=1 wifi_soc=8450 brings up the link, the SMMU
+	help    context of SID 0x1c01, MHI and ath11k (stages 1-11 of WIFI-PLAN.md, a "wifi: STAGE n" line each), with wifi_join,
+	help    wifi_ssid/wifi_psk, wifi_board, pcie_gen, wifi_smmu, wifi_msi, wifi_mhi_dump; needs the QCA6490's files in fw-wifi/

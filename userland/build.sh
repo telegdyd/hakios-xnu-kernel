@@ -507,6 +507,26 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
+# ... and the OnePlus 10 Pro's (negroni): its radio is a QCA6490 on PCIe, and what ath11k is given is Android's own files for it, from
+# the modem partition's image/ into ../fw-wifi (drivers/wifi/hakios.wifi.pci.c has the table of names): amss.bin and amss20.bin (the
+# chip's firmware; amss20.bin is the one SoC major 2 gets), m3.bin, regdb.bin, and the board data files, bdwlan.* and bdwlang.*
+# (wifi_board=NAME or the QMI board id says which one is used). Nothing else of that directory goes into the image: not mac.txt, not
+# credentials, hash lists, JSON or logs. It applies where there is no wpss.mdt (that is redwood's, above); fw/network, if somebody
+# keeps one in ../fw-wifi for a name or passphrase with a space in it (wifi_ssid/wifi_psk take no spaces), follows redwood's rule.
+if [ ! -f ../fw-wifi/wpss.mdt ] && { [ -f ../fw-wifi/m3.bin ] || ls ../fw-wifi/amss*.bin > /dev/null 2>&1; }; then
+	mkdir -p root/fw
+	for f in amss.bin amss20.bin m3.bin regdb.bin; do
+		[ -f ../fw-wifi/$f ] && install -m 0644 ../fw-wifi/$f root/fw/
+	done
+	for f in ../fw-wifi/bdwlan.* ../fw-wifi/bdwlang.*; do
+		case "${f##*/}" in
+		*.json|*.log|*.txt|*.md|*.sha*|*SHA256*|*mac*|*credential*) continue ;;
+		esac
+		[ -f "$f" ] && install -m 0644 "$f" root/fw/
+	done
+	rm -f root/fw/network
+	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
+fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (drivers/haptic/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
 if [ -f ../fw-haptic/aw8697_haptic.bin ]; then

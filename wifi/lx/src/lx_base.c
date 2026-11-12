@@ -962,6 +962,10 @@ linuxkpi_firmware_request_nowarn(const struct linuxkpi_firmware **out, const cha
 	unsigned long size = 0;
 	int error = lx_os_firmware(name, &data, &size);
 
+	if (error == ENODEV) {
+		/* (PCIe path: board.bin and no wifi_board: the file is chosen by the QMI board id, lx_bus.c) */
+		error = lx_firmware_by_board(&data, &size);
+	}
 	printf("lx: the driver asks for the file \"%s\": %s\n", name, error == 0 ? "there" : "not there");
 	if (error != 0) {
 		return (-ENOENT);

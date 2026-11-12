@@ -1986,6 +1986,7 @@ mhi_prepare_for_power_up(struct mhi_controller *c)
 	}
 	r = dev_ctxt_init(p);
 	if (r) {
+		lx_os_stage(5, "probe", 0, "mhi contexts: errno %d", -r);
 		return r;
 	}
 	if (rd(c, c->regs, R_BHIOFF, &off)) {
@@ -2017,8 +2018,12 @@ mhi_prepare_for_power_up(struct mhi_controller *c)
 	}
 	p->prepared = true;
 	MHI_LOG("prepared: BHI %#x, %u channels, %u event rings", (u32)(p->bhi - (u8 *)c->regs), p->max_chan, p->n_ev);
+	/* WIFI-PLAN stage 5: ath11k's PCI probe is done as far as the chip's power-up, which is the next call (BAR, MSI, hardware, MHI) */
+	lx_os_stage(5, "probe", 1, "pci probe: BAR0 and MSI up, mhi registered and prepared (BHI %#x, %u channels, %u event rings)",
+	    (u32)(p->bhi - (u8 *)c->regs), p->max_chan, p->n_ev);
 	return 0;
 fail:
+	lx_os_stage(5, "probe", 0, "mhi prepare: errno %d", -r);
 	dev_ctxt_deinit(p);
 	p->bhi = p->bhie = NULL;
 	return r;
@@ -2104,6 +2109,7 @@ mhi_sync_power_up(struct mhi_controller *c)
 
 	r = mhi_async_power_up(c);
 	if (r) {
+		lx_os_stage(6, "mhi", 0, "power up refused: errno %d", -r);
 		return r;
 	}
 	to = p->ready_timeout_ms ? p->ready_timeout_ms : c->timeout_ms;
@@ -2120,6 +2126,7 @@ mhi_sync_power_up(struct mhi_controller *c)
 	}
 	if (p->mission_done && !(p->pm & PM_ERRORS) && !p->builtin_err) {
 		MHI_LOG("power up done: mission mode");
+		lx_os_stage(6, "mhi", 1, "mhi: EE %s", ee_name(p->ee));      /* (WIFI-PLAN stage 6) */
 		return 0;
 	}
 	if (p->builtin_err) {
@@ -2134,8 +2141,19 @@ mhi_sync_power_up(struct mhi_controller *c)
 		    state_name(p->dev_state));
 		dump(p, "power-up stall");
 	}
+	lx_os_stage(6, "mhi", 0, "power up failed: errno %d, EE %s, state %s (wifi_mhi_dump=1 dumps SBL and PCIe)", -r, ee_name(p->ee),
+	    state_name(p->dev_state));
 	power_down_inner(p, true);
 	return r;
+}
+
+/* The chip's serial number (BHI), once the first image has been sent: for the identity a derived address is made of. 0 if unknown. */
+u32
+lx_mhi_serial(void)
+{
+	struct mhi_priv *p = active_ctrl ? PRIV(active_ctrl) : NULL;
+
+	return p ? p->serial : 0;
 }
 
 /* ---- power down: Linux __mhi_power_down + mhi_pm_disable_transition ----
