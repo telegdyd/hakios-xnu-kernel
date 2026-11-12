@@ -960,6 +960,17 @@ pci_thread(__unused void *parameter, __unused wait_result_t result)
 		hakios_wifi_tell("wifi: chain: the firmware files and the network are looked for, then C2 up\n");
 	}
 	stage = hakios_wifi_pci_start(&pci.words, &real_ops, &pci.run);
+	/*
+	 * Once more after a failure between the probe and the radio's registration (stages 5-9): on a warm reboot the
+	 * chip has been seen to reach mission mode and never complete IPCR's channel start (2 of ~14 boots). The failed
+	 * run has undone everything, rails and WLAN_EN included; the chip stays unpowered for a second first.
+	 */
+	if (stage >= 5 && stage <= 9) {
+		hakios_wifi_tell("wifi: stage %d failed: the radio is powered off and brought up once more in 1 s\n", stage);
+		delay_for_interval(1000, NSEC_PER_MSEC);
+		stage = hakios_wifi_pci_start(&pci.words, &real_ops, &pci.run);
+		hakios_wifi_tell("wifi: the second bring-up: %s\n", stage == 0 ? "ok" : "failed too");
+	}
 	if (stage == 0) {
 		absolutetime_to_nanoseconds(mach_absolute_time(), &now);
 		hakios_wifi_tell("wifi: THE RADIO IS UP (QCA6490 over PCIe0), %llu.%llu s after the kernel began on it%s\n",

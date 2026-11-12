@@ -347,6 +347,7 @@ WIFI_LX	arg	wifi_lx	Wi-Fi	k	hakios.wifi.c,lx_bus.c
 WIFI_LX_STEP	arg	wifi_lx_step	Wi-Fi	k	lx_base.c	
 WIFI_MAC	arg	wifi_mac	Wi-Fi	k	hakios.wifi.c,hakios.wifi.pci.c	the radio's own address for the driver (hakios_wifi_radio_address() below; xl takes it from a file that is not in the repository)
 WIFI_MHI_DUMP	arg	wifi_mhi_dump	Wi-Fi	k	hakios.wifi.pci.c,lx_mhi.c	the registers the BHI/MHI keep of a failed or stalled boot (iOSPlus10 0339/0343)
+WIFI_MHI_FAIL	arg	wifi_mhi_fail	Wi-Fi	k	lx_mhi.c	the first power-up of the boot is made to time out, for the chain's retry (hakios.wifi.pci.c)
 WIFI_MISSION	arg	wifi_mission	Wi-Fi	k	hakios.wlfw.c	
 WIFI_MSI	arg	wifi_msi	Wi-Fi	k	hakios.wifi.pci.c,lx_pci.c	one message-signalled interrupt vector instead of the 32 that are enabled before MHI powers up (lx_pci.c)
 WIFI_NEW	arg	wifi_new	Wi-Fi	k	hakios.wifi.c	steps K and later have not been seen to work (default: the last one)

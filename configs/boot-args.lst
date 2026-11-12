@@ -382,6 +382,7 @@ wifi_lx	k
 wifi_lx_step	k
 wifi_mac	k
 wifi_mhi_dump	k
+wifi_mhi_fail	k
 wifi_mission	k
 wifi_msi	k
 wifi_new	k

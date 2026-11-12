@@ -63,6 +63,7 @@ p = Path(sys.argv[1]) / 'com.hakios.wifi.plist'
 job = plistlib.loads(p.read_bytes())
 job['ProgramArguments'] = ['/redwood/bin/wifi_start']
 job['LimitLoadToSessionType'] = 'System'
+job['KeepAlive'] = True   # wifi_start watches for the whole session; launchd restarts it if it ever exits
 p.write_bytes(plistlib.dumps(job, fmt=plistlib.FMT_BINARY))
 PY
 "$SIGN" -S "$STAGE/lib/HakiosMetal.bundle/HakiosMetal"

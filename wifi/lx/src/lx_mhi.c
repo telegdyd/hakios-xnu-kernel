@@ -2113,6 +2113,16 @@ mhi_sync_power_up(struct mhi_controller *c)
 		return r;
 	}
 	to = p->ready_timeout_ms ? p->ready_timeout_ms : c->timeout_ms;
+	/* wifi_mhi_fail=1: the first power-up of the boot is made to time out, for the chain's retry (hakios.wifi.pci.c) */
+	{
+		static bool injected;
+
+		if (!injected && lx_os_option("wifi_mhi_fail")) {
+			injected = true;
+			to = 1;
+			MHI_LOG("wifi_mhi_fail: this power-up is made to time out");
+		}
+	}
 	end = lx_os_nanoseconds() + (u64)to * 1000000ull;
 	for (;;) {
 		service(p);
