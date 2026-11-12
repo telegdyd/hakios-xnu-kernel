@@ -53,6 +53,7 @@ wifi     bsd/dev/hakios.wifi.c
 wifi     bsd/dev/hakios.wlfw.c
 wifi     bsd/dev/hakios.wifi.stage.c
 wifi     bsd/dev/hakios.qrtr.c
+wifi     bsd/dev/hakios.pcie.c
 wifi     bsd/dev/hakios.lx.c
 wifi     bsd/dev/hakios.sta.c
 wifi     bsd/dev/hakios.apple80211.c
@@ -73,6 +74,7 @@ core     bsd/dev/hakios.platform.c
 core     bsd/dev/hakios.stubs.c
 core     iokit/Kernel/hakios.stubs.cpp
 core    bsd/dev/hakios.socinfo.c
+core    bsd/dev/hakios.smmu.c
 power   bsd/dev/hakios.thermal.c
 power   bsd/dev/hakios.pmic.c
 power   bsd/dev/hakios.battguard.c
