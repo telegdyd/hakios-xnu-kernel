@@ -79,6 +79,8 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/hakios.audio.h>
+#include <sys/hakios.smmu.h>
+#include <sys/hakios.mmio.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -87,7 +89,8 @@ extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 
 /* The SMMU's match registers and contexts are found free and taken by the Wi-Fi's start as well (hakios.wifi.c). */
-extern lck_mtx_t hakios_smmu_lock;
+static LCK_GRP_DECLARE(audio_space_group, "hakios-audio-space");
+static LCK_MTX_DECLARE(audio_space_lock, &audio_space_group);
 
 static LCK_GRP_DECLARE(sound_lock_group, "hakios-sound");
 static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up or taken down */
@@ -503,41 +506,6 @@ afe_off(void)
 
 /* ---- the DSP's view of our memory: stream 0x1801 of the SMMU ------------------------------------------- */
 
-static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };
-static struct block apps_smmu_second = { "apps smmu", 0, 0x1000 };              /* the second page: a word per context */
-static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1000 };
-#define SMMU_SCR0               0x000
-#define SMMU_IDR0               0x020
-#define SMMU_IDR1               0x024
-#define SMMU_SGFSR              0x048
-#define SMMU_SGFSYNR1           0x054
-#define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
-#define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
-#define SMMU_CBAR(n)            (4 * (n))
-#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)
-#define SMMU_CBA2R(n)           (0x800 + 4 * (n))
-#define SMMU_CBA2R_64_BIT       1
-#define SMMU_CB_SCTLR           0x00
-#define SMMU_CB_TCR2            0x10
-#define SMMU_CB_TTBR0           0x20
-#define SMMU_CB_TTBR1           0x28
-#define SMMU_CB_TCR             0x30
-#define SMMU_CB_MAIR0           0x38
-#define SMMU_CB_MAIR1           0x3c
-#define SMMU_CB_FSR             0x58
-#define SMMU_CB_FAR             0x60
-#define SMMU_CB_FSYNR0          0x68
-#define SMMU_CB_TLBIASID        0x610
-#define SMMU_CB_TLBSYNC         0x7f0
-#define SMMU_CB_TLBSTATUS       0x7f4
-#define SMMU_SCTLR_ON           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 8 | 1u << 12)
-#define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
-#define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)
-#define SMMU_MAIR0              0xf404ff44
-#define SMMU_FSR_ALL            0xc00001fe
-#define PTE_ADDRESS             0x0000fffffffff000ull
-#define AUDIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)       /* as hakios.wifi.c's */
-
 #define AUDIO_STREAM            0x1801
 #define AUDIO_ADDRESSES         0x10000000ull   /* dt: qcom,iommu-dma-addr-pool of qcom,msm-audio-ion */
 #define AUDIO_STREAM_BITS       (1ull << 32)    /* the stream's low bits (0x1801 & 0xf), where the DSP takes them from */
@@ -550,187 +518,73 @@ static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1
 #define MIC_BYTES               (16 * 4096)             /* the microphones' (hakios.mic.c), behind those */
 #define SHARED_BYTES            (BUFFER_BYTES + COMMAND_BYTES + MIC_BYTES)
 
-static struct {
-	bool found, on, passed;         /* passed: the boot chain lets the stream through untranslated */
-	uint32_t page, pages, match, context, old_smr, old_s2cr, old_sctlr;
-	vm_offset_t tables;             /* three of 4K: the root, one of the second level, one of the third */
-} space;
-static vm_offset_t buffer;              /* BUFFER_BYTES of ours, the periods (and MIC_BYTES behind them: the microphones') */
-static uint64_t buffer_address;         /* as the DSP is to know it */
+/* C3 owns hardware and tables; audio_space_lock owns this client/user count.
+ * Never hold hakios_smmu_lock while calling C3 (the helper takes it itself).
+ */
+static struct { bool passed, on; struct hakios_smmu_context *ctx; } space;
+static vm_offset_t buffer;
+static uint64_t buffer_address;
+extern lck_mtx_t hakios_smmu_lock;
 
+/* Preserve the old redwood boot-chain bypass case without rewriting its SMR.
+ * Unknown/refused reads fail closed; C3 then rejects an overlapping owned SMR.
+ */
 static bool
-space_find(void)
+space_is_bypassed(void)
 {
-	bool used[256] = { false };
-	uint32_t scr0 = get(&apps_smmu, "scr0", SMMU_SCR0), idr0 = get(&apps_smmu, "idr0", SMMU_IDR0);
-	uint32_t idr1 = get(&apps_smmu, "idr1", SMMU_IDR1), matches = idr0 & 0xff, contexts = idr1 & 0xff;
-
-	if (scr0 & 1u << 3) {
-		say("sound: this SMMU numbers its streams with 16 bits, which nothing here is written for\n");
-		return false;
-	}
-	space.page = idr1 >> 31 ? 0x10000 : 0x1000;
-	space.pages = 2u << (idr1 >> 28 & 7);
-	if (2 * space.pages * space.page != 0x100000) {
-		say("sound: the SMMU says it has 2 x %u pages of %#x bytes, not a megabyte: its contexts are not looked for\n",
-		    space.pages, space.page);
-		return false;
-	}
-	space.match = ~0u;
-	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
-		uint32_t smr = rd(apps_smmu.base + SMMU_SMR(n)), s2cr = rd(apps_smmu.base + SMMU_S2CR(n));
-		uint32_t stream = smr & 0x7fff, mask = smr >> 16 & 0x7fff;
-
-		if (smr >> 31) {
-			used[s2cr & 0xff] = true;
-			if (((stream ^ AUDIO_STREAM) & ~mask) == 0) {
-				say("sound: match register %u covers the audio stream already: stream %#x mask %#x, s2cr %#x\n", n,
-				    stream, mask, s2cr);
-				if ((s2cr >> 16 & 3) == 1) {
-					space.passed = true;
-					return true;
-				}
-				say("sound: ... and does not let it through untranslated: it is somebody's, and is left alone\n");
-				return false;
-			}
-		} else if (space.match == ~0u) {
-			space.match = n;
-			space.old_smr = smr;
-			space.old_s2cr = s2cr;
-		}
-	}
-	for (space.context = 0; space.context < contexts && used[space.context]; space.context++) {
-	}
-	if (space.match == ~0u || space.context >= contexts) {
-		say("sound: the SMMU has no match register or no context left\n");
-		return false;
-	}
-	apps_smmu_second.phys = apps_smmu.phys + space.page;
-	apps_smmu_context.phys = apps_smmu.phys + (space.pages + space.context) * space.page;
-	say("sound: the boot chain has set nothing up for stream %#x; free: match register %u (smr %#x, s2cr %#x) and context %u, at "
-	    "%#x\n", AUDIO_STREAM, space.match, space.old_smr, space.old_s2cr, space.context, apps_smmu_context.phys);
-	space.old_sctlr = get(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR);
-	if (space.old_sctlr & 1) {
-		say("sound: CONTEXT %u IS SWITCHED ON although no stream is sent through it: it is somebody's, and is left alone\n",
-		    space.context);
-		return false;
-	}
-	space.found = true;
-	return true;
+    vm_offset_t regs; unsigned id0, scr0; bool passed=false;
+    lck_mtx_lock(&hakios_smmu_lock);
+    regs=ml_io_map(0x15000000,0x2000);
+    if (!regs || hakios_mmio_try_read32((void *)regs,&scr0) || (scr0&(1u<<3)) ||
+        hakios_mmio_try_read32((void *)(regs+0x20),&id0)) goto out;
+    for (unsigned n=0;n<(id0&255);n++) {
+        unsigned smr,s2cr;
+        if (hakios_mmio_try_read32((void *)(regs+0x800+4*n),&smr) ||
+            hakios_mmio_try_read32((void *)(regs+0xc00+4*n),&s2cr)) break;
+        if ((smr>>31) && !((smr^AUDIO_STREAM)&0x7fff&~(smr>>16))) {
+            passed=((s2cr>>16)&3)==1; break;
+        }
+    }
+out:
+    lck_mtx_unlock(&hakios_smmu_lock);
+    return passed;
 }
 
 static void
 space_faults(void)
 {
-	uint32_t status, global;
-
-	if (!space.on) {
-		return;
-	}
-	status = rd(apps_smmu_context.base + SMMU_CB_FSR);
-	global = rd(apps_smmu.base + SMMU_SGFSR);
-	if ((status & SMMU_FSR_ALL) == 0 && global == 0) {
-		say("sound: the SMMU has refused the DSP nothing (context %u: fsr %#x; sgfsr 0)\n", space.context, status);
-		return;
-	}
-	say("sound: THE SMMU HAS REFUSED A REQUEST: context %u: status %#x, address %#llx, syndrome %#x; the SMMU as a whole: status "
-	    "%#x, stream %#x\n", space.context, status, (uint64_t)rd(apps_smmu_context.base + SMMU_CB_FAR + 4) << 32 |
-	    rd(apps_smmu_context.base + SMMU_CB_FAR), rd(apps_smmu_context.base + SMMU_CB_FSYNR0), global,
-	    rd(apps_smmu.base + SMMU_SGFSYNR1));
+    if (space.ctx) hakios_smmu_faults(space.ctx);
 }
 
-/* Our buffer behind the DSP's addresses from AUDIO_ADDRESSES on, through a context of ours. */
 static bool
 space_on(void)
 {
-	uint64_t *root, *second, *third, table_root;
-	uint32_t smr = SMMU_SMR(space.match), s2cr = SMMU_S2CR(space.match), sees = 1u << 31 | AUDIO_STREAM;
-
-	/*
-	 * (the page tables are allocated once and reused: this runs at every first user of the DSP's buffers, and nothing frees
-	 * the tables, so a new allocation each time would lose 12 KB of wired memory per recording or run)
-	 */
-	if (space.tables != 0) {
-		bzero((void *)space.tables, 3 * 4096);
-	} else if (kmem_alloc(kernel_map, &space.tables, 3 * 4096, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
-	    KERN_SUCCESS) {
-		space.tables = 0;
-		return false;
-	}
-	root = (uint64_t *)space.tables;
-	second = (uint64_t *)(space.tables + 4096);
-	third = (uint64_t *)(space.tables + 8192);
-	root[AUDIO_ADDRESSES >> 30 & 0x1ff] = kvtophys((vm_offset_t)second) | 3;
-	second[AUDIO_ADDRESSES >> 21 & 0x1ff] = kvtophys((vm_offset_t)third) | 3;
-	for (unsigned page = 0; page < SHARED_BYTES / 4096; page++) {
-		third[(AUDIO_ADDRESSES >> 12 & 0x1ff) + page] = kvtophys(buffer + 4096 * page) | AUDIO_PTE;
-	}
-	for (vm_offset_t line = space.tables; line < space.tables + 3 * 4096; line += 64) {
-		__asm__ volatile ("dc civac, %0" : : "r" (line));
-	}
-	__asm__ volatile ("dsb sy");
-	table_root = kvtophys(space.tables) | (uint64_t)space.context << 48;
-	say("sound: THE SMMU IS ABOUT TO BE WRITTEN: context %u gets page tables of ours (root %#llx) for the %u KB of the periods and the microphones' "
-	    "at %#llx, and match register %u sends stream %#x through it\n", space.context, table_root & PTE_ADDRESS,
-	    SHARED_BYTES / 1024, AUDIO_ADDRESSES, space.match, AUDIO_STREAM);
-	if (pause_ms) {
-		sleep_ms(pause_ms);
-	}
-	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, 0);
-	put(&apps_smmu_second, "cba2r", SMMU_CBA2R(space.context), SMMU_CBA2R_64_BIT);
-	put(&apps_smmu_second, "cbar", SMMU_CBAR(space.context), SMMU_CBAR_STAGE_1);
-	put(&apps_smmu_context, "tcr2", SMMU_CB_TCR2, SMMU_TCR2);
-	put(&apps_smmu_context, "tcr", SMMU_CB_TCR, SMMU_TCR_39_BITS);
-	put(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0, (uint32_t)table_root);
-	put(&apps_smmu_context, "ttbr0, high", SMMU_CB_TTBR0 + 4, (uint32_t)(table_root >> 32));
-	put(&apps_smmu_context, "ttbr1, low", SMMU_CB_TTBR1, 0);
-	put(&apps_smmu_context, "ttbr1, high", SMMU_CB_TTBR1 + 4, 0);
-	put(&apps_smmu_context, "mair0", SMMU_CB_MAIR0, SMMU_MAIR0);
-	put(&apps_smmu_context, "mair1", SMMU_CB_MAIR1, 0);
-	put(&apps_smmu_context, "fsr", SMMU_CB_FSR, SMMU_FSR_ALL);
-	put(&apps_smmu_context, "tlbiasid", SMMU_CB_TLBIASID, space.context);
-	put(&apps_smmu_context, "tlbsync", SMMU_CB_TLBSYNC, 1);
-	for (unsigned ms = 0; rd(apps_smmu_context.base + SMMU_CB_TLBSTATUS) & 1; ms++) {
-		if (ms == 100) {
-			say("sound: the SMMU does not finish forgetting old translations\n");
-			return false;
-		}
-		sleep_ms(1);
-	}
-	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, SMMU_SCTLR_ON);
-	space.on = true;
-	put(&apps_smmu, "s2cr", s2cr, space.context);
-	put(&apps_smmu, "smr", smr, sees);
-	if (get(&apps_smmu, "smr", smr) != sees || (get(&apps_smmu, "s2cr", s2cr) & 0x300ff) != space.context ||
-	    !(get(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR) & 1) ||
-	    get(&apps_smmu_context, "ttbr0, low", SMMU_CB_TTBR0) != (uint32_t)table_root) {
-		say("sound: THE SMMU DID NOT TAKE WHAT WAS WRITTEN: stream %#x is not going through context %u\n", AUDIO_STREAM,
-		    space.context);
-		return false;
-	}
-	say("sound: THE AUDIO STREAM GOES THROUGH CONTEXT %u of the SMMU, with our page tables\n", space.context);
-	return true;
+    space.passed=space_is_bypassed();
+    if (space.passed) return true;
+    space.ctx=hakios_smmu_claim(AUDIO_STREAM,0,AUDIO_ADDRESSES,SHARED_BYTES,"sound");
+    if (!space.ctx) return false;
+    for (unsigned page=0;page<SHARED_BYTES/4096;page++) {
+        if (hakios_smmu_map(space.ctx,AUDIO_ADDRESSES+4096*page,kvtophys(buffer+4096*page),
+            4096,HAKIOS_SMMU_READ|HAKIOS_SMMU_WRITE)) {
+            hakios_smmu_release(space.ctx); space.ctx=NULL; return false;
+        }
+    }
+    space.on=true;
+    return true;
 }
 
 static void
 space_off(void)
 {
-	if (!space.on) {
-		return;
-	}
-	space_faults();
-	say("sound: the audio stream and context %u of the SMMU are put back as they were found\n", space.context);
-	put(&apps_smmu, "smr", SMMU_SMR(space.match), space.old_smr);
-	put(&apps_smmu, "s2cr", SMMU_S2CR(space.match), space.old_s2cr);
-	put(&apps_smmu_context, "sctlr", SMMU_CB_SCTLR, space.old_sctlr);
-	get(&apps_smmu, "smr", SMMU_SMR(space.match));
-	space.on = false;
+    space_faults();
+    hakios_smmu_release(space.ctx);
+    space.ctx=NULL; space.on=false; space.passed=false;
 }
 
 /*
  * The DSP's view of our memory is one: the sound's periods and the microphones' buffers behind them
  * (hakios.mic.c), through the same stream and context. Whoever comes first sets it up, whoever
- * leaves last takes it down. user: 0 the sound, 1 the microphones. With hakios_smmu_lock held.
+ * leaves last takes it down. user: 0 the sound, 1 the microphones. With audio_space_lock held.
  */
 static uint32_t space_users;
 
@@ -742,9 +596,6 @@ shared_get(unsigned user)
 		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 			buffer = 0;
 			say("sound: no memory for the DSP's buffers\n");
-			return false;
-		}
-		if (!space.found && !space.passed && !space_find()) {
 			return false;
 		}
 		if (!space.passed && !space.on && !space_on()) {
@@ -781,9 +632,9 @@ hakios_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *byte
 {
 	bool ok;
 
-	lck_mtx_lock(&hakios_smmu_lock);
+	lck_mtx_lock(&audio_space_lock);
 	ok = shared_get(1);
-	lck_mtx_unlock(&hakios_smmu_lock);
+	lck_mtx_unlock(&audio_space_lock);
 	if (ok) {
 		*memory = buffer + BUFFER_BYTES + COMMAND_BYTES;
 		*dsp_address = buffer_address + BUFFER_BYTES + COMMAND_BYTES;
@@ -795,9 +646,9 @@ hakios_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *byte
 void
 hakios_audio_dsp_memory_put(void)
 {
-	lck_mtx_lock(&hakios_smmu_lock);
+	lck_mtx_lock(&audio_space_lock);
 	shared_put(1);
-	lck_mtx_unlock(&hakios_smmu_lock);
+	lck_mtx_unlock(&audio_space_lock);
 }
 
 /* ---- ADM and ASM: the path and the stream --------------------------------------------------------------- */
@@ -2011,9 +1862,9 @@ take_down(void)
 			afe_off();
 		}
 		pins_off();
-		lck_mtx_lock(&hakios_smmu_lock);
+		lck_mtx_lock(&audio_space_lock);
 		shared_put(0);
-		lck_mtx_unlock(&hakios_smmu_lock);
+		lck_mtx_unlock(&audio_space_lock);
 		hakios_adsp_apr_events(NULL);
 		say("sound: everything of the sound's is stopped and put back\n");
 	}
@@ -2052,9 +1903,9 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	if (level >= 2 || AR) {
 		/* (the DSP's graph on SM8450 has the shared-memory end point in it at every level: our memory is mapped at level 1 too) */
-		lck_mtx_lock(&hakios_smmu_lock);
+		lck_mtx_lock(&audio_space_lock);
 		ok = shared_get(0);
-		lck_mtx_unlock(&hakios_smmu_lock);
+		lck_mtx_unlock(&audio_space_lock);
 		if (!ok) {
 			goto out;
 		}

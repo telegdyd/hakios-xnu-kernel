@@ -19,3 +19,6 @@ driver SOCINFO
 	file    bsd/dev/hakios.socinfo.c
 	help    the chip's identity from the firmware's shared memory: kern.hakios.soc_* (socinfo=1). Any Qualcomm SoC
 	help    that keeps SMEM item 137; where the shared memory is comes from soc_smem=
+
+standard bsd/dev/hakios.smmu.c
+	help    shared guarded apps-SMMU stage-1 contexts for audio and PCIe DMA
