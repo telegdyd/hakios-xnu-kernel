@@ -79,14 +79,17 @@ static uint64_t stretch_first, stretch_last;    /* mach_absolute_time() of its f
 static uint64_t stretch_frames, stretch_latest; /* frames written, and how many of them by the latest write */
 static uint64_t stretch_sound, stretch_lost;    /* frames in writes that were not silence; frames the sink did not take */
 static uint32_t stretch_peak;                   /* the largest sample, as an absolute value */
+/* the writes' cadence: how many came later than the frames before them last (by half again and 2 ms), the longest gap */
+static uint32_t stretch_writes, stretch_late, stretch_size_min, stretch_size_max;
+static uint64_t stretch_gap_max_us, stretch_late_us;
 static thread_call_t report_call;
 static bool report_armed;
 
 static void
 audio_report(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
-	uint64_t frames, latest, sound, lost, deadline, since = 0, lasted = 0;
-	uint32_t loudest;
+	uint64_t frames, latest, sound, lost, deadline, since = 0, lasted = 0, gap_max, late_us;
+	uint32_t loudest, writes, late, size_min, size_max;
 
 	lck_mtx_lock(&audio_lock);
 	absolutetime_to_nanoseconds(mach_absolute_time() - stretch_last, &since);
@@ -103,8 +106,15 @@ audio_report(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	sound = stretch_sound;
 	lost = stretch_lost;
 	loudest = stretch_peak;
+	writes = stretch_writes;
+	late = stretch_late;
+	size_min = stretch_size_min;
+	size_max = stretch_size_max;
+	gap_max = stretch_gap_max_us;
+	late_us = stretch_late_us;
 	stretch_frames = stretch_sound = stretch_lost = 0;
-	stretch_peak = 0;
+	stretch_peak = stretch_writes = stretch_late = stretch_size_min = stretch_size_max = 0;
+	stretch_gap_max_us = stretch_late_us = 0;
 	report_armed = false;
 	lck_mtx_unlock(&audio_lock);
 
@@ -119,6 +129,8 @@ audio_report(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	if (lost) {
 		printf(", %llu ms lost (the sink was full)", lost * 1000 / HAKIOS_AUDIO_RATE);
 	}
+	printf("; %u writes of %u to %u frames, %u of them late (%llu ms in all over the frames before them), the longest gap %llu.%llu ms",
+	    writes, size_min, size_max, late, late_us / 1000, gap_max / 1000, gap_max % 1000 / 100);
 	printf("\n");
 }
 
@@ -189,6 +201,22 @@ audio_play(const int16_t *frames, uint32_t count)
 		taken = audio_sink(frames, count);
 		stretch_lost += count - taken;
 	}
+	if (stretch_frames != 0) {
+		uint64_t gap_us = 0, due_us = (uint64_t)stretch_latest * 1000000 / HAKIOS_AUDIO_RATE;
+
+		absolutetime_to_nanoseconds(mach_absolute_time() - stretch_last, &gap_us);
+		gap_us /= 1000;
+		if (gap_us > stretch_gap_max_us) {
+			stretch_gap_max_us = gap_us;
+		}
+		if (gap_us > due_us * 3 / 2 + 2000) {
+			stretch_late++;
+			stretch_late_us += gap_us - due_us;
+		}
+	}
+	stretch_writes++;
+	stretch_size_min = stretch_size_min == 0 || count < stretch_size_min ? count : stretch_size_min;
+	stretch_size_max = count > stretch_size_max ? count : stretch_size_max;
 	stretch_last = mach_absolute_time();
 	if (stretch_frames == 0) {
 		stretch_first = stretch_last;

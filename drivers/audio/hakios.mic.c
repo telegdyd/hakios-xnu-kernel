@@ -55,6 +55,16 @@
  *            175.5 Hz in the samples)
  *
  * What is asked for is given back at the end, and before the DSP is shut down (hakios_mic_dsp_down()).
+ *
+ * The OnePlus 10 Pro (negroni, SM8450; taken when the DSP speaks GPR, adsp_soc=8450): the same levels, from its
+ * live tree, OnePlus's mixer paths (device-info/.../audio/) and OnePlus's kernel (audio-kernel's lpass-cdc,
+ * swr-mstr-ctrl.c, wcd938x.c, pinctrl-lpi.c). What differs: the votes and the clock are PRM's (GPR); the codec's
+ * TX device is on the VA macro's SoundWire master (0x33B0000, version 1.7: CPU1's FIFOs), its reset GPIO43; the
+ * microphones are the two digital ones Android records from ("handset-mic": DMIC3 and DMIC4, from MIC BIAS3 and
+ * MIC BIAS1), into decimators 0 and 1; the DSP's side is one AudioReach graph (see "the OnePlus 10 Pro: its
+ * handset microphones"). mic=3 says both microphones' levels; Darwin (mic=4) gets DMIC3's, or DMIC4's with
+ * mic_channel=1; the recording (rec_sound_mic=1) has DMIC3 left, DMIC4 right. mic_input=0 (exact silence) and
+ * mic_test=1 (no mic bias) are tests here as well.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -80,6 +90,11 @@ static LCK_MTX_DECLARE(mic_lock, &mic_lock_group);      /* what is asked for, an
 
 static uint32_t level;
 static bool running;
+/*
+ * The OnePlus 10 Pro (SM8450): the DSP speaks GPR (AudioReach, hakios_adsp_is_gpr()), and everything below that
+ * differs from the X5 Pro's takes this into account ("ar"); see "the OnePlus 10 Pro" further down for what it is.
+ */
+static bool ar;
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -175,6 +190,21 @@ struct block {
 	vm_offset_t base;
 };
 
+/*
+ * boot-arg mic_slow=1 (a test): every access to a block said before it is made, and a quarter of a second for the
+ * USB log to carry it away -- an access that hangs the bus resets the phone at once, and then this is its last line
+ */
+static uint32_t slow;
+
+static void
+about_to(const char *what, struct block *b, const char *name, uint32_t offset)
+{
+	if (slow) {
+		say("mic: about to %s %s %s (%#x)\n", what, b->name, name, b->phys + offset);
+		delay_for_interval(250, NSEC_PER_MSEC);
+	}
+}
+
 static uint32_t
 get(struct block *b, const char *name, uint32_t offset)
 {
@@ -183,6 +213,7 @@ get(struct block *b, const char *name, uint32_t offset)
 	if (b->base == 0) {
 		b->base = ml_io_map(b->phys, b->size);
 	}
+	about_to("read", b, name, offset);
 	value = rd(b->base + offset);
 	note("mic: %s %s (%#x) = %#x\n", b->name, name, b->phys + offset, value);
 	return value;
@@ -204,6 +235,7 @@ put(struct block *b, const char *name, uint32_t offset, uint32_t value, uint32_t
 		b->base = ml_io_map(b->phys, b->size);
 	}
 	snprintf(last_write, sizeof(last_write), "%#x to %s %s (%#x)", value, b->name, name, b->phys + offset);
+	about_to("write", b, name, offset);
 	wr(b->base + offset, value);
 	back = rd(b->base + offset);
 	if ((back & check) != (value & check)) {
@@ -224,6 +256,7 @@ put_bits(struct block *b, const char *name, uint32_t offset, uint32_t mask, uint
 	if (b->base == 0) {
 		b->base = ml_io_map(b->phys, b->size);
 	}
+	about_to("read", b, name, offset);
 	now = rd(b->base + offset);
 	return put(b, name, offset, (now & ~mask) | (value & mask), mask);
 }
@@ -321,6 +354,200 @@ afe_clock(const char *what, uint32_t id, bool on)
 	return afe_service_param(what, AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
 }
 
+/*
+ * GPR (the OnePlus 10 Pro): one command to a module of the DSP, as hakios.sound.c sends them (see there): the payload
+ * built up in words, behind APM's command header (in band) if `apm_header'. True if the answer is the basic one for
+ * this opcode with status 0, or the opcode `wanted' (then in *answer, for the caller to look at).
+ */
+#define AR_PORT_APM                     1
+#define AR_PORT_PRM                     2
+#define AR_OURS                         3
+#define AR_OURS_PRM                     7
+#define AR_OURS_MIC                     0x10000002u     /* our port for the microphones' graph's data (the speakers': ...01) */
+#define AR_WAIT_MS                      5000            /* (Linux's q6apm and q6prm wait 5 s for an answer) */
+#define GPR_BASIC_RSP_RESULT            0x02001005u
+#define PRM_CMD_REQUEST_HW_RSC          0x0100100fu
+#define PRM_CMD_RSP_REQUEST_HW_RSC      0x02001002u
+#define PRM_CMD_RELEASE_HW_RSC          0x01001010u
+#define PRM_CMD_RSP_RELEASE_HW_RSC      0x02001003u
+#define PARAM_ID_RSC_AUDIO_HW_CLK       0x0800102cu
+#define PARAM_ID_RSC_HW_CORE            0x08001032u
+#define PRM_HW_CORE_LPASS               1               /* Android's lpass_core_hw_vote (Linux: Q6PRM_HW_CORE_ID_LPASS) */
+#define PRM_HW_CORE_DCODEC              2               /* lpass_audio_hw_vote (Q6PRM_HW_CORE_ID_DCODEC) */
+
+struct words {
+	uint32_t w[160];
+	unsigned n;
+	bool full;
+};
+
+static void
+word(struct words *p, uint32_t value)
+{
+	if (p->n >= sizeof(p->w) / sizeof(p->w[0])) {
+		p->full = true;
+		return;
+	}
+	p->w[p->n++] = value;
+}
+
+static void
+halves(struct words *p, uint16_t low, uint16_t high)
+{
+	word(p, (uint32_t)low | (uint32_t)high << 16);
+}
+
+/* a module's parameter: its instance, the parameter, its size, error 0 (the data follows) */
+static void
+param(struct words *p, uint32_t instance, uint32_t id, uint32_t bytes)
+{
+	word(p, instance);
+	word(p, id);
+	word(p, bytes);
+	word(p, 0);
+}
+
+static void
+pad8(struct words *p)
+{
+	if (p->n & 1) {
+		word(p, 0);
+	}
+}
+
+/* a page of memory the DSP has mapped (ar_graph_on()), for APM's commands too big for GLINK; handle 0: none */
+static struct {
+	uintptr_t memory;
+	uint64_t address;
+	uint32_t handle;
+} spare;
+
+static bool
+gcommand(const char *what, uint32_t to_port, uint32_t from_port, uint32_t opcode, bool apm_header, const struct words *p,
+    uint32_t wanted, struct hakios_apr_answer *answer)
+{
+	struct hakios_apr_answer local;
+	uint32_t packet[4 + 160];
+	uint32_t length = 0;
+
+	if (answer == NULL) {
+		answer = &local;
+	}
+	if (p != NULL && p->full) {
+		say("mic: %s: THE PACKET IS TOO BIG to be built here: not sent\n", what);
+		return false;
+	}
+	bzero(packet, sizeof(packet));
+	if (apm_header) {
+		packet[3] = p != NULL ? p->n * 4 : 0;
+		length = 16;
+	}
+	if (p != NULL) {
+		memcpy((uint8_t *)packet + length, p->w, p->n * 4);
+		length += p->n * 4;
+	}
+	snprintf(last_write, sizeof(last_write), "sent %s (opcode %#x to %#x)", what, opcode, to_port);
+	if (slow) {
+		say("mic: about to send %s (opcode %#x to port %#x)\n", what, opcode, to_port);
+		delay_for_interval(250, NSEC_PER_MSEC);
+	}
+	if (!hakios_adsp_gpr(to_port, from_port, 0, opcode, packet, length, AR_WAIT_MS, answer)) {
+		uint32_t bytes = p != NULL ? p->n * 4 : 0;
+
+		/* not sent (no intent of the DSP's that big): the payload out of band, from the spare page (hakios.sound.c's ar_command()) */
+		if (hakios_adsp_gpr_error == 0 || !apm_header || bytes == 0 || bytes > 4096 || spare.handle == 0) {
+			say("mic: %s (opcode %#x to port %#x, %u bytes): %s\n", what, opcode, to_port, length,
+			    hakios_adsp_gpr_error == 0 ? "NO ANSWER" : "NOT SENT");
+			return false;
+		}
+		memcpy((void *)spare.memory, p->w, bytes);
+		for (uintptr_t line = spare.memory; line < spare.memory + bytes; line += 64) {
+			__asm__ volatile ("dc civac, %0" : : "r" (line));
+		}
+		__asm__ volatile ("dsb sy");
+		packet[0] = (uint32_t)spare.address;
+		packet[1] = (uint32_t)(spare.address >> 32);
+		packet[2] = spare.handle;
+		packet[3] = bytes;
+		say("mic: %s: too big for the link (%u bytes), sent out of band: its %u bytes at %#llx, handle %#x\n", what, length, bytes,
+		    spare.address, spare.handle);
+		if (!hakios_adsp_gpr(to_port, from_port, 0, opcode, packet, 16, AR_WAIT_MS, answer)) {
+			say("mic: %s, out of band (opcode %#x to port %#x): %s\n", what, opcode, to_port,
+			    hakios_adsp_gpr_error == 0 ? "NO ANSWER" : "NOT SENT");
+			return false;
+		}
+	}
+	if (answer->opcode == GPR_BASIC_RSP_RESULT && answer->words[0] == opcode) {
+		if (answer->words[1] == 0) {
+			note("mic: %s: done\n", what);
+		} else {
+			say("mic: %s: REFUSED: %s\n", what, dsp_error(answer->words[1]));
+		}
+		return answer->words[1] == 0;
+	}
+	if (wanted != 0 && answer->opcode == wanted) {
+		return true;
+	}
+	say("mic: %s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", what, answer->opcode, answer->length,
+	    answer->words[0], answer->words[1]);
+	return false;
+}
+
+/* PRM's answer to a request or a release: the basic result's status in its second word (q6prm.c) */
+static bool
+prm_command(const char *what, bool on, const struct words *p)
+{
+	struct hakios_apr_answer answer;
+
+	bzero(&answer, sizeof(answer));
+	if (!gcommand(what, AR_PORT_PRM, AR_OURS_PRM, on ? PRM_CMD_REQUEST_HW_RSC : PRM_CMD_RELEASE_HW_RSC, true, p,
+	    on ? PRM_CMD_RSP_REQUEST_HW_RSC : PRM_CMD_RSP_RELEASE_HW_RSC, &answer)) {
+		return false;
+	}
+	if (answer.opcode == GPR_BASIC_RSP_RESULT) {
+		return true;
+	}
+	if (answer.words[1] != 0) {
+		say("mic: %s: REFUSED: %s\n", what, dsp_error(answer.words[1]));
+		return false;
+	}
+	say("mic: %s: %s\n", what, on ? "GRANTED" : "released");
+	return true;
+}
+
+/* one of PRM's "hardware cores" (q6prm_vote_lpass_core_hw()), asked for or given back */
+static bool
+prm_core(uint32_t core, bool on)
+{
+	struct words p = { .n = 0 };
+	char what[96];
+
+	param(&p, AR_PORT_PRM, PARAM_ID_RSC_HW_CORE, 4);
+	word(&p, core);
+	snprintf(what, sizeof(what), "PRM: hardware core %u (%s)%s", core, core == PRM_HW_CORE_LPASS ? "the LPASS's macros" :
+	    "the digital codec", on ? "" : ", given back");
+	return prm_command(what, on, &p);
+}
+
+/* one of PRM's clocks (q6prm_request_lpass_clock()): at `hz', attribute 1 ("couple no"), the default root */
+static bool
+prm_clock(uint32_t id, uint32_t hz, bool on)
+{
+	struct words p = { .n = 0 };
+	char what[96];
+
+	param(&p, AR_PORT_PRM, PARAM_ID_RSC_AUDIO_HW_CLK, on ? 20 : 8);
+	word(&p, 1);
+	word(&p, id);
+	if (on) {
+		word(&p, hz);
+		word(&p, 1);
+		word(&p, 0);
+	}
+	snprintf(what, sizeof(what), "PRM: clock %#x%s", id, on ? " at 19.2 MHz" : ", released");
+	return prm_command(what, on, &p);
+}
+
 static uint32_t vote_handle[5];
 static bool voted[5], core_clock, npl_clock;
 
@@ -363,6 +590,13 @@ devote(uint32_t block)
 static bool
 clocks_on(void)
 {
+	if (ar) {
+		/* the two votes, then TX_CORE_CLK (the tree's tx_core_clk: 0x30c at 19.2 MHz), which the VA macro's master uses too */
+		voted[1] = prm_core(PRM_HW_CORE_LPASS, true);
+		voted[2] = voted[1] && prm_core(PRM_HW_CORE_DCODEC, true);
+		core_clock = voted[2] && prm_clock(CLOCK_TX_CORE, CLOCK_HZ, true);
+		return core_clock;
+	}
 	if (!vote(LPASS_HW_MACRO_BLOCK, "LPASS_HW_MACRO") || !vote(LPASS_HW_DCODEC_BLOCK, "LPASS_HW_DCODEC")) {
 		return false;
 	}
@@ -377,6 +611,19 @@ clocks_on(void)
 static void
 clocks_off(void)
 {
+	if (ar) {
+		if (core_clock) {
+			(void)prm_clock(CLOCK_TX_CORE, CLOCK_HZ, false);
+			core_clock = false;
+		}
+		for (uint32_t core = PRM_HW_CORE_DCODEC; core >= PRM_HW_CORE_LPASS; core--) {
+			if (voted[core]) {
+				(void)prm_core(core, false);
+				voted[core] = false;
+			}
+		}
+		return;
+	}
 	if (npl_clock) {
 		(void)afe_clock("the TX macro's NPL clock, off", CLOCK_TX_NPL, false);
 		npl_clock = false;
@@ -391,6 +638,15 @@ clocks_off(void)
 
 /* ---- the blocks, read ------------------------------------------------------------------------------ */
 
+/*
+ * (On the 10 Pro, hakios_mic_dsp_up() moves the VA macro to 0x33F0000, the master to the VA macro's at 0x33B0000,
+ * the LPASS pins to 0x3440000 and their slew rates to 0x34DA000: the tree's lpass-cdc and lpi_pinctrl@3440000.)
+ */
+static unsigned reset_gpio = 83;        /* the codec's reset: GPIO83 on the X5 Pro, GPIO43 on the 10 Pro (wcd938x_reset_active) */
+#define TLMM_CFG_83             (0x1000 * reset_gpio)
+#define TLMM_IO_83              (0x1000 * reset_gpio + 4)
+#define TLMM_INTR_CFG_83        (0x1000 * reset_gpio + 8)       /* [0] enable, [4] raw status, [7:5] the processor it goes to */
+#define TLMM_INTR_STATUS_83     (0x1000 * reset_gpio + 0xc)
 static struct block tx_macro = { "the TX macro", 0x03220000, 0x1000 };
 static struct block va_macro = { "the VA macro", 0x03370000, 0x1000 };
 static struct block tx_swr = { "the TX SoundWire master", 0x03230000, 0x2000 };
@@ -413,7 +669,9 @@ look(void)
 		{ "ENUMERATOR_STATUS", 0x504 }, { "MCP_FRAME_CTRL_BANK0", 0x101c }, { "MCP_BUS_CTRL", 0x1044 },
 		{ "MCP_CFG", 0x1048 }, { "MCP_STATUS", 0x104c }, { "MCP_SLV_STATUS", 0x1090 },
 	};
-	static const unsigned pins[] = { 0, 1, 2 };
+	static const unsigned pins[] = { 0, 1, 2 }, ar_pins[] = { 0, 1, 2, 14, 8, 9, 12, 13 };
+	const unsigned *list = ar ? ar_pins : pins;
+	size_t count = ar ? sizeof(ar_pins) / sizeof(ar_pins[0]) : sizeof(pins) / sizeof(pins[0]);
 
 	for (size_t i = 0; i < sizeof(tx) / sizeof(tx[0]); i++) {
 		(void)get(&tx_macro, tx[i].name, tx[i].offset);
@@ -421,31 +679,40 @@ look(void)
 	for (size_t i = 0; i < sizeof(va) / sizeof(va[0]); i++) {
 		(void)get(&va_macro, va[i].name, va[i].offset);
 	}
-	for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+	if (ar) {
+		(void)get(&va_macro, "CORE_ID_0", 0x0c0);
+		(void)get(&va_macro, "CORE_ID_1", 0x0c4);
+		(void)get(&va_macro, "SWR_CONTROL", 0x008);
+		(void)get(&va_macro, "DMIC1_CTL", 0x088);
+		(void)get(&va_macro, "DMIC2_CTL", 0x08c);
+	}
+	for (size_t i = 0; i < count; i++) {
 		char name[48];
 
-		snprintf(name, sizeof(name), "gpio%u config (SoundWire TX)", pins[i]);
-		(void)get(&lpi, name, 0x1000 * pins[i]);
-		snprintf(name, sizeof(name), "gpio%u in/out", pins[i]);
-		(void)get(&lpi, name, 0x1000 * pins[i] + 4);
+		snprintf(name, sizeof(name), "gpio%u config", list[i]);
+		(void)get(&lpi, name, 0x1000 * list[i]);
+		snprintf(name, sizeof(name), "gpio%u in/out", list[i]);
+		(void)get(&lpi, name, 0x1000 * list[i] + 4);
 	}
-	(void)get(&lpi_high, "gpio14 config (SoundWire TX data 2)", 0);
-	(void)get(&lpi_high, "gpio14 in/out", 4);
-	(void)get(&tlmm, "gpio83 config (the codec's reset)", 0x1000 * 83);
-	(void)get(&tlmm, "gpio83 in/out", 0x1000 * 83 + 4);
+	if (!ar) {
+		(void)get(&lpi_high, "gpio14 config (SoundWire TX data 2)", 0);
+		(void)get(&lpi_high, "gpio14 in/out", 4);
+	}
+	(void)get(&tlmm, "the codec's reset pin config", TLMM_CFG_83);
+	(void)get(&tlmm, "the codec's reset pin in/out", TLMM_IO_83);
 	/* (last: the master is a block of its own, and not yet known; with its version above 1.5.1 the votes are all it needs) */
 	for (size_t i = 0; i < sizeof(swr) / sizeof(swr[0]); i++) {
 		(void)get(&tx_swr, swr[i].name, swr[i].offset);
 	}
-	(void)get(&tx_hctl, "HCTL (0x32a90a8)", 0x0a8);
+	if (!ar) {
+		(void)get(&tx_hctl, "HCTL (0x32a90a8)", 0x0a8);
+	}
 }
 
 /* ---- the codec's reset, the master's pins ------------------------------------------------------------ */
 
-#define TLMM_CFG_83             (0x1000 * 83)
-#define TLMM_IO_83              (0x1000 * 83 + 4)
-static uint32_t found_reset_cfg, found_reset_io;
-static bool reset_taken;
+static uint32_t found_reset_cfg, found_reset_io, found_reset_intr;
+static bool reset_taken, reset_intr_taken;
 
 static bool
 reset_release(void)
@@ -453,19 +720,51 @@ reset_release(void)
 	if (tlmm.base == 0) {
 		tlmm.base = ml_io_map(tlmm.phys, tlmm.size);
 	}
+	about_to("read", &tlmm, "the codec's reset pin", TLMM_CFG_83);
 	found_reset_cfg = rd(tlmm.base + TLMM_CFG_83);
 	found_reset_io = rd(tlmm.base + TLMM_IO_83);
 	reset_taken = true;
+	say("mic: the codec's reset is gpio%u (config %#x, in/out %#x as found)\n", reset_gpio, found_reset_cfg, found_reset_io);
+	if (ar) {
+		/*
+		 * (the 10 Pro reset itself the moment this pin went high, round 1c: if the pin's interrupt is left on, going
+		 * somewhere, its edge is the first suspect -- it is turned off while the pin is ours, and put back after)
+		 */
+		found_reset_intr = rd(tlmm.base + TLMM_INTR_CFG_83);
+		say("mic: gpio%u's interrupt: config %#x (enable %u, raw status %u, to processor %u, detection %u, polarity %u), "
+		    "status %#x\n", reset_gpio, found_reset_intr, found_reset_intr & 1, found_reset_intr >> 4 & 1,
+		    found_reset_intr >> 5 & 7, found_reset_intr >> 2 & 3, found_reset_intr >> 1 & 1,
+		    rd(tlmm.base + TLMM_INTR_STATUS_83));
+		if (found_reset_intr & 0x11) {
+			reset_intr_taken = true;
+			if (!put(&tlmm, "the reset pin's interrupt: off (enable and raw status 0)", TLMM_INTR_CFG_83,
+			    found_reset_intr & ~0x11u, 0x11)) {
+				return false;
+			}
+		}
+	}
 	/* the sleep state: gpio, 16 mA, no pull, output low; 20 us; the active state: output high */
-	if (!put(&tlmm, "gpio83 out (the codec's reset)", TLMM_IO_83, 0, 2) ||
-	    !put(&tlmm, "gpio83 config: gpio, 16 mA, no pull, output", TLMM_CFG_83, 0x3c0, 0x3ff)) {
+	if (!put(&tlmm, "the reset pin out (the codec's reset)", TLMM_IO_83, 0, 2) ||
+	    !put(&tlmm, "the reset pin's config: gpio, 16 mA, no pull, output", TLMM_CFG_83, 0x3c0, 0x3ff)) {
 		return false;
 	}
 	spin_us(30);
-	if (!put(&tlmm, "gpio83 out: high (the codec out of reset)", TLMM_IO_83, 2, 2)) {
+	if (!put(&tlmm, "the reset pin out: high (the codec out of reset)", TLMM_IO_83, 2, 2)) {
 		return false;
 	}
 	spin_us(30);
+	if (ar) {
+		/* (how long the phone lives on after it, if it does not: at once is the power, later an interrupt or a watchdog) */
+		static const unsigned marks[] = { 1, 20, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000 };
+		unsigned at = 0;
+
+		for (unsigned i = 0; i < sizeof(marks) / sizeof(marks[0]); i++) {
+			delay_for_interval(marks[i] - at, NSEC_PER_MSEC);
+			at = marks[i];
+			say("mic: the codec out of reset for %u ms: still running (gpio%u in/out %#x, interrupt status %#x)\n", at,
+			    reset_gpio, rd(tlmm.base + TLMM_IO_83), rd(tlmm.base + TLMM_INTR_STATUS_83));
+		}
+	}
 	return true;
 }
 
@@ -476,9 +775,14 @@ reset_restore(void)
 		return;
 	}
 	broken = false;         /* (putting back is done whatever went before) */
-	(void)put(&tlmm, "gpio83 out: low (the codec in reset)", TLMM_IO_83, 0, 2);
-	(void)put(&tlmm, "gpio83 config, as it was found", TLMM_CFG_83, found_reset_cfg, 0x3ff);
-	(void)put(&tlmm, "gpio83 out, as it was found", TLMM_IO_83, found_reset_io & 2, 2);
+	(void)put(&tlmm, "the reset pin out: low (the codec in reset)", TLMM_IO_83, 0, 2);
+	(void)put(&tlmm, "the reset pin's config, as it was found", TLMM_CFG_83, found_reset_cfg, 0x3ff);
+	(void)put(&tlmm, "the reset pin out, as it was found", TLMM_IO_83, found_reset_io & 2, 2);
+	if (reset_intr_taken) {
+		wr(tlmm.base + TLMM_INTR_STATUS_83, 0);
+		(void)put(&tlmm, "the reset pin's interrupt, as it was found", TLMM_INTR_CFG_83, found_reset_intr, 0xff);
+		reset_intr_taken = false;
+	}
 	reset_taken = false;
 }
 
@@ -503,9 +807,11 @@ pins_on(void)
 		lpi_slew.base = ml_io_map(lpi_slew.phys, lpi_slew.size);
 	}
 	for (unsigned i = 0; i < SWR_PINS; i++) {
+		about_to("read", &lpi, swr_pins[i].name, 0x1000 * swr_pins[i].pin);
 		found_pin_cfg[i] = rd(lpi.base + 0x1000 * swr_pins[i].pin);
 		found_pin_dir[i] = rd(lpi.base + 0x1000 * swr_pins[i].pin + 4);
 	}
+	about_to("read", &lpi_slew, "slew rates", 0);
 	found_slew = rd(lpi_slew.base);
 	pins_taken = true;
 	slew = found_slew;
@@ -516,8 +822,11 @@ pins_on(void)
 		return false;
 	}
 	for (unsigned i = 0; i < SWR_PINS; i++) {
-		/* [1:0] pull, [5:2] function, [8:6] drive (mA / 2 - 1), [9] output: function 1, 2 mA, not an output */
-		uint32_t cfg = (found_pin_cfg[i] & ~0x3ffu) | swr_pins[i].pull | 1u << 2;
+		/*
+		 * [1:0] pull, [5:2] function, [8:6] drive (mA / 2 - 1), [9] output: function 1, 2 mA (the 10 Pro's
+		 * tx_swr_*_active: 4 mA), not an output
+		 */
+		uint32_t cfg = (found_pin_cfg[i] & ~0x3ffu) | swr_pins[i].pull | 1u << 2 | (ar ? 1u << 6 : 0);
 
 		if (!put(&lpi, swr_pins[i].name, 0x1000 * swr_pins[i].pin, cfg, 0x3ff) ||
 		    !put(&lpi, "its direction: in", 0x1000 * swr_pins[i].pin + 4, 0, 2)) {
@@ -550,6 +859,7 @@ pins_restore(void)
 #define TX_FREQ_MCLK            0x090
 #define VA_MCLK_CONTROL         0x000
 #define VA_FS_CNT_CONTROL       0x004
+#define VA_SWR_CONTROL          0x008
 #define VA_TOP_CFG0             0x080
 
 #define SWRM_COMP_CFG                   0x0004
@@ -582,11 +892,37 @@ pins_restore(void)
 static bool tx_clocks_taken, master_taken;
 static uint32_t found_hctl;
 static uint8_t read_id = 0;
+/*
+ * The master's command FIFOs and interrupt enables: CPU0's up to version 1.6, CPU1's from 1.7 on (swr-mstr-registers.h
+ * with CONFIG_SWRM_VER_1P7, the 10 Pro's: the link manager given to execution environment 1, SWRM_LINK_MANAGER_EE)
+ */
+static uint32_t swrm_wr_cmd = 0x0300, swrm_rd_cmd = 0x0304, swrm_fifo_status = 0x030c, swrm_rd_fifo = 0x0318,
+    swrm_interrupt_en = 0x0204, swrm_interrupt_mask = 0x1fdfd;
+static bool swrm_v17;
+#define SWRM_COMP_HW_VERSION            0x0000
+#define SWRM_LINK_MANAGER_EE            0x0018
 
 static bool
 tx_clocks_on(void)
 {
 	tx_clocks_taken = true;
+	if (ar) {
+		/*
+		 * lpass-cdc (the 10 Pro): the same fs-gen (the tree's qcom,fs-gen-sequence, in the VA macro), then
+		 * lpass_cdc_tx_macro_mclk_enable() (no FREQ_MCLK any more), then the SoundWire clock of the master that
+		 * has the codec's TX device, the VA macro's (lpass_cdc_va_macro_tx_va_mclk_enable(), TX_MCLK: with the
+		 * first reset)
+		 */
+		return put_bits(&va_macro, "MCLK_CONTROL (fs-gen)", VA_MCLK_CONTROL, 0x01, 0x01) &&
+		       put_bits(&va_macro, "FS_CNT_CONTROL (fs-gen)", VA_FS_CNT_CONTROL, 0x03, 0x03) &&
+		       put_bits(&va_macro, "FS_CNT_CONTROL (fs-gen)", VA_FS_CNT_CONTROL, 0x03, 0x01) &&
+		       put_bits(&va_macro, "TOP_CFG0 (fs-gen)", VA_TOP_CFG0, 0x02, 0x02) &&
+		       put_bits(&tx_macro, "MCLK_CONTROL: on", TX_MCLK_CONTROL, 0x01, 0x01) &&
+		       put_bits(&tx_macro, "FS_CNT_CONTROL: on", TX_FS_CNT_CONTROL, 0x01, 0x01) &&
+		       put_bits(&va_macro, "SWR_CONTROL: reset", VA_SWR_CONTROL, 0x02, 0x02) &&
+		       put_bits(&va_macro, "SWR_CONTROL: clock on", VA_SWR_CONTROL, 0x01, 0x01) &&
+		       put_bits(&va_macro, "SWR_CONTROL: reset over", VA_SWR_CONTROL, 0x02, 0x00);
+	}
 	/* bolero_clk_rsc_fs_gen_request(): the tree's qcom,fs-gen-sequence, register, mask, value */
 	return put_bits(&va_macro, "MCLK_CONTROL (fs-gen)", VA_MCLK_CONTROL, 0x01, 0x01) &&
 	       put_bits(&va_macro, "FS_CNT_CONTROL (fs-gen)", VA_FS_CNT_CONTROL, 0x03, 0x03) &&
@@ -612,10 +948,12 @@ tx_clocks_off(void)
 		return;
 	}
 	broken = false;
-	(void)put_bits(&tx_macro, "SWR_CONTROL: clock off", TX_SWR_CONTROL, 0x01, 0x00);
+	(void)put_bits(ar ? &va_macro : &tx_macro, "SWR_CONTROL: clock off", ar ? VA_SWR_CONTROL : TX_SWR_CONTROL, 0x01, 0x00);
 	(void)put_bits(&tx_macro, "FS_CNT_CONTROL: off", TX_FS_CNT_CONTROL, 0x01, 0x00);
 	(void)put_bits(&tx_macro, "MCLK_CONTROL: off", TX_MCLK_CONTROL, 0x01, 0x00);
-	(void)put(&tx_macro, "FREQ_MCLK: as at reset", TX_FREQ_MCLK, 0, 0);
+	if (!ar) {
+		(void)put(&tx_macro, "FREQ_MCLK: as at reset", TX_FREQ_MCLK, 0, 0);
+	}
 	(void)put_bits(&va_macro, "TOP_CFG0 (fs-gen off)", VA_TOP_CFG0, 0x02, 0x00);
 	(void)put_bits(&va_macro, "FS_CNT_CONTROL (fs-gen off)", VA_FS_CNT_CONTROL, 0x03, 0x00);
 	(void)put_bits(&va_macro, "MCLK_CONTROL (fs-gen off)", VA_MCLK_CONTROL, 0x01, 0x00);
@@ -627,6 +965,7 @@ swr_rd(uint32_t offset)
 {
 	if (tx_swr.base == 0) {
 		tx_swr.base = ml_io_map(tx_swr.phys, tx_swr.size);
+		about_to("read (the first time)", &tx_swr, "a register", offset);
 	}
 	return rd(tx_swr.base + offset);
 }
@@ -637,6 +976,49 @@ master_on(void)
 	uint32_t ssp = SWR_BUS_HZ * 2 / (SWR_ROWS * SWR_COLUMNS * SWR_FRAME_SYNC_HZ), cfg;
 	bool linked = false;
 
+	if (ar) {
+		uint32_t version = swr_rd(SWRM_COMP_HW_VERSION);
+
+		master_taken = true;
+		swrm_v17 = version >= 0x01070000;
+		if (swrm_v17) {
+			swrm_wr_cmd = 0x031c;
+			swrm_rd_cmd = 0x0320;
+			swrm_fifo_status = 0x0328;
+			swrm_rd_fifo = 0x0334;
+			swrm_interrupt_en = 0x0210;
+			swrm_interrupt_mask = 0x1dfdfd;
+		}
+		say("mic: the VA SoundWire master is version %#x: %s\n", version, swrm_v17 ? "1.7 or later, CPU1's FIFOs" :
+		    "BEFORE 1.7, CPU0's FIFOs");
+		/* swrm_runtime_resume(), swrm_master_init() for 1.7 (no hctl register in the tree for this master) */
+		cfg = (swr_rd(SWRM_MCP_CFG) & ~0x3e0000u) | 0x1fu << 17;
+		if (!put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) || !put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) ||
+		    !put(&tx_swr, "MCP_BUS_CTRL", SWRM_MCP_BUS_CTRL, 1, 0) ||
+		    !put(&tx_swr, "MCP_FRAME_CTRL_BANK0: 50 rows, 2 columns", SWRM_MCP_FRAME_CTRL_BANK0, 1u << 3 | 0u | (ssp - 1) << 16,
+		    0xffffffff) ||
+		    !put(&tx_swr, "ENUMERATOR_CFG: auto", SWRM_ENUMERATOR_CFG, 1, 1) ||
+		    !put(&tx_swr, "MCP_CFG: 31 pings", SWRM_MCP_CFG, cfg, 0x3e0000) ||
+		    !put(&tx_swr, "CMD_FIFO_CFG: 3 retries", SWRM_CMD_FIFO_CFG, 3, 0xff) ||
+		    (swrm_v17 && !put(&tx_swr, "LINK_MANAGER_EE: 1", SWRM_LINK_MANAGER_EE, 1, 0)) ||
+		    !put(&tx_swr, "MCP_BUS_CTRL: the clock started", SWRM_MCP_BUS_CTRL, swrm_v17 ? 2u << 1 : 2u, 0) ||
+		    !put(&tx_swr, "COMP_CFG: interrupts as pulses", SWRM_COMP_CFG, 2, 0) ||
+		    !put(&tx_swr, "INTERRUPT_CLEAR", SWRM_INTERRUPT_CLEAR, 0xffffffff, 0) ||
+		    !put(&tx_swr, "INTERRUPT_EN", swrm_interrupt_en, swrm_interrupt_mask, 0) ||
+		    !put(&tx_swr, "CPU1_INTERRUPT_EN", SWRM_CPU1_INTERRUPT_EN, swrm_interrupt_mask, 0) ||
+		    !put(&tx_swr, "COMP_CFG: on", SWRM_COMP_CFG, 3, 0)) {
+			return false;
+		}
+		for (int i = 0; i < 100 && !linked; i++) {
+			linked = swr_rd(SWRM_COMP_STATUS) & 1;
+			if (!linked) {
+				spin_us(510);
+			}
+		}
+		say("mic: the SoundWire link %s (COMP_STATUS %#x)\n", linked ? "IS UP" : "DID NOT COME UP", swr_rd(SWRM_COMP_STATUS));
+		return linked &&
+		       put(&tx_swr, "CMD_FIFO_CFG: | 0x80000000", SWRM_CMD_FIFO_CFG, swr_rd(SWRM_CMD_FIFO_CFG) | 0x80000000u, 0);
+	}
 	if (tx_hctl.base == 0) {
 		tx_hctl.base = ml_io_map(tx_hctl.phys, tx_hctl.size);
 	}
@@ -688,10 +1070,12 @@ master_off(void)
 	}
 	broken = false;
 	(void)put(&tx_swr, "COMP_CFG: off", SWRM_COMP_CFG, 0, 0);
-	(void)put(&tx_swr, "INTERRUPT_EN: none", SWRM_INTERRUPT_EN, 0, 0);
+	(void)put(&tx_swr, "INTERRUPT_EN: none", swrm_interrupt_en, 0, 0);
 	(void)put(&tx_swr, "CPU1_INTERRUPT_EN: none", SWRM_CPU1_INTERRUPT_EN, 0, 0);
 	(void)put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0);
-	(void)put(&tx_hctl, "HCTL, as it was found", 0x0a8, found_hctl, 0x3);
+	if (!ar) {
+		(void)put(&tx_hctl, "HCTL, as it was found", 0x0a8, found_hctl, 0x3);
+	}
 	master_taken = false;
 }
 
@@ -700,12 +1084,18 @@ static bool
 swr_write(uint8_t device, uint16_t reg, uint8_t value, uint8_t id)
 {
 	uint32_t command = reg | (uint32_t)id << 16 | (uint32_t)device << 20 | (uint32_t)value << 24;
+	int i;
 
-	for (int i = 0; i < 20 && ((swr_rd(SWRM_CMD_FIFO_STATUS) >> 8) & 0x1f) >= 16; i++) {
+	for (i = 0; i < 20 && ((swr_rd(swrm_fifo_status) >> 8) & 0x1f) >= 16; i++) {
 		spin_us(500);
 	}
 	snprintf(last_write, sizeof(last_write), "SoundWire: device %u register %#x <- %#x", device, reg, value);
-	wr(tx_swr.base + SWRM_CMD_FIFO_WR_CMD, command);
+	if (i == 20) {
+		say("mic: SoundWire: device %u register %#x <- %#x: THE COMMAND FIFO STAYS FULL (status %#x): not sent\n", device, reg,
+		    value, swr_rd(swrm_fifo_status));
+		return false;
+	}
+	wr(tx_swr.base + swrm_wr_cmd, command);
 	spin_us(155);
 	return true;
 }
@@ -717,20 +1107,20 @@ swr_read(uint8_t device, uint16_t reg, uint8_t *value)
 	uint32_t answer = 0;
 
 	read_id = read_id < 14 ? read_id + 1 : 0;
-	wr(tx_swr.base + SWRM_CMD_FIFO_RD_CMD, reg | (uint32_t)read_id << 16 | (uint32_t)device << 20 | 1u << 24);
+	wr(tx_swr.base + swrm_rd_cmd, reg | (uint32_t)read_id << 16 | (uint32_t)device << 20 | 1u << 24);
 	spin_us(255);
 	for (int tries = 0; tries < 4; tries++) {
-		for (int i = 0; i < 20 && ((swr_rd(SWRM_CMD_FIFO_STATUS) >> 16) & 0x1f) == 0; i++) {
+		for (int i = 0; i < 20 && ((swr_rd(swrm_fifo_status) >> 16) & 0x1f) == 0; i++) {
 			spin_us(500);
 		}
-		answer = swr_rd(SWRM_CMD_FIFO_RD_FIFO);
+		answer = swr_rd(swrm_rd_fifo);
 		if (((answer >> 8) & 0xf) == read_id) {
 			*value = (uint8_t)answer;
 			return true;
 		}
 		spin_us(505);
 	}
-	say("mic: SoundWire: device %u register %#x: no answer (fifo %#x, last %#x)\n", device, reg, swr_rd(SWRM_CMD_FIFO_STATUS),
+	say("mic: SoundWire: device %u register %#x: no answer (fifo %#x, last %#x)\n", device, reg, swr_rd(swrm_fifo_status),
 	    answer);
 	return false;
 }
@@ -849,7 +1239,10 @@ codec_put(uint16_t reg, uint8_t value, uint8_t check)
 		return false;
 	}
 	write_id = write_id < 14 ? write_id + 1 : 0;
-	swr_write(codec_device, reg, value, write_id);
+	if (!swr_write(codec_device, reg, value, write_id)) {
+		broken = true;
+		return false;
+	}
 	if (check == 0) {
 		note("mic: the codec's %#06x <- %#04x\n", reg, value);
 		return true;
@@ -898,13 +1291,21 @@ static bool
 codec_init(void)
 {
 	uint8_t efuse = 0;
-	/* the tree's qcom,cdc-micbias1..4-mv: 2750 mV, (2750 - 1000) / 50 */
-	const uint8_t vout = (2750 - 1000) / 50;
+	/*
+	 * the tree's qcom,cdc-micbias1..4-mv, (mV - 1000) / 50: 2750 mV all four on the X5 Pro; 1800, 2700, 1800, 1800
+	 * on the 10 Pro (its digital microphones are powered from MIC BIAS3 and MIC BIAS1)
+	 */
+	static const uint16_t x5_mv[4] = { 2750, 2750, 2750, 2750 }, oneplus_mv[4] = { 1800, 2700, 1800, 1800 };
+	const uint16_t *mv = ar ? oneplus_mv : x5_mv;
+	uint8_t vout[4];
 
+	for (unsigned i = 0; i < 4; i++) {
+		vout[i] = (uint8_t)((mv[i] - 1000) / 50);
+	}
 	if (!codec_put(WCD_INTR_LEVEL_0, 0, 0xff) || !codec_put(WCD_INTR_LEVEL_0 + 1, 0, 0xff) ||
 	    !codec_put(WCD_INTR_LEVEL_0 + 2, 0, 0xff) ||
-	    !codec_bits(WCD_ANA_MICB1, 0x3f, vout) || !codec_bits(WCD_ANA_MICB2, 0x3f, vout) ||
-	    !codec_bits(WCD_ANA_MICB3, 0x3f, vout) || !codec_bits(WCD_ANA_MICB4, 0x3f, vout) ||
+	    !codec_bits(WCD_ANA_MICB1, 0x3f, vout[0]) || !codec_bits(WCD_ANA_MICB2, 0x3f, vout[1]) ||
+	    !codec_bits(WCD_ANA_MICB3, 0x3f, vout[2]) || !codec_bits(WCD_ANA_MICB4, 0x3f, vout[3]) ||
 	    !codec_bits(WCD_SLEEP_CTL, 0x0e, 0x0e) || !codec_bits(WCD_SLEEP_CTL, 0x80, 0x80)) {
 		return false;
 	}
@@ -929,7 +1330,8 @@ codec_init(void)
 	    !codec_bits(WCD_MICB3_TEST_CTL_1, 0xe0, 0xe0) || !codec_bits(WCD_MICB4_TEST_CTL_1, 0xe0, 0xe0) ||
 	    !codec_bits(WCD_TX_3_4_TEST_BLK_EN2, 0x01, 0x00) || !swr_read(codec_device, WCD_EFUSE_REG_30, &efuse) ||
 	    !codec_bits(WCD_SLEEP_CTL, 0x0e, (uint8_t)((efuse & 0x07) << 1)) ||
-	    !codec_bits(WCD_HPH_SURGE_HPHLR_SURGE_EN, 0xc0, 0x00)) {
+	    /* (Xiaomi's driver: 0x00; OnePlus's, for the 10 Pro: 0xC0) */
+	    !codec_bits(WCD_HPH_SURGE_HPHLR_SURGE_EN, 0xc0, ar ? 0xc0 : 0x00)) {
 		return false;
 	}
 	say("mic: the codec is set up as wcd938x_init_reg() sets it up (efuse 30: %#x)\n", efuse);
@@ -1113,6 +1515,11 @@ bolero_look(void)
 {
 	uint32_t id0 = get(&va_macro, "CORE_ID_0", VA_CORE_ID_0) & 0xff, id1 = get(&va_macro, "CORE_ID_1", VA_CORE_ID_1) & 0xff;
 
+	if (ar) {
+		/* (lpass-cdc reads no core ID of its own; it is said, for the record) */
+		say("mic: the digital codec (lpass-cdc, the tree's version 6): core ID %02x %02x\n", id0, id1);
+		return true;
+	}
 	bolero_version = id0 == 0x01 && id1 == 0x0f ? 20 : id0 == 0x02 && id1 == 0x0e ? 21 : 0;
 	say("mic: the digital codec is bolero %s\n", bolero_version == 20 ? "2.0" : bolero_version == 21 ? "2.1" : "OF AN UNKNOWN VERSION");
 	if (bolero_version != 21) {
@@ -1272,8 +1679,28 @@ static volatile uint32_t read_ready, read_errors, reads_done;
 static volatile uint32_t read_sizes[MIC_PERIODS];
 
 static bool
-mic_events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
+mic_events(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
 {
+	/* the 10 Pro: RD_SHARED_MEM_EP's "done" of a read (status, the buffer's address and handle, then the bytes it wrote) */
+	if (service == HAKIOS_GPR_SERVICE) {
+		if (port != 0x6015 || !(token & READ_TOKEN) || (token & 0x3fffffff) >= MIC_PERIODS) {
+			return false;
+		}
+		if (opcode == 0x05001005u) {
+			if (length < 20 || payload[0] != 0) {
+				OSIncrementAtomic((volatile SInt32 *)&read_errors);
+			}
+			read_sizes[token & 0x3fffffff] = length >= 20 ? payload[4] : 0;
+		} else if (opcode == 0x02001005u) {
+			OSIncrementAtomic((volatile SInt32 *)&read_errors);
+			read_sizes[token & 0x3fffffff] = 0;
+		} else {
+			return false;
+		}
+		OSIncrementAtomic((volatile SInt32 *)&reads_done);
+		OSBitOrAtomic(1u << (token & 31), &read_ready);
+		return true;
+	}
 	if (service != APR_SVC_ASM || !(token & READ_TOKEN) || (token & 0x3fffffff) >= MIC_PERIODS) {
 		return false;
 	}
@@ -1447,6 +1874,556 @@ dsp_off(void)
 	}
 }
 
+/* ---- the OnePlus 10 Pro: its handset microphones -------------------------------------------------------------- */
+
+/*
+ * The 10 Pro records from two digital microphones (OnePlus's mixer paths, "handset-mic"): DMIC3 into the TX macro's
+ * decimator 0 and DMIC4 into decimator 1 ("TX DEC0 MUX" MSM_DMIC, "TX DMIC MUX0" DMIC3; "TX DEC1 MUX" MSM_DMIC,
+ * "TX DMIC MUX1" DMIC4; "TX_AIF1_CAP Mixer" DEC0 and DEC1). They are powered from the WCD938x's MIC BIAS3 and MIC
+ * BIAS1 (the tree's audio-routing: "TX DMIC3" from "MIC BIAS3", "TX DMIC4" from "MIC BIAS1", both 1800 mV), so the
+ * codec is still brought up over SoundWire -- the VA macro's master here, which has the codec's TX device -- but
+ * no SoundWire data port is used: the samples come in on the LPASS's own pins, DMIC23 (gpio8 its clock, gpio9 its
+ * data) and DMIC45 (gpio12, gpio13), at 2.4 MHz (qcom,tx-dmic-sample-rate: the 9.6 MHz MCLK / 4). The clocks of
+ * the DMIC pairs are in the VA macro's registers (lpass_cdc_dmic_clk_enable(): DMIC1_CTL for DMIC2/3, DMIC2_CTL for
+ * DMIC4/5). From the decimators the codec DMA interface TX3 (the LPASS's RX/TX codec DMA, CODEC_DMA-LPAIF_RXTX-TX-3,
+ * 2 channels: decimators 0 and 1) takes them into the DSP, where AudioReach's graph does what AFE, ADM and ASM did:
+ *
+ *   0x4012 device (record): container 0x5012 ("EP") with CODEC_DMA_SOURCE 0x6011 (RXTX, TX3, channels 0x3)
+ *   0x4011 stream (record): container 0x5011 ("CD") with MFC 0x6012 -> PCM_CNV 0x6013 -> PCM_ENC 0x6014 ->
+ *          RD_SHARED_MEM_EP 0x6015, which writes into our periods as DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2 asks
+ *
+ * (linux-msm/audioreach-topology's subgraph-device-codec-dma-capture.m4 and subgraph-stream-capture.m4, without
+ * their loggers; the formats as Linux's q6apm-dai sets them for a capture: 16 bits, 2 channels, 48 kHz.)
+ */
+#define TX_ADC_MUX_CFG0(d)              (0x100 + 8 * (d))
+#define TX_ADC_MUX_CFG1(d)              (0x104 + 8 * (d))
+#define TX_PATH_CTL(d)                  (0x400 + 0x80 * (d))
+#define TX_PATH_CFG0(d)                 (0x404 + 0x80 * (d))
+#define TX_VOL_CTL(d)                   (0x40c + 0x80 * (d))
+#define TX_PATH_SEC2(d)                 (0x418 + 0x80 * (d))
+#define VA_DMIC_CTL(pair)               (0x084 + 4 * (pair))    /* DMIC0_CTL .. DMIC3_CTL: the pairs 0/1 .. 6/7 */
+#define VA_DMIC_CFG                     0x094
+#define AR_DMIC_DIV                     2                       /* LPASS_CDC_TX_MACRO_CLK_DIV_4: 9.6 MHz / 2.4 MHz */
+#define AR_CHANNELS                     2
+
+static const struct { unsigned dmic, decimator, micbias; uint32_t clk_pin, data_pin; } ar_mics[AR_CHANNELS] = {
+	{ 3, 0, 3, 8, 9 }, { 4, 1, 1, 12, 13 },
+};
+static uint32_t ar_found_tx[AR_CHANNELS][6], ar_found_va[3];
+static uint32_t ar_found_pin[4][2];
+static uint8_t ar_hpf[AR_CHANNELS];
+static bool ar_pins_taken, ar_dmic_taken, ar_micbias_on;
+static uint32_t pick;                   /* boot-arg mic_channel=N: which of the two Darwin gets (0 DMIC3, 1 DMIC4) */
+
+/* the DMIC pins' active states (dmic23_*_active, dmic45_*_active): function 1, 8 mA; the clocks driven (output-high) */
+static bool
+ar_pins_on(void)
+{
+	static const uint32_t pins[4] = { 8, 9, 12, 13 };
+
+	if (lpi.base == 0) {
+		lpi.base = ml_io_map(lpi.phys, lpi.size);
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		about_to("read", &lpi, "a DMIC pin", 0x1000 * pins[i]);
+		ar_found_pin[i][0] = rd(lpi.base + 0x1000 * pins[i]);
+		ar_found_pin[i][1] = rd(lpi.base + 0x1000 * pins[i] + 4);
+	}
+	ar_pins_taken = true;
+	for (unsigned i = 0; i < 4; i++) {
+		bool clock = (i % 2) == 0;
+		uint32_t cfg = (ar_found_pin[i][0] & ~0x3fcu) | 1u << 2 | 3u << 6 | (clock ? 1u << 9 : 0);
+		char name[64];
+
+		snprintf(name, sizeof(name), "gpio%u (DMIC%s %s): function 1, 8 mA", pins[i], i < 2 ? "23" : "45", clock ? "clock" : "data");
+		if (!put(&lpi, name, 0x1000 * pins[i], cfg, 0x3fc) ||
+		    !put(&lpi, clock ? "its direction: out" : "its direction: in", 0x1000 * pins[i] + 4, clock ? 2 : 0, 2)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void
+ar_pins_restore(void)
+{
+	static const uint32_t pins[4] = { 8, 9, 12, 13 };
+
+	if (!ar_pins_taken) {
+		return;
+	}
+	broken = false;
+	for (unsigned i = 0; i < 4; i++) {
+		(void)put(&lpi, "a DMIC pin, as it was found", 0x1000 * pins[i], ar_found_pin[i][0], 0x3ff);
+		(void)put(&lpi, "its direction, as it was found", 0x1000 * pins[i] + 4, ar_found_pin[i][1], 2);
+	}
+	ar_pins_taken = false;
+}
+
+/*
+ * The microphones on: MIC BIAS3 and MIC BIAS1 (wcd938x_micbias_control(MICB_ENABLE)), the two DMIC clocks, the
+ * mixer controls' writes (lpass_cdc_tx_macro_put_dec_enum()), hw_params' rate, and each decimator's PMU as
+ * lpass_cdc_tx_macro_enable_dec() does it for a digital microphone. Then muted, the high-pass filter at 150 Hz:
+ * ar_unmute() after 50 ms and ar_settled() after 300 ms (OnePlus's tx_dmic_unmute_delay, ..._DMIC_HPF_DELAY_MS).
+ */
+static bool
+ar_dmic_on(void)
+{
+	for (unsigned c = 0; c < AR_CHANNELS; c++) {
+		unsigned d = ar_mics[c].decimator;
+
+		ar_found_tx[c][0] = get(&tx_macro, "ADC_MUX_CFG0 (as found)", TX_ADC_MUX_CFG0(d));
+		ar_found_tx[c][1] = get(&tx_macro, "ADC_MUX_CFG1 (as found)", TX_ADC_MUX_CFG1(d));
+		ar_found_tx[c][2] = get(&tx_macro, "TX_PATH_CTL (as found)", TX_PATH_CTL(d));
+		ar_found_tx[c][3] = get(&tx_macro, "TX_PATH_CFG0 (as found)", TX_PATH_CFG0(d));
+		ar_found_tx[c][4] = get(&tx_macro, "TX_PATH_SEC2 (as found)", TX_PATH_SEC2(d));
+		ar_found_tx[c][5] = get(&tx_macro, "TX_VOL_CTL (as found)", TX_VOL_CTL(d));
+	}
+	ar_found_va[0] = get(&va_macro, "DMIC1_CTL (as found)", VA_DMIC_CTL(1));
+	ar_found_va[1] = get(&va_macro, "DMIC2_CTL (as found)", VA_DMIC_CTL(2));
+	ar_found_va[2] = get(&va_macro, "DMIC_CFG (as found)", VA_DMIC_CFG);
+	ar_dmic_taken = true;
+	/* the mic biases: the codec's clocks for them once, then MIC BIAS3 and MIC BIAS1 (mic_test=1: not switched on) */
+	ar_micbias_on = true;
+	if (!codec_bits(WCD_CDC_DIG_CLK_CTL, 0xf0, 0xf0) || !codec_bits(WCD_CDC_ANA_CLK_CTL, 0x10, 0x10) ||
+	    !codec_bits(WCD_CDC_ANA_TX_CLK_CTL, 0x01, 0x01) || !codec_bits(WCD_MICB1_TEST_CTL_2, 0x01, 0x01) ||
+	    !codec_bits(WCD_MICB2_TEST_CTL_2, 0x01, 0x01) || !codec_bits(WCD_MICB3_TEST_CTL_2, 0x01, 0x01) ||
+	    !codec_bits(WCD_MICB4_TEST_CTL_2, 0x01, 0x01) ||
+	    !codec_bits(WCD_ANA_MICB3, 0xc0, (test_bits & 1) ? 0x00 : 0x40) ||
+	    !codec_bits(WCD_ANA_MICB1, 0xc0, (test_bits & 1) ? 0x00 : 0x40)) {
+		return false;
+	}
+	say("mic: MIC BIAS3 and MIC BIAS1 %s (1800 mV)\n", (test_bits & 1) ? "LEFT OFF (mic_test=1)" : "on");
+	/* the mixer controls (mic_input=0: the DMIC muxes at ZERO, exact silence) and the rate */
+	for (unsigned c = 0; c < AR_CHANNELS; c++) {
+		unsigned d = ar_mics[c].decimator;
+		uint32_t input = smic_input == 0 ? 0 : ar_mics[c].dmic + 1;
+
+		if (!put_bits(&tx_macro, "ADC_MUX_CFG1: MSM_DMIC", TX_ADC_MUX_CFG1(d), 0x03, 0x00) ||
+		    !put_bits(&tx_macro, input ? "ADC_MUX_CFG0: the DMIC" : "ADC_MUX_CFG0: ZERO (mic_input=0)", TX_ADC_MUX_CFG0(d), 0xf0,
+		    input << 4) ||
+		    !put_bits(&tx_macro, "TX_PATH_CFG0: a digital microphone", TX_PATH_CFG0(d), 0x80, 0x80) ||
+		    !put_bits(&tx_macro, "TX_PATH_CTL: 48 kHz", TX_PATH_CTL(d), 0x0f, 0x04)) {
+			return false;
+		}
+	}
+	/* the DMIC clocks: of the pair 2/3 (DMIC1_CTL) and 4/5 (DMIC2_CTL), divided by 4, on */
+	if (!put_bits(&va_macro, "DMIC_CFG: no frequency change pending", VA_DMIC_CFG, 0x80, 0x00) ||
+	    !put_bits(&va_macro, "DMIC1_CTL: MCLK / 4", VA_DMIC_CTL(1), 0x0e, AR_DMIC_DIV << 1) ||
+	    !put_bits(&va_macro, "DMIC1_CTL: the DMIC23 clock on", VA_DMIC_CTL(1), 0x01, 0x01) ||
+	    !put_bits(&va_macro, "DMIC2_CTL: MCLK / 4", VA_DMIC_CTL(2), 0x0e, AR_DMIC_DIV << 1) ||
+	    !put_bits(&va_macro, "DMIC2_CTL: the DMIC45 clock on", VA_DMIC_CTL(2), 0x01, 0x01)) {
+		return false;
+	}
+	/* each decimator: PRE_PMU (mode 0, muted), POST_PMU (on, the filter's zero gate, 150 Hz while it settles, the gain) */
+	for (unsigned c = 0; c < AR_CHANNELS; c++) {
+		unsigned d = ar_mics[c].decimator;
+
+		if (!put_bits(&tx_macro, "TX_PATH_CFG0: mode 0", TX_PATH_CFG0(d), 0x06, 0x00) ||
+		    !put_bits(&tx_macro, "TX_PATH_CTL: muted", TX_PATH_CTL(d), 0x10, 0x10) ||
+		    !put_bits(&tx_macro, "TX_PATH_CTL: on", TX_PATH_CTL(d), 0x20, 0x20) ||
+		    !put_bits(&tx_macro, "TX_PATH_SEC2: the zero gate off", TX_PATH_SEC2(d), 0x01, 0x00)) {
+			return false;
+		}
+		sleep_ms(1);
+		ar_hpf[c] = (uint8_t)((get(&tx_macro, "TX_PATH_CFG0", TX_PATH_CFG0(d)) & 0x60) >> 5);
+		if (ar_hpf[c] != 2) {
+			if (!put_bits(&tx_macro, "TX_PATH_CFG0: high-pass 150 Hz", TX_PATH_CFG0(d), 0x60, 2u << 5) ||
+			    !put_bits(&tx_macro, "TX_PATH_SEC2: 0x2", TX_PATH_SEC2(d), 0x03, 0x02) ||
+			    !put_bits(&tx_macro, "TX_PATH_SEC2: 0x0", TX_PATH_SEC2(d), 0x03, 0x00) ||
+			    !put_bits(&tx_macro, "TX_PATH_SEC2: 0x1", TX_PATH_SEC2(d), 0x03, 0x01)) {
+				return false;
+			}
+			sleep_ms(6);
+		}
+		if (!put(&tx_macro, "TX_VOL_CTL: the gain again (0 dB: \"TX_DEC Volume\" 84)", TX_VOL_CTL(d),
+		    get(&tx_macro, "TX_VOL_CTL", TX_VOL_CTL(d)), 0xff)) {
+			return false;
+		}
+	}
+	say("mic: DMIC3 into decimator 0, DMIC4 into decimator 1, at 48 kHz: on, muted, the filters settling\n");
+	return true;
+}
+
+static bool
+ar_unmute(void)
+{
+	for (unsigned c = 0; c < AR_CHANNELS; c++) {
+		if (!put_bits(&tx_macro, "TX_PATH_CTL: unmuted", TX_PATH_CTL(ar_mics[c].decimator), 0x10, 0x00)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* lpass_cdc_tx_macro_tx_hpf_corner_freq_callback() for a digital microphone: the filter back to where it was */
+static bool
+ar_settled(void)
+{
+	for (unsigned c = 0; c < AR_CHANNELS; c++) {
+		unsigned d = ar_mics[c].decimator;
+
+		if (ar_hpf[c] == 2) {
+			continue;
+		}
+		if (!put_bits(&tx_macro, "TX_PATH_CFG0: high-pass as it was", TX_PATH_CFG0(d), 0x60, (uint32_t)ar_hpf[c] << 5) ||
+		    !put_bits(&tx_macro, "TX_PATH_SEC2: 0x2 set", TX_PATH_SEC2(d), 0x02, 0x02)) {
+			return false;
+		}
+		sleep_ms(1);
+		if (!put_bits(&tx_macro, "TX_PATH_SEC2: 0x2 cleared", TX_PATH_SEC2(d), 0x02, 0x00)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void
+ar_dmic_off(void)
+{
+	if (!ar_dmic_taken) {
+		return;
+	}
+	broken = false;
+	for (unsigned c = 0; c < AR_CHANNELS; c++) {
+		(void)put_bits(&tx_macro, "TX_PATH_CTL: muted", TX_PATH_CTL(ar_mics[c].decimator), 0x10, 0x10);
+		(void)put_bits(&tx_macro, "TX_PATH_CTL: off", TX_PATH_CTL(ar_mics[c].decimator), 0x20, 0x00);
+	}
+	(void)put_bits(&va_macro, "DMIC1_CTL: the clock off", VA_DMIC_CTL(1), 0x01, 0x00);
+	(void)put_bits(&va_macro, "DMIC2_CTL: the clock off", VA_DMIC_CTL(2), 0x01, 0x00);
+	if (ar_micbias_on && codec_device != 0) {
+		(void)codec_bits(WCD_ANA_MICB1, 0xc0, 0x00);
+		(void)codec_bits(WCD_ANA_MICB3, 0xc0, 0x00);
+		broken = false;
+	}
+	ar_micbias_on = false;
+	for (unsigned c = 0; c < AR_CHANNELS; c++) {
+		unsigned d = ar_mics[c].decimator;
+
+		(void)put(&tx_macro, "ADC_MUX_CFG0 (put back as found)", TX_ADC_MUX_CFG0(d), ar_found_tx[c][0], 0);
+		(void)put(&tx_macro, "ADC_MUX_CFG1 (put back as found)", TX_ADC_MUX_CFG1(d), ar_found_tx[c][1], 0);
+		(void)put(&tx_macro, "TX_PATH_CTL (put back as found)", TX_PATH_CTL(d), ar_found_tx[c][2], 0);
+		(void)put(&tx_macro, "TX_PATH_CFG0 (put back as found)", TX_PATH_CFG0(d), ar_found_tx[c][3], 0);
+		(void)put(&tx_macro, "TX_PATH_SEC2 (put back as found)", TX_PATH_SEC2(d), ar_found_tx[c][4], 0);
+		(void)put(&tx_macro, "TX_VOL_CTL (put back as found)", TX_VOL_CTL(d), ar_found_tx[c][5], 0);
+	}
+	(void)put(&va_macro, "DMIC1_CTL (put back as found)", VA_DMIC_CTL(1), ar_found_va[0], 0);
+	(void)put(&va_macro, "DMIC2_CTL (put back as found)", VA_DMIC_CTL(2), ar_found_va[1], 0);
+	(void)put(&va_macro, "DMIC_CFG (put back as found)", VA_DMIC_CFG, ar_found_va[2], 0);
+	ar_dmic_taken = false;
+}
+
+/* ---- the 10 Pro: the DSP's graph for recording ------------------------------------------------------------ */
+
+#define APM_CMD_GRAPH_OPEN              0x01001000u
+#define APM_CMD_GRAPH_PREPARE           0x01001001u
+#define APM_CMD_GRAPH_START             0x01001002u
+#define APM_CMD_GRAPH_STOP              0x01001003u
+#define APM_CMD_GRAPH_CLOSE             0x01001004u
+#define APM_CMD_SET_CFG                 0x01001006u
+#define APM_CMD_SHARED_MEM_MAP_REGIONS  0x0100100cu
+#define APM_CMD_SHARED_MEM_UNMAP_REGIONS 0x0100100du
+#define APM_CMD_RSP_SHARED_MEM_MAP_REGIONS 0x02001001u
+#define APM_PARAM_ID_CONTAINER_CONFIG   0x08001000u
+#define APM_PARAM_ID_SUB_GRAPH_CONFIG   0x08001001u
+#define APM_PARAM_ID_MODULE_LIST        0x08001002u
+#define APM_PARAM_ID_MODULE_PROP        0x08001003u
+#define APM_PARAM_ID_MODULE_CONN        0x08001004u
+#define APM_PARAM_ID_SUB_GRAPH_LIST     0x08001005u
+#define PARAM_ID_PCM_OUTPUT_FORMAT_CFG  0x08001008u
+#define APM_SUB_GRAPH_PROP_ID_PERF_MODE 0x0800100eu
+#define APM_SUB_GRAPH_PROP_ID_DIRECTION 0x0800100fu
+#define APM_SUB_GRAPH_PROP_ID_SCENARIO_ID 0x08001010u
+#define APM_CONTAINER_PROP_ID_CAPABILITY_LIST 0x08001011u
+#define APM_CONTAINER_PROP_ID_GRAPH_POS 0x08001012u
+#define APM_CONTAINER_PROP_ID_STACK_SIZE 0x08001013u
+#define APM_CONTAINER_PROP_ID_PROC_DOMAIN 0x08001014u
+#define APM_MODULE_PROP_ID_PORT_INFO    0x08001015u
+#define PARAM_ID_HW_EP_MF_CFG           0x08001017u
+#define PARAM_ID_HW_EP_FRAME_SIZE_FACTOR 0x08001018u
+#define PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT 0x08001024u
+#define PARAM_ID_CODEC_DMA_INTF_CFG     0x08001063u
+#define PARAM_ID_HW_EP_POWER_MODE_CFG   0x08001176u
+#define DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2 0x0400100bu
+#define DATA_CMD_RSP_RD_SH_MEM_EP_DATA_BUFFER_V2 0x05001005u
+#define MODULE_ID_RD_SHARED_MEM_EP      0x07001001u
+#define MODULE_ID_PCM_CNV               0x07001003u
+#define MODULE_ID_PCM_ENC               0x07001004u
+#define MODULE_ID_MFC                   0x07001015u
+#define MODULE_ID_CODEC_DMA_SOURCE      0x07001024u
+#define MEDIA_FMT_ID_PCM                0x09001000u
+#define AR_SG_STREAM                    0x4011
+#define AR_SG_DEVICE                    0x4012
+#define AR_CONT_STREAM                  0x5011
+#define AR_CONT_DEVICE                  0x5012
+#define AR_CDMA                         0x6011
+#define AR_MFC                          0x6012
+#define AR_PCM_CNV                      0x6013
+#define AR_PCM_ENC                      0x6014
+#define AR_RD_EP                        0x6015
+#define AR_PERIOD_BYTES                 (MIC_PERIOD_FRAMES * 2 * AR_CHANNELS)
+#define PCM_CHANNEL_FL                  1
+#define PCM_CHANNEL_FR                  2
+
+static bool ar_open, ar_started, ar_mapped;
+static uint32_t ar_map_handle;
+
+static bool
+ar_graph_open(void)
+{
+	static const struct {
+		uint32_t subgraph, container, module, instance, inputs, outputs;
+	} modules[] = {
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_MFC, AR_MFC, 1, 1 },
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_PCM_CNV, AR_PCM_CNV, 1, 1 },
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_PCM_ENC, AR_PCM_ENC, 1, 1 },
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_RD_SHARED_MEM_EP, AR_RD_EP, 1, 0 },
+		{ AR_SG_DEVICE, AR_CONT_DEVICE, MODULE_ID_CODEC_DMA_SOURCE, AR_CDMA, 0, 1 },
+	};
+	static const uint32_t connections[][2] = {
+		{ AR_CDMA, AR_MFC }, { AR_MFC, AR_PCM_CNV }, { AR_PCM_CNV, AR_PCM_ENC }, { AR_PCM_ENC, AR_RD_EP },
+	};
+	struct words p = { .n = 0 };
+	unsigned at;
+
+	/* the subgraphs: low latency (2), direction TX (1), the scenario "record" (2), both */
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_SUB_GRAPH_CONFIG, 0);
+	word(&p, 2);
+	for (unsigned s = 0; s < 2; s++) {
+		word(&p, s == 0 ? AR_SG_STREAM : AR_SG_DEVICE);
+		word(&p, 3);
+		word(&p, APM_SUB_GRAPH_PROP_ID_PERF_MODE);
+		word(&p, 4);
+		word(&p, 2);
+		word(&p, APM_SUB_GRAPH_PROP_ID_DIRECTION);
+		word(&p, 4);
+		word(&p, 1);
+		word(&p, APM_SUB_GRAPH_PROP_ID_SCENARIO_ID);
+		word(&p, 4);
+		word(&p, 2);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	/* the containers: CD (2) for the stream, EP (3) for the device; both "global device" (4), stack 8192, the ADSP */
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_CONTAINER_CONFIG, 0);
+	word(&p, 2);
+	for (unsigned c = 0; c < 2; c++) {
+		word(&p, c == 0 ? AR_CONT_STREAM : AR_CONT_DEVICE);
+		word(&p, 4);
+		word(&p, APM_CONTAINER_PROP_ID_CAPABILITY_LIST);
+		word(&p, 8);
+		word(&p, 1);
+		word(&p, c == 0 ? 2 : 3);
+		word(&p, APM_CONTAINER_PROP_ID_GRAPH_POS);
+		word(&p, 4);
+		word(&p, 4);
+		word(&p, APM_CONTAINER_PROP_ID_STACK_SIZE);
+		word(&p, 4);
+		word(&p, 8192);
+		word(&p, APM_CONTAINER_PROP_ID_PROC_DOMAIN);
+		word(&p, 4);
+		word(&p, 2);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_MODULE_LIST, 0);
+	word(&p, 2);
+	for (unsigned c = 0; c < 2; c++) {
+		uint32_t container = c == 0 ? AR_CONT_STREAM : AR_CONT_DEVICE;
+		unsigned count = 0;
+
+		for (unsigned m = 0; m < sizeof(modules) / sizeof(modules[0]); m++) {
+			count += modules[m].container == container;
+		}
+		word(&p, c == 0 ? AR_SG_STREAM : AR_SG_DEVICE);
+		word(&p, container);
+		word(&p, count);
+		for (unsigned m = 0; m < sizeof(modules) / sizeof(modules[0]); m++) {
+			if (modules[m].container == container) {
+				word(&p, modules[m].module);
+				word(&p, modules[m].instance);
+			}
+		}
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_MODULE_PROP, 0);
+	word(&p, sizeof(modules) / sizeof(modules[0]));
+	for (unsigned m = 0; m < sizeof(modules) / sizeof(modules[0]); m++) {
+		word(&p, modules[m].instance);
+		word(&p, 1);
+		word(&p, APM_MODULE_PROP_ID_PORT_INFO);
+		word(&p, 8);
+		word(&p, modules[m].inputs);
+		word(&p, modules[m].outputs);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_MODULE_CONN, 0);
+	word(&p, sizeof(connections) / sizeof(connections[0]));
+	for (unsigned c = 0; c < sizeof(connections) / sizeof(connections[0]); c++) {
+		word(&p, connections[c][0]);
+		word(&p, 1);
+		word(&p, connections[c][1]);
+		word(&p, 2);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	say("mic: the graph: %u bytes of GRAPH_OPEN\n", p.n * 4 + 16);
+	ar_open = gcommand("APM: GRAPH_OPEN (the device 0x4012: CODEC_DMA_SOURCE; the stream 0x4011: MFC, PCM_CNV, PCM_ENC, "
+	    "RD_SHARED_MEM_EP)", AR_PORT_APM, AR_OURS, APM_CMD_GRAPH_OPEN, true, &p, 0, NULL);
+	return ar_open;
+}
+
+static bool
+ar_graph_formats(void)
+{
+	struct words p = { .n = 0 };
+
+	/* the codec DMA source: 48 kHz, 16 bits, 2 channels; frame-size factor 1; RXTX (1), TX3 (4), channels 0x3; power mode 0 */
+	param(&p, AR_CDMA, PARAM_ID_HW_EP_MF_CFG, 16);
+	word(&p, MIC_RATE);
+	halves(&p, 16, AR_CHANNELS);
+	word(&p, 1);                                    /* fixed point */
+	word(&p, 0);
+	param(&p, AR_CDMA, PARAM_ID_HW_EP_FRAME_SIZE_FACTOR, 8);
+	word(&p, 1);
+	word(&p, 0);
+	param(&p, AR_CDMA, PARAM_ID_CODEC_DMA_INTF_CFG, 16);
+	word(&p, 1);
+	word(&p, 4);
+	word(&p, (1u << AR_CHANNELS) - 1);
+	word(&p, 0);
+	param(&p, AR_CDMA, PARAM_ID_HW_EP_POWER_MODE_CFG, 8);
+	word(&p, 0);
+	word(&p, 0);
+	if (!gcommand("CODEC_DMA_SOURCE 0x6011: RXTX TX3, 2 channels of 16 bits at 48 kHz", AR_PORT_APM, AR_OURS, APM_CMD_SET_CFG,
+	    true, &p, 0, NULL)) {
+		return false;
+	}
+	/* MFC: 48 kHz, 16 bits, 2 channels (left, right) out */
+	p.n = 0;
+	p.full = false;
+	param(&p, AR_MFC, PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT, 12);
+	word(&p, MIC_RATE);
+	halves(&p, 16, AR_CHANNELS);
+	halves(&p, PCM_CHANNEL_FL, PCM_CHANNEL_FR);
+	if (!gcommand("MFC 0x6012: 48 kHz, 16 bits, 2 channels out", AR_PORT_APM, AR_OURS, APM_CMD_SET_CFG, true, &p, 0, NULL)) {
+		return false;
+	}
+	/* PCM_CNV and PCM_ENC: 16 bits out, interleaved (the topology's PCM_INTERLEAVED for both) */
+	for (unsigned i = 0; i < 2; i++) {
+		p.n = 0;
+		p.full = false;
+		param(&p, i == 0 ? AR_PCM_CNV : AR_PCM_ENC, PARAM_ID_PCM_OUTPUT_FORMAT_CFG, 32);
+		word(&p, 1);
+		word(&p, MEDIA_FMT_ID_PCM);
+		word(&p, 20);
+		halves(&p, 16, 1);                      /* bit width, alignment */
+		halves(&p, 16, 15);                     /* bits per sample, Q factor */
+		halves(&p, 1, 1);                       /* endianness, interleaved */
+		halves(&p, 0, AR_CHANNELS);             /* reserved, channels */
+		halves(&p, PCM_CHANNEL_FL | PCM_CHANNEL_FR << 8, 0);
+		if (!gcommand(i == 0 ? "PCM_CNV 0x6013: 16 bits out, interleaved" : "PCM_ENC 0x6014: 16 bits out, interleaved",
+		    AR_PORT_APM, AR_OURS, APM_CMD_SET_CFG, true, &p, 0, NULL)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+ar_graph_command(const char *what, uint32_t opcode)
+{
+	struct words p = { .n = 0 };
+
+	param(&p, AR_PORT_APM, APM_PARAM_ID_SUB_GRAPH_LIST, 16);
+	word(&p, 2);
+	word(&p, AR_SG_STREAM);
+	word(&p, AR_SG_DEVICE);
+	pad8(&p);
+	return gcommand(what, AR_PORT_APM, AR_OURS, opcode, true, &p, 0, NULL);
+}
+
+/* the graph opened and set up, our periods mapped, the graph prepared: GRAPH_START is listen()'s */
+static bool
+ar_graph_on(void)
+{
+	struct words p = { .n = 0 };
+	struct hakios_apr_answer answer;
+	uint32_t bytes = 0;
+
+	if (!hakios_audio_dsp_memory(&mic_memory, &mic_address, &bytes) || bytes < (MIC_PERIODS + 1) * 4096) {
+		say("mic: no memory the DSP can see\n");
+		return false;
+	}
+	memory_taken = true;
+	hakios_adsp_apr_events_second(mic_events);
+	/* (the memory first, the periods and a spare page behind them: a GRAPH_OPEN too big for the link goes out of band) */
+	halves(&p, 3, 1);                               /* APM_MEMORY_MAP_SHMEM8_4K_POOL, one region */
+	word(&p, 0);
+	word(&p, (uint32_t)mic_address);
+	word(&p, (uint32_t)(mic_address >> 32));
+	word(&p, (MIC_PERIODS + 1) * 4096);
+	if (!gcommand("our periods for the microphones, mapped for the DSP", AR_PORT_APM, AR_OURS_MIC, APM_CMD_SHARED_MEM_MAP_REGIONS,
+	    false, &p, APM_CMD_RSP_SHARED_MEM_MAP_REGIONS, &answer)) {
+		return false;
+	}
+	ar_mapped = true;
+	ar_map_handle = answer.words[0];
+	spare.memory = mic_memory + MIC_PERIODS * 4096;
+	spare.address = mic_address + MIC_PERIODS * 4096;
+	spare.handle = ar_map_handle;
+	say("mic: our %u KB at %#llx are the DSP's handle %#x\n", (MIC_PERIODS + 1) * 4, mic_address, ar_map_handle);
+	if (!ar_graph_open() || !ar_graph_formats()) {
+		return false;
+	}
+	return ar_graph_command("APM: GRAPH_PREPARE (the microphones')", APM_CMD_GRAPH_PREPARE);
+}
+
+static void
+ar_graph_off(void)
+{
+	if (ar_started) {
+		(void)ar_graph_command("APM: GRAPH_STOP (the microphones')", APM_CMD_GRAPH_STOP);
+		ar_started = false;
+	}
+	if (ar_mapped) {
+		struct words p = { .n = 0 };
+
+		word(&p, ar_map_handle);
+		(void)gcommand("our periods, unmapped", AR_PORT_APM, AR_OURS_MIC, APM_CMD_SHARED_MEM_UNMAP_REGIONS, false, &p, 0, NULL);
+		ar_mapped = false;
+		spare.handle = 0;
+	}
+	if (ar_open) {
+		(void)ar_graph_command("APM: GRAPH_CLOSE (the microphones')", APM_CMD_GRAPH_CLOSE);
+		ar_open = false;
+	}
+	if (ar) {
+		hakios_adsp_apr_events_second(NULL);
+		if (memory_taken) {
+			hakios_audio_dsp_memory_put();
+			memory_taken = false;
+		}
+	}
+}
+
+static bool
+ar_read(unsigned period)
+{
+	uint64_t at = mic_address + 4096 * period;
+	uint32_t read[8] = { (uint32_t)at, (uint32_t)(at >> 32), ar_map_handle, AR_PERIOD_BYTES, 0, 0, 0, 0 };
+
+	return hakios_adsp_gpr(AR_RD_EP, AR_OURS_MIC, READ_TOKEN | period, DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2, read, sizeof(read),
+	           0, NULL);
+}
+
 /* ---- mic=4: the microphone for Darwin ------------------------------------------------------------------- */
 
 /*
@@ -1549,13 +2526,38 @@ static uint32_t mic_secs = 10;
  * Darwin into the ring. False if it could not get going (the run refused, a read not sent, no read ever came
  * back): not a failure that sets `broken', so for_darwin() counts it from this.
  */
+/* 20 log10(rms / 32768), in tenths, by a table of halvings: good enough to tell loud from quiet */
+static int
+db10_of(uint64_t mean_square, uint32_t *rms_out)
+{
+	uint32_t rms = 0;
+	int db10 = -999;
+
+	while ((uint64_t)(rms + 1) * (rms + 1) <= mean_square) {
+		rms++;
+	}
+	if (rms > 0) {
+		uint32_t r = rms;
+		int tenths = 0;
+
+		while (r < 16384) {
+			r *= 2;
+			tenths -= 60;   /* 6.02 dB a halving, near enough */
+		}
+		db10 = tenths - (int)((32768 - r) * 60 / 16384);
+	}
+	*rms_out = rms;
+	return db10;
+}
+
 static bool
 listen(bool for_darwin)
 {
-	uint32_t run[3] = { 0, 0, 0 }, frames = 0, seconds = 0, peak = 0, periods = 0, empty = 0;
+	uint32_t run[3] = { 0, 0, 0 }, frames = 0, seconds = 0, peak = 0, periods = 0, empty = 0, other_peak = 0;
 	int64_t sum = 0;
-	uint64_t squares = 0;
-	unsigned next = 0;
+	uint64_t squares = 0, other_squares = 0;
+	unsigned next = 0, channels = ar ? AR_CHANNELS : 1;
+	uint32_t period_bytes = MIC_PERIOD_FRAMES * 2 * channels, unmute_ms = ar ? 50 : 200;
 	bool unmuted = false, settled = false;
 	uint64_t began = mach_absolute_time(), now, elapsed_ms;
 
@@ -1563,14 +2565,21 @@ listen(bool for_darwin)
 
 	read_ready = 0;
 	reads_done = read_errors = 0;
-	if (!hakios_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), APR_WAIT_MS, &answer) ||
-	    answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
-		say("mic: the session, run: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
-		return false;
+	if (ar) {
+		ar_started = ar_graph_command("APM: GRAPH_START (the microphones')", APM_CMD_GRAPH_START);
+		if (!ar_started) {
+			return false;
+		}
+	} else {
+		if (!hakios_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), APR_WAIT_MS, &answer) ||
+		    answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
+			say("mic: the session, run: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
+			return false;
+		}
+		say("mic: the session 2, run: done\n");
 	}
-	say("mic: the session 2, run: done\n");
 	for (unsigned p = 0; p < MIC_PERIODS; p++) {
-		if (!mic_read(p)) {
+		if (!(ar ? ar_read(p) : mic_read(p))) {
 			say("mic: a read could not be sent\n");
 			return false;
 		}
@@ -1583,11 +2592,11 @@ listen(bool for_darwin)
 	for (;;) {
 		absolutetime_to_nanoseconds(mach_absolute_time() - began, &now);
 		elapsed_ms = now / NSEC_PER_MSEC;
-		if (!unmuted && elapsed_ms >= 200) {            /* TX_MACRO_AMIC_UNMUTE_DELAY_MS */
-			unmuted = dec1_unmute();
+		if (!unmuted && elapsed_ms >= unmute_ms) {      /* TX_MACRO_AMIC_UNMUTE_DELAY_MS; the 10 Pro's DMICs: 50 ms */
+			unmuted = ar ? ar_unmute() : dec1_unmute();
 		}
-		if (!settled && elapsed_ms >= 300) {            /* TX_MACRO_AMIC_HPF_DELAY_MS */
-			settled = dec1_settled();
+		if (!settled && elapsed_ms >= 300) {            /* TX_MACRO_AMIC_HPF_DELAY_MS (and _DMIC_) */
+			settled = ar ? ar_settled() : dec1_settled();
 		}
 		if (tap && elapsed_ms >= 2000 && elapsed_ms < 3000) {
 			hakios_haptic_pretend(20000);
@@ -1610,70 +2619,70 @@ listen(bool for_darwin)
 		OSBitAndAtomic(~(1u << next), &read_ready);
 		{
 			int16_t *samples = (int16_t *)(mic_memory + 4096 * next);
-			uint32_t got = read_sizes[next] / 2;
-			int16_t stereo[2 * 240];
+			uint32_t got = read_sizes[next] / (2 * channels);
+			int16_t stereo[2 * 240], mono[MIC_PERIOD_FRAMES];
 
-			for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + MIC_PERIOD_BYTES; line += 64) {
+			for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + period_bytes; line += 64) {
 				__asm__ volatile ("dc ivac, %0" : : "r" (line));
 			}
 			__asm__ volatile ("dsb sy");
 			got = got > MIC_PERIOD_FRAMES ? MIC_PERIOD_FRAMES : got;
 			empty += got == 0;
+			/* (the 10 Pro: two channels interleaved, DMIC3 then DMIC4; the one Darwin gets is `pick', the other's said too) */
 			for (uint32_t i = 0; i < got; i++) {
-				int32_t v = samples[i];
+				int32_t v = samples[i * channels + (channels > 1 ? pick : 0)];
 				uint32_t a = (uint32_t)(v < 0 ? -v : v);
 
+				mono[i] = (int16_t)v;
 				sum += v;
 				squares += (uint64_t)((int64_t)v * v);
 				peak = a > peak ? a : peak;
+				if (channels > 1) {
+					int32_t o = samples[i * channels + (1 - pick)];
+					uint32_t b = (uint32_t)(o < 0 ? -o : o);
+
+					other_squares += (uint64_t)((int64_t)o * o);
+					other_peak = b > other_peak ? b : other_peak;
+				}
 			}
 			frames += got;
 			if (for_darwin) {
-				ring_put(samples, got);
+				ring_put(mono, got);
 			}
 			if (hakios_audio_recording_mic()) {
 				for (uint32_t i = 0; i < got; i += 240) {
 					uint32_t n = got - i < 240 ? got - i : 240;
 
 					for (uint32_t j = 0; j < n; j++) {
-						stereo[2 * j] = stereo[2 * j + 1] = samples[i + j];
+						stereo[2 * j] = samples[(i + j) * channels];
+						stereo[2 * j + 1] = samples[(i + j) * channels + channels - 1];
 					}
 					hakios_audio_record_fed(stereo, n);
 				}
 			}
 		}
 		periods++;
-		(void)mic_read(next);
+		(void)(ar ? ar_read(next) : mic_read(next));
 		next = (next + 1) % MIC_PERIODS;
 		if (frames >= MIC_RATE) {
-			uint64_t mean_square = squares / frames;
-			uint32_t rms = 0;
-			int db10 = -999;
+			uint32_t rms = 0, other_rms = 0;
+			int db10 = db10_of(squares / frames, &rms), other_db10 = db10_of(other_squares / frames, &other_rms);
+			char other[96] = "";
 
-			while ((uint64_t)(rms + 1) * (rms + 1) <= mean_square) {
-				rms++;
-			}
-			if (rms > 0) {
-				/* 20 log10(rms / 32768), in tenths, by a table of halvings: good enough to tell loud from quiet */
-				uint32_t r = rms;
-				int tenths = 0;
-
-				while (r < 16384) {
-					r *= 2;
-					tenths -= 60;   /* 6.02 dB a halving, near enough */
-				}
-				db10 = tenths - (int)((32768 - r) * 60 / 16384);
-			}
 			seconds++;
+			if (channels > 1) {
+				snprintf(other, sizeof(other), "; DMIC%u: %d.%d dBFS (rms %u), peak %u", ar_mics[1 - pick].dmic, other_db10 / 10,
+				    other_db10 < 0 ? -other_db10 % 10 : other_db10 % 10, other_rms, other_peak);
+			}
 			if (!for_darwin || seconds <= 3 || seconds % 30 == 0) {
-				say("mic: second %u: %u frames (%u periods, %u empty), level %d.%d dBFS (rms %u), peak %u, mean %lld; "
+				say("mic: second %u: %u frames (%u periods, %u empty), level %d.%d dBFS (rms %u), peak %u, mean %lld%s; "
 				    "reads %u, errors %u%s%s\n", seconds, frames, periods, empty, db10 / 10, db10 < 0 ? -db10 % 10 : db10 % 10,
-				    rms, peak, sum / (int64_t)frames, reads_done, read_errors, unmuted ? "" : " (muted)",
+				    rms, peak, sum / (int64_t)frames, other, reads_done, read_errors, unmuted ? "" : " (muted)",
 				    settled ? "" : " (settling)");
 			}
-			frames = periods = empty = peak = 0;
+			frames = periods = empty = peak = other_peak = 0;
 			sum = 0;
-			squares = 0;
+			squares = other_squares = 0;
 		}
 	}
 	return true;
@@ -1682,12 +2691,15 @@ listen(bool for_darwin)
 static void
 undo(void)
 {
+	ar_graph_off();         /* (first: the graph stopped before dsp_off() gives our memory back) */
 	dsp_off();
+	ar_dmic_off();
 	dec1_off();
 	va_mic_off();
 	master_off();
 	tx_clocks_off();
 	pins_restore();
+	ar_pins_restore();
 	reset_restore();
 	clocks_off();
 }
@@ -1700,7 +2712,7 @@ path_up(void)
 		say("mic: the clocks were not all given: the blocks are not touched\n");
 		return false;
 	}
-	if (!reset_release() || !pins_on() || !tx_clocks_on() || !master_on()) {
+	if (!reset_release() || !pins_on() || (ar && !ar_pins_on()) || !tx_clocks_on() || !master_on()) {
 		return false;
 	}
 	sleep_ms(5);    /* ("5 ms for SoundWire's auto-enumeration", wcd938x_bind()) */
@@ -1714,6 +2726,10 @@ path_up(void)
 	}
 	if (level < 3) {
 		return true;
+	}
+	if (ar) {
+		/* the codec, the graph (up to its start, in listen()), the microphones' biases, clocks and decimators */
+		return bolero_look() && codec_init() && ar_graph_on() && ar_dmic_on();
 	}
 	/* the stream and path, the port's format and start, the codec's widgets */
 	return bolero_look() && codec_init() && dsp_path_on() && dsp_port_on() && dec1_on() && (!adc_on || adc1_on()) &&
@@ -1825,6 +2841,27 @@ hakios_mic_dsp_up(void)
 		return;
 	}
 	level = level > 4 ? 4 : level;
+	ar = hakios_adsp_is_gpr();
+	{
+		uint32_t soc = 0;
+
+		if (!ar && PE_parse_boot_argn("adsp_soc", &soc, sizeof(soc)) && soc == 8450) {
+			say("mic: the DSP is the 10 Pro's (adsp_soc=8450) but its audio framework did not answer as ready: no microphone\n");
+			return;
+		}
+	}
+	if (ar) {
+		va_macro.phys = 0x033f0000;
+		tx_swr.name = "the VA SoundWire master";
+		tx_swr.phys = 0x033b0000;
+		lpi.phys = 0x03440000;
+		lpi.size = 0x20000;
+		lpi_slew.phys = 0x034da000;
+		reset_gpio = 43;
+		PE_parse_boot_argn("mic_channel", &pick, sizeof(pick));
+		pick = pick > 1 ? 1 : pick;
+	}
+	PE_parse_boot_argn("mic_slow", &slow, sizeof(slow));
 	PE_parse_boot_argn("mic_secs", &mic_secs, sizeof(mic_secs));
 	PE_parse_boot_argn("mic_input", &smic_input, sizeof(smic_input));
 	PE_parse_boot_argn("mic_adc", &adc_on, sizeof(adc_on));

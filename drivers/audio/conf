@@ -13,7 +13,9 @@ driver ADSP
 
 driver SPEAKER
 	file    bsd/dev/hakios.speaker.c
-	help    the two speaker amplifiers on I2C, and their watch of temperature and battery
+	file    bsd/dev/hakios.tfa.c
+	help    the two speaker amplifiers on I2C, and their watch of temperature and battery; the OnePlus 10 Pro's
+	help    TFA9874s (speaker_soc=8450)
 
 driver SOUND
 	file    bsd/dev/hakios.sound.c

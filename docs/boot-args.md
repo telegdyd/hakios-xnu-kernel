@@ -2,7 +2,7 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **385 arguments**: 313 read by the kernel, 16 by the loader, 68 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **390 arguments**: 318 read by the kernel, 16 by the loader, 68 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
@@ -205,7 +205,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `soc_pas_mpss` | K | `hakios.mpss.c` | `CONFIG_SOC_PAS_MPSS` |  |
 | `soc_smem` | K | `hakios.mpss.c`, `hakios.socinfo.c` | `CONFIG_SOC_SMEM` |  |
 
-## Audio and battery (41)
+## Audio and battery (45)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -218,9 +218,10 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `adsp_pause` | K | `hakios.adsp.c` | `CONFIG_ADSP_PAUSE` |  |
 | `adsp_return` | K | `hakios.adsp.c` | `CONFIG_ADSP_RETURN` |  |
 | `adsp_return_s` | K | `hakios.adsp.c` | `CONFIG_ADSP_RETURN_S` |  |
-| `adsp_soc` | K | `hakios.adsp.c` | `CONFIG_ADSP_SOC` |  |
+| `adsp_soc` | K | `hakios.adsp.c`, `hakios.mic.c` | `CONFIG_ADSP_SOC` |  |
 | `adsp_step` | K | `hakios.adsp.c` | `CONFIG_ADSP_STEP` |  |
 | `adsp_wait` | K | `hakios.adsp.c` | `CONFIG_ADSP_WAIT` |  |
+| `audio_wait` | K | `hakios.adsp.c`, `hakios.tfa.c` | `CONFIG_AUDIO_WAIT` |  |
 | `battery` | KL | `hakios.adsp.c`, `hakios.battery.c`, `loader.c` | `CONFIG_BATTERY` |  |
 | `battery_log` | K | `hakios.battery_bcl.c` | `CONFIG_BATTERY_LOG` |  |
 | `battery_poll` | K | `hakios.battery_bcl.c` | `CONFIG_BATTERY_POLL` |  |
@@ -234,9 +235,11 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `battmgr_sink` | K | `hakios.adsp.c` | `CONFIG_BATTMGR_SINK` |  |
 | `mic` | K | `hakios.mic.c` | `CONFIG_MIC` |  |
 | `mic_adc` | K | `hakios.mic.c` | `CONFIG_MIC_ADC` |  |
+| `mic_channel` | K | `hakios.mic.c` | `CONFIG_MIC_CHANNEL` |  |
 | `mic_input` | K | `hakios.mic.c` | `CONFIG_MIC_INPUT` |  |
 | `mic_main` | K | `hakios.mic.c` | `CONFIG_MIC_MAIN` |  |
 | `mic_secs` | K | `hakios.mic.c` | `CONFIG_MIC_SECS` |  |
+| `mic_slow` | K | `hakios.mic.c` | `CONFIG_MIC_SLOW` |  |
 | `mic_tap` | K | `hakios.mic.c` | `CONFIG_MIC_TAP` |  |
 | `mic_test` | K | `hakios.mic.c` | `CONFIG_MIC_TEST` |  |
 | `rec_sound` | K | `hakios.audio.c` | `CONFIG_REC_SOUND` |  |
@@ -248,6 +251,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `sound_guard_as` | K | `hakios.sound.c` | `CONFIG_SOUND_GUARD_AS` |  |
 | `sound_pause` | K | `hakios.sound.c` | `CONFIG_SOUND_PAUSE` |  |
 | `sound_secs` | K | `hakios.sound.c` | `CONFIG_SOUND_SECS` |  |
+| `sound_soc` | K | `hakios.sound.c` | `CONFIG_SOUND_SOC` |  |
 | `speaker_probe` | K | `hakios.speaker.c` | `CONFIG_SPEAKER_PROBE` |  |
 | `virtio_sound` | K | `hakios.virtio_sound.c` | `CONFIG_VIRTIO_SOUND` |  |
 
@@ -424,7 +428,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 | `usb_net` | KL | `hakios.usb_net.c`, `loader.c` | `CONFIG_USB_NET` |  |
 
-## User space (39)
+## User space (40)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -457,6 +461,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `reboot_fastboot` | K | `hakios.platform.c` | `CONFIG_REBOOT_FASTBOOT` |  |
 | `root_apfs` | U | `init.c` | `CONFIG_ROOT_APFS` |  |
 | `sb_delay` | U | `inject_sb.c` |  | xl (XL_SB_DELAY) |
+| `speaker_soc` | K | `hakios.tfa.c` | `CONFIG_SPEAKER_SOC` |  |
 | `switcher_wallpaper` | U | `inject_sb.c` | `CONFIG_SWITCHER_WALLPAPER` |  |
 | `touch_bus` | K | `hakios.s3908.c` | `CONFIG_TOUCH_BUS` |  |
 | `tu_debug` | U | `HakiosMetalCA.m` | `CONFIG_TU_DEBUG` |  |

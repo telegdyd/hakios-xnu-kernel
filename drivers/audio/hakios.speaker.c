@@ -737,6 +737,9 @@ faulty(struct amplifier *a, uint16_t *status)
 bool
 hakios_speaker_prepare(const uint8_t *acf, uint64_t size)
 {
+	if (hakios_tfa_wanted()) {
+		return hakios_tfa_prepare(acf, size);         /* (the OnePlus 10 Pro's TFA9874s: hakios.tfa.c) */
+	}
 	if (tlmm == 0) {
 		tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	}
@@ -827,6 +830,9 @@ hakios_speaker_prepare(const uint8_t *acf, uint64_t size)
 bool
 hakios_speaker_start(void)
 {
+	if (hakios_tfa_wanted()) {
+		return hakios_tfa_start();
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t status = 0, interrupts = 0;
@@ -900,6 +906,9 @@ hakios_speaker_volume(uint32_t below, uint32_t step_ms)
 {
 	uint16_t status;
 
+	if (hakios_tfa_wanted()) {
+		return hakios_tfa_volume(below, step_ms);
+	}
 	/* Nothing is quieter than the driver's mute volume. Without this a huge `below' wraps volume_at + below to a level
 	   under volume_at, which the fade loop below can never reach (set_volume() never goes louder than Android), so it
 	   would spin forever with the amplifiers at their loudest. */
@@ -959,6 +968,9 @@ hakios_speaker_volume(uint32_t below, uint32_t step_ms)
 bool
 hakios_speaker_healthy(void)
 {
+	if (hakios_tfa_wanted()) {
+		return hakios_tfa_healthy();
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t status;
@@ -1005,6 +1017,9 @@ hakios_speaker_monitor(bool tell)
 {
 	uint32_t wanted = 0;
 
+	if (hakios_tfa_wanted()) {
+		return hakios_tfa_monitor(tell);
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t vbat = 0, temp = 0, pvdd = 0, isn = 0, vsn = 0;
@@ -1059,6 +1074,10 @@ stop_failed(void)
 void
 hakios_speaker_stop(void)
 {
+	if (hakios_tfa_wanted()) {
+		hakios_tfa_stop();
+		return;
+	}
 	if (broken) {
 		return;                 /* (already powered down) */
 	}
@@ -1100,6 +1119,10 @@ hakios_speaker_quiesce(void)
 {
 	bool any = false;
 
+	if (hakios_tfa_wanted()) {
+		hakios_tfa_quiesce();
+		return;
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		any |= amplifiers[i].started;
 	}
@@ -1234,6 +1257,10 @@ hakios_speaker_init(void)
 	thread_t thread;
 
 	if (!PE_parse_boot_argn("speaker_probe", &probe_level, sizeof(probe_level)) || probe_level == 0) {
+		return;
+	}
+	if (hakios_tfa_wanted()) {
+		hakios_tfa_probe(probe_level);
 		return;
 	}
 	if (kernel_thread_start(probe_thread, NULL, &thread) == KERN_SUCCESS) {

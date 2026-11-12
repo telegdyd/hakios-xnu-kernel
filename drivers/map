@@ -39,6 +39,7 @@ audio    bsd/dev/hakios.adsp.c
 audio    bsd/dev/hakios.audio.c
 audio    bsd/dev/hakios.sound.c
 audio    bsd/dev/hakios.speaker.c
+audio    bsd/dev/hakios.tfa.c
 audio    bsd/dev/hakios.mic.c
 audio    bsd/dev/hakios.virtio_sound.c
 audio    bsd/dev/hakios.guard.c

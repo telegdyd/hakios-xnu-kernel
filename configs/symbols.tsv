@@ -19,7 +19,7 @@ ADSP_NEW	arg	adsp_new	Audio and battery	k	hakios.adsp.c
 ADSP_PAUSE	arg	adsp_pause	Audio and battery	k	hakios.adsp.c	
 ADSP_RETURN	arg	adsp_return	Audio and battery	k	hakios.adsp.c	
 ADSP_RETURN_S	arg	adsp_return_s	Audio and battery	k	hakios.adsp.c	S seconds after this, the DSP is stopped and the run goes back to the loader
-ADSP_SOC	arg	adsp_soc	Audio and battery	k	hakios.adsp.c	
+ADSP_SOC	arg	adsp_soc	Audio and battery	k	hakios.adsp.c,hakios.mic.c	
 ADSP_STEP	arg	adsp_step	Audio and battery	k	hakios.adsp.c	
 ADSP_WAIT	arg	adsp_wait	Audio and battery	k	hakios.adsp.c	
 APFS_CHEAP	arg	apfs_cheap	Storage and APFS	k	apfs_vfsops.c	
@@ -53,6 +53,7 @@ APFS_WRITE_LEN	arg	apfs_write_len	Storage and APFS	k	hakios.apfs_check.c	how man
 APFS_WRITE_PATH	arg	apfs_write_path	Storage and APFS	k	hakios.apfs_check.c	the file in it, by path from the volume's root
 APPLOG	arg	applog	CPU, memory and boot	k	(patch)	
 APPLOG_NAME	arg	applog_name	CPU, memory and boot	k	(patch)	
+AUDIO_WAIT	arg	audio_wait	Audio and battery	k	hakios.adsp.c,hakios.tfa.c	
 AUTOUNLOCK	arg	autounlock	User space	u	inject_sb.c	
 BACKLIGHT	arg	backlight	GPU and display	k	hakios.backlight.cpp	
 BACKLIGHT_MAX	arg	backlight_max	GPU and display	k	hakios.backlight.cpp	
@@ -182,9 +183,11 @@ METAL_SKIP	arg	metal_skip	User space	u	HakiosMetalCA.m
 METAL_TRACE	arg	metal_trace	User space	u	HakiosMetalCA.m	
 METAL_WATCH	arg	metal_watch	User space	u	inject.c	
 MIC_ADC	arg	mic_adc	Audio and battery	k	hakios.mic.c	
+MIC_CHANNEL	arg	mic_channel	Audio and battery	k	hakios.mic.c	
 MIC_INPUT	arg	mic_input	Audio and battery	k	hakios.mic.c	
 MIC_MAIN	arg	mic_main	Audio and battery	k	hakios.mic.c	
 MIC_SECS	arg	mic_secs	Audio and battery	k	hakios.mic.c	
+MIC_SLOW	arg	mic_slow	Audio and battery	k	hakios.mic.c	
 MIC_TAP	arg	mic_tap	Audio and battery	k	hakios.mic.c	
 MIC_TEST	arg	mic_test	Audio and battery	k	hakios.mic.c	
 MODEM_APN	arg	modem_apn	Cellular	k	hakios.mpss.c	a session to that APN instead of the default profile
@@ -264,7 +267,9 @@ SOUND_GAIN	arg	sound_gain	Audio and battery	k	hakios.sound.c
 SOUND_GUARD_AS	arg	sound_guard_as	Audio and battery	k	hakios.sound.c	
 SOUND_PAUSE	arg	sound_pause	Audio and battery	k	hakios.sound.c	
 SOUND_SECS	arg	sound_secs	Audio and battery	k	hakios.sound.c	
+SOUND_SOC	arg	sound_soc	Audio and battery	k	hakios.sound.c	
 SPEAKER_PROBE	arg	speaker_probe	Audio and battery	k	hakios.speaker.c	reads registers and nothing else: the pins, the power names (below)
+SPEAKER_SOC	arg	speaker_soc	User space	k	hakios.tfa.c	
 SURF_CLEAR	arg	surf_clear	GPU and display	k	MiniIOSurface.cpp	kept memory is given out as it is (to see what the clearing costs; a surface is then not all zeroes)
 SURF_WRAP	arg	surf_wrap	GPU and display	k	MiniIOSurface.cpp	surfaces around the client's pictures refused, as before methodWrapClientImage (for comparing)
 SURFTRACE	arg	surftrace	GPU and display	k	MiniIOSurface.cpp	log the first N surfaces created (default 24)

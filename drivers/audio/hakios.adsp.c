@@ -115,7 +115,8 @@ static LCK_GRP_DECLARE(adsp_lock_group, "hakios-adsp");
 
 #define STEPS                   11
 static uint32_t adsp_soc;               /* boot-arg adsp_soc: 0 the X5 Pro (SM7325), 8450 the OnePlus 10 Pro (adsp_soc_8450()) */
-static uint32_t steps_all = STEPS;      /* the steps there are: STEPS, or 10 on SM8450 (no APR there) */
+static uint32_t steps_all = STEPS;      /* the steps there are */
+static bool gpr;                        /* the audio services speak GPR (AudioReach, SM8450), not APR: step 11 is GPR's */
 #define HAKIOS_SOC_BASE        0x00400000ul    /* where the loader says the phone's peripherals begin */
 
 static uint32_t last_step, pause_ms = 2200, listen_seconds = 3;
@@ -1891,10 +1892,12 @@ struct glink_channel {
 	uint32_t theirs;                        /* the DSP's number for it; 0: it has not opened it */
 	bool asked, acknowledged, open;         /* our open sent; acknowledged; both ways done and our intents told */
 	bool request_answered, request_granted; /* our last request for an intent */
+	bool request_intent;                    /* and an intent that big came after it */
+	uint32_t request_size;                  /* (its size; 0: none asked) */
 	struct {
 		uint32_t id, size;
 		bool there, in_use;
-	} their_intents[64];                    /* what we may send into */
+	} their_intents[128];                   /* what we may send into (the DSP gives adsp_apps 77 of 128 bytes) */
 	struct {
 		uint32_t size, fill;
 		uint8_t *data;
@@ -1910,8 +1913,8 @@ static struct {
 	uint32_t features;
 	bool agreed;
 	struct glink_channel channel[CHANNELS];
-	uint32_t said, heard, trace;
-	char others[4][33];                     /* the channels the DSP opens that nobody here speaks (for the log) */
+	uint32_t said, heard, trace, intents_told;
+	char others[4][33];                    /* the channels the DSP opens that nobody here speaks (for the log) */
 } glink = {
 	.channel = {
 		[CHANNEL_QRTR] = { .name = "IPCRTR", .ours = 1, .intents = { { 0x800, 5 }, { 0x2000, 3 }, { 0x4400, 2 } } },
@@ -2191,15 +2194,34 @@ glink_pump(void)
 		case GLINK_INTENT:
 			channel = glink_theirs(message.param1);
 			for (uint32_t i = 0; channel != NULL && i < message.param2; i++) {
+				unsigned count = sizeof(channel->their_intents) / sizeof(channel->their_intents[0]), slot = count;
+
 				glink_peek(words, 8 + 8 * i, 8);
-				for (unsigned n = 0; n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
-					if (!channel->their_intents[n].there || channel->their_intents[n].id == words[1]) {
-						channel->their_intents[n].there = true;
-						channel->their_intents[n].in_use = false;
-						channel->their_intents[n].size = words[0];
-						channel->their_intents[n].id = words[1];
-						break;
+				/* (the same id first, then a free place: a new intent never takes the place of one still there) */
+				for (unsigned n = 0; n < count && slot == count; n++) {
+					if (channel->their_intents[n].there && channel->their_intents[n].id == words[1]) {
+						slot = n;
 					}
+				}
+				for (unsigned n = 0; n < count && slot == count; n++) {
+					if (!channel->their_intents[n].there) {
+						slot = n;
+					}
+				}
+				if (channel == &glink.channel[CHANNEL_APR] && gpr && (glink.intents_told < 8 || slot == count || channel->request_size != 0)) {
+					glink.intents_told++;
+					tell("adsp: glink: the DSP's intent %u on \"%s\": %u bytes%s\n", words[1], channel->name, words[0],
+					    slot == count ? ": NO PLACE FOR IT HERE, forgotten" : "");
+				}
+				if (slot == count) {
+					continue;
+				}
+				channel->their_intents[slot].there = true;
+				channel->their_intents[slot].in_use = false;
+				channel->their_intents[slot].size = words[0];
+				channel->their_intents[slot].id = words[1];
+				if (channel->request_size != 0 && words[0] >= channel->request_size) {
+					channel->request_intent = true;
 				}
 			}
 			glink_advance(length);
@@ -2226,9 +2248,13 @@ glink_pump(void)
 		case GLINK_INTENT_REQUEST_ACK:
 			glink_advance(length);
 			for (unsigned c = 0; c < CHANNELS; c++) {
-				if (message.param1 == glink.channel[c].theirs || message.param1 == glink.channel[c].ours) {
+				if (glink.channel[c].request_size != 0 &&
+				    (message.param1 == glink.channel[c].theirs || message.param1 == glink.channel[c].ours)) {
 					glink.channel[c].request_answered = true;
 					glink.channel[c].request_granted = message.param2 != 0;
+					tell("adsp: glink: our request for an intent of %u bytes on \"%s\": %s (the answer's channel %u, ours %u, "
+					    "the DSP's %u)\n", glink.channel[c].request_size, glink.channel[c].name, message.param2 ? "GRANTED" :
+					    "REFUSED", message.param1, glink.channel[c].ours, glink.channel[c].theirs);
 				}
 			}
 			break;
@@ -2314,6 +2340,7 @@ glink_send(struct glink_channel *channel, const void *data, uint32_t length)
 		uint32_t size, left;
 	} header = { { GLINK_DATA, (uint16_t)channel->ours, 0 }, length, 0 };
 	bool asked = false, fits;
+	unsigned waited;
 	int found = -1;
 
 	lck_mtx_lock(&glink_lock);
@@ -2321,7 +2348,7 @@ glink_send(struct glink_channel *channel, const void *data, uint32_t length)
 		lck_mtx_unlock(&glink_lock);
 		return EMSGSIZE;
 	}
-	for (unsigned waited = 0;; waited++) {
+	for (waited = 0;; waited++) {
 		glink_pump();
 		if (!glink.up || !channel->open || glink.broken) {
 			lck_mtx_unlock(&glink_lock);
@@ -2343,18 +2370,41 @@ glink_send(struct glink_channel *channel, const void *data, uint32_t length)
 			break;
 		}
 		if (!fits && !asked) {
-			channel->request_answered = false;
+			uint32_t biggest = 0, there = 0;
+
+			for (unsigned n = 0; n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
+				if (channel->their_intents[n].there) {
+					there++;
+					biggest = channel->their_intents[n].size > biggest ? channel->their_intents[n].size : biggest;
+				}
+			}
+			tell("adsp: glink: %u bytes for \"%s\", the DSP's %u intents there take at most %u: an intent that big is asked for\n",
+			    length, channel->name, there, biggest);
+			channel->request_answered = channel->request_granted = channel->request_intent = false;
+			channel->request_size = length;
 			glink_say(GLINK_INTENT_REQUEST, channel->ours, length, NULL, 0);
 			asked = true;
 		}
 		if (waited >= 5000 || (!fits && asked && channel->request_answered && !channel->request_granted)) {
+			if (asked) {
+				tell("adsp: glink: no intent of %u bytes on \"%s\" after %u ms: %s\n", length, channel->name, waited,
+				    !channel->request_answered ? "the request was NEVER ANSWERED" : !channel->request_granted ?
+				    "the request was REFUSED" : !channel->request_intent ? "granted, but NO SUCH INTENT CAME" :
+				    "it came, but stayed in use");
+			}
+			channel->request_size = 0;
 			lck_mtx_unlock(&glink_lock);
-			return found < 0 ? ENOBUFS : EAGAIN;
+			return found >= 0 ? EAGAIN : !asked || channel->request_answered ? ENOBUFS : ETIMEDOUT;
 		}
 		lck_mtx_unlock(&glink_lock);
 		sleep_ms(1);
 		lck_mtx_lock(&glink_lock);
 	}
+	if (asked) {
+		tell("adsp: glink: %u bytes for \"%s\" go into the DSP's intent %u (%u bytes), %u ms after the request\n", length,
+		    channel->name, channel->their_intents[found].id, channel->their_intents[found].size, waited);
+	}
+	channel->request_size = 0;
 	channel->their_intents[found].in_use = true;
 	header.message.param2 = channel->their_intents[found].id;
 	glink_put(&header, sizeof(header), data, length);
@@ -2712,6 +2762,194 @@ static bool
 apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms)
 {
 	return hakios_adsp_apr(service, 0, 0, opcode, payload, length, ms, NULL);
+}
+
+/* ---- GPR: AudioReach's packets, on the channel adsp_apps (SM8450) ------------------------------------ */
+
+/*
+ * On SM8450 the audio services are AudioReach's (the "Signal Processing Framework", SPF), and what
+ * the operating system says to them goes in GPR packets (Linux: drivers/soc/qcom/apr.c, the gpr
+ * half; include/linux/soc/qcom/apr.h; sound/soc/qcom/qdsp6/audioreach.h): a header of six words --
+ * version 0, the header's length in words (6) and the packet's in bytes in the first; the domains
+ * (the DSP 2, we 3) in the second; the source and destination ports (a module's instance ID on the
+ * DSP's side: APM 1, PRM 2; any number of ours on our side, which the answer is sent back to); a
+ * token the answer carries back; the opcode -- and what the opcode takes. The answer to most
+ * commands is GPR_BASIC_RSP_RESULT (0x02001005): the command's opcode and a status, 0 when done.
+ */
+#define GPR_DOMAIN_ADSP                 2
+#define GPR_DOMAIN_APPS                 3
+#define GPR_HEADER_WORDS                6
+#define GPR_PORT_APM                    1
+#define GPR_PORT_OURS                   3       /* (Android's spf_core node: reg 3) */
+#define APM_CMD_GET_SPF_STATE           0x01001021u
+#define APM_CMD_RSP_GET_SPF_STATE       0x02001007u
+#define GPR_MAX_PAYLOAD                 2048
+
+struct gpr_header {
+	uint32_t sizes;                 /* [3:0] version, [7:4] header words, [31:8] packet bytes */
+	uint32_t domains;               /* [7:0] destination, [15:8] source */
+	uint32_t from_port, to_port;
+	uint32_t token, opcode;
+};
+
+static uint32_t gpr_in, gpr_out;
+
+/* A packet from the DSP's audio services. From the link's thread. */
+static void
+gpr_input(const uint8_t *data, uint32_t length)
+{
+	struct gpr_header header;
+	uint32_t header_length, size, payload;
+
+	if (length < sizeof(header)) {
+		printf("adsp: gpr: %u bytes, no GPR packet\n", length);
+		return;
+	}
+	memcpy(&header, data, sizeof(header));
+	header_length = (header.sizes >> 4 & 0xf) * 4;
+	size = header.sizes >> 8;
+	/* (both lengths are the DSP's words: a header shorter than ours, or longer than the packet, and the packet is dropped) */
+	if (header_length < sizeof(header) || header_length > length || size < header_length) {
+		printf("adsp: gpr: a header of %u bytes in a packet of %u (%u by its own word): dropped\n", header_length, length, size);
+		return;
+	}
+	payload = (size < length ? size : length) - header_length;
+	gpr_in++;
+	if (header.token != apr_waited_for || apr_waited_for == 0) {
+		uint32_t words[64];
+
+		bzero(words, sizeof(words));
+		memcpy(words, data + header_length, payload < sizeof(words) ? payload : sizeof(words));
+		for (unsigned i = 0; i < 2; i++) {
+			hakios_apr_events_t events = i == 0 ? apr_events : apr_events_second;
+
+			if (events != NULL && events(HAKIOS_GPR_SERVICE, (uint16_t)header.from_port, header.opcode, header.token, words,
+			    payload < sizeof(words) ? payload : sizeof(words))) {
+				return;
+			}
+		}
+	}
+	if (gpr_in <= 40) {
+		uint32_t w[4] = { 0, 0, 0, 0 };
+
+		memcpy(w, data + header_length, payload < sizeof(w) ? payload : sizeof(w));
+		tell("adsp: gpr: < from port %#x of domain %u to port %#x: opcode %#x, token %#x, %u bytes: %#x %#x %#x %#x\n",
+		    header.from_port, header.domains >> 8 & 0xff, header.to_port, header.opcode, header.token, payload, w[0], w[1], w[2],
+		    w[3]);
+	}
+	bzero(apr_answer.words, sizeof(apr_answer.words));
+	memcpy(apr_answer.words, data + header_length, payload < sizeof(apr_answer.words) ? payload : sizeof(apr_answer.words));
+	apr_answer.length = payload;
+	apr_answer.opcode = header.opcode;
+	apr_answer.token = header.token;
+	os_atomic_store(&apr_answer.there, true, release);
+}
+
+/*
+ * A GPR command to a module of the DSP (to_port: its instance ID) from a port of ours, and its answer waited
+ * for with ms: true when it was sent and, if waited for, answered (then in *answer). token 0: one of our own.
+ */
+bool
+hakios_adsp_gpr(uint32_t to_port, uint32_t from_port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
+    uint32_t ms, struct hakios_apr_answer *answer)
+{
+	struct gpr_header *header;
+	uint32_t size = (uint32_t)sizeof(*header) + length;
+	bool answered = false;
+	uint8_t *packet;
+	int error;
+
+	hakios_adsp_gpr_error = ENOTCONN;
+	if (!gpr || length > GPR_MAX_PAYLOAD || !glink.channel[CHANNEL_APR].open) {
+		return false;
+	}
+	hakios_adsp_gpr_error = ENOMEM;
+	packet = kalloc_data(size, Z_WAITOK | Z_ZERO);
+	if (packet == NULL) {
+		return false;
+	}
+	header = (struct gpr_header *)packet;
+	header->sizes = (uint32_t)GPR_HEADER_WORDS << 4 | size << 8;
+	header->domains = GPR_DOMAIN_ADSP | GPR_DOMAIN_APPS << 8;
+	header->from_port = from_port;
+	header->to_port = to_port;
+	header->opcode = opcode;
+	if (length != 0) {
+		memcpy(packet + sizeof(*header), payload, length);
+	}
+	if (ms == 0) {
+		header->token = token;
+		error = glink_send(&glink.channel[CHANNEL_APR], packet, size);
+		gpr_out += error == 0;
+		hakios_adsp_gpr_error = error;
+		kfree_data(packet, size);
+		return error == 0;
+	}
+	lck_mtx_lock(&apr_lock);
+	if (token == 0) {
+		token = apr_next_token++;
+		if (apr_next_token >= 0x01000000u) {
+			apr_next_token = 1;
+		}
+	}
+	header->token = token;
+	apr_answer.there = false;
+	apr_waited_for = token;
+	error = glink_send(&glink.channel[CHANNEL_APR], packet, size);
+	hakios_adsp_gpr_error = error;
+	if (error != 0) {
+		tell("adsp: gpr: > opcode %#x to port %#x, %u bytes: NOT SENT (%d: %s)\n", opcode, to_port, size, error,
+		    error == EMSGSIZE ? "bigger than our FIFO allows" : error == ENOBUFS ? "no intent of the DSP's that big, none granted" :
+		    error == EAGAIN ? "the DSP's intents stayed in use" : error == ENOTCONN ? "the channel is not open" :
+		    error == ETIMEDOUT ? "no intent of the DSP's that big, our request for one not answered" : "?");
+	} else {
+		gpr_out++;
+		for (uint32_t waited = 0; waited < ms && !answered; waited++) {
+			if (os_atomic_load(&apr_answer.there, acquire) && apr_answer.token == token) {
+				answered = true;
+				if (answer != NULL) {
+					answer->opcode = apr_answer.opcode;
+					answer->token = apr_answer.token;
+					answer->length = apr_answer.length;
+					memcpy(answer->words, apr_answer.words, sizeof(answer->words));
+				}
+				break;
+			}
+			sleep_ms(1);
+		}
+		if (!answered) {
+			tell("adsp: gpr: > opcode %#x to port %#x, %u bytes, token %#x: sent, NO ANSWER in %u ms\n", opcode, to_port, size,
+			    token, ms);
+		}
+	}
+	apr_waited_for = 0;
+	lck_mtx_unlock(&apr_lock);
+	kfree_data(packet, size);
+	return answered;
+}
+
+int hakios_adsp_gpr_error;
+
+uint32_t
+hakios_adsp_gpr_room(void)
+{
+	struct glink_channel *channel = &glink.channel[CHANNEL_APR];
+	uint32_t biggest = 0;
+
+	lck_mtx_lock(&glink_lock);
+	for (unsigned n = 0; gpr && channel->open && n < sizeof(channel->their_intents) / sizeof(channel->their_intents[0]); n++) {
+		if (channel->their_intents[n].there && channel->their_intents[n].size > biggest) {
+			biggest = channel->their_intents[n].size;
+		}
+	}
+	lck_mtx_unlock(&glink_lock);
+	return biggest;
+}
+
+bool
+hakios_adsp_is_gpr(void)
+{
+	return gpr;
 }
 
 /* ---- the battery manager, on the channel PMIC_RTR_ADSP_APPS ------------------------------------------ */
@@ -3179,6 +3417,8 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 				qrtr_input(packet->data, packet->length);
 			} else if (from == CHANNEL_PMIC) {
 				battmgr_input(packet->data, packet->length);
+			} else if (gpr) {
+				gpr_input(packet->data, packet->length);
 			} else {
 				apr_input(packet->data, packet->length);
 			}
@@ -3314,10 +3554,30 @@ step_link(void)
 	for (unsigned ms = 0; ms < 5000 && !glink.channel[CHANNEL_QRTR].open && !glink.broken; ms++) {
 		sleep_ms(1);
 	}
+	if (gpr && glink.agreed) {
+		/*
+		 * GPR's channel is opened from our side (Linux: the qcom,gpr node under qcom,glink makes the
+		 * rpmsg device, which opens "adsp_apps"); the DSP answers with its own open once its audio
+		 * services run, and the channel is open both ways from then on (glink_pump()).
+		 */
+		struct glink_channel *channel = &glink.channel[CHANNEL_APR];
+		uint32_t size = (uint32_t)strlen(channel->name) + 1;
+		char name[33];
+
+		lck_mtx_lock(&glink_lock);
+		if (!channel->asked) {
+			bzero(name, sizeof(name));
+			strlcpy(name, channel->name, sizeof(name));
+			glink_say(GLINK_OPEN, channel->ours, size, name, (size + 7) & ~7u);
+			channel->asked = true;
+		}
+		lck_mtx_unlock(&glink_lock);
+		printf("adsp: %u: \"%s\" opened from our side as channel %u (GPR's)\n", step, channel->name, channel->ours);
+	}
 	sleep_ms(50);
-	printf("adsp: %u: %llu ms after our version: versions %s (features %#x); the channel \"IPCRTR\" is %s, \"apr_audio_svc\" %s; "
+	printf("adsp: %u: %llu ms after our version: versions %s (features %#x); the channel \"IPCRTR\" is %s, \"%s\" %s; "
 	    "the DSP also opened \"%s\" \"%s\" \"%s\" \"%s\"\n", step, (now_us() - began) / 1000, glink.agreed ? "agreed" :
-	    "NOT AGREED", glink.features, glink.channel[CHANNEL_QRTR].open ? "OPEN" : "NOT OPEN",
+	    "NOT AGREED", glink.features, glink.channel[CHANNEL_QRTR].open ? "OPEN" : "NOT OPEN", glink.channel[CHANNEL_APR].name,
 	    glink.channel[CHANNEL_APR].open ? "OPEN" : "NOT OPEN", glink.others[0], glink.others[1], glink.others[2], glink.others[3]);
 	return glink.channel[CHANNEL_QRTR].open;
 }
@@ -3348,12 +3608,59 @@ step_qrtr(void)
 
 /* ---- step 11: APR ---------------------------------------------------------------------------------- */
 
+/*
+ * SM8450: GPR's channel open both ways (the DSP opens its side once its audio services run), then APM
+ * asked whether the framework is ready (APM_CMD_GET_SPF_STATE, which Linux's q6apm asks before anything
+ * else; the answer's word is 1 when it is), again and again until it is or adsp_apr_wait seconds pass.
+ */
+static bool
+step_gpr(void)
+{
+	uint32_t wait_seconds = 10, asked = 0, state = 0;
+	uint64_t began = now_us(), opened;
+	struct hakios_apr_answer answer;
+
+	PE_parse_boot_argn("adsp_apr_wait", &wait_seconds, sizeof(wait_seconds));
+	announce("wait for the audio DSP to open GPR's channel (adsp_apps) from its side, then ask APM whether the audio "
+	    "framework (SPF) is ready, again and again");
+	while (!glink.channel[CHANNEL_APR].open && now_us() - began < wait_seconds * 1000000ull) {
+		sleep_ms(1);
+	}
+	opened = now_us();
+	if (!glink.channel[CHANNEL_APR].open) {
+		tell("adsp: %u: GPR: THE CHANNEL \"adsp_apps\" IS NOT OPEN after %u s (we asked: %s, the DSP acknowledged: %s, the DSP "
+		    "opened its side: %s)\n", step, wait_seconds, glink.channel[CHANNEL_APR].asked ? "yes" : "no",
+		    glink.channel[CHANNEL_APR].acknowledged ? "yes" : "no", glink.channel[CHANNEL_APR].theirs ? "yes" : "no");
+		return false;
+	}
+	bzero(&answer, sizeof(answer));
+	while (now_us() - began < wait_seconds * 1000000ull) {
+		asked++;
+		if (hakios_adsp_gpr(GPR_PORT_APM, GPR_PORT_OURS, 0, APM_CMD_GET_SPF_STATE, NULL, 0, 500, &answer) &&
+		    answer.opcode == APM_CMD_RSP_GET_SPF_STATE) {
+			state = answer.words[0];
+			if (state == 1) {
+				break;
+			}
+		}
+		sleep_ms(200);
+	}
+	audio_up = state == 1;
+	tell("adsp: %u: GPR: the channel open %llu ms after we asked; %s after %u questions (the last answer: opcode %#x, %u bytes, "
+	    "%#x %#x)\n", step, (opened - began) / 1000, state == 1 ? "SPF IS READY" : "SPF DOES NOT SAY IT IS READY", asked,
+	    answer.opcode, answer.length, answer.words[0], answer.words[1]);
+	return state == 1;
+}
+
 static bool
 step_apr(void)
 {
 	uint32_t wait_seconds = 10, asked = 0, state = 0;
 	uint64_t began = now_us();
 
+	if (gpr) {
+		return step_gpr();
+	}
 	PE_parse_boot_argn("adsp_apr_wait", &wait_seconds, sizeof(wait_seconds));
 	announce("ask the audio DSP's core service over APR whether the audio services are up (again and again, as Android "
 	    "does), then which services it has");
@@ -3407,7 +3714,8 @@ static void
 steps_over(uint32_t done)
 {
 	lck_mtx_lock(&dsp_lock);
-	if (dsp_started && done == last_step && keep) {
+	/* (on SM8450 the battery needs only the link and QRTR, step 10: the DSP stays for it if GPR's step fails) */
+	if (dsp_started && keep && (done == last_step || (gpr && done >= 10))) {
 		printf("adsp: THE AUDIO DSP STAYS ON while the system runs%s\n", link_runs ? ", and the link with it" : "");
 	} else if (dsp_started) {
 		dsp_shutdown("the steps are over");
@@ -3499,15 +3807,31 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
 		services += qrtr_servers[i].there;
 	}
-	if (step == steps_all && dsp_started) {
+	if ((step == steps_all || (gpr && step >= 10)) && dsp_started) {
 		tell("adsp: THE AUDIO DSP IS UP AND LINKED%s, %llu ms after the kernel began on it (the root's waited for "
-		    "included): node %u, %u services; it stays on\n", steps_all == STEPS ? ", its audio services up (APR)" : "",
-		    (now_us() - began) / 1000, qrtr_peer, services);
-		if (steps_all == STEPS) {
+		    "included): node %u, %u services; it stays on\n", step == STEPS ? (gpr ? ", its audio framework ready (GPR)" :
+		    ", its audio services up (APR)") : ", ITS AUDIO SERVICES NOT UP", (now_us() - began) / 1000, qrtr_peer, services);
+		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
+		if (step == STEPS) {
+			/*
+			 * boot-arg audio_wait=S (a test): the sound S + 15 s from here and the microphones S + 30 s, one after
+			 * the other and after the USB log is up, so that a part that brings the run down says so first
+			 */
+			uint32_t wait_s = 0;
+
+			PE_parse_boot_argn("audio_wait", &wait_s, sizeof(wait_s));
+			if (wait_s != 0) {
+				tell("adsp: audio_wait=%u: the sound in %u s, the microphones in %u s\n", wait_s, wait_s + 15, wait_s + 30);
+				sleep_ms((wait_s + 15) * 1000);
+				tell("adsp: audio_wait: the sound now\n");
+			}
 			hakios_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, hakios.sound.c) */
+			if (wait_s != 0) {
+				sleep_ms(15 * 1000);
+				tell("adsp: audio_wait: the microphones now\n");
+			}
 			hakios_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, hakios.mic.c) */
 		}
-		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);
@@ -3539,8 +3863,9 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
  *   - its memory: adsp_region 0x85700000 + 0x2800000, and the image is relocatable (step_firmware())
  *   - IPCC at 0x0ed18000 (qcom,ipcc@ed18000), not 0x00408000
  *   - the sequencer: rsc@17a00000, drv-id 2, so DRV 2's block at 0x17a20000
- *   - its audio is AudioReach's GPR, not APR: steps 1 to 10 only. The battery manager's channel (PMIC_RTR_ADSP_APPS,
- *     opened by the DSP's charger_pd) needs only the link, so it is asked once QRTR is up
+ *   - its audio is AudioReach's GPR, not APR: step 11 opens the channel adsp_apps (dt: qcom,gpr, intents 20 x 512)
+ *     and waits for SPF (step_gpr()). The battery manager's channel (PMIC_RTR_ADSP_APPS, opened by the DSP's
+ *     charger_pd) needs only the link, so it is asked once QRTR is up, whether step 11 works or not
  * The loader's window for the kernel (0x842000000 on) is nowhere near the DSP's memory.
  */
 static void
@@ -3550,7 +3875,8 @@ adsp_soc_8450(void)
 	adsp_memory_size = 0x02800000u;
 	ipcc.phys = 0x0ed18000u;
 	rsc.phys = 0x17a20000u;
-	steps_all = 10;
+	gpr = true;
+	glink.channel[CHANNEL_APR].name = "adsp_apps";
 	batt_shift = 0;
 	printf("adsp: the OnePlus 10 Pro's (SM8450) audio DSP: memory %#x + %#x, IPCC %#x, RPMh DRV 2 %#x, steps 1 to %u\n",
 	    adsp_memory, adsp_memory_size, ipcc.phys, rsc.phys, steps_all);

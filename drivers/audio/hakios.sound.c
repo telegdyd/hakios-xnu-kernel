@@ -209,17 +209,30 @@ static struct block tlmm = { "pin controller", 0x0f100000, 0x100000 };
 #define CFG_8MA                 (3u << 6)
 #define CFG_OUTPUT              (1u << 9)
 
-static const struct {
+struct pin {
 	unsigned pin;
 	const char *name;
 	uint32_t cfg, io;               /* Android's active state */
-} tdm_pins[] = {
+};
+static const struct pin redwood_pins[] = {
 	{ 97, "gpio97 (bit clock)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
 	{ 100, "gpio100 (frame sync)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
 	{ 98, "gpio98 (data in)", CFG_MI2S0 | CFG_8MA, 0 },
 	{ 99, "gpio99 (data out)", CFG_MI2S0 | CFG_8MA, 0 },
 };
-#define TDM_PINS                (sizeof(tdm_pins) / sizeof(tdm_pins[0]))
+/*
+ * The OnePlus 10 Pro (sound_soc=8450): the tertiary MI2S interface, Android's tert_aux_pcm_*_active states
+ * (function mi2s2_sck/ws/data0/data1, function 1 of pinctrl-sm8450.c; 8 mA, no pull; the clock and the word
+ * select output-high): the speakers' data goes out on SD1 (GPIO124), their feedback would come in on SD0.
+ */
+static const struct pin negroni_pins[] = {
+	{ 121, "gpio121 (bit clock)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
+	{ 123, "gpio123 (word select)", CFG_MI2S0 | CFG_8MA | CFG_OUTPUT, 2 },
+	{ 122, "gpio122 (data 0, in)", CFG_MI2S0 | CFG_8MA, 0 },
+	{ 124, "gpio124 (data 1, out)", CFG_MI2S0 | CFG_8MA, 0 },
+};
+#define TDM_PINS                4
+static const struct pin *tdm_pins = redwood_pins;
 static uint32_t found_cfg[TDM_PINS], found_io[TDM_PINS];
 static bool pins_taken;
 
@@ -533,8 +546,9 @@ static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1
 #define PERIOD_FRAMES           960             /* 20 ms */
 #define PERIOD_BYTES            (PERIOD_FRAMES * 4)
 #define BUFFER_BYTES            (PERIODS * 4096)        /* a page each */
-#define MIC_BYTES               (16 * 4096)             /* the microphones' (hakios.mic.c), behind the periods */
-#define SHARED_BYTES            (BUFFER_BYTES + MIC_BYTES)
+#define COMMAND_BYTES           4096                    /* behind them: AudioReach's commands too big for GLINK (ar_command()) */
+#define MIC_BYTES               (16 * 4096)             /* the microphones' (hakios.mic.c), behind those */
+#define SHARED_BYTES            (BUFFER_BYTES + COMMAND_BYTES + MIC_BYTES)
 
 static struct {
 	bool found, on, passed;         /* passed: the boot chain lets the stream through untranslated */
@@ -771,8 +785,8 @@ hakios_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *byte
 	ok = shared_get(1);
 	lck_mtx_unlock(&hakios_smmu_lock);
 	if (ok) {
-		*memory = buffer + BUFFER_BYTES;
-		*dsp_address = buffer_address + BUFFER_BYTES;
+		*memory = buffer + BUFFER_BYTES + COMMAND_BYTES;
+		*dsp_address = buffer_address + BUFFER_BYTES + COMMAND_BYTES;
 		*bytes = MIC_BYTES;
 	}
 	return ok;
@@ -939,6 +953,576 @@ stream_off(void)
 	}
 }
 
+/* ---- AudioReach: the OnePlus 10 Pro's DSP (sound_soc=8450) ----------------------------------------------------------- */
+
+/*
+ * On SM8450 the DSP's audio framework is AudioReach (SPF), spoken to in GPR packets (hakios_adsp_gpr()),
+ * and what Android's AFE, ADM and ASM did is one graph of modules there. What is said and in which
+ * order is Linux's (sound/soc/qcom/qdsp6/audioreach.c, q6apm.c, q6prm.c; the topology of
+ * linux-msm/audioreach-topology's SM8450-HDK.m4 and audioreach/subgraph-*.m4 for the shapes):
+ *
+ *   the clock    PRM (instance 2) is asked for the tertiary MI2S interface's internal bit clock (clock
+ *                0x104, TER_MI2S_IBIT) at 48000 x 2 x 32 = 3.072 MHz, attribute 1 ("couple no"), root 0
+ *                -- Android's speaker back end MI2S-LPAIF-RX-TERTIARY, 2 channels of 24 bits in 32-bit
+ *                slots (resourcemanager.xml, AK msm_common.c), the SoC the master
+ *   the graph    one GRAPH_OPEN with two subgraphs, as the topology's stream and device subgraphs are:
+ *                  0x4001 stream (low latency, playback): container 0x5001 (capability "CD", stack
+ *                         8192, the ADSP) with WR_SHARED_MEM_EP 0x6001 -> PCM_DEC 0x6002 -> PCM_CNV
+ *                         0x6003 -> MFC 0x6004
+ *                  0x4002 device: container 0x5002 ("EP") with I2S_SINK 0x6005 (tertiary, SD1, the
+ *                         word select ours)
+ *                MFC's output to I2S_SINK's input; output ports are 1, input ports 2
+ *   its setup    SET_CFG to each module as q6apm_graph_media_format_shmem()/_pcm() send them: the
+ *                shared-memory end point takes 16-bit PCM, 2 channels, 48 kHz (PARAM_ID_MEDIA_FORMAT);
+ *                PCM_DEC and PCM_CNV give 16 bits out (PARAM_ID_PCM_OUTPUT_FORMAT_CFG, interleaved and
+ *                de-interleaved unpacked); MFC gives 24 bits (PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT), the
+ *                I2S end point is set to 48 kHz, 24 bits, 2 channels (PARAM_ID_HW_EP_MF_CFG), its
+ *                interface (PARAM_ID_I2S_INTF_CFG) and a frame-size factor of 1
+ *   the memory   our periods mapped for the DSP (APM_CMD_SHARED_MEM_MAP_REGIONS, the 4K pool), through
+ *                the SMMU as on the X5 Pro (stream 0x1801, the address's bits 32 on the stream's low bits)
+ *   then         GRAPH_PREPARE and GRAPH_START of both subgraphs; each period written with
+ *                DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2 to the end point, its "done" (0x05001004) coming
+ *                back to our port with the period in the token
+ *   at the end   GRAPH_STOP, the memory unmapped, GRAPH_CLOSE, the clock released
+ */
+#define AR_PORT_APM                     1
+#define AR_PORT_PRM                     2
+#define AR_OURS                         3               /* our port for APM's commands (Android's spf_core: 3) */
+#define AR_OURS_PRM                     7               /* and for PRM's (Android's q6prm: 7) */
+#define AR_OURS_DATA                    0x10000001u     /* the graph's data commands (Linux: GPR_DYNAMIC_PORT_START on) */
+#define AR_WAIT_MS                      5000            /* (Linux's q6apm and q6prm wait 5 s for an answer) */
+#define GPR_BASIC_RSP_RESULT            0x02001005u
+#define APM_CMD_GRAPH_OPEN              0x01001000u
+#define APM_CMD_GRAPH_PREPARE           0x01001001u
+#define APM_CMD_GRAPH_START             0x01001002u
+#define APM_CMD_GRAPH_STOP              0x01001003u
+#define APM_CMD_GRAPH_CLOSE             0x01001004u
+#define APM_CMD_SET_CFG                 0x01001006u
+#define APM_CMD_SHARED_MEM_MAP_REGIONS  0x0100100cu
+#define APM_CMD_SHARED_MEM_UNMAP_REGIONS 0x0100100du
+#define APM_CMD_RSP_SHARED_MEM_MAP_REGIONS 0x02001001u
+#define PRM_CMD_REQUEST_HW_RSC          0x0100100fu
+#define PRM_CMD_RSP_REQUEST_HW_RSC      0x02001002u
+#define PRM_CMD_RELEASE_HW_RSC          0x01001010u
+#define PRM_CMD_RSP_RELEASE_HW_RSC      0x02001003u
+#define PARAM_ID_RSC_AUDIO_HW_CLK       0x0800102cu
+#define APM_PARAM_ID_CONTAINER_CONFIG   0x08001000u
+#define APM_PARAM_ID_SUB_GRAPH_CONFIG   0x08001001u
+#define APM_PARAM_ID_MODULE_LIST        0x08001002u
+#define APM_PARAM_ID_MODULE_PROP        0x08001003u
+#define APM_PARAM_ID_MODULE_CONN        0x08001004u
+#define APM_PARAM_ID_SUB_GRAPH_LIST     0x08001005u
+#define PARAM_ID_PCM_OUTPUT_FORMAT_CFG  0x08001008u
+#define PARAM_ID_MEDIA_FORMAT           0x0800100cu
+#define APM_SUB_GRAPH_PROP_ID_PERF_MODE 0x0800100eu
+#define APM_SUB_GRAPH_PROP_ID_DIRECTION 0x0800100fu
+#define APM_SUB_GRAPH_PROP_ID_SCENARIO_ID 0x08001010u
+#define APM_CONTAINER_PROP_ID_CAPABILITY_LIST 0x08001011u
+#define APM_CONTAINER_PROP_ID_GRAPH_POS 0x08001012u
+#define APM_CONTAINER_PROP_ID_STACK_SIZE 0x08001013u
+#define APM_CONTAINER_PROP_ID_PROC_DOMAIN 0x08001014u
+#define APM_MODULE_PROP_ID_PORT_INFO    0x08001015u
+#define PARAM_ID_HW_EP_MF_CFG           0x08001017u
+#define PARAM_ID_HW_EP_FRAME_SIZE_FACTOR 0x08001018u
+#define PARAM_ID_I2S_INTF_CFG           0x08001019u
+#define PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT 0x08001024u
+#define DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2 0x0400100au
+#define DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2 0x05001004u
+#define MODULE_ID_WR_SHARED_MEM_EP      0x07001000u
+#define MODULE_ID_PCM_CNV               0x07001003u
+#define MODULE_ID_PCM_DEC               0x07001005u
+#define MODULE_ID_I2S_SINK              0x0700100au
+#define MODULE_ID_MFC                   0x07001015u
+#define MEDIA_FMT_ID_PCM                0x09001000u
+#define CLOCK_TER_MI2S_IBIT             0x104
+#define AR_BCLK                         (RATE * 2 * 32)
+#define AR_SG_STREAM                    0x4001
+#define AR_SG_DEVICE                    0x4002
+#define AR_CONT_STREAM                  0x5001
+#define AR_CONT_DEVICE                  0x5002
+#define AR_WR_EP                        0x6001
+#define AR_PCM_DEC                      0x6002
+#define AR_PCM_CNV                      0x6003
+#define AR_MFC                          0x6004
+#define AR_I2S                          0x6005
+#define AR_DEVICE_BITS                  24
+
+static uint32_t sound_soc;              /* boot-arg sound_soc: 8450 the OnePlus 10 Pro (AudioReach, the TFA9874 amplifiers) */
+#define AR                              (sound_soc == 8450)
+static bool ar_clock_on, ar_open, ar_started;
+
+static const char *
+ar_error(uint32_t status)
+{
+	/* (AudioReach's AR_E* are the same numbers as APR's ADSP_E*: ar_error_codes.h) */
+	return dsp_error(status);
+}
+
+/* A packet's words built up: what each of the commands below takes, little-endian 32-bit words. */
+struct words {
+	uint32_t w[256];
+	unsigned n;
+	bool full;
+};
+
+static void
+word(struct words *p, uint32_t value)
+{
+	if (p->n >= sizeof(p->w) / sizeof(p->w[0])) {
+		p->full = true;
+		return;
+	}
+	p->w[p->n++] = value;
+}
+
+static void
+halves(struct words *p, uint16_t low, uint16_t high)
+{
+	word(p, (uint32_t)low | (uint32_t)high << 16);
+}
+
+/*
+ * One command to a module of the DSP, its answer waited for: true if it is the basic answer with status 0 for this
+ * opcode, or the opcode `wanted' (then in *answer). `apm_header': the command's payload is behind APM's command
+ * header (in band: address 0, handle 0, and the payload's size), as audioreach_alloc_cmd_pkt() makes it.
+ */
+static bool
+ar_command(const char *what, uint32_t to_port, uint32_t from_port, uint32_t opcode, bool apm_header, const struct words *p,
+    uint32_t wanted, struct hakios_apr_answer *answer)
+{
+	struct hakios_apr_answer local;
+	uint32_t packet[4 + 256];
+	uint32_t length = 0;
+
+	if (answer == NULL) {
+		answer = &local;
+	}
+	if (p != NULL && p->full) {
+		say("sound: %s: THE PACKET IS TOO BIG to be built here: not sent\n", what);
+		return false;
+	}
+	bzero(packet, sizeof(packet));
+	if (apm_header) {
+		packet[3] = p != NULL ? p->n * 4 : 0;
+		length = 16;
+	}
+	if (p != NULL) {
+		memcpy((uint8_t *)packet + length, p->w, p->n * 4);
+		length += p->n * 4;
+	}
+	snprintf(last_write, sizeof(last_write), "sent %s (opcode %#x to %#x)", what, opcode, to_port);
+	if (!hakios_adsp_gpr(to_port, from_port, 0, opcode, packet, length, AR_WAIT_MS, answer)) {
+		uint32_t bytes = p != NULL ? p->n * 4 : 0;
+		uint64_t at = buffer_address + BUFFER_BYTES;
+
+		/*
+		 * Not sent (no intent of the DSP's that big): APM's commands take their payload out of band too, from memory the
+		 * DSP has mapped -- the header's address, the map's handle and the size instead of the payload behind it
+		 */
+		if (hakios_adsp_gpr_error == 0 || !apm_header || bytes == 0 || bytes > COMMAND_BYTES || !mapped) {
+			say("sound: %s (opcode %#x to port %#x, %u bytes): %s\n", what, opcode, to_port, length,
+			    hakios_adsp_gpr_error == 0 ? "NO ANSWER" : "NOT SENT");
+			return false;
+		}
+		memcpy((void *)(buffer + BUFFER_BYTES), p->w, bytes);
+		for (vm_offset_t line = buffer + BUFFER_BYTES; line < buffer + BUFFER_BYTES + bytes; line += 64) {
+			__asm__ volatile ("dc civac, %0" : : "r" (line));
+		}
+		__asm__ volatile ("dsb sy");
+		packet[0] = (uint32_t)at;
+		packet[1] = (uint32_t)(at >> 32);
+		packet[2] = map_handle;
+		packet[3] = bytes;
+		say("sound: %s: too big for the link (%u bytes), sent out of band: its %u bytes at %#llx, handle %#x\n", what, length,
+		    bytes, at, map_handle);
+		if (!hakios_adsp_gpr(to_port, from_port, 0, opcode, packet, 16, AR_WAIT_MS, answer)) {
+			say("sound: %s, out of band (opcode %#x to port %#x): %s\n", what, opcode, to_port,
+			    hakios_adsp_gpr_error == 0 ? "NO ANSWER" : "NOT SENT");
+			return false;
+		}
+	}
+	if (answer->opcode == GPR_BASIC_RSP_RESULT && answer->words[0] == opcode) {
+		say("sound: %s: %s%s\n", what, answer->words[1] == 0 ? "done" : "REFUSED: ", answer->words[1] == 0 ? "" :
+		    ar_error(answer->words[1]));
+		return answer->words[1] == 0 && wanted == 0;
+	}
+	if (wanted != 0 && answer->opcode == wanted) {
+		return true;
+	}
+	say("sound: %s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", what, answer->opcode, answer->length,
+	    answer->words[0], answer->words[1]);
+	return false;
+}
+
+/* A module's parameter in a SET_CFG: its instance, the parameter, the size, error 0; then the data (padded to 8). */
+static void
+param(struct words *p, uint32_t instance, uint32_t id, uint32_t bytes)
+{
+	word(p, instance);
+	word(p, id);
+	word(p, bytes);
+	word(p, 0);
+}
+
+static void
+pad8(struct words *p)
+{
+	if (p->n & 1) {
+		word(p, 0);
+	}
+}
+
+/* PRM: the bit clock of the tertiary MI2S interface, asked for or released. */
+static bool
+ar_clock(bool on)
+{
+	struct words p = { .n = 0 };
+	struct hakios_apr_answer answer;
+	bool ok;
+
+	param(&p, AR_PORT_PRM, PARAM_ID_RSC_AUDIO_HW_CLK, on ? 20 : 8);
+	word(&p, 1);                                    /* one clock */
+	word(&p, CLOCK_TER_MI2S_IBIT);
+	if (on) {
+		word(&p, AR_BCLK);
+		word(&p, 1);                            /* Q6PRM_LPASS_CLK_ATTRIBUTE_COUPLE_NO */
+		word(&p, 0);                            /* the default root */
+	}
+	ok = ar_command(on ? "PRM: the tertiary MI2S bit clock (0x104) at 3.072 MHz" : "PRM: the tertiary MI2S bit clock, released",
+	    AR_PORT_PRM, AR_OURS_PRM, on ? PRM_CMD_REQUEST_HW_RSC : PRM_CMD_RELEASE_HW_RSC, true, &p,
+	    on ? PRM_CMD_RSP_REQUEST_HW_RSC : PRM_CMD_RSP_RELEASE_HW_RSC, &answer);
+	if (ok) {
+		/* (q6prm.c's callback: the answer's payload is the basic result, opcode then status) */
+		say("sound: %s: %s%s\n", on ? "the bit clock" : "the bit clock's release", answer.words[1] == 0 ? "GRANTED" : "REFUSED: ",
+		    answer.words[1] == 0 ? "" : ar_error(answer.words[1]));
+		ok = answer.words[1] == 0;
+	}
+	return ok;
+}
+
+/* The graph: two subgraphs, two containers, five modules, four connections (see above). */
+static bool
+ar_graph_open(void)
+{
+	static const struct {
+		uint32_t subgraph, container, module, instance, inputs, outputs;
+	} modules[] = {
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_WR_SHARED_MEM_EP, AR_WR_EP, 0, 1 },
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_PCM_DEC, AR_PCM_DEC, 1, 1 },
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_PCM_CNV, AR_PCM_CNV, 1, 1 },
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_MFC, AR_MFC, 1, 1 },
+		{ AR_SG_DEVICE, AR_CONT_DEVICE, MODULE_ID_I2S_SINK, AR_I2S, 1, 0 },
+	};
+	static const uint32_t connections[][2] = {
+		{ AR_WR_EP, AR_PCM_DEC }, { AR_PCM_DEC, AR_PCM_CNV }, { AR_PCM_CNV, AR_MFC }, { AR_MFC, AR_I2S },
+	};
+	struct words p = { .n = 0 };
+	unsigned at;
+
+	/* the subgraphs: perf mode 2 (low latency), direction (the stream 2, the device 1, as the topology has them), playback */
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_SUB_GRAPH_CONFIG, 0);
+	word(&p, 2);
+	for (unsigned s = 0; s < 2; s++) {
+		word(&p, s == 0 ? AR_SG_STREAM : AR_SG_DEVICE);
+		word(&p, 3);
+		word(&p, APM_SUB_GRAPH_PROP_ID_PERF_MODE);
+		word(&p, 4);
+		word(&p, 2);
+		word(&p, APM_SUB_GRAPH_PROP_ID_DIRECTION);
+		word(&p, 4);
+		word(&p, s == 0 ? 2 : 1);
+		word(&p, APM_SUB_GRAPH_PROP_ID_SCENARIO_ID);
+		word(&p, 4);
+		word(&p, 1);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	/* the containers: capability CD (2) for the stream, EP (3) for the device; graph position "stream", stack 8192, the ADSP */
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_CONTAINER_CONFIG, 0);
+	word(&p, 2);
+	for (unsigned c = 0; c < 2; c++) {
+		word(&p, c == 0 ? AR_CONT_STREAM : AR_CONT_DEVICE);
+		word(&p, 4);
+		word(&p, APM_CONTAINER_PROP_ID_CAPABILITY_LIST);
+		word(&p, 8);
+		word(&p, 1);
+		word(&p, c == 0 ? 2 : 3);
+		word(&p, APM_CONTAINER_PROP_ID_GRAPH_POS);
+		word(&p, 4);
+		word(&p, 1);
+		word(&p, APM_CONTAINER_PROP_ID_STACK_SIZE);
+		word(&p, 4);
+		word(&p, 8192);
+		word(&p, APM_CONTAINER_PROP_ID_PROC_DOMAIN);
+		word(&p, 4);
+		word(&p, 2);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	/* the modules of each container */
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_MODULE_LIST, 0);
+	word(&p, 2);
+	for (unsigned c = 0; c < 2; c++) {
+		uint32_t container = c == 0 ? AR_CONT_STREAM : AR_CONT_DEVICE;
+		unsigned count = 0;
+
+		for (unsigned m = 0; m < sizeof(modules) / sizeof(modules[0]); m++) {
+			count += modules[m].container == container;
+		}
+		word(&p, c == 0 ? AR_SG_STREAM : AR_SG_DEVICE);
+		word(&p, container);
+		word(&p, count);
+		for (unsigned m = 0; m < sizeof(modules) / sizeof(modules[0]); m++) {
+			if (modules[m].container == container) {
+				word(&p, modules[m].module);
+				word(&p, modules[m].instance);
+			}
+		}
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	/* their ports */
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_MODULE_PROP, 0);
+	word(&p, sizeof(modules) / sizeof(modules[0]));
+	for (unsigned m = 0; m < sizeof(modules) / sizeof(modules[0]); m++) {
+		word(&p, modules[m].instance);
+		word(&p, 1);
+		word(&p, APM_MODULE_PROP_ID_PORT_INFO);
+		word(&p, 8);
+		word(&p, modules[m].inputs);
+		word(&p, modules[m].outputs);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	/* the connections: output port 1 to input port 2 */
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_MODULE_CONN, 0);
+	word(&p, sizeof(connections) / sizeof(connections[0]));
+	for (unsigned c = 0; c < sizeof(connections) / sizeof(connections[0]); c++) {
+		word(&p, connections[c][0]);
+		word(&p, 1);
+		word(&p, connections[c][1]);
+		word(&p, 2);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	say("sound: the graph: %u bytes of GRAPH_OPEN\n", p.n * 4 + 16);
+	ar_open = ar_command("APM: GRAPH_OPEN (the stream 0x4001: WR_SHARED_MEM_EP, PCM_DEC, PCM_CNV, MFC; the device 0x4002: "
+	    "I2S_SINK)", AR_PORT_APM, AR_OURS, APM_CMD_GRAPH_OPEN, true, &p, 0, NULL);
+	return ar_open;
+}
+
+/* The modules' formats, each a SET_CFG of its own (as audioreach_set_media_format() sends them). */
+static bool
+ar_graph_formats(void)
+{
+	struct words p;
+
+	/* the end point's input: 16-bit PCM, 2 channels, 48 kHz (Linux's payload_size for the format, kept as it is) */
+	p.n = 0;
+	p.full = false;
+	param(&p, AR_WR_EP, PARAM_ID_MEDIA_FORMAT, 32);
+	word(&p, 1);                                    /* DATA_FORMAT_FIXED_POINT */
+	word(&p, MEDIA_FMT_ID_PCM);
+	word(&p, 48 - 12);
+	word(&p, RATE);
+	halves(&p, 16, 1);                              /* bit width, alignment: LSB */
+	halves(&p, 16, 15);                             /* bits per sample, Q factor */
+	halves(&p, 1, 2);                               /* little-endian, channels */
+	halves(&p, PCM_CHANNEL_FL | PCM_CHANNEL_FR << 8, 0);
+	if (!ar_command("the end point 0x6001's input: 16-bit PCM, 2 channels, 48 kHz", AR_WR_EP, AR_OURS_DATA, APM_CMD_SET_CFG, true,
+	    &p, 0, NULL)) {
+		return false;
+	}
+	/* PCM_DEC (interleaved) and PCM_CNV (de-interleaved unpacked): 16 bits out */
+	for (unsigned i = 0; i < 2; i++) {
+		p.n = 0;
+		p.full = false;
+		param(&p, i == 0 ? AR_PCM_DEC : AR_PCM_CNV, PARAM_ID_PCM_OUTPUT_FORMAT_CFG, 32);
+		word(&p, 1);
+		word(&p, MEDIA_FMT_ID_PCM);
+		word(&p, 20);
+		halves(&p, 16, 1);                      /* bit width, alignment */
+		halves(&p, 16, 15);                     /* bits per sample, Q factor */
+		halves(&p, 1, i == 0 ? 1 : 3);          /* endianness, interleaving */
+		halves(&p, 0, 2);                       /* reserved, channels */
+		halves(&p, PCM_CHANNEL_FL | PCM_CHANNEL_FR << 8, 0);
+		if (!ar_command(i == 0 ? "PCM_DEC 0x6002: 16 bits out, interleaved" : "PCM_CNV 0x6003: 16 bits out, de-interleaved",
+		    AR_PORT_APM, AR_OURS, APM_CMD_SET_CFG, true, &p, 0, NULL)) {
+			return false;
+		}
+	}
+	/* MFC: 48 kHz, 24 bits, 2 channels (left, right) out */
+	p.n = 0;
+	p.full = false;
+	param(&p, AR_MFC, PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT, 12);
+	word(&p, RATE);
+	halves(&p, AR_DEVICE_BITS, 2);
+	halves(&p, PCM_CHANNEL_FL, PCM_CHANNEL_FR);
+	if (!ar_command("MFC 0x6004: 48 kHz, 24 bits, 2 channels out", AR_PORT_APM, AR_OURS, APM_CMD_SET_CFG, true, &p, 0, NULL)) {
+		return false;
+	}
+	/* I2S_SINK: the interface (tertiary, SD1, the word select internal), its format, a frame-size factor of 1 */
+	p.n = 0;
+	p.full = false;
+	param(&p, AR_I2S, PARAM_ID_I2S_INTF_CFG, 16);
+	word(&p, 0);                                    /* LPAIF */
+	word(&p, 2);                                    /* I2S_INTF_TYPE_TERTIARY */
+	halves(&p, 2, 1);                               /* I2S_SD1; CONFIG_I2S_WS_SRC_INTERNAL */
+	word(&p, 0);
+	param(&p, AR_I2S, PARAM_ID_HW_EP_MF_CFG, 16);
+	word(&p, RATE);
+	halves(&p, AR_DEVICE_BITS, 2);
+	word(&p, 1);                                    /* fixed point */
+	word(&p, 0);
+	param(&p, AR_I2S, PARAM_ID_HW_EP_FRAME_SIZE_FACTOR, 8);
+	word(&p, 1);
+	word(&p, 0);
+	return ar_command("I2S_SINK 0x6005: tertiary MI2S, SD1, 48 kHz, 24 bits, 2 channels", AR_PORT_APM, AR_OURS, APM_CMD_SET_CFG,
+	           true, &p, 0, NULL);
+}
+
+static bool
+ar_graph_command(const char *what, uint32_t opcode)
+{
+	struct words p = { .n = 0 };
+
+	param(&p, AR_PORT_APM, APM_PARAM_ID_SUB_GRAPH_LIST, 16);
+	word(&p, 2);
+	word(&p, AR_SG_STREAM);
+	word(&p, AR_SG_DEVICE);
+	pad8(&p);
+	return ar_command(what, AR_PORT_APM, AR_OURS, opcode, true, &p, 0, NULL);
+}
+
+/* The DSP's events: the "done" of every write. On the link's thread. */
+static bool
+ar_events(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
+{
+	if (service != HAKIOS_GPR_SERVICE || port != AR_WR_EP || !(token & WRITE_TOKEN)) {
+		return false;
+	}
+	if (opcode == DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2) {
+		if (length >= 16 && payload[3] != 0) {
+			OSIncrementAtomic((volatile SInt32 *)&write_errors);
+		}
+	} else if (opcode == GPR_BASIC_RSP_RESULT) {
+		/* (a write the DSP refused outright: it answers it as a command) */
+		OSIncrementAtomic((volatile SInt32 *)&write_errors);
+	} else {
+		return false;
+	}
+	OSIncrementAtomic((volatile SInt32 *)&written_done);
+	OSBitOrAtomic(1u << (token & 31), &returned);
+	return true;
+}
+
+static bool
+ar_stream_on(void)
+{
+	struct words p = { .n = 0 };
+	struct hakios_apr_answer answer;
+
+	announce("the DSP is given the graph (APM: GRAPH_OPEN), its formats (SET_CFG), our periods (SHARED_MEM_MAP), and the graph "
+	    "is prepared and started");
+	/* (the memory first: a GRAPH_OPEN too big for the link goes out of band, from the page behind the periods) */
+	halves(&p, 3, 1);                               /* APM_MEMORY_MAP_SHMEM8_4K_POOL, one region */
+	word(&p, 0);
+	word(&p, (uint32_t)buffer_address);
+	word(&p, (uint32_t)(buffer_address >> 32));
+	word(&p, BUFFER_BYTES + COMMAND_BYTES);
+	if (!ar_command("our periods, mapped for the DSP", AR_PORT_APM, AR_OURS_DATA, APM_CMD_SHARED_MEM_MAP_REGIONS, false, &p,
+	    APM_CMD_RSP_SHARED_MEM_MAP_REGIONS, &answer)) {
+		return false;
+	}
+	mapped = true;
+	map_handle = answer.words[0];
+	say("sound: our %u KB at %#llx are the DSP's handle %#x\n", (BUFFER_BYTES + COMMAND_BYTES) / 1024, buffer_address,
+	    map_handle);
+	if (!ar_graph_open() || !ar_graph_formats()) {
+		return false;
+	}
+	if (!ar_graph_command("APM: GRAPH_PREPARE", APM_CMD_GRAPH_PREPARE)) {
+		return false;
+	}
+	ar_started = ar_graph_command("APM: GRAPH_START", APM_CMD_GRAPH_START);
+	return ar_started;
+}
+
+static void
+ar_stream_off(void)
+{
+	if (ar_started) {
+		ar_graph_command("APM: GRAPH_STOP", APM_CMD_GRAPH_STOP);
+		ar_started = false;
+	}
+	if (mapped) {
+		struct words p = { .n = 0 };
+
+		word(&p, map_handle);
+		ar_command("our periods, unmapped", AR_PORT_APM, AR_OURS_DATA, APM_CMD_SHARED_MEM_UNMAP_REGIONS, false, &p, 0, NULL);
+		mapped = false;
+	}
+	if (ar_open) {
+		ar_graph_command("APM: GRAPH_CLOSE", APM_CMD_GRAPH_CLOSE);
+		ar_open = false;
+	}
+}
+
+static bool
+ar_period_write(unsigned period)
+{
+	uint64_t at = buffer_address + 4096 * period;
+	uint32_t write[11] = { (uint32_t)at, (uint32_t)(at >> 32), map_handle, PERIOD_BYTES, 0, 0, 0, 0, 0, 0, 0 };
+
+	return hakios_adsp_gpr(AR_WR_EP, AR_OURS_DATA, WRITE_TOKEN | period, DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2, write,
+	           sizeof(write), 0, NULL);
+}
+
+/*
+ * The speakers' level in software, on the OnePlus 10 Pro: the TFA9874s play at Android's own gain (the
+ * container's), and everything under it is taken off the samples here, after the guard (hakios.tfa.c).
+ * In Q15, from eighths of a dB (10^(-1/160) an eighth).
+ */
+static volatile uint32_t soft_q15 = 0;  /* 0: silence until a level is set */
+
+static uint32_t
+q15_of(uint32_t below)
+{
+	uint64_t g = 1ull << 30;
+
+	if (below >= 90 * 8) {
+		return 0;
+	}
+	for (uint32_t db = 0; db < below / 8; db++) {
+		g = g * 957037441ull >> 30;             /* -1 dB */
+	}
+	for (uint32_t e = 0; e < below % 8; e++) {
+		g = g * 1058396570ull >> 30;            /* -1/8 dB */
+	}
+	return (uint32_t)(g >> 15);
+}
+
+void
+hakios_sound_soft_level(uint32_t below, bool muted)
+{
+	soft_q15 = muted ? 0 : q15_of(below);
+}
+
+static void
+soft_apply(int16_t *samples, uint32_t count)
+{
+	uint32_t g = soft_q15;
+
+	for (uint32_t i = 0; i < count; i++) {
+		samples[i] = (int16_t)(((int32_t)samples[i] * (int32_t)g) >> 15);
+	}
+}
+
 /* ---- the test tone ----------------------------------------------------------------------------------- */
 
 /* 1 kHz at 48 kHz, -20 dBFS (a peak of 3277): one cycle */
@@ -961,6 +1545,9 @@ period_fill(unsigned period, bool silent)
 		samples[2 * frame] = sample;
 		samples[2 * frame + 1] = sample;
 	}
+	if (AR) {
+		soft_apply(samples, 2 * PERIOD_FRAMES);
+	}
 	for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + PERIOD_BYTES; line += 64) {
 		__asm__ volatile ("dc cvac, %0" : : "r" (line));        /* the DSP reads memory, not our caches */
 	}
@@ -973,6 +1560,9 @@ period_write(unsigned period)
 	uint32_t write[8] = { (uint32_t)(buffer_address + 4096 * period), (uint32_t)((buffer_address + 4096 * period) >> 32),
 		              map_handle, PERIOD_BYTES, period, 0, 0, 0 };
 
+	if (AR) {
+		return ar_period_write(period);
+	}
 	return hakios_adsp_apr(APR_SVC_ASM, STREAM_PORT, WRITE_TOKEN | period, ASM_DATA_CMD_WRITE_V2, write, sizeof(write), 0, NULL);
 }
 
@@ -1081,6 +1671,9 @@ static volatile uint32_t ring_head, ring_tail;  /* frames: written by the sink, 
 static volatile uint64_t last_sound_us;         /* when the latest write that was not silence came */
 static volatile bool feeder_runs, watcher_runs;
 static uint64_t fed_frames, silent_frames, darwin_frames;
+static volatile uint32_t short_periods, dropped_frames, primings;
+static bool primed;                             /* the ring holds its cushion (period_fill_darwin()) */
+#define CUSHION_FRAMES          (2 * PERIOD_FRAMES)   /* (since the last 5 s line) a period cut short in sound; frames the ring had no room for */
 static volatile uint32_t darwin_peak;              /* the largest sample since the amplifiers last started */
 
 /* From the writer's thread, under hakios.audio.c's lock: never waits. */
@@ -1104,6 +1697,7 @@ darwin_sink(const int16_t *frames, uint32_t count)
 	OSMemoryBarrier();
 	ring_head = head + taken;
 	darwin_frames += taken;
+	dropped_frames += count - taken;
 	if (sound) {
 		last_sound_us = now_us();
 	}
@@ -1147,8 +1741,38 @@ static void
 period_fill_darwin(unsigned period)
 {
 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
-	uint32_t tail = ring_tail, available = ring_head - tail, n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
+	uint32_t tail, available, n;
 
+	/*
+	 * In the middle of sound a period is not cut short: the rest of it silence was a click each time Darwin's writes
+	 * came a little after the DSP's period (round 2). Up to 10 ms are waited for the rest -- the period is played
+	 * behind the seven queued at the DSP, 140 ms on -- and only then is it filled with what there is.
+	 */
+	for (unsigned waited = 0; guard_on && primed && ring_head - ring_tail < PERIOD_FRAMES && ring_head != ring_tail && waited < 10;
+	    waited++) {
+		sleep_ms(1);
+	}
+	tail = ring_tail;
+	available = ring_head - tail;
+	/*
+	 * Darwin keeps the ring at about a period, just in time (round 2: 0 to 960 frames, and periods cut short even so): when
+	 * sound begins, or after a period had to be cut short, the ring is let fill to a cushion of two periods behind silence
+	 * first, and played from then on 40 ms later -- the DSP and Darwin keep the same rate, so the cushion stays (what is
+	 * left when the sound has ended, 0.2 s on, is played as it is).
+	 */
+	if (!primed && available != 0 && available < CUSHION_FRAMES && now_us() - last_sound_us < 200000) {
+		available = 0;
+	} else if (!primed && available != 0) {
+		primed = true;
+		primings++;
+	}
+	n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
+	if (n < PERIOD_FRAMES && primed) {
+		if (n != 0 && guard_on) {
+			short_periods++;
+		}
+		primed = false;
+	}
 	OSMemoryBarrier();
 	for (uint32_t i = 0; i < n; i++) {
 		samples[2 * i] = ring[2 * ((tail + i) % RING_FRAMES)];
@@ -1161,8 +1785,12 @@ period_fill_darwin(unsigned period)
 	silent_frames += PERIOD_FRAMES - n;
 	/* the guard, on every period, silence too: its filter and its averages go on (hakios.guard.c) */
 	hakios_guard_process(samples, PERIOD_FRAMES);
-	if (n != 0 && hakios_audio_recording_fed()) {
-		hakios_audio_record_fed(samples, n);
+	/* (whole periods while the amplifiers are on, the silence a short one was filled up with too: the recording is what is played) */
+	if ((n != 0 || guard_on) && hakios_audio_recording_fed()) {
+		hakios_audio_record_fed(samples, PERIOD_FRAMES);
+	}
+	if (AR) {
+		soft_apply(samples, 2 * PERIOD_FRAMES);       /* (the level under Android's, after the guard: see soft_q15) */
 	}
 	guard_periods++;
 	for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + PERIOD_BYTES; line += 64) {
@@ -1192,6 +1820,11 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 			guard_say(" until the amplifiers stopped", false);
 		} else if (guard_on && guard_periods >= 250) {
 			guard_say(", 5 s", false);
+			say("sound: Darwin's, 5 s: %u periods cut short, %u frames dropped (the ring full), %u frames in the ring now, "
+			    "%u starts behind a cushion\n", short_periods, dropped_frames, ring_head - ring_tail, primings);
+			short_periods = 0;
+			primings = 0;
+			dropped_frames = 0;
 			guard_periods = 0;
 		}
 		was_on = guard_on;
@@ -1367,8 +2000,16 @@ take_down(void)
 	if (running && !taken_down) {
 		taken_down = true;
 		hakios_speaker_stop();
-		stream_off();
-		afe_off();
+		if (AR) {
+			ar_stream_off();
+			if (ar_clock_on) {
+				ar_clock(false);
+				ar_clock_on = false;
+			}
+		} else {
+			stream_off();
+			afe_off();
+		}
 		pins_off();
 		lck_mtx_lock(&hakios_smmu_lock);
 		shared_put(0);
@@ -1400,14 +2041,17 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		    "the port, a stream with a test tone, and the amplifiers", seconds);
 	}
 	if (level >= 3) {
-		acf = hakios_adsp_fw_file("aw882xx_acf.bin", &acf_size);
+		const char *file = AR ? "tfa98xx.cnt" : "aw882xx_acf.bin";
+
+		acf = hakios_adsp_fw_file(file, &acf_size);
 		if (acf == NULL) {
-			say("sound: no /fw/aw882xx_acf.bin: put the phone's /vendor/etc/aw882xx_acf.bin into fw-audio/ and run SYSTEM=1 "
-			    "userland/build.sh\n");
+			say("sound: no /fw/%s nor /private/var/fw/%s: put the phone's %s there (fw-audio/ and SYSTEM=1 userland/build.sh, "
+			    "or sweet-sh.py --put)\n", file, file, AR ? "/odm/firmware/tfa98xx.cnt" : "/vendor/etc/aw882xx_acf.bin");
 			goto out;
 		}
 	}
-	if (level >= 2) {
+	if (level >= 2 || AR) {
+		/* (the DSP's graph on SM8450 has the shared-memory end point in it at every level: our memory is mapped at level 1 too) */
 		lck_mtx_lock(&hakios_smmu_lock);
 		ok = shared_get(0);
 		lck_mtx_unlock(&hakios_smmu_lock);
@@ -1415,24 +2059,32 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 			goto out;
 		}
 		ok = false;
-		hakios_adsp_apr_events(events);
+		hakios_adsp_apr_events(AR ? ar_events : events);
 	}
-	announce("the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
+	announce(AR ? "the tertiary MI2S pins (GPIO 121 to 124) to the interface, as Android's active state has them" :
+	    "the TDM pins (GPIO 97 to 100) to the interface, as Android's active state has them");
 	pins_on();
-	if (!afe_on()) {
+	if (AR) {
+		/* the bit clock (PRM), then the whole graph started: the interface's clocks run at the pins from its start */
+		announce("the DSP is asked for the speakers' bit clock (PRM)");
+		ar_clock_on = ar_clock(true);
+		if (!ar_clock_on || !ar_stream_on()) {
+			goto out;
+		}
+	} else if (!afe_on()) {
 		goto out;
 	}
 	sleep_ms(20);
-	pin_activity(97, "the bit clock (gpio97)", &changes, &ones);
-	pin_activity(100, "the frame sync (gpio100)", &sync_changes, &sync_ones);
-	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE TDM CLOCK AND FRAME SYNC RUN at the pins" :
-	    "THE PINS DO NOT SHOW A RUNNING TDM CLOCK");
+	pin_activity(tdm_pins[0].pin, tdm_pins[0].name, &changes, &ones);
+	pin_activity(tdm_pins[1].pin, tdm_pins[1].name, &sync_changes, &sync_ones);
+	say("sound: %s\n", changes > 100 && sync_changes > 4 ? "THE BIT CLOCK AND THE FRAME SYNC RUN at the pins" :
+	    "THE PINS DO NOT SHOW A RUNNING BIT CLOCK");
 	if (level == 1) {
 		sleep_ms(seconds * 1000);
 		ok = true;
 		goto out;
 	}
-	if (!stream_on()) {
+	if (!AR && !stream_on()) {
 		goto out;
 	}
 	if (level == 4) {
@@ -1504,6 +2156,14 @@ hakios_sound_dsp_up(void)
 	}
 	if (level > 4) {
 		level = 4;
+	}
+	PE_parse_boot_argn("sound_soc", &sound_soc, sizeof(sound_soc));
+	if (AR) {
+		if (!hakios_adsp_is_gpr()) {
+			say("sound: sound_soc=8450 is AudioReach's way, and the DSP does not speak GPR (adsp_soc=8450 is needed)\n");
+			return;
+		}
+		tdm_pins = negroni_pins;
 	}
 	PE_parse_boot_argn("sound_secs", &seconds, sizeof(seconds));
 	PE_parse_boot_argn("sound_below", &below, sizeof(below));

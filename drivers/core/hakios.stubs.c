@@ -126,6 +126,7 @@ void hakios_speaker_init(void) {}
 void hakios_sound_dsp_up(void) {}
 void hakios_sound_dsp_down(void) {}
 void hakios_sound_quiesce(void) {}
+void hakios_sound_soft_level(__unused uint32_t below, __unused bool muted) {}
 #endif
 
 #ifndef HAKIOS_MIC

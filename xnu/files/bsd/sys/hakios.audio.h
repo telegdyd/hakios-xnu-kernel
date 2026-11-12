@@ -74,6 +74,22 @@ void hakios_speaker_quiesce(void);     /* powered down at once, without sleeping
 uint32_t hakios_speaker_monitor(bool tell);
 
 /*
+ * The OnePlus 10 Pro's two NXP TFA9874s (drivers/audio/hakios.tfa.c, boot-arg speaker_soc=8450), to which the
+ * functions above hand over; `cnt' is Android's container (/odm/firmware/tfa98xx.cnt). They stay at Android's
+ * gain: the level under it is taken off the samples by the sound's feeder (hakios_sound_soft_level()).
+ */
+bool hakios_tfa_wanted(void);
+void hakios_tfa_probe(uint32_t probe);
+bool hakios_tfa_prepare(const uint8_t *cnt, uint64_t size);
+bool hakios_tfa_start(void);
+bool hakios_tfa_volume(uint32_t below, uint32_t step_ms);
+bool hakios_tfa_healthy(void);
+uint32_t hakios_tfa_monitor(bool tell);
+void hakios_tfa_stop(void);
+void hakios_tfa_quiesce(void);
+void hakios_sound_soft_level(uint32_t below, bool muted);     /* the samples' level, eighths of a dB under Android's */
+
+/*
  * The speakers' guard (drivers/audio/hakios.guard.c): what the samples go through in the feeder on their
  * way to the amplifiers, for want of the DSP's speaker protection. Levels in eighths of a dB.
  */
@@ -115,6 +131,18 @@ typedef bool (*hakios_apr_events_t)(uint8_t service, uint16_t port, uint32_t opc
 bool hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
     uint32_t wait_ms, struct hakios_apr_answer *answer);
 void hakios_adsp_apr_events(hakios_apr_events_t handler);
+/*
+ * SM8450 (adsp_soc=8450): the audio services are AudioReach's and speak GPR instead (hakios.adsp.c). One packet
+ * to a module of the DSP (to_port: its instance ID; APM 1, PRM 2) from a port of ours, the answer waited for
+ * as above; the events' handler gets GPR's packets with service HAKIOS_GPR_SERVICE and port = the DSP's port.
+ */
+#define HAKIOS_GPR_SERVICE     0xff
+bool hakios_adsp_gpr(uint32_t to_port, uint32_t from_port, uint32_t token, uint32_t opcode, const void *payload,
+    uint32_t length, uint32_t wait_ms, struct hakios_apr_answer *answer);
+bool hakios_adsp_is_gpr(void);         /* the DSP's audio services are GPR's (and SPF answered as ready) */
+/* why the last hakios_adsp_gpr() was false: 0 sent but not answered, else the errno it was not sent with */
+extern int hakios_adsp_gpr_error;
+uint32_t hakios_adsp_gpr_room(void);   /* the biggest packet the DSP's intents on adsp_apps take now (0: none known) */
 const uint8_t *hakios_adsp_fw_file(const char *name, uint64_t *size);        /* /fw/name, read whole; give back with: */
 void hakios_adsp_fw_free(const uint8_t *data, uint64_t size);
 

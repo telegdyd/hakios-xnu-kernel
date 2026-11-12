@@ -54,6 +54,7 @@ apfs_write_len	k
 apfs_write_path	k
 applog	k
 applog_name	k
+audio_wait	k
 autounlock	u
 backlight	k
 backlight_max	k
@@ -197,9 +198,11 @@ metal_trace	u
 metal_watch	u
 mic	k
 mic_adc	k
+mic_channel	k
 mic_input	k
 mic_main	k
 mic_secs	k
+mic_slow	k
 mic_tap	k
 mic_test	k
 modem	k
@@ -288,7 +291,9 @@ sound_gain	k
 sound_guard_as	k
 sound_pause	k
 sound_secs	k
+sound_soc	k
 speaker_probe	k
+speaker_soc	k
 surf_clear	k
 surf_wrap	k
 surftrace	k
