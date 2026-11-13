@@ -1,0 +1,321 @@
+/*
+ * Host tests of drivers/wifi/hakios.apple80211.c (the request map, P3a): the source the kernel is built from, behind a
+ * fake station boundary, driven through hakios_apple80211_ioctl() as wifid drives it.
+ */
+#include "shim/shim.h"
+#include <sys/hakios.sta.h>
+
+errno_t hakios_apple80211_ioctl(u_long command, void *data);
+
+#define SIOCSA80211 0x802869c8u
+#define SIOCGA80211 0xc02869c9u
+
+struct apple80211req {
+	char req_if_name[16];
+	int32_t req_type;
+	int32_t req_val;
+	uint32_t req_len;
+	user_addr_t req_data __attribute__((aligned(8)));
+};
+
+static unsigned checks, failures;
+
+#define CHECK(c, ...) do { checks++; if (!(c)) { failures++; printf("FAIL %s:%d: ", __FILE__, __LINE__); \
+	printf(__VA_ARGS__); printf("\n"); } } while (0)
+
+/* ---- the fake station ---- */
+
+static struct hakios_sta_state now;
+static struct hakios_sta_bss heard[3];
+static unsigned heard_count;
+
+int kev_post_msg(struct kev_msg *message) { (void)message; return 0; }
+void proc_selfname(char *name, int size) { snprintf(name, (size_t)size, "wifid"); }
+bool hakios_sta_present(void) { return true; }
+bool hakios_sta_powered(void) { return true; }
+int hakios_sta_ask_power(bool on) { (void)on; return 0; }
+int hakios_sta_ask_scan(const struct hakios_sta_scan *what) { (void)what; return 0; }
+int hakios_sta_ask_join(const struct hakios_sta_join *what) { (void)what; return 0; }
+int hakios_sta_ask_leave(void) { return 0; }
+int hakios_sta_ask_country(const char *code) { (void)code; return 0; }
+bool hakios_sta_country(char *code) { memcpy(code, "DE", 2); return true; }
+void hakios_sta_state(struct hakios_sta_state *state) { *state = now; }
+unsigned hakios_sta_channels(struct hakios_sta_channel *channels, unsigned most) { (void)channels; (void)most; return 0; }
+
+bool
+hakios_sta_heard(unsigned index, struct hakios_sta_bss *bss)
+{
+	if (index >= heard_count) {
+		return false;
+	}
+	*bss = heard[index];
+	return true;
+}
+
+/* ---- requests ---- */
+
+static int
+ask(bool set, int32_t type, int32_t *value, void *data, uint32_t length)
+{
+	struct apple80211req request = { .req_if_name = "en0", .req_type = type, .req_val = value ? *value : 0,
+		                         .req_len = length, .req_data = (user_addr_t)(uintptr_t)data };
+	int error = hakios_apple80211_ioctl(set ? SIOCSA80211 : SIOCGA80211, &request);
+
+	if (value != NULL) {
+		*value = request.req_val;
+	}
+	return error;
+}
+
+static int
+get_value(int32_t type, int32_t *value)
+{
+	*value = -12345;
+	return ask(false, type, value, NULL, 0);
+}
+
+/* ---- networks ---- */
+
+static void
+add(struct hakios_sta_bss *bss, const uint8_t *element, unsigned length)
+{
+	memcpy(bss->elements + bss->elements_length, element, length);
+	bss->elements_length = (uint16_t)(bss->elements_length + length);
+}
+
+static const uint8_t rates_ofdm[] = { 1, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c };     /* 6 ... 54 */
+static const uint8_t rates_b[] = { 1, 4, 0x82, 0x84, 0x8b, 0x96 };                               /* 1, 2, 5.5, 11 */
+
+static void
+ht_cap(struct hakios_sta_bss *bss, bool two)
+{
+	uint8_t e[28] = { 45, 26 };
+
+	e[2 + 3] = 0xff;                        /* rx_mask[0] */
+	e[2 + 4] = two ? 0xff : 0;              /* rx_mask[1] */
+	add(bss, e, sizeof(e));
+}
+
+static void
+ht_op(struct hakios_sta_bss *bss, uint8_t info)
+{
+	uint8_t e[24] = { 61, 22, 36, info };
+
+	add(bss, e, sizeof(e));
+}
+
+static void
+vht(struct hakios_sta_bss *bss, uint16_t map, uint8_t width)
+{
+	uint8_t cap[14] = { 191, 12 }, op[7] = { 192, 5, width, 42 };
+
+	cap[2 + 4] = (uint8_t)map;
+	cap[2 + 5] = (uint8_t)(map >> 8);
+	add(bss, cap, sizeof(cap));
+	add(bss, op, sizeof(op));
+}
+
+static void
+network(uint16_t frequency)
+{
+	bzero(&now, sizeof(now));
+	now.phase = HAKIOS_STA_JOINED;
+	now.bss.frequency = frequency;
+	now.bss.rssi = -60;
+	memcpy(now.bss.bssid, "\x02\x11\x22\x33\x44\x55", 6);
+}
+
+static void
+expect_link(const char *what, uint32_t mode, int32_t rate, int32_t mcs, int32_t streams)
+{
+	uint32_t phy[3] = { 0 };
+	int32_t value;
+	int error;
+
+	CHECK(ask(false, 14, NULL, phy, sizeof(phy)) == 0 && phy[0] == 1 && phy[1] == 0x9e && phy[2] == mode,
+	    "%s: PHY_MODE {%u, %#x, %#x}, want active %#x", what, phy[0], phy[1], phy[2], mode);
+	CHECK(get_value(8, &value) == 0 && value == rate, "%s: RATE %d, want %d", what, value, rate);
+	error = get_value(57, &value);
+	if (mcs < 0) {
+		CHECK(error == ENXIO, "%s: MCS of a legacy link: error %d, want ENXIO", what, error);
+	} else {
+		CHECK(error == 0 && value == mcs, "%s: MCS %d (error %d), want %d", what, value, error, mcs);
+	}
+	CHECK(get_value(353, &value) == 0 && value == streams, "%s: NSS %d, want %d", what, value, streams);
+}
+
+int
+main(void)
+{
+	int32_t value;
+	int error;
+
+	/* not joined */
+	bzero(&now, sizeof(now));
+	now.phase = HAKIOS_STA_IDLE;
+	{
+		uint32_t phy[3] = { 7, 7, 7 }, prot[3] = { 7, 7, 7 };
+		uint8_t deauth[16];
+
+		CHECK(ask(false, 14, NULL, phy, sizeof(phy)) == 0 && phy[0] == 1 && phy[1] == 0x9e && phy[2] == 0,
+		    "PHY_MODE not joined {%u, %#x, %#x}", phy[0], phy[1], phy[2]);
+		CHECK(get_value(8, &value) == ENXIO, "RATE not joined");
+		CHECK(get_value(57, &value) == ENXIO, "MCS not joined");
+		CHECK(get_value(353, &value) == ENXIO, "NSS not joined");
+		CHECK(get_value(5, &value) == 0 && value == 0, "POWERSAVE %d", value);
+		CHECK(get_value(18, &value) == 0 && value == 0, "INT_MIT %d", value);
+		CHECK(ask(false, 6, NULL, prot, sizeof(prot)) == 0 && prot[0] == 1 && prot[1] == 0 && prot[2] == 0, "PROTMODE");
+		memset(deauth, 0xaa, sizeof(deauth));
+		CHECK(ask(false, 29, NULL, deauth, sizeof(deauth)) == 0 && deauth[0] == 1 && deauth[4] == 0 && deauth[8] == 0,
+		    "DEAUTH with nothing lost");
+		{
+			int32_t noise[13];
+
+			CHECK(ask(false, 17, NULL, noise, sizeof(noise)) == ENXIO, "NOISE not joined");
+		}
+	}
+
+	/* lost: DEAUTH says it, and from whom */
+	now.phase = HAKIOS_STA_IDLE;
+	now.last_error = ETIMEDOUT;
+	memcpy(now.bss.bssid, "\x02\x11\x22\x33\x44\x55", 6);
+	{
+		struct {
+			uint32_t version, reason;
+			uint8_t address[6], unused[2];
+		} deauth;
+
+		CHECK(ask(false, 29, NULL, &deauth, sizeof(deauth)) == 0 && deauth.version == 1 && deauth.reason == 4 &&
+		    memcmp(deauth.address, "\x02\x11\x22\x33\x44\x55", 6) == 0, "DEAUTH after a loss: reason %u", deauth.reason);
+	}
+
+	/* VHT, 80 MHz, two streams up to MCS 9 (5 GHz) */
+	network(5180);
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	ht_cap(&now.bss, true);
+	ht_op(&now.bss, 0x05);
+	vht(&now.bss, 0xfffa, 1);
+	expect_link("VHT80 2x2", 0x80, 780, 9, 2);
+
+	/* the owner's access point (P1c): 20 MHz (no "any width" bit), VHT 2x2 -> MCS 8 at most at 20 MHz */
+	network(5180);
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	ht_cap(&now.bss, true);
+	ht_op(&now.bss, 0x08);
+	vht(&now.bss, 0xfffa, 0);
+	expect_link("VHT20 2x2", 0x80, 156, 8, 2);
+
+	/* VHT with only one stream in its map, up to MCS 7 */
+	network(5180);
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	ht_cap(&now.bss, true);
+	ht_op(&now.bss, 0x05);
+	vht(&now.bss, 0xfffc, 1);
+	expect_link("VHT80 1x1 MCS 7", 0x80, 292, 7, 1);
+
+	/* HT on 2.4 GHz: one stream at 20 MHz, two streams at 40 MHz (HT counts the streams into the index) */
+	network(2412);
+	add(&now.bss, rates_b, sizeof(rates_b));
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	ht_cap(&now.bss, false);
+	ht_op(&now.bss, 0x00);
+	vht(&now.bss, 0xfffa, 1);               /* (VHT on 2.4 GHz is not used) */
+	expect_link("HT20 1x1", 0x10, 65, 7, 1);
+	network(2412);
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	ht_cap(&now.bss, true);
+	ht_op(&now.bss, 0x05);
+	expect_link("HT40 2x2", 0x10, 270, 15, 2);
+
+	/* legacy: 802.11b only, 802.11g, 802.11a */
+	network(2437);
+	add(&now.bss, rates_b, sizeof(rates_b));
+	expect_link("11b", 0x4, 11, -1, 1);
+	network(2437);
+	add(&now.bss, rates_b, sizeof(rates_b));
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	expect_link("11g", 0x8, 54, -1, 1);
+	network(5500);
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	expect_link("11a", 0x2, 54, -1, 1);
+
+	/* a truncated element list: no reading past it */
+	network(5180);
+	{
+		uint8_t broken[] = { 45, 26, 0, 0 };
+
+		add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+		add(&now.bss, broken, sizeof(broken));
+	}
+	expect_link("broken HT element", 0x2, 54, -1, 1);
+
+	/* NOISE when joined */
+	{
+		int32_t noise[13];
+
+		CHECK(ask(false, 17, NULL, noise, sizeof(noise)) == 0 && noise[0] == 1 && noise[1] == 1 && noise[7] == -95 &&
+		    noise[3] == -95 && noise[12] == -95, "NOISE joined");
+	}
+
+	/* a short buffer gets only what fits */
+	{
+		uint8_t phy[6];
+
+		memset(phy, 0xee, sizeof(phy));
+		CHECK(ask(false, 14, NULL, phy, 4) == 0 && phy[0] == 1 && phy[4] == 0xee, "PHY_MODE into 4 bytes");
+	}
+
+	/* the beacon cache: one network a request, EIO after the last, then from the first again */
+	heard_count = 3;
+	for (unsigned i = 0; i < heard_count; i++) {
+		bzero(&heard[i], sizeof(heard[i]));
+		heard[i].frequency = 2412;
+		heard[i].ssid_length = 3;
+		heard[i].ssid[0] = 'a' + (char)i;
+	}
+	for (unsigned pass = 0; pass < 2; pass++) {
+		uint8_t result[1164];
+
+		for (unsigned i = 0; i < heard_count; i++) {
+			memset(result, 0, sizeof(result));
+			result[0x8a] = 0x00;
+			result[0x8b] = 0x04;    /* (elements_length: the room, as IO80211 sets it) */
+			error = ask(false, 390, NULL, result, sizeof(result));
+			CHECK(error == 0 && result[0x61] == 'a' + i, "pass %u, network %u: error %d, name %c", pass, i, error,
+			    result[0x61]);
+		}
+		CHECK(ask(false, 390, NULL, result, sizeof(result)) == EIO, "pass %u ends in EIO", pass);
+	}
+	/* ... and does not move SCAN_RESULT's place */
+	{
+		uint8_t result[1164] = { 0 };
+
+		CHECK(ask(false, 11, NULL, result, sizeof(result)) == 0 && result[0x61] == 'a', "SCAN_RESULT starts at the first");
+	}
+
+	/* SET_PROPERTY taken */
+	{
+		static char plist[4104];
+		const char *text = "<?xml version=\"1.0\"?><plist><dict><key>IO80211InterfaceHeartBeat</key><true/></dict></plist>";
+
+		memcpy(plist + 8, text, strlen(text));
+		CHECK(ask(true, 383, NULL, plist, sizeof(plist)) == 0, "SET_PROPERTY taken");
+	}
+
+	/* refused the Broadcom way: EOPNOTSUPP */
+	{
+		static uint8_t room[4104];
+		static const int32_t gets[] = { 96, 97, 115, 346, 386, 387, 423, 7, 47, 49, 79, 80, 107 };
+		static const int32_t sets[] = { 25, 422, 47, 86, 90, 94, 95, 382 };
+
+		for (unsigned i = 0; i < sizeof(gets) / sizeof(gets[0]); i++) {
+			CHECK(ask(false, gets[i], NULL, room, sizeof(room)) == EOPNOTSUPP, "get %d not refused", gets[i]);
+		}
+		for (unsigned i = 0; i < sizeof(sets) / sizeof(sets[0]); i++) {
+			CHECK(ask(true, sets[i], NULL, room, sizeof(room)) == EOPNOTSUPP, "set %d not refused", sets[i]);
+		}
+	}
+
+	printf("apple80211-test: %u checks, %u failed\n", checks, failures);
+	return failures != 0;
+}
