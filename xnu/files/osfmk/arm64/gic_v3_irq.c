@@ -95,6 +95,7 @@ static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor fr
 static uint64_t gic_active_iar[MAX_CPUS];
 uint64_t        gic_unhandled_count;
 uint32_t        gic_last_unhandled;
+extern bool     hakios_its_lpi(uint32_t intid) __attribute__((weak));   /* the ITS's LPIs (bsd/dev/hakios.its.c) */
 
 /*
  * The attached SPIs. A slot is filled before its interrupt is enabled and emptied after it has
@@ -307,7 +308,9 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 		uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
 		uint32_t intid = (uint32_t)(iar & 0xffffff);
 
-		if (intid >= GIC_INTID_SPURIOUS_MIN) {
+		/* 1020-1023 only: an LPI (8192 and up) is acknowledged and must be ended like any other, or this
+		 * processor's running priority stays raised and its timer never comes again (p1b-its2: a reset) */
+		if (intid >= GIC_INTID_SPURIOUS_MIN && intid < 8192) {
 			break;
 		}
 		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
@@ -322,9 +325,11 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			/* comes back only if nobody has in fact asked for that */
 			psci_smp_stop_here();
 		} else if (intid >= 8192) {
-			/* an LPI nobody owns (its_probe=1 takes its own with interrupts off): no GICD bit to mask it by */
-			gic_unhandled_count++;
-			gic_last_unhandled = intid;
+			/* an LPI: the ITS's (bsd/dev/hakios.its.c); one nobody owns has no GICD bit to mask it by */
+			if (!hakios_its_lpi || !hakios_its_lpi(intid)) {
+				gic_unhandled_count++;
+				gic_last_unhandled = intid;
+			}
 		} else if (intid >= GIC_INTID_SPI_MIN && gic_spi_handle(intid)) {
 			/* a driver's */
 		} else {

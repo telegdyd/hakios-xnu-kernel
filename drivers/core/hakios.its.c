@@ -1,31 +1,30 @@
 /*
- * Can this kernel use the GIC's ITS and LPIs under the hypervisor? Only with boot-arg its_probe=1
- * (WIFI-PLAN.md section 7.3, P1a: the first check before an ITS driver is written).
+ * The GIC's ITS: message-signalled interrupts as LPIs (C9, sys/hakios.its.h; WIFI-PLAN.md 7.3, P1a). SM8450 under Gunyah.
  *
- * Today every PCIe interrupt of the Wi-Fi chip goes to a page of RAM and a 1 ms thread polls it. On SM8450 the
- * PCIe MSIs are meant for the GIC-600's ITS (the device tree: msi-controller@17140000, PCIe0's msi-map gives the
- * radio DeviceID 0x5981). Linux on Android uses it, so Gunyah lets its guest have an ITS; whether that is the real
- * one or an emulation, and whether HLOS may program it and the redistributors' LPI registers, is what this finds out.
+ * A PCIe device raises an interrupt by writing an event number to GITS_TRANSLATER; the ITS looks the device (its DeviceID,
+ * which the SMMU/PCIe side gives the write) and the event up in tables in RAM and makes an LPI of it, which a redistributor
+ * hands to its processor like any other interrupt (gic_v3_irq.c calls hakios_its_lpi() for every INTID from 8192 up).
  *
- * Part 1, read: GICD_TYPER (LPIS, MBIS, IDbits), the IIDRs, every redistributor's TYPER/CTLR/PROPBASER/PENDBASER,
- * the ITS's CTLR/TYPER/CBASER/BASER0-7. Part 2, try-write (guarded: a refused access is a line, not a reset), each
- * value read back and the old one put back: this CPU's PROPBASER and PENDBASER (only while its LPIs are off), the
- * ITS's CBASER and its first BASER (only while the ITS is off). Part 3, only when part 2 found all of them writable:
- * one LPI end to end. Tables in RAM, this CPU's LPIs on, the ITS on, MAPC/MAPD/MAPTI for DeviceID 0x5981 event 0 ->
- * LPI 8192, then the ITS's own INT command makes the interrupt as if the radio had written it; with interrupts off
- * on this CPU, ICC_HPPIR1 must show 8192, and it is acknowledged and ended here. Then everything is unmapped and the
- * ITS switched off; the tables stay allocated, because a redistributor's EnableLPIs may not go back to 0.
- * The last line is "its: RESULT ..." with what P1a takes from it.
+ * What the phone showed (its_probe=1, runs p1a-its and p1a-its2, 2026-11-13): the GIC is Gunyah's virtual one (IIDR
+ * 0x47000070, implementer 0x070), GICD_TYPER LPIS 1 IDbits 14; every redistributor PLPIS 1 and EnableLPIs 0 at start;
+ * GITS_TYPER 0x150003e731 (ITT entry 4 bytes, 8 event bits, 32 DeviceID bits, PTA 0: a collection names a processor
+ * number, HCC 0: the collection table is in RAM); BASER0 the device table (8-byte entries), BASER1 the collections, flat,
+ * 4 KiB pages. Its 64-bit registers take only whole 64-bit accesses (32-bit halves fault or are dropped). MAPC and MAPD with V=0
+ * stall the command queue, so neither a collection nor a device is ever unmapped; a redistributor's EnableLPIs cannot be cleared again,
+ * so the tables live for the rest of the boot. An ITS command INT for DeviceID 0x5981 reached CPU 7 in 6 us.
  *
- * Nothing here runs without its_probe=1. A 64-bit register is read and written whole: Gunyah's virtual GIC (IIDR
- * implementer 0x070) refuses or drops 32-bit halves of them, which real GIC-600 would take.
+ * What this keeps: LPIs on for processor 0 only (one collection, ICID 0): every LPI goes to it. 256 LPIs (8192..8447),
+ * handed out to at most 4 devices; a device keeps its LPIs and ITT across off/on. Nothing is touched until a driver asks
+ * (hakios_its_device()) or its_probe=1 runs the self-test.
  *
  * Boot-args:
- *   its_probe=1        run the three parts once, a second after start
- *   its_probe=2        parts 1 and 2 only (no LPI is switched on)
+ *   its_probe=1        a second after start: the GIC's registers said, then the self-test (DeviceID 1, one event,
+ *                      the ITS's own INT command, the handler must run) -> "its: RESULT ..."
+ *   its_probe=2        the registers only
  */
 #include <kern/clock.h>
 #include <kern/cpu_number.h>
+#include <kern/locks.h>
 #include <kern/startup.h>
 #include <kern/processor.h>
 #include <kern/sched_prim.h>
@@ -34,8 +33,10 @@
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <machine/machine_routines.h>
+#include <os/atomic_private.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
+#include <sys/hakios.its.h>
 #include <sys/systm.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
@@ -49,6 +50,7 @@ extern int hakios_mmio_try_read64(const volatile void *, unsigned long long *) _
 extern int hakios_mmio_try_write64(volatile void *, unsigned long long) __attribute__((weak));
 extern kern_return_t thread_terminate(thread_t);
 extern void loader_log_putc(char) __attribute__((weak));
+bool hakios_its_lpi(uint32_t intid);
 
 /* SM8450 (live.dts: interrupt-controller@17100000, msi-controller@17140000, redistributor-stride 0x40000) */
 #define GICD_PA                 0x17100000UL
@@ -58,26 +60,20 @@ extern void loader_log_putc(char) __attribute__((weak));
 #define GICR_STRIDE             0x40000UL
 #define GITS_PA                 0x17140000UL
 #define GITS_SIZE               0x20000UL
-#define RADIO_DEVICE_ID         0x5981u         /* PCIe0 msi-map: RID 0x100 -> 0x5981 */
+#define GITS_TRANSLATER_PA      (GITS_PA + 0x10040UL)
 
 #define GICD_CTLR               0x0000
 #define GICD_TYPER              0x0004
 #define GICD_IIDR               0x0008
 #define GICD_TYPER2             0x000c
-#define GICD_TYPER_MBIS         (1u << 16)
-#define GICD_TYPER_LPIS         (1u << 17)
-
 #define GICR_CTLR               0x0000
 #define GICR_IIDR               0x0004
 #define GICR_TYPER              0x0008
 #define GICR_PROPBASER          0x0070
 #define GICR_PENDBASER          0x0078
 #define GICR_CTLR_ENABLE_LPIS   (1u << 0)
-#define GICR_CTLR_RWP           (1u << 3)
 #define GICR_TYPER_PLPIS        (1u << 0)
-#define GICR_TYPER_DIRECTLPI    (1u << 3)
 #define GICR_TYPER_LAST         (1u << 4)
-
 #define GITS_CTLR               0x0000
 #define GITS_IIDR               0x0004
 #define GITS_TYPER              0x0008
@@ -88,7 +84,6 @@ extern void loader_log_putc(char) __attribute__((weak));
 #define GITS_CTLR_ENABLED       (1u << 0)
 #define GITS_CTLR_QUIESCENT     (1u << 31)
 
-/* table attributes: inner shareable, inner write-back read/write-allocate (Linux's GIC_BASER_CACHE_RaWaWb) */
 #define BASER_VALID             (1ULL << 63)
 #define BASER_INNER_WB          (7ULL << 59)
 #define BASER_SHARE_INNER       (1ULL << 10)
@@ -98,12 +93,41 @@ extern void loader_log_putc(char) __attribute__((weak));
 #define RDIST_SHARE_INNER       (1ULL << 10)
 
 #define LPI_FIRST               8192u
-#define LPI_ID_BITS             14u             /* LPIs 8192..16383: 8 KiB of properties, 2 KiB of pending bits */
-#define LPI_PRIORITY            0x80u           /* above the timer's 0xa0, so ICC_HPPIR1 shows it first */
-#define ITT_EVENT_BITS          5u
+#define LPI_ID_BITS             14u             /* the property table covers 8192..16383 (8 KiB) */
+#define LPIS_MAX                256u            /* handed out: 8192..8447 */
+#define LPI_PRIORITY            0xa0u           /* gic_v3_irq.c's default */
+#define DEVICE_IDS              0x10000u        /* the device table covers DeviceIDs below this (PCIe RIDs) */
+#define DEVICES_MAX             4u
+#define QUEUE_COMMANDS          128u            /* 4 KiB */
 
 static vm_offset_t gicd, gicr, gits;
-static int failures;
+static vm_offset_t rdist;               /* processor 0's redistributor frame */
+
+struct its_device {
+	unsigned id, events, lpi_first;
+	bool used, mapped, itt_mapped;   /* itt_mapped: MAPD done; never undone (Gunyah stalls on MAPD V=0) */
+	vm_offset_t itt;
+	uint64_t itt_pa;
+	void (*handler)(void *context, unsigned event);
+	void *context;
+};
+static struct its_device devices[DEVICES_MAX];
+static struct {
+	struct its_device *device;      /* NULL: nobody's */
+	unsigned event;
+	uint64_t count;
+} lpis[LPIS_MAX];
+static uint32_t lpi_busy;               /* handlers running now */
+static unsigned lpi_next;               /* the next LPI to hand out, from LPI_FIRST */
+static bool its_on;
+static int its_error;                   /* why it cannot be switched on; 0: not tried or on */
+static uint64_t rdbase;                 /* MAPC/SYNC target: processor 0's GIC processor number (PTA 0) */
+static unsigned itt_entry;
+static uint8_t *prop;
+static uint64_t *queue;
+static unsigned queue_next;
+static LCK_GRP_DECLARE(its_group, "hakios-its");
+static LCK_MTX_DECLARE(its_lock, &its_group);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -124,7 +148,6 @@ say(const char *format, ...)
 	return printf("%s", line);
 }
 
-/* Guarded accesses; a refused one is said once per register and counted. */
 static bool
 rd32(vm_offset_t base, unsigned offset, uint32_t *value, const char *name)
 {
@@ -132,7 +155,6 @@ rd32(vm_offset_t base, unsigned offset, uint32_t *value, const char *name)
 	int error = hakios_mmio_try_read32((const volatile void *)(base + offset), &v);
 	if (error) {
 		say("its: read of %s refused: errno %d\n", name, error);
-		failures++;
 		return false;
 	}
 	*value = v;
@@ -145,12 +167,12 @@ wr32(vm_offset_t base, unsigned offset, uint32_t value, const char *name)
 	int error = hakios_mmio_try_write32((volatile void *)(base + offset), value);
 	if (error) {
 		say("its: write of %s refused: errno %d\n", name, error);
-		failures++;
 		return false;
 	}
 	return true;
 }
 
+/* 64-bit registers: one whole access (Gunyah refuses the 32-bit halves) */
 static bool
 rd64(vm_offset_t base, unsigned offset, uint64_t *value, const char *name)
 {
@@ -158,119 +180,43 @@ rd64(vm_offset_t base, unsigned offset, uint64_t *value, const char *name)
 	int error = hakios_mmio_try_read64((const volatile void *)(base + offset), &v);
 	if (error) {
 		say("its: read of %s refused: errno %d\n", name, error);
-		failures++;
 		return false;
 	}
 	*value = v;
 	return true;
 }
 
-/* One 64-bit access: Gunyah's virtual GIC refuses the 32-bit halves of its 64-bit registers (p1a-its, 2026-11-13). */
 static bool
 wr64(vm_offset_t base, unsigned offset, uint64_t value, const char *name)
 {
 	int error = hakios_mmio_try_write64((volatile void *)(base + offset), value);
 	if (error) {
 		say("its: write of %s refused: errno %d\n", name, error);
-		failures++;
 		return false;
 	}
 	return true;
 }
 
-/* Write, read back, put the old value back; true when the bits in `care` stuck. */
 static bool
-try64(vm_offset_t base, unsigned offset, uint64_t test, uint64_t care, const char *name)
+mapped(void)
 {
-	uint64_t old, seen = 0, back = 0;
-	if (!rd64(base, offset, &old, name)) {
-		return false;
+	if (!gicd) {
+		gicd = ml_io_map_unmappable(GICD_PA, GICD_SIZE, VM_WIMG_IO);
+		gicr = ml_io_map_unmappable(GICR_PA, GICR_SIZE, VM_WIMG_IO);
+		gits = ml_io_map_unmappable(GITS_PA, GITS_SIZE, VM_WIMG_IO);
 	}
-	if (!wr64(base, offset, test, name)) {
-		return false;
-	}
-	(void)rd64(base, offset, &seen, name);
-	(void)wr64(base, offset, old, name);
-	(void)rd64(base, offset, &back, name);
-	bool stuck = (seen & care) == (test & care);
-	say("its: try %s: was %#llx, wrote %#llx, read %#llx (%s), restored %#llx%s\n", name, old, test, seen,
-	    stuck ? "WRITABLE" : "not kept", back, back == old ? "" : " (NOT the old value)");
-	return stuck;
+	return gicd && gicr && gits;
 }
 
-/* This CPU's redistributor frame: GICR_TYPER[63:32] is its affinity (Aff3.Aff2.Aff1.Aff0). */
-static vm_offset_t
-my_frame(uint64_t *typer_out, vm_offset_t *pa_out)
+static uint64_t
+micros(void)
 {
-	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
-	uint32_t affinity = (uint32_t)(((mpidr >> 32) & 0xff) << 24 | (mpidr & 0xffffff));
-	for (vm_offset_t off = 0; off + GICR_STRIDE <= GICR_SIZE; off += GICR_STRIDE) {
-		uint64_t typer;
-		if (!rd64(gicr + off, GICR_TYPER, &typer, "GICR_TYPER")) {
-			return 0;
-		}
-		if ((uint32_t)(typer >> 32) == affinity) {
-			*typer_out = typer;
-			*pa_out = GICR_PA + off;
-			return gicr + off;
-		}
-		if (typer & GICR_TYPER_LAST) {
-			break;
-		}
-	}
-	return 0;
+	uint64_t ns;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000;
 }
 
-static void
-part1(void)
-{
-	uint32_t ctlr = 0, typer = 0, iidr = 0, typer2 = 0;
-	(void)rd32(gicd, GICD_CTLR, &ctlr, "GICD_CTLR");
-	(void)rd32(gicd, GICD_TYPER, &typer, "GICD_TYPER");
-	(void)rd32(gicd, GICD_IIDR, &iidr, "GICD_IIDR");
-	(void)rd32(gicd, GICD_TYPER2, &typer2, "GICD_TYPER2");
-	say("its: GICD ctlr %#x typer %#x (LPIS %u, MBIS %u, IDbits %u, ITLines %u) typer2 %#x iidr %#x (implementer %#x product %#x)\n",
-	    ctlr, typer, !!(typer & GICD_TYPER_LPIS), !!(typer & GICD_TYPER_MBIS), ((typer >> 19) & 0x1f) + 1, typer & 0x1f,
-	    typer2, iidr, iidr & 0xfff, iidr >> 24);
-	for (vm_offset_t off = 0; off + GICR_STRIDE <= GICR_SIZE; off += GICR_STRIDE) {
-		uint64_t rt = 0, prop = 0, pend = 0;
-		uint32_t rc = 0, ri = 0;
-		if (!rd64(gicr + off, GICR_TYPER, &rt, "GICR_TYPER")) {
-			break;
-		}
-		(void)rd32(gicr + off, GICR_CTLR, &rc, "GICR_CTLR");
-		(void)rd32(gicr + off, GICR_IIDR, &ri, "GICR_IIDR");
-		(void)rd64(gicr + off, GICR_PROPBASER, &prop, "GICR_PROPBASER");
-		(void)rd64(gicr + off, GICR_PENDBASER, &pend, "GICR_PENDBASER");
-		say("its: GICR %#lx: affinity %#x processor %u PLPIS %u DirectLPI %u ctlr %#x (EnableLPIs %u) iidr %#x propbaser %#llx pendbaser %#llx\n",
-		    GICR_PA + off, (uint32_t)(rt >> 32), (uint32_t)((rt >> 8) & 0xffff), !!(rt & GICR_TYPER_PLPIS),
-		    !!(rt & GICR_TYPER_DIRECTLPI), rc, rc & GICR_CTLR_ENABLE_LPIS, ri, prop, pend);
-		if (rt & GICR_TYPER_LAST) {
-			break;
-		}
-	}
-	uint32_t gctlr = 0, giidr = 0;
-	uint64_t gtyper = 0, cbaser = 0, creadr = 0, cwriter = 0;
-	(void)rd32(gits, GITS_CTLR, &gctlr, "GITS_CTLR");
-	(void)rd32(gits, GITS_IIDR, &giidr, "GITS_IIDR");
-	(void)rd64(gits, GITS_TYPER, &gtyper, "GITS_TYPER");
-	(void)rd64(gits, GITS_CBASER, &cbaser, "GITS_CBASER");
-	(void)rd64(gits, GITS_CWRITER, &cwriter, "GITS_CWRITER");
-	(void)rd64(gits, GITS_CREADR, &creadr, "GITS_CREADR");
-	say("its: GITS ctlr %#x (enabled %u quiescent %u) iidr %#x typer %#llx (physical %u, ITT entry %llu B, IDbits %llu, Devbits %llu, PTA %u, HCC %llu)"
-	    " cbaser %#llx cwriter %#llx creadr %#llx\n", gctlr, gctlr & GITS_CTLR_ENABLED, !!(gctlr & GITS_CTLR_QUIESCENT), giidr,
-	    gtyper, (unsigned)(gtyper & 1), ((gtyper >> 4) & 0xf) + 1, ((gtyper >> 8) & 0x1f) + 1, ((gtyper >> 13) & 0x1f) + 1,
-	    (unsigned)((gtyper >> 19) & 1), (gtyper >> 24) & 0xff, cbaser, cwriter, creadr);
-	for (unsigned n = 0; n < 8; n++) {
-		uint64_t b = 0;
-		if (rd64(gits, GITS_BASER(n), &b, "GITS_BASER")) {
-			say("its: GITS_BASER%u %#llx (type %llu, entry %llu B, valid %u, indirect %u, page size code %llu, size %llu)\n", n, b,
-			    BASER_TYPE(b), BASER_ESIZE(b), (unsigned)(b >> 63), (unsigned)((b >> 62) & 1), (b >> 8) & 3, (b & 0xff) + 1);
-		}
-	}
-}
-
-/* Contiguous, zeroed, physically aligned to `align`; never freed (see the header). */
+/* Contiguous, zeroed, physically aligned to `align`; never freed (EnableLPIs stays on). */
 static vm_offset_t
 table(vm_size_t size, vm_size_t align, uint64_t *pa)
 {
@@ -290,50 +236,7 @@ table(vm_size_t size, vm_size_t align, uint64_t *pa)
 	return va;
 }
 
-static bool
-part2(vm_offset_t frame, uint64_t scratch_pa, bool *rd_ok, bool *its_ok)
-{
-	uint32_t rc = 0, gctlr = 0;
-	*rd_ok = *its_ok = false;
-	if (rd32(frame, GICR_CTLR, &rc, "GICR_CTLR") && !(rc & GICR_CTLR_ENABLE_LPIS)) {
-		bool p = try64(frame, GICR_PROPBASER, scratch_pa | RDIST_SHARE_INNER | RDIST_INNER_WB | (LPI_ID_BITS - 1),
-		    0x000ffffffffff000ULL | 0x1f, "this CPU's GICR_PROPBASER");
-		bool q = try64(frame, GICR_PENDBASER, scratch_pa | RDIST_SHARE_INNER | RDIST_INNER_WB,
-		    0x000fffffffff0000ULL, "this CPU's GICR_PENDBASER");
-		*rd_ok = p && q;
-	} else {
-		say("its: this CPU's LPIs are already on (GICR_CTLR %#x): its PROPBASER/PENDBASER cannot be changed\n", rc);
-	}
-	if (rd32(gits, GITS_CTLR, &gctlr, "GITS_CTLR") && !(gctlr & GITS_CTLR_ENABLED)) {
-		uint64_t b0 = 0;
-		bool c = try64(gits, GITS_CBASER, scratch_pa | BASER_INNER_WB | BASER_SHARE_INNER, 0x000ffffffffff000ULL, "GITS_CBASER");
-		bool d = false;
-		if (rd64(gits, GITS_BASER(0), &b0, "GITS_BASER0") && BASER_TYPE(b0) != 0) {
-			d = try64(gits, GITS_BASER(0), (b0 & (7ULL << 56)) | scratch_pa | BASER_INNER_WB | BASER_SHARE_INNER,
-			    0x0000fffffffff000ULL, "GITS_BASER0 (valid 0)");
-		} else {
-			say("its: GITS_BASER0 has no table type (%#llx): not written\n", b0);
-		}
-		*its_ok = c && d;
-	} else {
-		say("its: the ITS is already on (GITS_CTLR %#x): its tables cannot be changed\n", gctlr);
-	}
-	return *rd_ok && *its_ok;
-}
-
-/* ---- part 3: one LPI through the ITS ---- */
-
-static uint64_t *queue;                 /* 4 KiB command queue: 128 commands of 32 bytes */
-static unsigned queue_next;
-
-static uint64_t
-micros(void)
-{
-	uint64_t ns;
-	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
-	return ns / 1000;
-}
-
+/* One command, and its completion (its_lock held). */
 static bool
 command(const char *what, uint64_t d0, uint64_t d1, uint64_t d2)
 {
@@ -341,7 +244,7 @@ command(const char *what, uint64_t d0, uint64_t d1, uint64_t d2)
 	c[0] = d0; c[1] = d1; c[2] = d2; c[3] = 0;
 	FlushPoC_DcacheRegion((vm_offset_t)c, 32);
 	__builtin_arm_dsb(0xf);
-	queue_next = (queue_next + 1) % 128;
+	queue_next = (queue_next + 1) % QUEUE_COMMANDS;
 	if (!wr64(gits, GITS_CWRITER, (uint64_t)queue_next * 32, "GITS_CWRITER")) {
 		return false;
 	}
@@ -352,6 +255,7 @@ command(const char *what, uint64_t d0, uint64_t d1, uint64_t d2)
 		}
 		if (r & 1) {
 			say("its: command %s stalled the queue (CREADR %#llx)\n", what, r);
+			its_error = EIO;
 			return false;
 		}
 		if ((r & 0xfffe0) == (uint64_t)queue_next * 32) {
@@ -359,157 +263,386 @@ command(const char *what, uint64_t d0, uint64_t d1, uint64_t d2)
 		}
 		if (micros() - start > 10000) {
 			say("its: command %s not taken in 10 ms (CREADR %#llx, CWRITER %#x)\n", what, r, queue_next * 32);
+			its_error = EIO;
 			return false;
 		}
 	}
 }
 
-static const char *
-part3(vm_offset_t frame, vm_offset_t frame_pa, uint64_t frame_typer, uint64_t *latency_us)
-{
-	uint64_t gtyper = 0, prop_pa = 0, pend_pa = 0, itt_pa = 0, queue_pa = 0, x = 0;
-	uint32_t v = 0;
-	if (!rd64(gits, GITS_TYPER, &gtyper, "GITS_TYPER")) {
-		return "GITS_TYPER unreadable";
-	}
-	unsigned devbits = (unsigned)((gtyper >> 13) & 0x1f) + 1, itt_entry = (unsigned)((gtyper >> 4) & 0xf) + 1;
-	unsigned hcc = (unsigned)((gtyper >> 24) & 0xff);
-	bool pta = (gtyper >> 19) & 1;
-	if (devbits < 15) {
-		return "the ITS has fewer than 15 DeviceID bits";
-	}
+#define CMD_SYNC()              command("SYNC", 0x05, 0, rdbase << 16)
 
-	/* the redistributor's tables, then its LPIs on */
-	uint8_t *prop = (uint8_t *)table((1u << LPI_ID_BITS) - LPI_FIRST, PAGE_SIZE, &prop_pa);
+/* Processor 0's LPIs and the ITS on, run on processor 0 (its_up). 0, or an errno (kept: not tried again). */
+static int
+its_up_here(void)
+{
+	uint64_t typer = 0, gtyper = 0, x = 0, pa;
+	uint32_t v = 0;
+	if (its_on) {
+		return 0;
+	}
+	if (its_error) {
+		return its_error;
+	}
+	its_error = ENXIO;
+	if (!hakios_mmio_try_read64 || !hakios_mmio_try_write64 || !mapped()) {
+		say("its: not switched on: no guarded 64-bit MMIO or no mapping\n");
+		return its_error;
+	}
+	/* this processor's (0's) redistributor: the frame whose GICR_TYPER[63:32] is its affinity */
+	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
+	uint32_t affinity = (uint32_t)(((mpidr >> 32) & 0xff) << 24 | (mpidr & 0xffffff));
+	rdist = 0;
+	for (vm_offset_t off = 0; off + GICR_STRIDE <= GICR_SIZE && rdist == 0; off += GICR_STRIDE) {
+		if (!rd64(gicr + off, GICR_TYPER, &typer, "GICR_TYPER")) {
+			return its_error;
+		}
+		if ((uint32_t)(typer >> 32) == affinity) {
+			rdist = gicr + off;
+		} else if (typer & GICR_TYPER_LAST) {
+			break;
+		}
+	}
+	if (rdist == 0) {
+		say("its: not switched on: no redistributor for affinity %#x (cpu %d)\n", affinity, cpu_number());
+		return its_error;
+	}
+	if (!rd64(rdist, GICR_TYPER, &typer, "GICR_TYPER") || !rd32(rdist, GICR_CTLR, &v, "GICR_CTLR") ||
+	    !rd64(gits, GITS_TYPER, &gtyper, "GITS_TYPER")) {
+		return its_error;
+	}
+	if (!(typer & GICR_TYPER_PLPIS)) {
+		say("its: not switched on: processor 0's redistributor has no LPIs (GICR_TYPER %#llx)\n", typer);
+		return its_error;
+	}
+	if (v & GICR_CTLR_ENABLE_LPIS) {
+		say("its: not switched on: processor 0's LPIs were left on (GICR_CTLR %#x) by an earlier kernel, with its tables\n", v);
+		return its_error;
+	}
+	if (!rd32(gits, GITS_CTLR, &v, "GITS_CTLR") || (v & GITS_CTLR_ENABLED)) {
+		say("its: not switched on: the ITS is already on (GITS_CTLR %#x)\n", v);
+		return its_error;
+	}
+	if (((gtyper >> 13) & 0x1f) + 1 < 16 || ((gtyper >> 19) & 1)) {
+		say("its: not switched on: GITS_TYPER %#llx (fewer than 16 DeviceID bits, or PTA 1)\n", gtyper);
+		return its_error;
+	}
+	itt_entry = (unsigned)((gtyper >> 4) & 0xf) + 1;
+	unsigned hcc = (unsigned)((gtyper >> 24) & 0xff);
+	rdbase = (typer >> 8) & 0xffff;
+
+	uint64_t prop_pa = 0, pend_pa = 0, queue_pa = 0;
+	prop = (uint8_t *)table((1u << LPI_ID_BITS) - LPI_FIRST, PAGE_SIZE, &prop_pa);
 	vm_offset_t pend = table(0x10000, 0x10000, &pend_pa);
-	vm_offset_t itt = table((1u << ITT_EVENT_BITS) * itt_entry, 256, &itt_pa);
 	queue = (uint64_t *)table(4096, 0x10000, &queue_pa);
-	if (!prop || !pend || !itt || !queue) {
-		return "no memory for the tables";
+	if (!prop || !pend || !queue) {
+		say("its: not switched on: no memory for its tables\n");
+		its_error = ENOMEM;
+		return its_error;
 	}
-	prop[0] = LPI_PRIORITY | 2 | 1;         /* LPI 8192: priority, RES1, enabled */
-	FlushPoC_DcacheRegion((vm_offset_t)prop, 64);
-	if (!wr64(frame, GICR_PROPBASER, prop_pa | RDIST_SHARE_INNER | RDIST_INNER_WB | (LPI_ID_BITS - 1), "GICR_PROPBASER") ||
-	    !wr64(frame, GICR_PENDBASER, pend_pa | RDIST_SHARE_INNER | RDIST_INNER_WB | (1ULL << 62), "GICR_PENDBASER")) {
-		return "redistributor table write refused";
+	if (!wr64(rdist, GICR_PROPBASER, prop_pa | RDIST_SHARE_INNER | RDIST_INNER_WB | (LPI_ID_BITS - 1), "GICR_PROPBASER") ||
+	    !wr64(rdist, GICR_PENDBASER, pend_pa | RDIST_SHARE_INNER | RDIST_INNER_WB | (1ULL << 62), "GICR_PENDBASER") ||
+	    !rd64(rdist, GICR_PROPBASER, &x, "GICR_PROPBASER") || (x & 0x000ffffffffff000ULL) != prop_pa) {
+		say("its: not switched on: GICR_PROPBASER reads %#llx\n", x);
+		return its_error;
 	}
-	(void)rd64(frame, GICR_PROPBASER, &x, "GICR_PROPBASER");
-	say("its: GICR_PROPBASER now %#llx (shareability %llu)\n", x, (x >> 10) & 3);
-	if (!rd32(frame, GICR_CTLR, &v, "GICR_CTLR") || !wr32(frame, GICR_CTLR, v | GICR_CTLR_ENABLE_LPIS, "GICR_CTLR")) {
-		return "GICR_CTLR refused";
+	/* Set from another processor, Gunyah left it 0 (p1b-its: GICR_CTLR 0x4); from its own it took (p1a-its2). Waited for. */
+	if (!rd32(rdist, GICR_CTLR, &v, "GICR_CTLR") || !wr32(rdist, GICR_CTLR, v | GICR_CTLR_ENABLE_LPIS, "GICR_CTLR")) {
+		return its_error;
 	}
 	__builtin_arm_dsb(0xf);
-	(void)rd32(frame, GICR_CTLR, &v, "GICR_CTLR");
-	say("its: this CPU's GICR_CTLR now %#x\n", v);
-	if (!(v & GICR_CTLR_ENABLE_LPIS)) {
-		return "EnableLPIs did not stay on";
+	uint64_t since = micros();
+	while (rd32(rdist, GICR_CTLR, &v, "GICR_CTLR") && !(v & GICR_CTLR_ENABLE_LPIS) && micros() - since < 10000) {
+		delay(10);
 	}
-
-	/* the ITS's tables: device (type 1) and, without room in the ITS itself, collections (type 4) */
+	if (!(v & GICR_CTLR_ENABLE_LPIS)) {
+		say("its: not switched on: EnableLPIs does not stay on (GICR_CTLR %#x, cpu %d)\n", v, cpu_number());
+		return its_error;
+	}
 	for (unsigned n = 0; n < 8; n++) {
-		uint64_t b = 0, t_pa;
+		uint64_t b = 0;
 		if (!rd64(gits, GITS_BASER(n), &b, "GITS_BASER")) {
-			return "GITS_BASER unreadable";
+			return its_error;
 		}
-		unsigned type = (unsigned)BASER_TYPE(b);
 		vm_size_t bytes;
-		if (type == 1) {
-			bytes = (vm_size_t)(RADIO_DEVICE_ID + 1) * BASER_ESIZE(b);
-		} else if (type == 4 && hcc == 0) {
+		if (BASER_TYPE(b) == 1) {
+			bytes = (vm_size_t)DEVICE_IDS * BASER_ESIZE(b);
+		} else if (BASER_TYPE(b) == 4 && hcc == 0) {
 			bytes = 4096;
 		} else {
 			continue;
 		}
 		bytes = (bytes + 0xfff) & ~(vm_size_t)0xfff;
-		if (bytes > 256 * 4096) {
-			return "the device table would need the two-level form";
+		if (bytes > 256 * 4096 || !table(bytes, 0x10000, &pa)) {
+			say("its: not switched on: no %lu bytes for ITS table %u\n", (unsigned long)bytes, n);
+			return its_error;
 		}
-		if (!table(bytes, 0x10000, &t_pa)) {
-			return "no memory for an ITS table";
-		}
-		uint64_t w = BASER_VALID | BASER_INNER_WB | (b & (7ULL << 56)) | BASER_SHARE_INNER | t_pa | (bytes / 4096 - 1);
-		if (!wr64(gits, GITS_BASER(n), w, "GITS_BASER")) {
-			return "GITS_BASER refused";
-		}
-		(void)rd64(gits, GITS_BASER(n), &x, "GITS_BASER");
-		say("its: GITS_BASER%u type %u: wrote %#llx, reads %#llx\n", n, type, w, x);
-		if (!(x >> 63) || (x & 3ULL << 8) != 0) {
-			return "an ITS table was not taken as written (valid or page size)";
+		uint64_t w = BASER_VALID | BASER_INNER_WB | (b & (7ULL << 56)) | BASER_SHARE_INNER | pa | (bytes / 4096 - 1);
+		if (!wr64(gits, GITS_BASER(n), w, "GITS_BASER") || !rd64(gits, GITS_BASER(n), &x, "GITS_BASER") ||
+		    !(x >> 63) || (x & 0x0000fffffffff000ULL) != pa || (x & (3ULL << 8)) != 0) {
+			say("its: not switched on: GITS_BASER%u wrote %#llx, reads %#llx\n", n, w, x);
+			return its_error;
 		}
 	}
 	if (!wr64(gits, GITS_CBASER, BASER_VALID | BASER_INNER_WB | BASER_SHARE_INNER | queue_pa, "GITS_CBASER") ||
-	    !wr64(gits, GITS_CWRITER, 0, "GITS_CWRITER")) {
-		return "GITS_CBASER refused";
+	    !wr64(gits, GITS_CWRITER, 0, "GITS_CWRITER") || !rd32(gits, GITS_CTLR, &v, "GITS_CTLR") ||
+	    !wr32(gits, GITS_CTLR, v | GITS_CTLR_ENABLED, "GITS_CTLR")) {
+		return its_error;
 	}
 	queue_next = 0;
-	(void)rd64(gits, GITS_CBASER, &x, "GITS_CBASER");
-	say("its: GITS_CBASER now %#llx\n", x);
-	if (!rd32(gits, GITS_CTLR, &v, "GITS_CTLR") || !wr32(gits, GITS_CTLR, v | GITS_CTLR_ENABLED, "GITS_CTLR")) {
-		return "GITS_CTLR refused";
+	its_error = 0;
+	if (!command("MAPC", 0x09, 0, BASER_VALID | (rdbase << 16) | 0) || !CMD_SYNC()) {
+		return its_error ? its_error : (its_error = EIO);
 	}
-	(void)rd32(gits, GITS_CTLR, &v, "GITS_CTLR");
-	say("its: GITS_CTLR now %#x\n", v);
+	its_on = true;
+	say("its: on: processor 0's LPIs (GIC processor %llu), %u LPIs from %u, DeviceIDs below %#x, ITT entry %u bytes\n",
+	    rdbase, LPIS_MAX, LPI_FIRST, DEVICE_IDS, itt_entry);
+	return 0;
+}
 
-	uint64_t rdbase = pta ? (frame_pa >> 16) : ((frame_typer >> 8) & 0xffff);
-	uint64_t dev = (uint64_t)RADIO_DEVICE_ID << 32;
-	const char *result = NULL;
-	if (!command("MAPC", 0x09, 0, (1ULL << 63) | (rdbase << 16) | 0) ||
-	    !command("SYNC", 0x05, 0, rdbase << 16) ||
-	    !command("MAPD", 0x08 | dev, ITT_EVENT_BITS - 1, (1ULL << 63) | itt_pa) ||
-	    !command("MAPTI", 0x0a | dev, 0 | ((uint64_t)LPI_FIRST << 32), 0) ||
-	    !command("INV", 0x0c | dev, 0, 0) ||
-	    !command("SYNC", 0x05, 0, rdbase << 16)) {
-		result = "an ITS command failed";
+/* its_up_here() on processor 0 itself: Gunyah takes a redistributor's EnableLPIs only from its own processor. */
+static int
+its_up(void)
+{
+	if (its_on || its_error) {
+		return its_on ? 0 : its_error;
 	}
+	processor_t was = thread_bind(cpu_to_processor(0));
+	thread_block(THREAD_CONTINUE_NULL);
+	int error;
+	if (cpu_number() == 0) {
+		error = its_up_here();
+	} else {
+		say("its: not switched on: could not run on processor 0 (on %d)\n", cpu_number());
+		error = ENXIO;
+	}
+	if (error && !its_error) {
+		its_error = error;
+	}
+	thread_bind(was);
+	thread_block(THREAD_CONTINUE_NULL);
+	return error;
+}
 
-	if (result == NULL) {
-		boolean_t was = ml_set_interrupts_enabled(FALSE);
-		uint64_t start = micros(), seen = 0, iar = 0;
-		bool ok = command("INT", 0x03 | dev, 0, 0);
-		while (ok && micros() - start < 10000) {
-			uint64_t h = __builtin_arm_rsr64("S3_0_C12_C12_2");     /* ICC_HPPIR1_EL1 */
-			if ((h & 0xffffff) == LPI_FIRST) {
-				seen = micros() - start;
-				iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
-				__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
-				__builtin_arm_isb(0xf);
-				break;
+int
+hakios_its_device(unsigned device_id, unsigned events, void (*handler)(void *context, unsigned event), void *context,
+    unsigned long long *doorbell)
+{
+	struct its_device *d = NULL;
+	int error;
+	if (device_id >= DEVICE_IDS || events == 0 || events > 256 || (events & (events - 1)) || handler == NULL || doorbell == NULL) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&its_lock);
+	if ((error = its_up()) != 0) {
+		goto out;
+	}
+	for (unsigned i = 0; i < DEVICES_MAX && d == NULL; i++) {
+		if (devices[i].used && devices[i].id == device_id) {
+			d = &devices[i];
+		}
+	}
+	if (d && (d->mapped || d->events < events)) {
+		error = EBUSY;
+		goto out;
+	}
+	if (d == NULL) {
+		for (unsigned i = 0; i < DEVICES_MAX && d == NULL; i++) {
+			if (!devices[i].used) {
+				d = &devices[i];
 			}
 		}
-		ml_set_interrupts_enabled(was);
-		if (!ok) {
-			result = "the INT command failed";
-		} else if (seen == 0 && iar == 0) {
-			result = "no LPI 8192 pending at this CPU within 10 ms";
-		} else if ((iar & 0xffffff) != LPI_FIRST) {
-			say("its: ICC_HPPIR1 showed 8192 but ICC_IAR1 gave %llu (ended)\n", iar & 0xffffff);
-			result = "the acknowledged interrupt was another";
-		} else {
-			*latency_us = seen;
+		if (d == NULL || lpi_next + events > LPIS_MAX) {
+			error = ENOSPC;
+			goto out;
+		}
+		bzero(d, sizeof(*d));
+		if (!(d->itt = table(events * itt_entry, 256, &d->itt_pa))) {
+			error = ENOMEM;
+			goto out;
+		}
+		d->used = true;
+		d->id = device_id;
+		d->events = events;
+		d->lpi_first = lpi_next;
+		lpi_next += events;
+	}
+	d->handler = handler;
+	d->context = context;
+	for (unsigned e = 0; e < events; e++) {
+		lpis[d->lpi_first + e].event = e;
+		os_atomic_store(&lpis[d->lpi_first + e].device, d, release);
+		prop[d->lpi_first + e] = LPI_PRIORITY | 2 | 1;
+	}
+	FlushPoC_DcacheRegion((vm_offset_t)prop, PAGE_SIZE);
+	__builtin_arm_dsb(0xf);
+	uint64_t dev = (uint64_t)device_id << 32;
+	unsigned bits = 0;
+	while ((1u << bits) < events) {
+		bits++;
+	}
+	if (!d->itt_mapped && !command("MAPD", 0x08 | dev, bits ? bits - 1 : 0, BASER_VALID | d->itt_pa)) {
+		error = EIO;
+		goto out;
+	}
+	d->itt_mapped = true;
+	for (unsigned e = 0; e < events; e++) {
+		uint64_t lpi = LPI_FIRST + d->lpi_first + e;
+		if (!command("MAPTI", 0x0a | dev, e | (lpi << 32), 0) || !command("INV", 0x0c | dev, e, 0)) {
+			error = EIO;
+			goto out;
 		}
 	}
+	if (!CMD_SYNC()) {
+		error = EIO;
+		goto out;
+	}
+	d->mapped = true;
+	*doorbell = GITS_TRANSLATER_PA;
+	say("its: device %#x: %u events -> LPIs %u..%u, doorbell %#lx\n", device_id, events, LPI_FIRST + d->lpi_first,
+	    LPI_FIRST + d->lpi_first + events - 1, (unsigned long)GITS_TRANSLATER_PA);
+out:
+	lck_mtx_unlock(&its_lock);
+	return error;
+}
 
-	/* undo: the mapping, the ITS off, this CPU's LPIs off where the GIC allows it */
-	(void)command("DISCARD", 0x0f | dev, 0, 0);
-	(void)command("MAPD", 0x08 | dev, 0, 0);
-	/* no MAPC with V=0: Gunyah's ITS stalls its queue on it (p1a-its2, CREADR 0x121 at that command); Linux never unmaps one */
-	(void)command("SYNC", 0x05, 0, rdbase << 16);
-	if (rd32(gits, GITS_CTLR, &v, "GITS_CTLR")) {
-		(void)wr32(gits, GITS_CTLR, v & ~GITS_CTLR_ENABLED, "GITS_CTLR");
-	}
-	uint64_t start = micros();
-	while (rd32(gits, GITS_CTLR, &v, "GITS_CTLR") && !(v & GITS_CTLR_QUIESCENT) && micros() - start < 10000) {
-	}
-	say("its: ITS off: GITS_CTLR %#x\n", v);
-	if (rd32(frame, GICR_CTLR, &v, "GICR_CTLR")) {
-		(void)wr32(frame, GICR_CTLR, v & ~GICR_CTLR_ENABLE_LPIS, "GICR_CTLR");
-		start = micros();
-		while (rd32(frame, GICR_CTLR, &v, "GICR_CTLR") && (v & GICR_CTLR_RWP) && micros() - start < 10000) {
+void
+hakios_its_device_off(unsigned device_id)
+{
+	lck_mtx_lock(&its_lock);
+	for (unsigned i = 0; i < DEVICES_MAX; i++) {
+		struct its_device *d = &devices[i];
+		if (!d->used || d->id != device_id || !d->mapped) {
+			continue;
 		}
-		say("its: this CPU's LPIs off asked: GICR_CTLR %#x (%s)\n", v,
-		    v & GICR_CTLR_ENABLE_LPIS ? "EnableLPIs stays 1: the tables stay allocated" : "off");
+		uint64_t dev = (uint64_t)device_id << 32;
+		for (unsigned e = 0; e < d->events; e++) {
+			(void)command("DISCARD", 0x0f | dev, e, 0);
+			prop[d->lpi_first + e] = LPI_PRIORITY | 2;
+		}
+		/* no MAPD with V=0: Gunyah's ITS stalls its queue on it (p1b-its3), as on MAPC V=0 (p1a-its2); the device stays
+		 * mapped to its ITT with no event left, and a later hakios_its_device() maps the events again */
+		(void)CMD_SYNC();
+		FlushPoC_DcacheRegion((vm_offset_t)prop, PAGE_SIZE);
+		for (unsigned e = 0; e < d->events; e++) {
+			os_atomic_store(&lpis[d->lpi_first + e].device, NULL, release);
+		}
+		d->mapped = false;
 	}
-	return result;
+	lck_mtx_unlock(&its_lock);
+	while (os_atomic_load(&lpi_busy, acquire) != 0) {
+		delay(10);
+	}
+}
+
+unsigned long long
+hakios_its_count(unsigned device_id, unsigned event)
+{
+	for (unsigned i = 0; i < DEVICES_MAX; i++) {
+		if (devices[i].used && devices[i].id == device_id && event < devices[i].events) {
+			return lpis[devices[i].lpi_first + event].count;
+		}
+	}
+	return 0;
+}
+
+/* From gic_v3_irq.c, in interrupt context, for every INTID >= 8192: true when it was a device's. */
+bool
+hakios_its_lpi(uint32_t intid)
+{
+	unsigned n = intid - LPI_FIRST;
+	if (intid < LPI_FIRST || n >= LPIS_MAX) {
+		return false;
+	}
+	os_atomic_inc(&lpi_busy, acquire);
+	struct its_device *d = os_atomic_load(&lpis[n].device, acquire);
+	if (d != NULL) {
+		lpis[n].count++;
+		d->handler(d->context, lpis[n].event);
+	}
+	os_atomic_dec(&lpi_busy, release);
+	return d != NULL;
+}
+
+/* ---- its_probe ---- */
+
+static void
+registers(void)
+{
+	uint32_t ctlr = 0, typer = 0, iidr = 0, typer2 = 0;
+	(void)rd32(gicd, GICD_CTLR, &ctlr, "GICD_CTLR");
+	(void)rd32(gicd, GICD_TYPER, &typer, "GICD_TYPER");
+	(void)rd32(gicd, GICD_IIDR, &iidr, "GICD_IIDR");
+	(void)rd32(gicd, GICD_TYPER2, &typer2, "GICD_TYPER2");
+	say("its: GICD ctlr %#x typer %#x (LPIS %u, MBIS %u, IDbits %u) typer2 %#x iidr %#x\n", ctlr, typer, (typer >> 17) & 1,
+	    (typer >> 16) & 1, ((typer >> 19) & 0x1f) + 1, typer2, iidr);
+	for (vm_offset_t off = 0; off + GICR_STRIDE <= GICR_SIZE; off += GICR_STRIDE) {
+		uint64_t rt = 0, prop_r = 0, pend_r = 0;
+		uint32_t rc = 0;
+		if (!rd64(gicr + off, GICR_TYPER, &rt, "GICR_TYPER")) {
+			break;
+		}
+		(void)rd32(gicr + off, GICR_CTLR, &rc, "GICR_CTLR");
+		(void)rd64(gicr + off, GICR_PROPBASER, &prop_r, "GICR_PROPBASER");
+		(void)rd64(gicr + off, GICR_PENDBASER, &pend_r, "GICR_PENDBASER");
+		say("its: GICR %#lx: affinity %#x processor %u PLPIS %u ctlr %#x propbaser %#llx pendbaser %#llx\n", GICR_PA + off,
+		    (uint32_t)(rt >> 32), (uint32_t)((rt >> 8) & 0xffff), (unsigned)(rt & GICR_TYPER_PLPIS), rc, prop_r, pend_r);
+		if (rt & GICR_TYPER_LAST) {
+			break;
+		}
+	}
+	uint32_t gctlr = 0, giidr = 0;
+	uint64_t gtyper = 0, cbaser = 0;
+	(void)rd32(gits, GITS_CTLR, &gctlr, "GITS_CTLR");
+	(void)rd32(gits, GITS_IIDR, &giidr, "GITS_IIDR");
+	(void)rd64(gits, GITS_TYPER, &gtyper, "GITS_TYPER");
+	(void)rd64(gits, GITS_CBASER, &cbaser, "GITS_CBASER");
+	say("its: GITS ctlr %#x iidr %#x typer %#llx cbaser %#llx\n", gctlr, giidr, gtyper, cbaser);
+	for (unsigned n = 0; n < 8; n++) {
+		uint64_t b = 0;
+		if (rd64(gits, GITS_BASER(n), &b, "GITS_BASER") && b) {
+			say("its: GITS_BASER%u %#llx\n", n, b);
+		}
+	}
+}
+
+static uint64_t selftest_at;
+
+static void
+selftest_handler(__unused void *context, unsigned event)
+{
+	if (event == 0 && selftest_at == 0) {
+		selftest_at = micros();
+	}
+}
+
+#define SELFTEST_DEVICE         1u
+
+static void
+selftest(void)
+{
+	unsigned long long doorbell = 0;
+	int error = hakios_its_device(SELFTEST_DEVICE, 1, selftest_handler, NULL, &doorbell);
+	if (error) {
+		say("its: RESULT self-test: the device was not mapped: errno %d\n", error);
+		return;
+	}
+	lck_mtx_lock(&its_lock);
+	uint64_t start = micros();
+	bool sent = command("INT", 0x03 | ((uint64_t)SELFTEST_DEVICE << 32), 0, 0);
+	lck_mtx_unlock(&its_lock);
+	while (sent && selftest_at == 0 && micros() - start < 20000) {
+		delay(10);
+	}
+	uint64_t count = hakios_its_count(SELFTEST_DEVICE, 0);
+	hakios_its_device_off(SELFTEST_DEVICE);
+	if (!sent) {
+		say("its: RESULT self-test: the INT command failed\n");
+	} else if (selftest_at == 0) {
+		say("its: RESULT self-test: no LPI in 20 ms (count %llu)\n", count);
+	} else {
+		say("its: RESULT self-test ok: INT -> its LPI -> handler on processor 0 in %llu us (count %llu); command queue %s\n",
+		    selftest_at - start, count, its_error ? "STALLED" : "fine after the switch-off");
+	}
 }
 
 static void
@@ -519,52 +652,14 @@ probe_thread(void *arg, wait_result_t result)
 	(void)result;
 	assert_wait_timeout((event_t)&gits, THREAD_UNINT, 1000, NSEC_PER_MSEC);
 	(void)thread_block(THREAD_CONTINUE_NULL);
-
-	gicd = ml_io_map_unmappable(GICD_PA, GICD_SIZE, VM_WIMG_IO);
-	gicr = ml_io_map_unmappable(GICR_PA, GICR_SIZE, VM_WIMG_IO);
-	gits = ml_io_map_unmappable(GITS_PA, GITS_SIZE, VM_WIMG_IO);
-	if (!gicd || !gicr || !gits) {
+	if (!mapped()) {
 		say("its: RESULT not run: could not map the GIC\n");
-		goto done;
-	}
-	part1();
-
-	/* the rest on one CPU: its redistributor is the one written */
-	thread_bind(current_processor());
-	thread_block(THREAD_CONTINUE_NULL);
-	uint64_t frame_typer = 0, scratch_pa = 0, latency = 0;
-	vm_offset_t frame_pa = 0, frame = my_frame(&frame_typer, &frame_pa);
-	bool rd_ok = false, its_ok = false;
-	if (frame == 0) {
-		say("its: RESULT not run: no redistributor frame for this CPU (cpu %d)\n", cpu_number());
-		goto unbind;
-	}
-	say("its: on cpu %d, redistributor %#lx\n", cpu_number(), (unsigned long)frame_pa);
-	if (!(frame_typer & GICR_TYPER_PLPIS)) {
-		say("its: RESULT no LPIs: GICR_TYPER.PLPIS is 0; P1a falls back to the SPI doorbell or the timer\n");
-		goto unbind;
-	}
-	if (!table(0x10000, 0x10000, &scratch_pa)) {
-		say("its: RESULT not run: no memory\n");
-		goto unbind;
-	}
-	bool writable = part2(frame, scratch_pa, &rd_ok, &its_ok);
-	if (!writable || mode == 2) {
-		say("its: RESULT part 2: redistributor LPI registers %s, ITS tables %s, %d refused accesses%s\n",
-		    rd_ok ? "writable" : "NOT writable", its_ok ? "writable" : "NOT writable", failures,
-		    mode == 2 ? " (its_probe=2: no LPI switched on)" : "; no LPI test");
-		goto unbind;
-	}
-	const char *why = part3(frame, frame_pa, frame_typer, &latency);
-	if (why == NULL) {
-		say("its: RESULT LPI works: DeviceID %#x event 0 -> LPI %u reached cpu %d in %llu us through the ITS; %d refused accesses\n",
-		    RADIO_DEVICE_ID, LPI_FIRST, cpu_number(), latency, failures);
 	} else {
-		say("its: RESULT LPI test failed: %s; %d refused accesses\n", why, failures);
+		registers();
+		if (mode == 1) {
+			selftest();
+		}
 	}
-unbind:
-	thread_bind(PROCESSOR_NULL);
-done:
 	thread_terminate(current_thread());
 }
 

@@ -56,6 +56,29 @@ void *linux_dma_alloc_coherent(struct device *dev,size_t n,dma_addr_t *iova,int 
  if (fail_dma) return NULL;
  assert(n==4096); *iova=0xa0000000; return dma;
 }
+/* The ITS seam (lx_os_pci_msi*): -1 = wifi_its=0 by default, so the mailbox tests above are unchanged. */
+static int msi_result=-1; static unsigned msi_offs, wait_step;
+static unsigned per_irq[32];
+static irqreturn_t vhandler(int irq,void *data) { per_irq[irq-IRQ_BASE]++; return IRQ_HANDLED; }
+int lx_os_pci_msi(unsigned vectors,unsigned long long *address,unsigned *data)
+{
+ if (msi_result) return msi_result;
+ *address=0xa4000040; *data=0; return 0;
+}
+/* the script of test_its: what fired while the thread slept, and what else happened meanwhile */
+unsigned lx_os_pci_msi_wait(unsigned ms)
+{
+ assert(ms==10);
+ switch (wait_step++) {
+ case 0: return 1u<<1;                                         /* vector 1 alone */
+ case 1: lkpi_disable_irq(IRQ_BASE+2); return 1u<<2;           /* vector 2, while disabled: owed */
+ case 2: lkpi_enable_irq(IRQ_BASE+2); return 1u<<0;            /* vector 0; 2 enabled again: replayed at once */
+ case 3: return 0;                                             /* 10 ms quiet: every handler */
+ default: endpoint.stop=true; return 0;
+ }
+}
+void lx_os_pci_msi_off(void) { msi_offs++; }
+unsigned long long lx_os_pci_msi_count(unsigned vector) { return 0; }
 static unsigned cfg(unsigned off,unsigned n) { unsigned v=0; memcpy(&v,config+off,n); return v; }
 static void setup(void)
 {
@@ -64,6 +87,7 @@ static void setup(void)
  endpoint.link.bar0_size=sizeof(bar); endpoint.link.bar0_pa=0x60400000;
  endpoint.dev.msi_cap=0x50; option_msi=32; fault_offset=~0u; stuck_mask_offset=~0u; fail_dma=fail_thread=fail_readback=raw_fault=fail_enable_write=false;
  unsigned flags=0x80|(5u<<1); memcpy(config+0x52,&flags,2); handlers_called=0; cfg_writes=0;
+ msi_result=-1; msi_offs=0; wait_step=0; memset(per_irq,0,sizeof(per_irq));
 }
 static irqreturn_t handler(int irq,void *data) { handlers_called+=(unsigned)(uintptr_t)data; return IRQ_HANDLED; }
 static void run_poll(void) { endpoint.stop=false; endpoint.polling=true; poll(NULL); assert(!endpoint.polling); }
@@ -169,9 +193,27 @@ static void test_registration_and_mmio(void)
  assert(!endpoint.enabled && !endpoint.region && !endpoint.dev.msi_cap && !endpoint.pcie_cap);
  assert(!endpoint.msi.msg.address_lo && !endpoint.msi.msg.address_hi);
 }
+static void test_its(void)
+{
+ setup(); msi_result=0; assert(lx_pci_alloc_irq_vectors(&endpoint.dev,32,32,1)==32);
+ assert(endpoint.its && !endpoint.mailbox);
+ assert(lx_irq_get_msi_desc(IRQ_BASE)->msg.address_lo==0xa4000040 && lx_irq_get_msi_desc(IRQ_BASE)->msg.data==0);
+ assert(cfg(0x54,4)==0xa4000040 && cfg(0x58,4)==0 && cfg(0x5c,2)==0 && (cfg(0x52,2)&1));
+ for (unsigned v=0;v<3;v++) assert(!lkpi_request_irq(NULL,IRQ_BASE+v,vhandler,NULL,0,"v",(void *)(uintptr_t)(v+1)));
+ run_poll();
+ /* first pass all (1 each); v1 (+1); v2 owed; v0 (+1) and v2 replayed (+1); the quiet 10 ms: all (+1) */
+ assert(per_irq[0]==3 && per_irq[1]==3 && per_irq[2]==3 && wait_step==5);
+ lx_pci_free_irq_vectors(&endpoint.dev); assert(msi_offs==1 && !endpoint.its);
+ /* the kernel refuses: the mailbox, as before */
+ setup(); msi_result=5; assert(lx_pci_alloc_irq_vectors(&endpoint.dev,32,32,1)==32);
+ assert(!endpoint.its && endpoint.mailbox && cfg(0x54,4)==0xa0000000 && lx_irq_get_msi_desc(IRQ_BASE)->msg.data==0x100);
+ run_poll(); lx_pci_free_irq_vectors(&endpoint.dev); assert(!msi_offs);
+ /* a failure after the doorbell was given: it is given back */
+ setup(); msi_result=0; fail_thread=true; assert(lx_pci_alloc_irq_vectors(&endpoint.dev,32,32,1)==-EAGAIN); assert(msi_offs==1 && !endpoint.its);
+}
 int main(void)
 {
- test_msi(); test_per_vector_mask(); test_failed_probe_retry(); test_failures(); test_handlers(); test_deferred(); test_registration_and_mmio();
- puts("pci-test: MSI32/single, enable order, allocation/config/readback failures, shared IRQ detach, masking, deferred work and teardown passed");
+ test_msi(); test_per_vector_mask(); test_failed_probe_retry(); test_failures(); test_handlers(); test_deferred(); test_registration_and_mmio(); test_its();
+ puts("pci-test: MSI32/single, enable order, allocation/config/readback failures, shared IRQ detach, masking, deferred work, teardown and the ITS doorbell (wake, replay, net, fallback) passed");
  return 0;
 }

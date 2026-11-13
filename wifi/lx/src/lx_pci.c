@@ -1,7 +1,8 @@
 /*
  * RC0 endpoint for upstream ath11k PCI (17cb:1103). C4 owns the hardware
  * and the IOVA mapping. No direct access to unlinked or invalid BAR space.
- * MSI writes a coherent RAM mailbox; handlers are polled every millisecond,
+ * MSI writes the ITS doorbell (an LPI each: the thread wakes) or, without it
+ * (wifi_its=0, or the kernel refused), a coherent RAM mailbox; handlers are then polled every millisecond,
  * including when two messages overwrite the mailbox before we observe them.
  * The mailbox is diagnostic, never a condition for servicing an event ring.
  */
@@ -29,7 +30,7 @@ static struct {
  struct msi_desc msi;
  unsigned pcie_cap, vectors, msi_control, msi_mask_off, msi_mask_original;
  unsigned depth[VECTORS], status[VECTORS];
- bool enabled, region, linked, stop, polling;
+ bool enabled, region, linked, stop, polling, its;
  void *poll_owner;
  volatile u32 *mailbox;
  dma_addr_t mailbox_dma;
@@ -156,18 +157,40 @@ void lx_pci_write32(u32 v,volatile void *va)
 }
 static void deferred_poll(void);
 static void deferred_clear(void);
+static bool deferred_queued(void);
+/* What the ITS delivered, said once 20 s after MSIs started: the vectors that fired and how often. */
+static void msi_counts(const char *when)
+{
+ char line[200]; unsigned at=0; unsigned long long total=0;
+ for (unsigned v=0;v<endpoint.vectors && at<sizeof(line)-24;v++) {
+  unsigned long long n=lx_os_pci_msi_count(v); total+=n;
+  if (n) at+=snprintf(line+at,sizeof(line)-at," %u:%llu",v,n);
+ }
+ line[at]=0;
+ lx_tell("msi: ITS LPIs %s: %llu in all;%s\n",when,total,at ? line : " none");
+}
+/*
+ * The handlers' thread. With the ITS (endpoint.its) it sleeps until a vector fires and calls only the handlers of the
+ * vectors that fired; one that fired while its vector was disabled is called once it is enabled again (as Linux replays
+ * an edge interrupt); while a tasklet or NAPI is queued it does not sleep; and every 10 ms without an interrupt it calls
+ * all of them, as a net under a lost message. Without the ITS: all of them every millisecond (the RAM mailbox).
+ */
 static void poll(void *arg)
 {
+ unsigned want=~0u, owed=0;
+ unsigned long long started=lx_os_nanoseconds(); bool counted=false;
  endpoint.poll_owner=lx_os_thread_self();
  while (!endpoint.stop) {
   for (unsigned i=0;i<HANDLERS;i++) {
-   irq_handler_t handler,thread; void *data; unsigned irq;
+   irq_handler_t handler,thread; void *data; unsigned irq, bit;
    lx_os_lock();
    irq=endpoint.handlers[i].irq;
    handler=endpoint.handlers[i].handler;
    thread=endpoint.handlers[i].thread;
    data=endpoint.handlers[i].arg;
-   if (!handler || endpoint.depth[irq-IRQ_BASE]) { lx_os_unlock(); continue; }
+   bit=1u<<((irq-IRQ_BASE)&31);
+   if (!handler || !(want & bit)) { lx_os_unlock(); continue; }
+   if (endpoint.depth[irq-IRQ_BASE]) { owed|=bit; lx_os_unlock(); continue; }
    endpoint.handlers[i].active++;
    lx_os_unlock();
    irqreturn_t result=handler(irq,data);
@@ -175,7 +198,17 @@ static void poll(void *arg)
    lx_os_lock(); endpoint.handlers[i].active--; lx_os_unlock();
   }
   deferred_poll();
-  lx_pause_ms(1);
+  if (!endpoint.its) { lx_pause_ms(1); continue; }
+  if (!counted && lx_os_nanoseconds()-started>20000000000ull) { counted=true; msi_counts("in the first 20 s"); }
+  unsigned masked=0; bool queued;
+  lx_os_lock();
+  for (unsigned v=0;v<endpoint.vectors;v++) if (endpoint.depth[v]) masked|=1u<<v;
+  queued=deferred_queued();
+  lx_os_unlock();
+  unsigned ready=owed & ~masked;
+  if (queued || ready) { owed&=~ready; want=ready; continue; }
+  unsigned fired=lx_os_pci_msi_wait(10);
+  want=fired ? fired : ~0u;
  }
  endpoint.poll_owner=NULL;
  lx_os_lock(); endpoint.polling=false; lx_os_wakeup(&endpoint); lx_os_unlock();
@@ -206,18 +239,28 @@ int lx_pci_alloc_irq_vectors(struct pci_dev *p,int min,int max,unsigned flags)
  endpoint.msi_control=control & ~1u;
  /* A failed DMA allocation must not leave an old mailbox target enabled. */
  ret=cfg_write(p->msi_cap+2,2,control & ~1u); if (ret) goto fail;
- if (!endpoint.mailbox) {
-  endpoint.mailbox=linux_dma_alloc_coherent(&p->dev,4096,&endpoint.mailbox_dma,GFP_KERNEL);
-  if (!endpoint.mailbox || endpoint.mailbox_dma>0xfffff000ull || (endpoint.mailbox_dma & 4095)) { ret=-ENOMEM; goto fail; }
+ /* The ITS's doorbell when the kernel has one (each message an LPI); otherwise the RAM mailbox and the 1 ms poll. */
+ unsigned long long target=0; unsigned data=MSI_DATA;
+ int its_error=lx_os_pci_msi(n,&target,&data);
+ endpoint.its=!its_error && target<=0xfffffffcull;
+ if (!its_error && !endpoint.its) lx_os_pci_msi_off();
+ if (!endpoint.its) {
+  if (its_error!=-1) lx_tell("msi: no ITS doorbell (kernel errno %d): the RAM mailbox and the 1 ms poll\n",its_error);
+  data=MSI_DATA;
+  if (!endpoint.mailbox) {
+   endpoint.mailbox=linux_dma_alloc_coherent(&p->dev,4096,&endpoint.mailbox_dma,GFP_KERNEL);
+   if (!endpoint.mailbox || endpoint.mailbox_dma>0xfffff000ull || (endpoint.mailbox_dma & 4095)) { ret=-ENOMEM; goto fail; }
+  }
+  target=endpoint.mailbox_dma;
  }
- endpoint.msi.msg.address_lo=(u32)endpoint.mailbox_dma;
+ endpoint.msi.msg.address_lo=(u32)target;
  endpoint.msi.msg.address_hi=0;
- endpoint.msi.msg.data=MSI_DATA;
+ endpoint.msi.msg.data=data;
  endpoint.msi.pci.msi_attrib.is_64=!!(control & 0x80);
  ret=cfg_write(p->msi_cap+2,2,control & ~1u); if (ret) goto fail;
- ret=cfg_write(p->msi_cap+4,4,(u32)endpoint.mailbox_dma); if (ret) goto fail;
+ ret=cfg_write(p->msi_cap+4,4,(u32)target); if (ret) goto fail;
  if (control & 0x80) { ret=cfg_write(p->msi_cap+8,4,0); if (ret) goto fail; }
- ret=cfg_write(p->msi_cap+((control & 0x80)?12:8),2,MSI_DATA); if (ret) goto fail;
+ ret=cfg_write(p->msi_cap+((control & 0x80)?12:8),2,data); if (ret) goto fail;
  /* PCI MSI per-vector masking is optional. Old firmware may have left
   * every vector masked even though MSI itself is enabled. Unmask exactly
   * the allocated messages while MSI is disabled, then verify read-back. */
@@ -241,13 +284,15 @@ int lx_pci_alloc_irq_vectors(struct pci_dev *p,int min,int max,unsigned flags)
  endpoint.stop=false; endpoint.polling=true;
  ret=lx_os_thread("wifi-pci-poll",poll,NULL);
  if (ret) { endpoint.polling=false; lx_pci_free_irq_vectors(p); return -ret; }
- lx_tell("msi: %u vectors at %#llx data %#x enabled (control %#x)\n",n,(unsigned long long)endpoint.mailbox_dma,MSI_DATA,check);
+ lx_tell("msi: %u vectors at %#llx data %#x enabled (control %#x): %s\n",n,target,data,check,
+  endpoint.its ? "the ITS's doorbell, an LPI each" : "the RAM mailbox, polled every 1 ms");
  return n;
 fail:
  /* Even a failed write may have reached hardware: undo with the saved
   * control word, without depending on vectors having been published. */
  (void)cfg_write(p->msi_cap+2,2,endpoint.msi_control);
  msi_restore_mask();
+ if (endpoint.its) { lx_os_pci_msi_off(); endpoint.its=false; }
  memset(&endpoint.msi,0,sizeof(endpoint.msi));
  return ret;
 }
@@ -262,6 +307,7 @@ void lx_pci_free_irq_vectors(struct pci_dev *p)
  msi_restore_mask();
  endpoint.stop=true;
  while (endpoint.polling) lx_pause_ms(1);
+ if (endpoint.its) { msi_counts("when MSI was switched off"); lx_os_pci_msi_off(); endpoint.its=false; }
  memset(endpoint.handlers,0,sizeof(endpoint.handlers));
  memset(endpoint.depth,0,sizeof(endpoint.depth));
  memset(endpoint.status,0,sizeof(endpoint.status));
@@ -452,6 +498,13 @@ static void deferred_poll(void)
   lx_os_unlock();
   if (n) { n->poll(n,n->budget); lx_os_lock(); napis[i].running=false; lx_os_unlock(); }
  }
+}
+/* (lx_os_lock held) */
+static bool deferred_queued(void)
+{
+ for (unsigned i=0;i<DEFERRED_MAX;i++)
+  if ((tasks[i].task && tasks[i].pending) || (napis[i].napi && napis[i].pending && napis[i].enabled)) return true;
+ return false;
 }
 static void deferred_clear(void)
 {

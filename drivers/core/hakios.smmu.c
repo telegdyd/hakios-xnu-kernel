@@ -267,13 +267,15 @@ hakios_smmu_map(struct hakios_smmu_context *c, unsigned long long iova,
 	int error=EINVAL;
 	lck_mtx_lock(&hakios_smmu_lock);
 	if (!range_ok(c,iova,size) || pa&(PAGE-1) || pa >= (1ull<<36) || size-1 > ((1ull<<36)-1)-pa ||
-	    !prot || prot&~(HAKIOS_SMMU_READ|HAKIOS_SMMU_WRITE)) goto out;
+	    !prot || prot&~(HAKIOS_SMMU_READ|HAKIOS_SMMU_WRITE|HAKIOS_SMMU_MMIO)) goto out;
 	for (unsigned long n=0;n<size;n+=PAGE) if (*pte(c,iova+n)) { error=EEXIST; goto out; }
 	/* SMMUv2 stage-1 AP[2:1]: RW=1, RO=3 (both privilege levels).
 	 * Stage 1 cannot enforce write-only: reject rather than silently grant reads. */
 	if (!(prot&HAKIOS_SMMU_READ)) { error=ENOTSUP; goto out; }
 	uint64_t attrs=3ull|(1ull<<6)|(2ull<<8)|(1ull<<10)|(1ull<<11);
 	if (!(prot&HAKIOS_SMMU_WRITE)) attrs|=1ull<<7;
+	/* MAIR0 attribute 2 is 0x04, device nGnRE: an MSI doorbell (the ITS), not memory */
+	if (prot&HAKIOS_SMMU_MMIO) attrs=(attrs&~(3ull<<8))|(2ull<<2);
 	for (unsigned long n=0;n<size;n+=PAGE) *pte(c,iova+n)=(pa+n)|attrs;
 	clean(c); error=sync_context(c);
 	if (error) {

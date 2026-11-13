@@ -5,8 +5,12 @@
 struct hakios_smmu_context;
 #define HAKIOS_SMMU_READ  1u /* device may read */
 #define HAKIOS_SMMU_WRITE 2u /* device may write */
+#define HAKIOS_SMMU_MMIO  4u /* with READ: device memory (nGnRE), for an MSI doorbell */
 #define HAKIOS_WIFI_IOVA_BASE 0xa0000000ull
 #define HAKIOS_WIFI_POOL_SIZE (64ul * 1024 * 1024)
+/* the ITS doorbell page, just past the pool; the context claims the pool and 2 MiB more for it */
+#define HAKIOS_WIFI_DOORBELL_IOVA (HAKIOS_WIFI_IOVA_BASE + HAKIOS_WIFI_POOL_SIZE)
+#define HAKIOS_WIFI_CLAIM_SIZE (HAKIOS_WIFI_POOL_SIZE + 0x200000ul)
 
 /* NULL on failure; who is a borrowed static diagnostic string. mask is the
  * ARM SMR ignored-SID-bit mask (0 = exact SID), NOT a DMA address mask.
@@ -17,7 +21,7 @@ struct hakios_smmu_context;
 struct hakios_smmu_context *hakios_smmu_claim(unsigned sid, unsigned mask,
     unsigned long long iova_base, unsigned long iova_size, const char *who);
 /* 0 or positive errno. Whole 4-KiB pages, wholly inside claimed range; map
- * rejects overlaps. prot is nonzero READ|WRITE subset, normal DMA memory.
+ * rejects overlaps. prot is nonzero READ|WRITE subset, normal DMA memory; with MMIO, device memory.
  * Publish/remove PTEs with cache maintenance/barriers and TLB sync <=500 ms.
  * Failure must leave the original mappings intact. Caller quiesces DMA first.
  */

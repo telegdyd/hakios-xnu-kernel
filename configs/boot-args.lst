@@ -375,6 +375,7 @@ wifi_fine	k
 wifi_hold	k
 wifi_hostcap_ath	k
 wifi_irq	k
+wifi_its	k
 wifi_join	k
 wifi_keep	k
 wifi_listen	k

@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 430 symbols in 18 groups; 37 are set, 28 of them drivers built in.
+# 431 symbols in 18 groups; 37 are set, 28 of them drivers built in.
 #
 
 #
@@ -775,7 +775,7 @@ CONFIG_SOUND=4
 # CONFIG_VIRTIO_SOUND is not set
 
 #
-# Wi-Fi (45)
+# Wi-Fi (46)
 #
 
 # Wi-Fi: the radio, its driver, a connection (also fw-wifi/mac and fw-wifi/network) [needs fw-wifi/ from the phone]
@@ -831,6 +831,9 @@ CONFIG_WIFI=y
 
 # read by lx_bus.c (kernel)
 # CONFIG_WIFI_IRQ is not set
+
+# not used (the RAM mailbox and the 1 ms poll)
+# CONFIG_WIFI_ITS is not set
 
 # after the scan, join the network of wifi_ssid and wifi_psk (or of fw/network); default 0
 # CONFIG_WIFI_JOIN is not set
@@ -1282,7 +1285,7 @@ CONFIG_MODEM_AGAIN=y
 # the renderer is made to answer that it has those functions after all
 # CONFIG_GLYES is not set
 
-# run the three parts once, a second after start
+# a second after start: the GIC's registers said, then the self-test (DeviceID 1, one event, the ITS's own INT ...
 # CONFIG_ITS_PROBE is not set
 
 # Turnip's GPU trace of every render pass (u_trace) into a file, printed during the run

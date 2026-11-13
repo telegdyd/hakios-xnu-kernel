@@ -25,6 +25,7 @@
 #include <sys/errno.h>
 #include <sys/random.h>
 #include <sys/hakios.input.h>
+#include <sys/hakios.its.h>
 #include <sys/hakios.lx.h>
 #include <sys/hakios.net.h>
 #include <sys/hakios.smmu.h>
@@ -995,4 +996,98 @@ int
 hakios_lx_prepare(void)
 {
 	return lx_prepare();
+}
+
+/* ---- the PCIe radio's MSIs through the GIC's ITS (C9, drivers/core/hakios.its.c; WIFI-PLAN.md P1b) ------------------------
+ *
+ * The radio writes its vector number to the ITS's doorbell, mapped as device memory at HAKIOS_WIFI_DOORBELL_IOVA of its
+ * SMMU context (just past the pool), or at its physical address with wifi_smmu=bypass. The ITS turns that into an LPI on
+ * processor 0; its handler only notes the vector and wakes lx_pci.c's thread, which runs ath11k's handlers as before.
+ * wifi_its=0: not used (the RAM mailbox and the 1 ms poll). */
+#define LX_ITS_DEVICE   0x5981u                 /* PCIe0 msi-map: RID 0x100 -> DeviceID 0x5981 (live.dts) */
+
+static uint32_t lx_msi_fired;
+static bool lx_msi_on, lx_msi_doorbell;
+
+static void
+lx_msi_arrived(__unused void *context, unsigned event)
+{
+	os_atomic_or(&lx_msi_fired, 1u << (event & 31), relaxed);
+	thread_wakeup((event_t)&lx_msi_fired);
+}
+
+int
+lx_os_pci_msi(unsigned vectors, unsigned long long *address, unsigned *data)
+{
+	unsigned on = 1;
+	unsigned long long doorbell = 0;
+	int error;
+
+	if (PE_parse_boot_argn("wifi_its", &on, sizeof(on)) && on == 0) {
+		return -1;
+	}
+	if (vectors == 0 || vectors > 32 || lx_msi_on) {
+		return EINVAL;
+	}
+	if ((error = hakios_its_device(LX_ITS_DEVICE, vectors, lx_msi_arrived, NULL, &doorbell)) != 0) {
+		return error;
+	}
+	lck_mtx_lock(&lx_pool_lock);
+	if (lx_pool.bypass) {
+		*address = doorbell;
+	} else if (lx_pool.context == NULL) {
+		error = ENXIO;
+	} else {
+		error = hakios_smmu_map(lx_pool.context, HAKIOS_WIFI_DOORBELL_IOVA, doorbell & ~0xfffull, 4096,
+		    HAKIOS_SMMU_READ | HAKIOS_SMMU_WRITE | HAKIOS_SMMU_MMIO);
+		if (error == 0) {
+			lx_msi_doorbell = true;
+			*address = HAKIOS_WIFI_DOORBELL_IOVA + (doorbell & 0xfffull);
+		}
+	}
+	lck_mtx_unlock(&lx_pool_lock);
+	if (error != 0) {
+		hakios_its_device_off(LX_ITS_DEVICE);
+		return error;
+	}
+	*data = 0;
+	os_atomic_store(&lx_msi_fired, 0, relaxed);
+	lx_msi_on = true;
+	return 0;
+}
+
+unsigned
+lx_os_pci_msi_wait(unsigned milliseconds)
+{
+	uint32_t fired;
+
+	assert_wait_timeout((event_t)&lx_msi_fired, THREAD_UNINT, milliseconds, NSEC_PER_MSEC);
+	if ((fired = os_atomic_xchg(&lx_msi_fired, 0, acquire)) != 0) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+		return fired;
+	}
+	(void)thread_block(THREAD_CONTINUE_NULL);
+	return os_atomic_xchg(&lx_msi_fired, 0, acquire);
+}
+
+void
+lx_os_pci_msi_off(void)
+{
+	if (!lx_msi_on) {
+		return;
+	}
+	hakios_its_device_off(LX_ITS_DEVICE);
+	lck_mtx_lock(&lx_pool_lock);
+	if (lx_msi_doorbell && lx_pool.context != NULL) {
+		(void)hakios_smmu_unmap(lx_pool.context, HAKIOS_WIFI_DOORBELL_IOVA, 4096);
+	}
+	lx_msi_doorbell = false;
+	lck_mtx_unlock(&lx_pool_lock);
+	lx_msi_on = false;
+}
+
+unsigned long long
+lx_os_pci_msi_count(unsigned vector)
+{
+	return hakios_its_count(LX_ITS_DEVICE, vector);
 }

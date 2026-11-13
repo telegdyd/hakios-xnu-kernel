@@ -783,7 +783,7 @@ op_smmu_up(__unused void *ctx, bool bypass)
 	}
 	/* mask 1: 0x1c00 and 0x1c01, so that the chip's DMA matches even if the BDF-to-SID table (hakios.pcie.c) did not
 	 * take and it carries the root port's SID (iOSPlus10 0325) */
-	pci.smmu = hakios_smmu_claim(WIFI_SID, 1, HAKIOS_WIFI_IOVA_BASE, HAKIOS_WIFI_POOL_SIZE, "wifi");
+	pci.smmu = hakios_smmu_claim(WIFI_SID, 1, HAKIOS_WIFI_IOVA_BASE, HAKIOS_WIFI_CLAIM_SIZE, "wifi");
 	if (pci.smmu == NULL) {
 		return EBUSY;                   /* (the claim said why) */
 	}

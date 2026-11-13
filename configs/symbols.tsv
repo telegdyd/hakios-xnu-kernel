@@ -165,7 +165,7 @@ GPU_POWER_CONTROL	arg	gpu_power_control	GPU and display	k	hakios.adreno.c	A730 r
 GPU_SLUMBER	arg	gpu_slumber	GPU and display	k	hakios.adreno.c	A730 experimental deeper idle collapse after 1 second; default 0
 HANG_DETECT	arg	hang_detect	CPU, memory and boot	k	loader_return.c	
 HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
-ITS_PROBE	arg	its_probe	User space	k	hakios.its.c	run the three parts once, a second after start
+ITS_PROBE	arg	its_probe	User space	k	hakios.its.c	a second after start: the GIC's registers said, then the self-test (DeviceID 1, one event, the ITS's own INT command, the handler must run) -> "its:
 LOADER_STAY	arg	loader_stay	Loader	l	loader.c	
 M2V_UTRACE	arg	m2v_utrace	User space	u	HakiosMetalCA.m	Turnip's GPU trace of every render pass (u_trace) into a file, printed during the run
 MACHINE_NAME	arg	machine_name	CPU, memory and boot	k	GenericARMPE.cpp	
@@ -340,6 +340,7 @@ WIFI_FINE	arg	wifi_fine	Wi-Fi	k	hakios.wifi.c	such a step waits like that before
 WIFI_HOLD	arg	wifi_hold	Wi-Fi	k	lx_bus.c	
 WIFI_HOSTCAP_ATH	arg	wifi_hostcap_ath	Wi-Fi	k	lx_bus.c	
 WIFI_IRQ	arg	wifi_irq	Wi-Fi	k	lx_bus.c	
+WIFI_ITS	arg	wifi_its	Wi-Fi	k	hakios.lx.c	not used (the RAM mailbox and the 1 ms poll)
 WIFI_JOIN	arg	wifi_join	Wi-Fi	k	hakios.wifi.pci.c,lx_bus.c	after the scan, join the network of wifi_ssid and wifi_psk (or of fw/network); default 0
 WIFI_KEEP	arg	wifi_keep	Wi-Fi	k	hakios.wifi.c,hakios.wifi.pci.c,lx_bus.c	when the steps are over the DSP and the link stay up while the system runs, for whoever uses sys/hakios.qrtr.h; stopped when the run ends
 WIFI_LISTEN	arg	wifi_listen	Wi-Fi	k	hakios.wifi.c	how long step 14 waits for the Wi-Fi firmware's service (default 3)

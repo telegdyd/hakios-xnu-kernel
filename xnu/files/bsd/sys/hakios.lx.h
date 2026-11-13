@@ -115,6 +115,17 @@ void	 lx_os_irq_disable(unsigned vector);			/* returns when its function is not 
 void	 lx_os_irq_detach_all(void);				/* returns when no function is running */
 unsigned long long lx_os_irq_count(unsigned vector);		/* how many have arrived */
 
+/*
+ * ---- the PCIe radio's MSIs as LPIs of the GIC's ITS (wifi_soc=8450; wifi_its=0: lx_pci.c's RAM mailbox and 1 ms poll).
+ * lx_os_pci_msi(): where the radio writes (an IOVA of its SMMU context, the ITS's doorbell) and what: vector v is data + v.
+ * 0, -1 with wifi_its=0, or a (Darwin) errno: then the mailbox. lx_os_pci_msi_wait(): sleeps until a vector fires or the time is up; the vectors that
+ * fired since the last call (a bit each), 0 after the time. Nothing of the driver runs in an interrupt.
+ */
+int	 lx_os_pci_msi(unsigned vectors, unsigned long long *address, unsigned *data);
+unsigned lx_os_pci_msi_wait(unsigned milliseconds);
+void	 lx_os_pci_msi_off(void);					/* no more; returns when no interrupt of it is being taken */
+unsigned long long lx_os_pci_msi_count(unsigned vector);	/* how many have arrived */
+
 /* ---- the station: scanning and joining, for whoever asks the kernel (hakios.sta.h) ---- */
 void	 lx_os_station(const struct hakios_sta_ops *ops);	/* here it is, to be asked; NULL: no longer (returns when no call is under way) */
 void	 lx_os_station_lost(int error);				/* the network joined is gone by itself */
