@@ -2,7 +2,7 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **406 arguments**: 335 read by the kernel, 16 by the loader, 67 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **408 arguments**: 337 read by the kernel, 16 by the loader, 67 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
@@ -111,7 +111,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 |---|---|---|---|---|
 | `privs` | K | `kern_minimac.c` | `CONFIG_PRIVS` |  |
 
-## Wi-Fi (46)
+## Wi-Fi (48)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -146,6 +146,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `wifi_mission` | K | `hakios.wlfw.c` | `CONFIG_WIFI_MISSION` |  |
 | `wifi_msi` | K | `hakios.wifi.pci.c`, `lx_pci.c` | `CONFIG_WIFI_MSI` |  |
 | `wifi_new` | K | `hakios.wifi.c` | `CONFIG_WIFI_NEW` |  |
+| `wifi_offload` | K | `hakios.lx.c` | `CONFIG_WIFI_OFFLOAD` |  |
 | `wifi_pause` | K | `hakios.wifi.c` | `CONFIG_WIFI_PAUSE` |  |
 | `wifi_psk` | K | `hakios.wifi.pci.c` | `CONFIG_WIFI_PSK` |  |
 | `wifi_quiet` | K | `lx_bus.c` | `CONFIG_WIFI_QUIET` |  |
@@ -161,6 +162,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `wifi_wait` | K | `hakios.wifi.c` | `CONFIG_WIFI_WAIT` |  |
 | `wifi_watch` | K | `hakios.wifi.c` | `CONFIG_WIFI_WATCH` |  |
 | `wifi_wide` | K | `lx_80211.c` | `CONFIG_WIFI_WIDE` | implied by wifi=1 |
+| `wifi_wmm` | K | `hakios.lx.c` | `CONFIG_WIFI_WMM` |  |
 
 ## Cellular (53)
 

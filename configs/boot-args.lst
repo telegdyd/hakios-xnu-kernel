@@ -388,6 +388,7 @@ wifi_mhi_fail	k
 wifi_mission	k
 wifi_msi	k
 wifi_new	k
+wifi_offload	k
 wifi_pause	k
 wifi_psk	k
 wifi_quiet	k
@@ -403,4 +404,5 @@ wifi_step	k
 wifi_wait	k
 wifi_watch	k
 wifi_wide	k
+wifi_wmm	k
 xpcproxy_idversion	k

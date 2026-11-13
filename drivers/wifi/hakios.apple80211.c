@@ -303,7 +303,8 @@ channel_fill(struct apple80211_channel *channel, unsigned frequency, unsigned fl
 #define MODE_11G                0x8u
 #define MODE_11N                0x10u
 #define MODE_11AC               0x80u
-#define MODES_OURS              (MODE_11A | MODE_11B | MODE_11G | MODE_11N | MODE_11AC)   /* (no HE in our association yet) */
+#define MODE_11AX               0x100u
+#define MODES_OURS              (MODE_11A | MODE_11B | MODE_11G | MODE_11N | MODE_11AC | MODE_11AX)
 
 #define NOISE_FLOOR             (-95)           /* dBm: ath11k's ATH11K_DEFAULT_NOISE_FLOOR; the firmware reports none */
 
@@ -327,24 +328,47 @@ bss_element(const struct hakios_sta_bss *bss, unsigned id)
 	return NULL;
 }
 
+/* An extension element (255) of that number (35: HE capabilities). */
+static const uint8_t *
+bss_extension(const struct hakios_sta_bss *bss, unsigned number)
+{
+	for (unsigned at = 0; at + 3 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
+	    at += 2 + bss->elements[at + 1]) {
+		if (bss->elements[at] == 255 && bss->elements[at + 1] >= 1 && bss->elements[at + 2] == number) {
+			return &bss->elements[at];
+		}
+	}
+	return NULL;
+}
+
 /*
  * What the station set the link up with, from the access point's elements and the rules of wifi/lx/src/lx_80211.c
- * (station_width, the peer's streams): HT when it has HT capabilities, VHT on 5 GHz when it also has VHT; two
- * streams when its HT MCS set has the second; 80 MHz when its VHT operation says 80 (5 GHz), else 40 when its HT
+ * (station_width, the peer's streams): HT when it has HT capabilities, VHT on 5 GHz when it also has VHT, HE (both
+ * bands) when it has HE capabilities; two streams when its HT MCS set has the second; 160 MHz when its VHT operation
+ * says 160 (CCFS1 8 channels from CCFS0, or the old width 2), 80 when it says 80 (5 GHz), else 40 when its HT
  * operation allows a second 20, else 20 (wifi_wide is on by default; the channels' own limits are not checked
  * here). The rate is the top of the 802.11 rate tables for that, not a measurement.
  */
 static void
 link_of(const struct hakios_sta_bss *bss, struct joined_link *link)
 {
-	/* tenths of Mbit/s, one stream, long guard interval, MCS 0-9 */
-	static const uint16_t rates[3][10] = {
+	/* tenths of Mbit/s, one stream, long guard interval (VHT 0.8 us), MCS 0-9; 20, 40, 80, 160 MHz */
+	static const uint16_t rates[4][10] = {
 		{ 65, 130, 195, 260, 390, 520, 585, 650, 780, 867 },
 		{ 135, 270, 405, 540, 810, 1080, 1215, 1350, 1620, 1800 },
 		{ 293, 585, 878, 1170, 1755, 2340, 2633, 2925, 3510, 3900 },
+		{ 585, 1170, 1755, 2340, 3510, 4680, 5265, 5850, 7020, 7800 },
+	};
+	/* HE, 0.8 us guard interval, MCS 0-11 (802.11ax-2021 Tables 27-55 ff.) */
+	static const uint16_t he_rates[4][12] = {
+		{ 86, 172, 258, 344, 516, 688, 774, 860, 1032, 1147, 1290, 1434 },
+		{ 172, 344, 516, 688, 1032, 1376, 1549, 1721, 2065, 2294, 2581, 2868 },
+		{ 360, 721, 1081, 1441, 2162, 2882, 3243, 3603, 4324, 4804, 5404, 6005 },
+		{ 721, 1441, 2162, 2882, 4324, 5765, 6485, 7206, 8647, 9608, 10809, 12010 },
 	};
 	const uint8_t *ht = bss_element(bss, 45), *ht_op = bss_element(bss, 61);
-	const uint8_t *vht = bss_element(bss, 191), *vht_op = bss_element(bss, 192);
+	const uint8_t *vht = bss_element(bss, 191), *vht_op = bss_element(bss, 192), *he = bss_extension(bss, 35);
+	unsigned table;
 	bool low = bss->frequency < 4000;
 	unsigned best = 0;
 
@@ -369,8 +393,9 @@ link_of(const struct hakios_sta_bss *bss, struct joined_link *link)
 	link->streams = ht[2 + 3 + 1] != 0 ? 2 : 1;     /* (capabilities 2, A-MPDU 1, then the RX MCS bitmask) */
 	link->mcs = 7;
 	if (ht_op != NULL && ht_op[1] >= 22 && (ht_op[3] & 4) != 0) {
-		if (!low && vht != NULL && vht[1] >= 12 && vht_op != NULL && vht_op[1] >= 3 && vht_op[2] == 1) {
-			link->width = 80;
+		if (!low && vht != NULL && vht[1] >= 12 && vht_op != NULL && vht_op[1] >= 3 && (vht_op[2] == 1 || vht_op[2] == 2)) {
+			link->width = vht_op[2] == 2 || (vht_op[4] != 0 && (vht_op[4] == vht_op[3] + 8 || vht_op[3] == vht_op[4] + 8)) ?
+			    160 : 80;
 		} else if ((ht_op[3] & 3) == 1 || (ht_op[3] & 3) == 3) {
 			link->width = 40;
 		}
@@ -391,7 +416,30 @@ link_of(const struct hakios_sta_bss *bss, struct joined_link *link)
 		}
 		link->mcs = (int)(link->width == 20 && most == 9 ? 8 : most);  /* (VHT MCS 9 is not defined at 20 MHz, 1-2 streams) */
 	}
-	link->rate = rates[link->width == 80 ? 2 : link->width == 40 ? 1 : 0][link->mcs] * link->streams / 10;
+	table = link->width == 160 ? 3 : link->width == 80 ? 2 : link->width == 40 ? 1 : 0;
+	if (he != NULL && he[1] >= 1 + 17 + 4) {
+		/*
+		 * its RX HE-MCS map for <= 80 MHz (after the extension number, 6 MAC and 11 PHY bytes), or for 160 MHz when
+		 * the link is 160 and the element has that map: two bits a stream, 0 up to 7, 1 up to 9, 2 up to 11
+		 */
+		unsigned at = 2 + 1 + 17 + (link->width == 160 && (he[2 + 1 + 6] & 0x08) && he[1] >= 1 + 17 + 8 ? 4 : 0);
+		unsigned map = he[at] | he[at + 1] << 8, most = 11;
+
+		link->mode = MODE_11AX;
+		for (unsigned s = 0; s < link->streams; s++) {
+			unsigned m = (map >> (2 * s)) & 3;
+
+			if (m == 3) {
+				link->streams = s == 0 ? 1 : s;
+				break;
+			}
+			most = MIN(most, 7 + 2 * m);
+		}
+		link->mcs = (int)most;
+		link->rate = he_rates[table][link->mcs] * link->streams / 10;
+		return;
+	}
+	link->rate = rates[table][link->mcs] * link->streams / 10;
 }
 
 /* ---- what the caller is given back ------------------------------------------------------------------- */

@@ -99,7 +99,14 @@ int	 lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *pa
 /* ---- frames: the radio as what carries the machine's network interface ---- */
 void	 lx_os_net_attach(const unsigned char *address);	/* there is a radio, and this is its address */
 void	 lx_os_net_link(int up);				/* frames can pass now (a network is joined) / no longer */
-void	 lx_os_net_input(const unsigned char *frame, unsigned long length);	/* an Ethernet frame has arrived */
+/* an Ethernet frame has arrived; checked: the radio found its IPv4 header and TCP/UDP checksums good */
+void	 lx_os_net_input(const unsigned char *frame, unsigned long length, int checked);
+/*
+ * lx_transmit()'s flags: the frame's 802.11 traffic identifier (0-7, its WMM class) and whether the radio is
+ * to fill in its IPv4 header and TCP/UDP checksums (the stack left them, with the pseudo-header's sum in place).
+ */
+#define LX_TX_TID(flags)	((flags) & 7u)
+#define LX_TX_CSUM		0x100u
 
 /*
  * ---- the radio's interrupts (wifi_irq=1). The radio raises one by writing a number to an address
@@ -140,7 +147,7 @@ void	 lx_os_station_lost(int error);				/* the network joined is gone by itself 
  */
 int	 lx_start(void);
 void	 lx_stop(void);
-int	 lx_transmit(const unsigned char *frame, unsigned long length);
+int	 lx_transmit(const unsigned char *frame, unsigned long length, unsigned flags);
 /* before lx_start(), if the kernel wants it early: take the memory the radio will be shown. 0, or an errno. */
 int	 lx_prepare(void);
 

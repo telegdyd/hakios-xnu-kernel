@@ -353,6 +353,7 @@ WIFI_MHI_FAIL	arg	wifi_mhi_fail	Wi-Fi	k	lx_mhi.c	the first power-up of the boot 
 WIFI_MISSION	arg	wifi_mission	Wi-Fi	k	hakios.wlfw.c	
 WIFI_MSI	arg	wifi_msi	Wi-Fi	k	hakios.wifi.pci.c,lx_pci.c	one message-signalled interrupt vector instead of the 32 that are enabled before MHI powers up (lx_pci.c)
 WIFI_NEW	arg	wifi_new	Wi-Fi	k	hakios.wifi.c	steps K and later have not been seen to work (default: the last one)
+WIFI_OFFLOAD	arg	wifi_offload	Wi-Fi	k	hakios.lx.c	
 WIFI_PAUSE	arg	wifi_pause	Wi-Fi	k	hakios.wifi.c	
 WIFI_PSK	arg	wifi_psk	Wi-Fi	k	hakios.wifi.pci.c	its WPA2 passphrase, 8 to 63 bytes; it is said in no line of any log
 WIFI_QUIET	arg	wifi_quiet	Wi-Fi	k	lx_bus.c	
@@ -368,4 +369,5 @@ WIFI_STEP	arg	wifi_step	Wi-Fi	k	hakios.wifi.c
 WIFI_WAIT	arg	wifi_wait	Wi-Fi	k	hakios.wifi.c	how long step 11 watches for the DSP to say that it is up (default 10)
 WIFI_WATCH	arg	wifi_watch	Wi-Fi	k	hakios.wifi.c	
 WIFI_WIDE	arg	wifi_wide	Wi-Fi	k	lx_80211.c	
+WIFI_WMM	arg	wifi_wmm	Wi-Fi	k	hakios.lx.c	
 XPCPROXY_IDVERSION	arg	xpcproxy_idversion	CPU, memory and boot	k	(patch)	

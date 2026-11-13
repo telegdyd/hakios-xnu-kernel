@@ -115,6 +115,41 @@ vht(struct hakios_sta_bss *bss, uint16_t map, uint8_t width)
 	add(bss, op, sizeof(op));
 }
 
+/* VHT operation of 160 MHz: width 1, CCFS0 the 80 with the primary (42), CCFS1 the 160's center (50) */
+static void
+vht160(struct hakios_sta_bss *bss, uint16_t map)
+{
+	uint8_t cap[14] = { 191, 12 }, op[7] = { 192, 5, 1, 42, 50 };
+
+	cap[2] = 0x04;                          /* (supported widths: 160) */
+	cap[2 + 4] = (uint8_t)map;
+	cap[2 + 5] = (uint8_t)(map >> 8);
+	add(bss, cap, sizeof(cap));
+	add(bss, op, sizeof(op));
+}
+
+/* HE capabilities (extension 35): PHY B0 as given (0x08: 160 MHz, with its map after the <= 80 one) */
+static void
+he_cap(struct hakios_sta_bss *bss, uint8_t phy0, uint16_t map80, uint16_t map160)
+{
+	uint8_t e[2 + 1 + 17 + 8] = { 255, 0, 35 };
+	unsigned maps = phy0 & 0x08 ? 8 : 4;
+
+	e[1] = (uint8_t)(1 + 17 + maps);
+	e[3 + 6] = phy0;
+	e[20] = (uint8_t)map80;                 /* rx */
+	e[21] = (uint8_t)(map80 >> 8);
+	e[22] = (uint8_t)map80;                 /* tx */
+	e[23] = (uint8_t)(map80 >> 8);
+	if (maps == 8) {
+		e[24] = (uint8_t)map160;
+		e[25] = (uint8_t)(map160 >> 8);
+		e[26] = (uint8_t)map160;
+		e[27] = (uint8_t)(map160 >> 8);
+	}
+	add(bss, e, 2 + e[1]);
+}
+
 static void
 network(uint16_t frequency)
 {
@@ -132,7 +167,7 @@ expect_link(const char *what, uint32_t mode, int32_t rate, int32_t mcs, int32_t 
 	int32_t value;
 	int error;
 
-	CHECK(ask(false, 14, NULL, phy, sizeof(phy)) == 0 && phy[0] == 1 && phy[1] == 0x9e && phy[2] == mode,
+	CHECK(ask(false, 14, NULL, phy, sizeof(phy)) == 0 && phy[0] == 1 && phy[1] == 0x19e && phy[2] == mode,
 	    "%s: PHY_MODE {%u, %#x, %#x}, want active %#x", what, phy[0], phy[1], phy[2], mode);
 	CHECK(get_value(8, &value) == 0 && value == rate, "%s: RATE %d, want %d", what, value, rate);
 	error = get_value(57, &value);
@@ -157,7 +192,7 @@ main(void)
 		uint32_t phy[3] = { 7, 7, 7 }, prot[3] = { 7, 7, 7 };
 		uint8_t deauth[16];
 
-		CHECK(ask(false, 14, NULL, phy, sizeof(phy)) == 0 && phy[0] == 1 && phy[1] == 0x9e && phy[2] == 0,
+		CHECK(ask(false, 14, NULL, phy, sizeof(phy)) == 0 && phy[0] == 1 && phy[1] == 0x19e && phy[2] == 0,
 		    "PHY_MODE not joined {%u, %#x, %#x}", phy[0], phy[1], phy[2]);
 		CHECK(get_value(8, &value) == ENXIO, "RATE not joined");
 		CHECK(get_value(57, &value) == ENXIO, "MCS not joined");
@@ -212,6 +247,36 @@ main(void)
 	ht_op(&now.bss, 0x05);
 	vht(&now.bss, 0xfffc, 1);
 	expect_link("VHT80 1x1 MCS 7", 0x80, 292, 7, 1);
+
+	/* VHT 160 MHz (CCFS1 8 channels from CCFS0), two streams up to MCS 9 */
+	network(5180);
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	ht_cap(&now.bss, true);
+	ht_op(&now.bss, 0x05);
+	vht160(&now.bss, 0xfffa);
+	expect_link("VHT160 2x2", 0x80, 1560, 9, 2);
+
+	/* HE (Wi-Fi 6): 80 MHz 2x2 up to MCS 11; 160 MHz with its own map (up to MCS 9); 2.4 GHz 20 MHz 2x2 MCS 11 */
+	network(5180);
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	ht_cap(&now.bss, true);
+	ht_op(&now.bss, 0x05);
+	vht(&now.bss, 0xfffa, 1);
+	he_cap(&now.bss, 0x04, 0xfffa, 0);
+	expect_link("HE80 2x2", 0x100, 1201, 11, 2);
+	network(5180);
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	ht_cap(&now.bss, true);
+	ht_op(&now.bss, 0x05);
+	vht160(&now.bss, 0xfffa);
+	he_cap(&now.bss, 0x0c, 0xfffa, 0xfff5);
+	expect_link("HE160 2x2 MCS 9", 0x100, 1921, 9, 2);
+	network(2412);
+	add(&now.bss, rates_ofdm, sizeof(rates_ofdm));
+	ht_cap(&now.bss, true);
+	ht_op(&now.bss, 0x00);
+	he_cap(&now.bss, 0x02, 0xfffa, 0);
+	expect_link("HE20 2x2 2.4 GHz", 0x100, 286, 11, 2);
 
 	/* HT on 2.4 GHz: one stream at 20 MHz, two streams at 40 MHz (HT counts the streams into the index) */
 	network(2412);

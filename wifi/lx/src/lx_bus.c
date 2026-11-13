@@ -994,7 +994,7 @@ lx_stop(void)
 }
 
 int
-lx_transmit(const unsigned char *frame, unsigned long length)
+lx_transmit(const unsigned char *frame, unsigned long length, unsigned flags)
 {
-	return (driver != NULL ? lx_station_send(frame, length) : ENETDOWN);
+	return (driver != NULL ? lx_station_send(frame, length, flags) : ENETDOWN);
 }

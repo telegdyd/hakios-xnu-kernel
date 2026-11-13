@@ -48,6 +48,7 @@ struct net_if {
 	/* What has gone through: said once a minute while anything moves. */
 	struct {
 		uint64_t sent, received, sent_bytes, received_bytes, dropped_out, dropped_in;
+		uint64_t checked, offloaded;    /* received with the link's checksum check; sent with checksums left to the link */
 	} count;
 };
 static struct net_if net_ifs[HAKIOS_NET_UNITS];
@@ -154,6 +155,12 @@ net_output(ifnet_t ifp, mbuf_t packet)
 		lck_mtx_unlock(&n->tx_lock);
 	}
 	if (sent) {
+		mbuf_csum_request_flags_t request = 0;
+		uint32_t value;
+
+		if (n->link->offload != 0 && mbuf_get_csum_requested(packet, &request, &value) == 0 && request != 0) {
+			n->count.offloaded++;
+		}
 		n->count.sent++;
 		n->count.sent_bytes += length;
 		ifnet_stat_increment_out(ifp, 1, (uint32_t)length, 0);
@@ -165,13 +172,44 @@ net_output(ifnet_t ifp, mbuf_t packet)
 	return 0;
 }
 
+/*
+ * What a link's check of a received frame spares the stack: the IPv4 header's checksum, and the TCP or UDP one of a
+ * whole datagram (IPv4 not a fragment; IPv6 with TCP or UDP right after the fixed header). A fragment's piece of the
+ * datagram's checksum, and what follows IPv6 extension headers, are left for the stack to work out.
+ */
+static mbuf_csum_performed_flags_t
+checked_flags(const uint8_t *frame, size_t length)
+{
+	const uint8_t *ip = frame + ETHER_HDR_LEN;
+	uint16_t type = (uint16_t)(frame[12] << 8 | frame[13]);
+	mbuf_csum_performed_flags_t flags = 0;
+
+	if (type == ETHERTYPE_IP && length >= ETHER_HDR_LEN + 20 && (ip[0] >> 4) == 4) {
+		flags = MBUF_CSUM_DID_IP | MBUF_CSUM_IP_GOOD;
+		if ((ip[6] & 0x3f) == 0 && ip[7] == 0 && (ip[9] == IPPROTO_TCP || ip[9] == IPPROTO_UDP)) {
+			flags |= MBUF_CSUM_DID_DATA | MBUF_CSUM_PSEUDO_HDR;
+		}
+	} else if (type == ETHERTYPE_IPV6 && length >= ETHER_HDR_LEN + 40 && (ip[0] >> 4) == 6 &&
+	    (ip[6] == IPPROTO_TCP || ip[6] == IPPROTO_UDP)) {
+		flags = MBUF_CSUM_DID_DATA | MBUF_CSUM_PSEUDO_HDR;
+	}
+	return flags;
+}
+
 /* A frame has arrived on unit `unit`. */
 void
 hakios_net_input_unit(unsigned unit, const uint8_t *frame, size_t length)
 {
+	hakios_net_input_checked(unit, frame, length, false);
+}
+
+void
+hakios_net_input_checked(unsigned unit, const uint8_t *frame, size_t length, bool checked)
+{
 	struct net_if *n = net_if_unit(unit);
 	struct ifnet_stat_increment_param stats = { .packets_in = 1, .bytes_in = (uint32_t)length };
 	unsigned int chunks = 1;
+	mbuf_csum_performed_flags_t csum;
 	mbuf_t packet = NULL;
 	char *header;
 
@@ -187,6 +225,10 @@ hakios_net_input_unit(unsigned unit, const uint8_t *frame, size_t length)
 		mbuf_freem(packet);
 		n->count.dropped_in++;
 		return;
+	}
+	if (checked && (csum = checked_flags(frame, length)) != 0) {
+		mbuf_set_csum_performed(packet, csum, 0xffff);         /* (with PSEUDO_HDR: the sum is final, all ones) */
+		n->count.checked++;
 	}
 	/* as every Ethernet driver hands a frame up: the header noted and stepped over */
 	header = mbuf_data(packet);
@@ -321,9 +363,10 @@ net_thread(void *parameter, __unused wait_result_t result)
 		total = n->count.sent + n->count.received + n->count.dropped_out + n->count.dropped_in;
 		if (tick % 8192 == 0 && total != said) {
 			said = total;
-			printf("net: en%u so far %llu frames sent (%llu bytes), %llu received (%llu bytes); dropped: %llu out, %llu in\n",
-			    n->unit, n->count.sent, n->count.sent_bytes, n->count.received, n->count.received_bytes,
-			    n->count.dropped_out, n->count.dropped_in);
+			printf("net: en%u so far %llu frames sent (%llu bytes), %llu received (%llu bytes); dropped: %llu out, %llu in; "
+			    "checksums: %llu sent left to the link, %llu received checked by it\n", n->unit, n->count.sent,
+			    n->count.sent_bytes, n->count.received, n->count.received_bytes, n->count.dropped_out, n->count.dropped_in,
+			    n->count.offloaded, n->count.checked);
 		}
 		delay_for_interval(quiet < 100 ? 2 : 10, NSEC_PER_MSEC);
 	}
@@ -391,7 +434,8 @@ hakios_net_attach(const struct hakios_net_link *link)
 	ifnet_set_mtu(ifp, ETHERMTU);
 	ifnet_set_flags(ifp, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
 	ifnet_set_hdrlen(ifp, ETHER_HDR_LEN);
-	ifnet_set_offload(ifp, 0);
+	/* no TSO: ath11k (and the other links) send what they are given as it is; checksums if the link says it does them */
+	ifnet_set_offload(ifp, link->offload & HAKIOS_NET_CSUM_TX);
 	error = ifnet_attach(ifp, NULL);
 	if (error != 0) {
 		printf("net: the interface en%u cannot be attached: error %d\n", unit, error);

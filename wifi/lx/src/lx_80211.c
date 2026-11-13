@@ -127,6 +127,7 @@ struct lx_radio {
 	int8_t signal;				/* dBm, of the last beacon of the network joined */
 	int last_error;
 	unsigned sent, sent_lost, received, received_group, eapol, rekeys;
+	unsigned sent_offloaded, received_checked, sent_classed;	/* (P1d: checksums the radio did, WMM classes used) */
 	unsigned long long joined_at;		/* nanoseconds */
 };
 
@@ -570,6 +571,29 @@ extension_element(const uint8_t *elements, unsigned length, unsigned number)
 	return (NULL);
 }
 
+/*
+ * An HE capabilities element after its 17 fixed bytes (802.11ax-2021 9.4.2.248, as mac80211's util.c sizes it): the
+ * HE-MCS/NSS set is 4 bytes, 4 more with 160 MHz (PHY B0 bit 3), 4 more with 80+80 (bit 4); then, if PHY B6 bit 7
+ * says so, the PPE thresholds: a 7-bit header (NSS-1, RU index bitmask) and 6 bits per NSS per RU, rounded up to bytes.
+ */
+static unsigned
+he_mcs_size(const uint8_t *phy)
+{
+	return (4 + (phy[0] & 0x08 ? 4 : 0) + (phy[0] & 0x10 ? 4 : 0));
+}
+
+static unsigned
+he_ppe_size(uint8_t header, const uint8_t *phy)
+{
+	unsigned bits;
+
+	if (!(phy[6] & 0x80)) {
+		return (0);
+	}
+	bits = 7 + (unsigned)__builtin_popcount(header & 0x78) * (1 + (header & 7)) * 6;
+	return ((bits + 7) / 8);
+}
+
 static const uint8_t wmm[4] = { 0x00, 0x50, 0xf2, 0x02 };	/* Microsoft's, which is how WMM is announced */
 
 /* ---- what the radio hears -------------------------------------------------------------------------- */
@@ -756,9 +780,13 @@ management(struct lx_radio *radio, uint8_t *frame, unsigned kind)
 	return (frame + 24);
 }
 
-/* An Ethernet frame, through the driver's data path: the firmware makes 802.11 of it, and ciphers it once there is a key. */
+/*
+ * An Ethernet frame, through the driver's data path: the firmware makes 802.11 of it, and ciphers it once there is a key.
+ * flags (hakios.lx.h): the traffic identifier the firmware queues it under (its WMM access class: dp_tx.c takes it from
+ * skb->priority), and LX_TX_CSUM: the radio fills in the IPv4 header and TCP/UDP checksums (CHECKSUM_PARTIAL).
+ */
 static bool
-ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
+ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length, unsigned flags)
 {
 	struct sk_buff *skb;
 	uint8_t *bytes;
@@ -768,6 +796,14 @@ ethernet_send(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 		return (false);
 	}
 	memcpy(bytes, frame, length);
+	skb->priority = LX_TX_TID(flags);
+	if (flags & LX_TX_CSUM) {
+		skb->ip_summed = CHECKSUM_PARTIAL;
+		radio->sent_offloaded++;
+	}
+	if (LX_TX_TID(flags) != 0) {
+		radio->sent_classed++;
+	}
 	IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_CTL_HW_80211_ENCAP;
 	IEEE80211_SKB_CB(skb)->control.hw_key = radio->pairwise_key;
 	radio->sent++;
@@ -828,7 +864,7 @@ handshake_message(struct lx_radio *radio, const uint8_t *frame, unsigned length)
 		memcpy(reply + 6, radio->vif->addr, ETH_ALEN);
 		reply[12] = 0x88;
 		reply[13] = 0x8e;
-		ethernet_send(radio, reply, 14 + reply_length);
+		ethernet_send(radio, reply, 14 + reply_length, 0);
 	}
 	printf("lx: the handshake: a message of %u bytes from the access point: %s%s\n", length - 14, said == LX_WPA_ANSWER ?
 	    "its first; answered with ours (message 2)" : said == LX_WPA_KEYS ? "its second, SIGNED WITH THE KEY WE HAVE TOO, and "
@@ -861,7 +897,9 @@ ethernet_received(struct lx_radio *radio, struct sk_buff *skb)
 		handshake_message(radio, skb->data, skb->len);
 	} else if (radio->joined && skb->len >= 14) {
 		*(skb->data[0] & 1 ? &radio->received_group : &radio->received) += 1;
-		lx_os_net_input(skb->data, skb->len);
+		/* (dp_rx.c's attention bits: CHECKSUM_UNNECESSARY when neither the IP nor the TCP/UDP check failed) */
+		radio->received_checked += skb->ip_summed == CHECKSUM_UNNECESSARY;
+		lx_os_net_input(skb->data, skb->len, skb->ip_summed == CHECKSUM_UNNECESSARY);
 	}
 }
 
@@ -1319,8 +1357,8 @@ station_abilities(struct lx_radio *radio, const uint8_t *elements, unsigned leng
 	sta->deflink.supp_rates[band->band] = rates;
 	conf->basic_rates = basic;
 	sta->wme = conf->qos = vendor_element(elements, length, wmm) != NULL;
-	sta->deflink.bandwidth = radio->width == 80 ? IEEE80211_STA_RX_BW_80 : radio->width == 40 ? IEEE80211_STA_RX_BW_40 :
-	    IEEE80211_STA_RX_BW_20;
+	sta->deflink.bandwidth = radio->width == 160 ? IEEE80211_STA_RX_BW_160 : radio->width == 80 ? IEEE80211_STA_RX_BW_80 :
+	    radio->width == 40 ? IEEE80211_STA_RX_BW_40 : IEEE80211_STA_RX_BW_20;
 	sta->deflink.rx_nss = 1;
 	sta->deflink.smps_mode = IEEE80211_SMPS_OFF;
 	if ((e = element(elements, length, 45)) != NULL && e[1] >= 26 && band->ht_cap.ht_supported) {	/* HT capabilities */
@@ -1342,6 +1380,39 @@ station_abilities(struct lx_radio *radio, const uint8_t *elements, unsigned leng
 		vht->cap = e[2] | e[3] << 8 | e[4] << 16 | (uint32_t)e[5] << 24;
 		memcpy(&vht->vht_mcs, e + 6, sizeof(vht->vht_mcs));
 	}
+	/*
+	 * HE capabilities (extension 35): the access point's MAC and PHY capabilities, HE-MCS/NSS sets and PPE thresholds,
+	 * which ath11k_peer_assoc_h_he() intersects with ours; and HE operation (36): its parameters and BSS color, which
+	 * it gives the firmware (peer_he_ops, the vdev's BSS color), as mac80211 does in ieee80211_he_cap_ie_to_sta_he_cap()
+	 * and ieee80211_assoc_success().
+	 */
+	sta->deflink.he_cap.has_he = false;
+	conf->he_support = false;
+	if ((e = extension_element(elements, length, 35)) != NULL && e[1] >= 1 + 17 + 4 &&
+	    ieee80211_get_he_iftype_cap(band, NL80211_IFTYPE_STATION) != NULL) {
+		struct ieee80211_sta_he_cap *he = &sta->deflink.he_cap;
+		unsigned mcs = he_mcs_size(e + 9), have = e[1] - 18u, ppe;
+
+		if (have >= mcs) {
+			bzero(he, sizeof(*he));
+			memcpy(he->he_cap_elem.mac_cap_info, e + 3, sizeof(he->he_cap_elem.mac_cap_info));
+			memcpy(he->he_cap_elem.phy_cap_info, e + 9, sizeof(he->he_cap_elem.phy_cap_info));
+			memcpy(&he->he_mcs_nss_supp, e + 20, mcs);
+			ppe = have > mcs ? he_ppe_size(e[20 + mcs], e + 9) : 0;
+			if (ppe != 0 && have >= mcs + ppe && ppe <= sizeof(he->ppe_thres)) {
+				memcpy(he->ppe_thres, e + 20 + mcs, ppe);
+			} else {
+				he->he_cap_elem.phy_cap_info[6] &= ~0x80;	/* (no thresholds given: none said) */
+			}
+			he->has_he = true;
+			conf->he_support = true;
+		}
+	}
+	if (conf->he_support && (e = extension_element(elements, length, 36)) != NULL && e[1] >= 1 + 6) {
+		conf->he_oper.params = e[3] | e[4] << 8 | e[5] << 16 | (uint32_t)e[6] << 24;	/* (top byte: BSS color) */
+		conf->he_bss_color.color = e[6] & 0x3f;
+		conf->he_bss_color.enabled = !(e[6] & 0x80);
+	}
 	if ((e = element(elements, length, 61)) != NULL && e[1] >= 22) {	/* HT operation: the protection in use */
 		conf->ht_operation_mode = (uint16_t)(e[4] | e[5] << 8);
 	}
@@ -1362,6 +1433,7 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
 	const struct lx_target *target = &radio->target;
 	struct linuxkpi_ieee80211_channel *channel = radio->channel->def.chan;
 	struct ieee80211_supported_band *band = radio->wiphy->bands[channel->band];
+	const struct ieee80211_sta_he_cap *he;
 	uint8_t *at = out;
 	int count = band->n_bitrates;
 
@@ -1416,6 +1488,37 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
 		at[3] = (uint8_t)(band->vht_cap.cap >> 24);
 		memcpy(at + 4, &band->vht_cap.vht_mcs, sizeof(band->vht_cap.vht_mcs));
 		at += 12;
+	}
+	/*
+	 * Our HE capabilities, if the access point has HE: ath11k's band data for a station, with the channel widths the
+	 * join does not use taken out of PHY B0 (mac80211's ieee80211_get_adjusted_he_cap()), so the HE-MCS/NSS sets
+	 * shrink with them; then the PPE thresholds. Before WMM, as mac80211 orders them.
+	 */
+	if (extension_element(target->elements, target->elements_length, 35) != NULL &&
+	    (he = ieee80211_get_he_iftype_cap(band, NL80211_IFTYPE_STATION)) != NULL) {
+		uint8_t phy[sizeof(he->he_cap_elem.phy_cap_info)];
+		unsigned mcs, ppe;
+
+		memcpy(phy, he->he_cap_elem.phy_cap_info, sizeof(phy));
+		if (radio->width < 160) {
+			phy[0] &= ~(0x08 | 0x10);	/* 160 MHz, 80+80 in 5 GHz */
+		}
+		if (radio->width < 80) {
+			phy[0] &= ~0x04;		/* 40 and 80 MHz in 5 GHz */
+		}
+		if (radio->width < 40) {
+			phy[0] &= ~0x02;		/* 40 MHz in 2.4 GHz */
+		}
+		mcs = he_mcs_size(phy);
+		ppe = he_ppe_size(he->ppe_thres[0], phy);
+		*at++ = 255;
+		*at++ = (uint8_t)(1 + 6 + 11 + mcs + ppe);
+		*at++ = 35;
+		memcpy(at, he->he_cap_elem.mac_cap_info, 6);
+		memcpy(at + 6, phy, 11);
+		memcpy(at + 17, &he->he_mcs_nss_supp, mcs);
+		memcpy(at + 17 + mcs, he->ppe_thres, ppe);
+		at += 17 + mcs + ppe;
 	}
 	if (vendor_element(target->elements, target->elements_length, wmm) != NULL) {
 		memcpy(at, "\xdd\x07\x00\x50\xf2\x02\x00\x01\x00", 9);
@@ -1656,9 +1759,36 @@ station_width(struct lx_radio *radio, struct linuxkpi_ieee80211_channel *primary
 		    band->ht_cap.cap & IEEE80211_HT_CAP_SUP_WIDTH_20_40 ? "yes" : "NO");
 		return;
 	}
-	if (vht != NULL && vht[1] >= 3 && vht[2] == 1 && primary->band == NL80211_BAND_5GHZ && band->vht_cap.vht_supported) {
-		unsigned center = 5000 + 5 * vht[3];
+	if (vht != NULL && vht[1] >= 3 && (vht[2] == 1 || vht[2] == 2) && primary->band == NL80211_BAND_5GHZ &&
+	    band->vht_cap.vht_supported) {
+		/*
+		 * 160 MHz (802.11-2020 Table 9-274): width 1 with CCFS1 the 160's center, 8 channels from CCFS0 (the 80 with
+		 * the primary); or the old width 2 with CCFS0 the 160's center. Where we can (the band's VHT supported widths,
+		 * or extended NSS bandwidth) and all eight 20s may be used for it.
+		 */
+		unsigned wide = vht[2] == 2 ? 5000 + 5 * vht[3] : vht[4] != 0 && (vht[4] == vht[3] + 8 || vht[3] == vht[4] + 8) ?
+		    5000 + 5 * vht[4] : 0;
+		unsigned center = vht[2] == 2 ? (primary->center_freq < wide ? wide - 40 : wide + 40) : 5000 + 5 * vht[3];
 		bool all = true;
+
+		if (wide != 0 && (band->vht_cap.cap & (IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_MASK | IEEE80211_VHT_CAP_EXT_NSS_BW_MASK))) {
+			bool all160 = primary->center_freq >= wide - 70 && primary->center_freq <= wide + 70;
+
+			for (unsigned frequency = wide - 70; frequency <= wide + 70; frequency += 20) {
+				struct linuxkpi_ieee80211_channel *c = linuxkpi_ieee80211_get_channel(radio->wiphy, frequency);
+
+				all160 &= c != NULL && !(c->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_80MHZ |
+				    IEEE80211_CHAN_NO_160MHZ));
+			}
+			if (all160) {
+				def->width = NL80211_CHAN_WIDTH_160;
+				def->center_freq1 = wide;
+				radio->width = 160;
+				return;
+			}
+			lx_tell("lx: not 160 MHz around %u: the eight 20s or the primary %u MHz not all usable for it\n", wide,
+			    primary->center_freq);
+		}
 
 		for (unsigned frequency = center - 30; frequency <= center + 30; frequency += 20) {
 			struct linuxkpi_ieee80211_channel *c = linuxkpi_ieee80211_get_channel(radio->wiphy, frequency);
@@ -1974,6 +2104,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	}
 	radio->reached = IEEE80211_STA_AUTHORIZED;
 	radio->sent = radio->sent_lost = radio->received = radio->received_group = radio->rekeys = 0;
+	radio->sent_offloaded = radio->received_checked = radio->sent_classed = 0;
 	radio->joined_at = lx_os_nanoseconds();
 	radio->signal = target->signal;
 	radio->joined = true;
@@ -2022,9 +2153,11 @@ lx_station_say(void)
 	if (radio != NULL) {
 		lx_tell("lx: the network is %s, %llu s after it was joined: %u frames sent (%u could not be), %u received for us and "
 		    "%u sent to everybody; %u messages of the handshake, the group's key changed %u times; block ack: %u classes "
-		    "taken, %u refused\n", radio->joined ? "joined" : "NOT joined", radio->joined_at != 0 ? (lx_os_nanoseconds() -
+		    "taken, %u refused; checksums: %u sent left to the radio, %u received checked by it; %u sent in a WMM class other "
+		    "than best effort\n", radio->joined ? "joined" : "NOT joined", radio->joined_at != 0 ? (lx_os_nanoseconds() -
 		    radio->joined_at) / 1000000000ull : 0, radio->sent, radio->sent_lost, radio->received, radio->received_group,
-		    radio->eapol, radio->rekeys, radio->ba_sessions, radio->ba_refused);
+		    radio->eapol, radio->rekeys, radio->ba_sessions, radio->ba_refused, radio->sent_offloaded, radio->received_checked,
+		    radio->sent_classed);
 	}
 }
 
@@ -2047,14 +2180,14 @@ lx_station_leave(void)
 
 /* An Ethernet frame from the kernel for the network. 0, or an errno. */
 int
-lx_station_send(const unsigned char *frame, unsigned long length)
+lx_station_send(const unsigned char *frame, unsigned long length, unsigned flags)
 {
 	struct lx_radio *radio = the_radio;
 
 	if (radio == NULL || !radio->joined) {
 		return (ENETDOWN);
 	}
-	return (ethernet_send(radio, frame, (unsigned)length) ? 0 : ENOBUFS);
+	return (ethernet_send(radio, frame, (unsigned)length, flags) ? 0 : ENOBUFS);
 }
 
 /* ---- the station boundary: what the kernel asks through sys/hakios.sta.h --------------------------------- */

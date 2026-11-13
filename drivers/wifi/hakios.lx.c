@@ -295,8 +295,52 @@ lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *passphr
 
 struct lx_frame {
 	uint16_t length;
+	uint16_t flags;                         /* lx_transmit()'s: the WMM class's TID, LX_TX_CSUM */
 	uint8_t bytes[HAKIOS_NET_FRAME_MAX];
 };
+
+/*
+ * WIFI-PLAN P1d. wifi_offload=0: the stack does every checksum itself (none left to the radio, none of the radio's
+ * results believed). wifi_wmm=0: every frame best effort (TID 0). Both on by default.
+ */
+static unsigned lx_offload = 1, lx_wmm = 1;
+
+/* The frame's service class as the 802.11 TID of its WMM access class (as Apple's drivers map them). */
+static unsigned
+lx_frame_tid(mbuf_t packet)
+{
+	if (!lx_wmm) {
+		return 0;
+	}
+	switch (mbuf_get_service_class(packet)) {
+	case MBUF_SC_BK_SYS:
+	case MBUF_SC_BK:
+		return 1;                       /* background */
+	case MBUF_SC_AV:
+	case MBUF_SC_RV:
+	case MBUF_SC_VI:
+		return 5;                       /* video */
+	case MBUF_SC_VO:
+	case MBUF_SC_CTL:
+		return 6;                       /* voice */
+	default:
+		return 0;                       /* best effort: BE, RD, OAM */
+	}
+}
+
+/* LX_TX_CSUM if the stack left checksums of the frame for the interface to fill in (it was told it may: lx_link.offload). */
+static unsigned
+lx_frame_csum(mbuf_t packet)
+{
+	mbuf_csum_request_flags_t request = 0;
+	uint32_t value = 0;
+
+	if (!lx_offload || mbuf_get_csum_requested(packet, &request, &value) != 0) {
+		return 0;
+	}
+	return request & (MBUF_CSUM_REQ_IP | MBUF_CSUM_REQ_TCP | MBUF_CSUM_REQ_UDP | MBUF_CSUM_REQ_TCPIPV6 |
+	       MBUF_CSUM_REQ_UDPIPV6) ? LX_TX_CSUM : 0;
+}
 
 static bool lx_link_attached;
 static LCK_MTX_DECLARE(lx_queue_lock, &lx_lock_group);
@@ -316,7 +360,7 @@ lx_queue_runs(__unused void *parameter, __unused wait_result_t result)
 		}
 		frame = &lx_queue[lx_queue_out % LX_QUEUE];     /* (stays ours until lx_queue_out moves) */
 		lck_mtx_unlock(&lx_queue_lock);
-		lx_transmit(frame->bytes, frame->length);
+		lx_transmit(frame->bytes, frame->length, frame->flags);
 		lck_mtx_lock(&lx_queue_lock);
 		lx_queue_out++;
 		lck_mtx_unlock(&lx_queue_lock);
@@ -340,6 +384,7 @@ lx_link_transmit(mbuf_t packet, size_t length)
 		return false;
 	}
 	frame->length = (uint16_t)length;
+	frame->flags = (uint16_t)(lx_frame_tid(packet) | lx_frame_csum(packet));
 	lx_queue_in++;
 	lck_mtx_unlock(&lx_queue_lock);
 	thread_wakeup((event_t)&lx_queue_in);
@@ -371,6 +416,10 @@ lx_os_net_attach(const unsigned char *address)
 	}
 	thread_set_thread_name(thread, "wifi-send");
 	thread_deallocate(thread);
+	PE_parse_boot_argn("wifi_offload", &lx_offload, sizeof(lx_offload));
+	PE_parse_boot_argn("wifi_wmm", &lx_wmm, sizeof(lx_wmm));
+	/* (ath11k's TCL fills in IPv4 header, TCP and UDP checksums, v4 and v6, for a frame given as CHECKSUM_PARTIAL: dp_tx.c) */
+	lx_link.offload = lx_offload ? HAKIOS_NET_CSUM_TX : 0;
 	memcpy(lx_link.address, address, sizeof(lx_link.address));
 	lx_link_attached = hakios_net_attach(&lx_link);
 	say("lx: %s\n", lx_link_attached ? "the radio is the link behind en0" : "EN0 HAS A LINK ALREADY: the radio's frames go "
@@ -401,10 +450,10 @@ lx_os_net_link(int up)
 }
 
 void
-lx_os_net_input(const unsigned char *frame, unsigned long length)
+lx_os_net_input(const unsigned char *frame, unsigned long length, int checked)
 {
 	if (lx_link_attached && length <= HAKIOS_NET_FRAME_MAX) {
-		hakios_net_input(frame, length);
+		hakios_net_input_checked(0, frame, length, checked && lx_offload);
 	}
 }
 
@@ -975,7 +1024,7 @@ lx_prepare(void)
 }
 
 __attribute__((weak)) int
-lx_transmit(__unused const unsigned char *frame, __unused unsigned long length)
+lx_transmit(__unused const unsigned char *frame, __unused unsigned long length, __unused unsigned flags)
 {
 	return ENXIO;
 }
