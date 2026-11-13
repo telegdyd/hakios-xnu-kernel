@@ -558,6 +558,18 @@ vendor_element(const uint8_t *elements, unsigned length, const uint8_t *begins)
 	return (NULL);
 }
 
+/* An extension element (255) of that extension number (35: HE capabilities, 36: HE operation). */
+static const uint8_t *
+extension_element(const uint8_t *elements, unsigned length, unsigned number)
+{
+	for (unsigned at = 0; at + 2 <= length && at + 2 + elements[at + 1] <= length; at += 2 + elements[at + 1]) {
+		if (elements[at] == 255 && elements[at + 1] >= 1 && elements[at + 2] == number) {
+			return (elements + at);
+		}
+	}
+	return (NULL);
+}
+
 static const uint8_t wmm[4] = { 0x00, 0x50, 0xf2, 0x02 };	/* Microsoft's, which is how WMM is announced */
 
 /* ---- what the radio hears -------------------------------------------------------------------------- */
@@ -923,6 +935,55 @@ management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
  * A frame the radio has received, with the driver's description behind it (where, how strong,
  * and in which form: an Ethernet frame, or 802.11 as it was on the air).
  */
+/*
+ * What the data frames come in at, as the firmware reports each (WIFI-PLAN.md P1c): every RX_RATES_EVERY of them one line
+ * with the three commonest rates (encoding, MCS or legacy index, streams), then counted afresh (the
+ * Ethernet-decap path carries no signal: that is the station's RSSI, polled).
+ */
+#define RX_RATES_EVERY	20000u
+static struct {
+	unsigned count[4][2][12];		/* [legacy, HT, VHT, HE][1 or 2 streams][MCS / legacy rate index] */
+	unsigned frames, width[4];
+} rx_rates;
+
+static void
+rx_rate_note(const struct ieee80211_rx_status *status)
+{
+	static const char *const kind[4] = { "legacy", "HT", "VHT", "HE" };
+	unsigned e = status->encoding < 4 ? status->encoding : 0, s = status->nss >= 2 ? 1 : 0, m = status->rate_idx < 12 ?
+	    status->rate_idx : 11;
+	char line[160] = "";
+
+	rx_rates.count[e][s][m]++;
+	rx_rates.width[status->bw < 4 ? status->bw : 3]++;
+	if (++rx_rates.frames < RX_RATES_EVERY) {
+		return;
+	}
+	for (unsigned pick = 0; pick < 3; pick++) {
+		unsigned best = 0, be = 0, bs = 0, bm = 0;
+
+		for (unsigned i = 0; i < 4; i++) {
+			for (unsigned j = 0; j < 2; j++) {
+				for (unsigned k = 0; k < 12; k++) {
+					if (rx_rates.count[i][j][k] > best) {
+						best = rx_rates.count[i][j][k], be = i, bs = j, bm = k;
+					}
+				}
+			}
+		}
+		if (best == 0) {
+			break;
+		}
+		snprintf(line + strlen(line), sizeof(line) - strlen(line), " %s %s%u x%u %u%%,", kind[be], be ? "MCS" : "#", bm, bs + 1,
+		    best * 100 / rx_rates.frames);
+		rx_rates.count[be][bs][bm] = 0;
+	}
+	lx_tell("lx: the last %u data frames came in at:%s widths 20/40/80/160: %u/%u/%u/%u%%\n",
+	    rx_rates.frames, line, rx_rates.width[0] * 100 / rx_rates.frames, rx_rates.width[1] * 100 / rx_rates.frames,
+	    rx_rates.width[2] * 100 / rx_rates.frames, rx_rates.width[3] * 100 / rx_rates.frames);
+	bzero(&rx_rates, sizeof(rx_rates));
+}
+
 void
 linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee80211_sta *sta, struct napi_struct *napi,
     struct list_head *list)
@@ -931,6 +992,9 @@ linuxkpi_ieee80211_rx(struct ieee80211_hw *hw, struct sk_buff *skb, struct ieee8
 	const struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
 
 	radio->frames++;
+	if (status->flag & RX_FLAG_8023) {
+		rx_rate_note(status);
+	}
 	if (status->flag & RX_FLAG_MMIC_ERROR) {
 		/* ath11k detected a Michael MIC failure. Never deliver the corrupt packet or
 		 * implement a second countermeasure state machine beside the firmware. */
@@ -1586,6 +1650,10 @@ station_width(struct lx_radio *radio, struct linuxkpi_ieee80211_channel *primary
 	radio->width = 20;
 	if (!lx_os_option("wifi_wide") || ht == NULL || ht[1] < 22 || !band->ht_cap.ht_supported ||
 	    !(band->ht_cap.cap & IEEE80211_HT_CAP_SUP_WIDTH_20_40) || !(ht[3] & 4)) {
+		lx_tell("lx: 20 MHz: wifi_wide %u, HT operation %s (length %u, byte %#x: offset %u, any width %u), our HT %s, HT40 %s\n",
+		    lx_os_option("wifi_wide"), ht ? "there" : "MISSING", ht ? ht[1] : 0, ht && ht[1] >= 2 ? ht[3] : 0,
+		    ht && ht[1] >= 2 ? ht[3] & 3 : 0, ht && ht[1] >= 2 ? !!(ht[3] & 4) : 0, band->ht_cap.ht_supported ? "yes" : "NO",
+		    band->ht_cap.cap & IEEE80211_HT_CAP_SUP_WIDTH_20_40 ? "yes" : "NO");
 		return;
 	}
 	if (vht != NULL && vht[1] >= 3 && vht[2] == 1 && primary->band == NL80211_BAND_5GHZ && band->vht_cap.vht_supported) {
@@ -1603,6 +1671,13 @@ station_width(struct lx_radio *radio, struct linuxkpi_ieee80211_channel *primary
 			radio->width = 80;
 			return;
 		}
+		lx_tell("lx: not 80 MHz around %u: the four 20s %s, the primary %u MHz %s them\n", center, all ? "allowed" :
+		    "NOT ALL ALLOWED (disabled or no 80 MHz)", primary->center_freq, primary->center_freq + 30 >= center &&
+		    primary->center_freq <= center + 30 ? "inside" : "NOT INSIDE");
+	} else {
+		lx_tell("lx: not 80 MHz: VHT operation %s (length %u, width %u), %s, our VHT %s\n", vht ? "there" : "missing",
+		    vht ? vht[1] : 0, vht && vht[1] >= 1 ? vht[2] : 0, primary->band == NL80211_BAND_5GHZ ? "5 GHz" : "2.4 GHz",
+		    band->vht_cap.vht_supported ? "yes" : "no");
 	}
 	offset = ht[3] & 3;		/* the second 20 MHz: 1 above, 3 below, 0 none */
 	if (offset == 1 || offset == 3) {
@@ -1614,8 +1689,10 @@ station_width(struct lx_radio *radio, struct linuxkpi_ieee80211_channel *primary
 			def->width = NL80211_CHAN_WIDTH_40;
 			def->center_freq1 = offset == 1 ? primary->center_freq + 10 : primary->center_freq - 10;
 			radio->width = 40;
+			return;
 		}
 	}
+	lx_tell("lx: 20 MHz: no usable second 20 (offset %u, primary flags %#x)\n", offset, primary->flags);
 }
 
 /*
@@ -1708,9 +1785,10 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 	}
 	obstacle = protection(target, &group_cipher);
 	lx_tell("lx: the network that is wanted: an access point on channel %u (%u MHz) at %d dBm, capabilities %#x, beacons every "
-	    "%u units; HT %s, VHT %s, WMM %s; %s%s\n", channel != NULL ? channel_of(channel->center_freq) : 0, channel != NULL ?
+	    "%u units; HT %s, VHT %s, HE %s, WMM %s; %s%s\n", channel != NULL ? channel_of(channel->center_freq) : 0, channel != NULL ?
 	    channel->center_freq : 0, target->signal, target->capability, target->interval, element(target->elements,
 	    target->elements_length, 45) ? "yes" : "no", element(target->elements, target->elements_length, 191) ? "yes" : "no",
+	    extension_element(target->elements, target->elements_length, 35) ? "yes" : "no",
 	    vendor_element(target->elements, target->elements_length, wmm) ? "yes" : "no", obstacle == NULL ? "WPA2 with a "
 	    "passphrase and CCMP: it can be joined" : "IT CANNOT BE JOINED: ", obstacle == NULL ? "" : obstacle);
 	if (obstacle != NULL || channel == NULL || (channel->flags & IEEE80211_CHAN_DISABLED)) {
@@ -1856,9 +1934,10 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 		}
 		mutex_unlock(&hw->wiphy->mtx);
 	}
-	printf("lx: the driver is told of the association (rates %#x, HT %s, VHT %s, %u streams)\n",
+	lx_tell("lx: the driver is told of the association (rates %#x, HT %s, VHT %s, HE %s, %u streams, %u MHz)\n",
 	    radio->sta->deflink.supp_rates[channel->band], radio->sta->deflink.ht_cap.ht_supported ? "yes" : "no",
-	    radio->sta->deflink.vht_cap.vht_supported ? "yes" : "no", radio->sta->deflink.rx_nss);
+	    radio->sta->deflink.vht_cap.vht_supported ? "yes" : "no", radio->sta->deflink.he_cap.has_he ? "yes" : "no",
+	    radio->sta->deflink.rx_nss, radio->width);
 
 	/* the handshake: the access point begins it; its messages come in as frames and are answered where they come in */
 	began = lx_os_nanoseconds();
