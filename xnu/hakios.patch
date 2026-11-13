@@ -999,6 +999,19 @@ index 52992d4cd0af..140fed3bcb71 100755
  				tempname, munge_ret, argssize, size32) > sysent
  		printf("#endif\n") > sysent
  		
+diff --git a/bsd/kern/subr_log_stream.c b/bsd/kern/subr_log_stream.c
+index e994afaf0d8a..e999c707381b 100644
+--- a/bsd/kern/subr_log_stream.c
++++ b/bsd/kern/subr_log_stream.c
+@@ -653,7 +653,7 @@ log_stream_teardown(log_stream_t *ls)
+ 		kfree_data(ls->ls_buf, buf_size);
+ 	}
+ 	if (ls->ls_blk) {
+-		kfree_type(uint8_t, ls->ls_blk_count, ls->ls_blk);
++		kfree_data(ls->ls_blk, ls->ls_blk_count);      /* as log_stream_make allocated it (kalloc_data) */
+ 	}
+ 	bzero(ls, sizeof(*ls));
+ }
 diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
 index 4ca22ee4371a..e95e618b4cb6 100644
 --- a/bsd/kern/sys_generic.c
@@ -3661,7 +3674,7 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
  	if (ml_at_interrupt_context()) {
  		panic_with_thread_kernel_state("Unexpected abort while on interrupt stack.", state);
  	}
-@@ -2090,3 +2098,77 @@
+@@ -2090,3 +2098,132 @@
  	panic_with_thread_kernel_state("Invalid kernel stack pointer (probable corruption).", &context->ss);
  }
  
@@ -3670,15 +3683,23 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 + * The raw instruction shape and Mach-O alt_entry annotations follow
 + * iOSPlus10 0297-negroni-mmio-try.patch (ldr/str with a real base register).
 + * Unlike its CONFIG_XNUPOST thread hook, recovery is restricted directly to
-+ * these two instruction PCs and FSC_SYNC_EXT_ABORT in handle_kernel_abort.
++ * these instruction PCs and FSC_SYNC_EXT_ABORT in handle_kernel_abort.
 + * No FAR dependence (FnV is permitted), global armed state, locks, allocation,
 + * or test-only configuration dependency. Other faults retain XNU behavior.
++ * The 64-bit pair is for registers a hypervisor only emulates whole (Gunyah's
++ * virtual GIC: GITS_TYPER, GICR_PROPBASER; P1a): there a refused access shows
++ * as x0 != 0, since every 64-bit value is a possible register value.
 + */
 +extern char hakios_mmio_load_instruction[], hakios_mmio_store_instruction[];
++extern char hakios_mmio_load64_instruction[], hakios_mmio_store64_instruction[];
 +uint64_t hakios_mmio_load_raw(uintptr_t address);
 +uint64_t hakios_mmio_store_raw(uintptr_t address, uint64_t value);
++uint64_t hakios_mmio_load64_raw(uintptr_t address, uint64_t *value);
++uint64_t hakios_mmio_store64_raw(uintptr_t address, uint64_t value);
 +int hakios_mmio_try_read32(const volatile void *address, unsigned *value);
 +int hakios_mmio_try_write32(volatile void *address, unsigned value);
++int hakios_mmio_try_read64(const volatile void *address, unsigned long long *value);
++int hakios_mmio_try_write64(volatile void *address, unsigned long long value);
 +
 +__asm__(
 +    ".text\n"
@@ -3702,6 +3723,28 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 +    "str w1, [x2]\n"
 +    "dsb sy\n"
 +    "ret\n"
++    ".globl _hakios_mmio_load64_raw\n"
++    "_hakios_mmio_load64_raw:\n"
++    "mov x2, x0\n"
++    "mov x0, #0\n"
++    ".globl _hakios_mmio_load64_instruction\n"
++    ".alt_entry _hakios_mmio_load64_instruction\n"
++    "_hakios_mmio_load64_instruction:\n"
++    "ldr x3, [x2]\n"
++    "cbnz x0, 1f\n"
++    "str x3, [x1]\n"
++    "1:\n"
++    "ret\n"
++    ".globl _hakios_mmio_store64_raw\n"
++    "_hakios_mmio_store64_raw:\n"
++    "mov x2, x0\n"
++    "mov x0, #0\n"
++    ".globl _hakios_mmio_store64_instruction\n"
++    ".alt_entry _hakios_mmio_store64_instruction\n"
++    "_hakios_mmio_store64_instruction:\n"
++    "str x1, [x2]\n"
++    "dsb sy\n"
++    "ret\n"
 +);
 +
 +static bool
@@ -3709,7 +3752,9 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 +{
 +    uintptr_t pc = (uintptr_t)get_saved_state_pc(state);
 +    if (pc != (uintptr_t)hakios_mmio_load_instruction &&
-+        pc != (uintptr_t)hakios_mmio_store_instruction) {
++        pc != (uintptr_t)hakios_mmio_store_instruction &&
++        pc != (uintptr_t)hakios_mmio_load64_instruction &&
++        pc != (uintptr_t)hakios_mmio_store64_instruction) {
 +        return false;
 +    }
 +    set_saved_state_reg(state, 0, (register_t)~0ull);
@@ -3738,4 +3783,27 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 +        return EINVAL;
 +    }
 +    return hakios_mmio_store_raw((uintptr_t)address, value) ? EIO : 0;
++}
++
++int
++hakios_mmio_try_read64(const volatile void *address, unsigned long long *value)
++{
++    uint64_t v = 0;
++    if (address == NULL || value == NULL || ((uintptr_t)address & 7)) {
++        return EINVAL;
++    }
++    if (hakios_mmio_load64_raw((uintptr_t)address, &v)) {
++        return EIO;
++    }
++    *value = v;
++    return 0;
++}
++
++int
++hakios_mmio_try_write64(volatile void *address, unsigned long long value)
++{
++    if (address == NULL || ((uintptr_t)address & 7)) {
++        return EINVAL;
++    }
++    return hakios_mmio_store64_raw((uintptr_t)address, value) ? EIO : 0;
 +}

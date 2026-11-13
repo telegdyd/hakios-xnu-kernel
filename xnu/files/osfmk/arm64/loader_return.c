@@ -679,3 +679,176 @@ hv_wdt_pet_init(void)
 	hv_wdt_pet(NULL, NULL);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hv_wdt_pet_init);
+
+/*
+ * Hang detector (boot-arg hang_detect=0 turns it off). A hung kernel otherwise meets the hypervisor's
+ * watchdog, which resets the phone and takes the log with it. Every HANG_TICK_MS a timer on each processor
+ * notes the time and where that processor was interrupted, and a thread call notes that threads still run.
+ * When the thread call, or a running processor's timer, has been quiet for HANG_LIMIT_MS, the next timer
+ * to run panics with every processor's last interrupted place: the panic goes to the loader with the log.
+ * It starts HANG_START_SECONDS after boot.
+ */
+#include <kern/timer_call.h>
+#include <arm/cpu_data_internal.h>
+
+#define HANG_TICK_MS            500
+#define HANG_LIMIT_MS           5000
+#define HANG_START_SECONDS      30
+#define HANG_FRAMES             4
+
+struct hang_cpu {
+	_Atomic uint64_t at;            /* when its timer last ran (0: not yet) */
+	uint64_t pc, lr, frame[HANG_FRAMES];
+	uint32_t ticks;
+	uint8_t user;
+};
+
+extern vm_offset_t vm_kernel_slide;
+
+static struct hang_cpu hang_cpus[MAX_CPUS];
+static struct timer_call hang_timers[MAX_CPUS];
+static thread_call_t hang_thread_call, hang_start_call;
+static _Atomic uint64_t hang_thread_at;
+static uint64_t hang_tick_abs, hang_limit_abs;
+static uint32_t hang_detect = 1;
+static _Atomic uint32_t hang_fired;
+static char hang_text[2048];
+
+/* where this processor was when the timer interrupted it: pc, lr and the first few return addresses */
+static void
+hang_note(struct hang_cpu *c)
+{
+	arm_saved_state_t *st = getCpuDatap()->cpu_int_state;
+
+	c->pc = c->lr = 0;
+	for (int i = 0; i < HANG_FRAMES; i++) {
+		c->frame[i] = 0;
+	}
+	if (st == NULL) {
+		return;
+	}
+	c->user = PSR64_IS_USER(get_saved_state_cpsr(st)) ? 1 : 0;
+	c->pc = get_saved_state_pc(st);
+	c->lr = get_saved_state_lr(st);
+	if (c->user) {
+		return;
+	}
+	uint64_t fp = get_saved_state_fp(st);
+	for (int i = 0; i < HANG_FRAMES; i++) {
+		uint64_t pair[2];
+
+		if (fp < VM_MIN_KERNEL_ADDRESS || (fp & 0x7) != 0 ||
+		    ml_nofault_copy((vm_offset_t)fp, (vm_offset_t)pair, sizeof(pair)) != sizeof(pair)) {
+			break;
+		}
+		c->frame[i] = pair[1];
+		fp = pair[0];
+	}
+}
+
+static void
+hang_check(uint64_t now, int self)
+{
+	uint64_t t = os_atomic_load(&hang_thread_at, acquire);
+	const char *why = NULL;
+	int quiet = -1;
+	size_t n = 0;
+
+	if (t != 0 && now > t && now - t > hang_limit_abs) {
+		why = "no thread call has run";
+	}
+	for (int i = 0; why == NULL && i <= ml_get_max_cpu_number() && i < MAX_CPUS; i++) {
+		cpu_data_t *cd = (cpu_data_t *)CpuDataEntries[i].cpu_data_vaddr;
+		uint64_t a = os_atomic_load(&hang_cpus[i].at, acquire);
+
+		if (i != self && cd != NULL && cd->cpu_running && a != 0 && now > a && now - a > hang_limit_abs) {
+			why = "a processor's timer has not run";
+			quiet = i;
+		}
+	}
+	if (why == NULL || os_atomic_xchg(&hang_fired, 1, relaxed) != 0) {
+		return;
+	}
+	for (int i = 0; i <= ml_get_max_cpu_number() && i < MAX_CPUS && n < sizeof(hang_text) - 200; i++) {
+		struct hang_cpu *c = &hang_cpus[i];
+		uint64_t a = os_atomic_load(&c->at, relaxed), ago_ns = 0;
+
+		if (a != 0 && now > a) {
+			absolutetime_to_nanoseconds(now - a, &ago_ns);
+		}
+		n += (size_t)snprintf(hang_text + n, sizeof(hang_text) - n,
+		    "hang: cpu %d%s: last tick %llu ms ago (%u ticks), %s pc 0x%llx lr 0x%llx frames 0x%llx 0x%llx 0x%llx 0x%llx\n",
+		    i, i == self ? " (this one)" : "", a ? ago_ns / NSEC_PER_MSEC : 0ull, c->ticks, c->user ? "user" : "kernel",
+		    c->pc, c->lr, c->frame[0], c->frame[1], c->frame[2], c->frame[3]);
+	}
+	uint64_t thread_ns = 0;
+	if (t != 0 && now > t) {
+		absolutetime_to_nanoseconds(now - t, &thread_ns);
+	}
+	panic("hang detector: %s for over %u ms (noticed on cpu %d, quiet cpu %d, last thread call %llu ms ago, "
+	    "slide 0x%lx)\n%s", why, HANG_LIMIT_MS, self, quiet, thread_ns / NSEC_PER_MSEC, (unsigned long)vm_kernel_slide,
+	    hang_text);
+}
+
+static void
+hang_tick(timer_call_param_t p0, __unused timer_call_param_t p1)
+{
+	int cpu = cpu_number();
+	uint64_t now = mach_absolute_time();
+	struct hang_cpu *c = &hang_cpus[cpu];
+
+	hang_note(c);
+	c->ticks++;
+	os_atomic_store(&c->at, now, release);
+	hang_check(now, cpu);
+	timer_call_enter(&hang_timers[(uintptr_t)p0], now + hang_tick_abs, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
+}
+
+/* (in each processor's interrupt context, from the broadcast) */
+static void
+hang_arm(__unused void *arg)
+{
+	int cpu = cpu_number();
+
+	timer_call_enter(&hang_timers[cpu], mach_absolute_time() + hang_tick_abs, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
+}
+
+static void
+hang_thread_beat(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t now = mach_absolute_time();
+
+	os_atomic_store(&hang_thread_at, now, release);
+	thread_call_enter_delayed(hang_thread_call, now + hang_tick_abs);
+}
+
+static void
+hang_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	hang_thread_beat(NULL, NULL);
+	unsigned int armed = cpu_broadcast_xcall_simple(TRUE, hang_arm, NULL);
+	printf("hang detector: on, %u processors, a tick every %u ms, panics after %u ms quiet\n", armed, HANG_TICK_MS,
+	    HANG_LIMIT_MS);
+}
+
+__startup_func
+static void
+hang_detect_init(void)
+{
+	uint64_t deadline;
+
+	PE_parse_boot_argn("hang_detect", &hang_detect, sizeof(hang_detect));
+	if (!hang_detect) {
+		return;
+	}
+	nanoseconds_to_absolutetime((uint64_t)HANG_TICK_MS * NSEC_PER_MSEC, &hang_tick_abs);
+	nanoseconds_to_absolutetime((uint64_t)HANG_LIMIT_MS * NSEC_PER_MSEC, &hang_limit_abs);
+	for (uintptr_t i = 0; i < MAX_CPUS; i++) {
+		timer_call_setup(&hang_timers[i], hang_tick, (timer_call_param_t)i);
+	}
+	hang_thread_call = thread_call_allocate(hang_thread_beat, NULL);
+	hang_start_call = thread_call_allocate(hang_start, NULL);
+	clock_interval_to_deadline(HANG_START_SECONDS, NSEC_PER_SEC, &deadline);
+	thread_call_enter_delayed(hang_start_call, deadline);
+}
+STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hang_detect_init);

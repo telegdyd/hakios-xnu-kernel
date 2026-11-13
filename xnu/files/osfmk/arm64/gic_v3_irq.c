@@ -321,6 +321,10 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 		} else if (intid == GIC_SGI_STOP) {
 			/* comes back only if nobody has in fact asked for that */
 			psci_smp_stop_here();
+		} else if (intid >= 8192) {
+			/* an LPI nobody owns (its_probe=1 takes its own with interrupts off): no GICD bit to mask it by */
+			gic_unhandled_count++;
+			gic_last_unhandled = intid;
 		} else if (intid >= GIC_INTID_SPI_MIN && gic_spi_handle(intid)) {
 			/* a driver's */
 		} else {

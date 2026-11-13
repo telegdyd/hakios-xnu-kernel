@@ -55,7 +55,7 @@ struct apple80211req {
 	user_addr_t req_data __attribute__((aligned(8)));
 };
 
-/* (as far as they have come by: the names help reading the log) */
+/* (as far as they have come by: the names help reading the log; the newer ones from IO80211's kIoctlNameTable) */
 static const char *
 type_name(int32_t type)
 {
@@ -73,7 +73,11 @@ type_name(int32_t type)
 		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
 		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
-		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
+		{ 96, "VIRTUAL_IF_ROLE" }, { 97, "VIRTUAL_IF_PARENT" }, { 106, "RSSI_BOUNDS" }, { 107, "ROAM" },
+		{ 115, "POWER_DEBUG_INFO" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" }, { 267, "SUPPRESS_SCANS" },
+		{ 346, "BEACON_INFO" }, { 353, "NSS" }, { 365, "DISPLAY_STATE" }, { 382, "ABORT_SCAN" }, { 383, "SET_PROPERTY" },
+		{ 386, "LQM_SUMMARY" }, { 387, "COLOCATED_NETWORK_SCOPE_ID" }, { 390, "BEACON_SCAN_CACHE_REQ" },
+		{ 419, "LTE_RESTRICTED_CHANNELS" }, { 422, "6G_MODE" }, { 423, "COUNTRY_BAND_SUPPORT" },
 	};
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -610,6 +614,9 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	case 365:                               /* the display is on or off (the value): a hint for power save, which */
+		snprintf(said, said_size, " (the display: %s)", request->req_val ? "on" : "off");
+		return 0;                       /* the station has none; taken, nothing to do */
 	case 383: {                             /* Apple80211SetProperty: { key: value } as an XML property list, after a */
 		char data[384];                 /* version and its length; nothing here takes one, the key is said */
 		const char *key, *end;          /* (after the XML header and DOCTYPE, ~175 bytes) */

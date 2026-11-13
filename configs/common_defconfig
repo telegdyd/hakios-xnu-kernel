@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 429 symbols in 18 groups; 37 are set, 28 of them drivers built in.
+# 430 symbols in 18 groups; 37 are set, 28 of them drivers built in.
 #
 
 #
@@ -107,7 +107,7 @@ CONFIG_HAKIOS_VIRTIO_BLK=y
 CONFIG_HAKIOS_WIFI=y
 
 #
-# CPU, memory and boot (24)
+# CPU, memory and boot (25)
 #
 
 # CPU cores the kernel uses, 1 to 8; one if not set
@@ -145,6 +145,9 @@ CONFIG_HAKIOS_WIFI=y
 
 # read by hakios.cpufreq.c (kernel)
 # CONFIG_DDR_VOTE is not set
+
+# read by loader_return.c (kernel)
+# CONFIG_HANG_DETECT is not set
 
 # read by GenericARMPE.cpp (kernel)
 # CONFIG_MACHINE_NAME is not set
@@ -1243,9 +1246,6 @@ CONFIG_MODEM_AGAIN=y
 # User space (38)
 #
 
-# read by inject_sb.c (user space)
-# CONFIG_AUTOUNLOCK is not set
-
 # read by hakios.bt.c (kernel)
 # CONFIG_BT is not set
 
@@ -1281,6 +1281,9 @@ CONFIG_MODEM_AGAIN=y
 
 # the renderer is made to answer that it has those functions after all
 # CONFIG_GLYES is not set
+
+# run the three parts once, a second after start
+# CONFIG_ITS_PROBE is not set
 
 # Turnip's GPU trace of every render pass (u_trace) into a file, printed during the run
 # CONFIG_M2V_UTRACE is not set

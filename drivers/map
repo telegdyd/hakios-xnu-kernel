@@ -76,6 +76,7 @@ core     bsd/dev/hakios.stubs.c
 core     iokit/Kernel/hakios.stubs.cpp
 core    bsd/dev/hakios.socinfo.c
 core    bsd/dev/hakios.smmu.c
+core    bsd/dev/hakios.its.c
 power   bsd/dev/hakios.thermal.c
 power   bsd/dev/hakios.pmic.c
 power   bsd/dev/hakios.battguard.c

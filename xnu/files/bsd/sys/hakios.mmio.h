@@ -12,6 +12,9 @@ extern "C" {
 #endif
 int hakios_mmio_try_read32(const volatile void *address, unsigned *value);
 int hakios_mmio_try_write32(volatile void *address, unsigned value);
+/* The same, one 64-bit access (8-aligned): for registers a hypervisor emulates only whole. */
+int hakios_mmio_try_read64(const volatile void *address, unsigned long long *value);
+int hakios_mmio_try_write64(volatile void *address, unsigned long long value);
 #ifdef __cplusplus
 }
 #endif

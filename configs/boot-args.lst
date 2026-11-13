@@ -55,7 +55,6 @@ apfs_write_path	k
 applog	k
 applog_name	k
 audio_wait	k
-autounlock	u
 backlight	k
 backlight_max	k
 backlight_min	k
@@ -175,9 +174,11 @@ gpu_log	k
 gpu_power_control	k
 gpu_slumber	k
 hakios_kver	k
+hang_detect	k
 haptic	k
 haptic_effect	k
 hv_wdt_pet	k
+its_probe	k
 loader_return_after	kl
 loader_stay	l
 m2v_utrace	u

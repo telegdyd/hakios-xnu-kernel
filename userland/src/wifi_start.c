@@ -31,8 +31,14 @@ static void (*WiFiNetworkSetPassword)(CFTypeRef, CFStringRef);
 static int (*WiFiDeviceClientAssociateAsync)(CFTypeRef, CFTypeRef,
     void (*)(CFTypeRef, CFTypeRef, CFDictionaryRef, int, const void *), CFDictionaryRef);
 static int (*WiFiManagerClientMigrateList)(CFTypeRef);
+static int (*WiFiDeviceClientScanAsync)(CFTypeRef, CFDictionaryRef,
+    void (*)(CFTypeRef, CFArrayRef, const void *, const void *), const void *);
+static CFStringRef (*WiFiNetworkGetSSID)(CFTypeRef);
+static Boolean (*WiFiNetworkIsHidden)(CFTypeRef);
 
 static int finished, association_error;
+static int scanned;
+static CFArrayRef scan_results;
 
 /*
  * iOS 16's wifid joins from its known-network store (com.apple.wifi.known-networks.plist), which it fills
@@ -75,6 +81,48 @@ associated(CFTypeRef device, CFTypeRef network, CFDictionaryRef info, int error,
 	finished = 1;
 }
 
+/* The scan's third argument is its error (an int or a CFError by OS version): only the results are used. */
+static void
+scan_done(CFTypeRef device, CFArrayRef results, const void *error, const void *context)
+{
+	(void)device; (void)error; (void)context;
+	if (results && CFGetTypeID(results) == CFArrayGetTypeID()) scan_results = CFRetain(results);
+	scanned = 1;
+}
+
+/* The networks in range now: NULL when the scan failed or heard nothing (then every saved network is tried). */
+static CFArrayRef
+scan(CFTypeRef device)
+{
+	CFDictionaryRef options = CFDictionaryCreate(NULL, NULL, NULL, 0,
+	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	scanned = 0;
+	scan_results = NULL;
+	/* wifid refuses (16) while its own auto-join runs ("autojoin is busy"): ask again for up to 20 s */
+	int asked = -1;
+	for (unsigned attempt = 0; attempt < 10 && (asked = WiFiDeviceClientScanAsync(device, options, scan_done, NULL)) != 0; attempt++)
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2.0, false);
+	if (asked == 0) {
+		for (unsigned attempt = 0; !scanned && attempt < 40; attempt++)
+			CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false);
+	}
+	CFRelease(options);
+	if (!scanned) return NULL;	/* a late callback only leaks one array */
+	if (scan_results && CFArrayGetCount(scan_results) == 0) { CFRelease(scan_results); scan_results = NULL; }
+	return scan_results;
+}
+
+static Boolean
+heard(CFArrayRef found, CFTypeRef network)
+{
+	CFStringRef name = WiFiNetworkGetSSID(network);
+	for (CFIndex i = 0; name && i < CFArrayGetCount(found); i++) {
+		CFStringRef other = WiFiNetworkGetSSID(CFArrayGetValueAtIndex(found, i));
+		if (other && CFEqual(name, other)) return true;
+	}
+	return false;
+}
+
 static Boolean
 disabled(CFDictionaryRef record)
 {
@@ -95,34 +143,50 @@ joined(CFTypeRef device)
 	return current != NULL;
 }
 
-/* Every eligible saved network, newest lastJoined first, until one joins: the clock
- * restarts at 1970 on each boot, so lastJoined only orders, it cannot pick one, and a
- * network out of range must not keep the next one from being tried.
+/* The eligible saved networks a scan hears now, then hidden ones (a scan does not name them),
+ * each group newest lastJoined first, until one joins; one out of range is not tried, so it
+ * cannot hold up one in range (WIFI-PLAN.md I5). Without a scan result every one is tried.
  * 0: joined (by us, or by someone else meanwhile); 1: nothing joined; -1: nothing to try. */
 static int
 join_saved(CFTypeRef manager, CFTypeRef device)
 {
 	CFArrayRef networks = WiFiManagerClientCopyNetworks(manager);
+	CFArrayRef found = scan(device);
 	enum { MAX_TRY = 32 };
 	CFTypeRef order[MAX_TRY];
 	CFAbsoluteTime when[MAX_TRY];
-	unsigned count = 0;
+	Boolean first[MAX_TRY];	/* heard by the scan: before hidden ones */
+	unsigned count = 0, saved = 0, in_range = 0;
 	for (CFIndex i = 0; networks && i < CFArrayGetCount(networks) && count < MAX_TRY; i++) {
 		CFTypeRef network = CFArrayGetValueAtIndex(networks, i);
 		CFDictionaryRef record = WiFiNetworkCopyRecord(network);
 		if (record && !disabled(record)) {
-			CFTypeRef date = CFDictionaryGetValue(record, CFSTR("lastJoined"));
-			CFAbsoluteTime t = date && CFGetTypeID(date) == CFDateGetTypeID() ? CFDateGetAbsoluteTime(date) : -1.0e29;
-			unsigned k = count++;
-			for (; k > 0 && when[k - 1] < t; k--) { order[k] = order[k - 1]; when[k] = when[k - 1]; }
-			order[k] = network;
-			when[k] = t;
+			saved++;
+			Boolean near = found && heard(found, network);
+			in_range += near;
+			if (!found || near || WiFiNetworkIsHidden(network)) {
+				CFDateRef date = CFDictionaryGetValue(record, CFSTR("lastJoined"));
+				CFAbsoluteTime t = date && CFGetTypeID(date) == CFDateGetTypeID() ? CFDateGetAbsoluteTime(date) : -1.0e29;
+				unsigned k = count++;
+				for (; k > 0 && (first[k - 1] < near || (first[k - 1] == near && when[k - 1] < t)); k--) {
+					order[k] = order[k - 1]; when[k] = when[k - 1]; first[k] = first[k - 1];
+				}
+				order[k] = network;
+				when[k] = t;
+				first[k] = near;
+			}
 		}
 		if (record) CFRelease(record);
 	}
+	if (found) {
+		printf("wifi_start: scan heard %u of %u saved networks\n", in_range, saved);
+		CFRelease(found);
+	} else if (saved) {
+		puts("wifi_start: no scan result; trying every saved network");
+	}
 	if (!count) {
 		if (networks) CFRelease(networks);
-		return -1;
+		return saved ? 1 : -1;
 	}
 	int result = -1;
 	for (unsigned n = 0; n < count && result != 0; n++) {
@@ -163,6 +227,10 @@ main(void)
 	LOAD(WiFiNetworkSetPassword, void, (CFTypeRef, CFStringRef));
 	LOAD(WiFiDeviceClientAssociateAsync, int, (CFTypeRef, CFTypeRef,
 	    void (*)(CFTypeRef, CFTypeRef, CFDictionaryRef, int, const void *), CFDictionaryRef));
+	LOAD(WiFiDeviceClientScanAsync, int, (CFTypeRef, CFDictionaryRef,
+	    void (*)(CFTypeRef, CFArrayRef, const void *, const void *), const void *));
+	LOAD(WiFiNetworkGetSSID, CFStringRef, (CFTypeRef));
+	LOAD(WiFiNetworkIsHidden, Boolean, (CFTypeRef));
 	WiFiManagerClientMigrateList = (int (*)(CFTypeRef))dlsym(library, "WiFiManagerClientMigrateList");
 	CFTypeRef manager = WiFiManagerClientCreate(NULL, 0);
 	if (!manager) { puts("wifi_start: no native manager"); return 1; }

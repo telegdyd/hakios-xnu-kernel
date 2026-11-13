@@ -22,3 +22,6 @@ driver SOCINFO
 
 standard bsd/dev/hakios.smmu.c
 	help    shared guarded apps-SMMU stage-1 contexts for audio and PCIe DMA
+
+standard bsd/dev/hakios.its.c
+	help    its_probe=1: whether the GIC ITS and LPIs can be programmed under the hypervisor (Wi-Fi P1a); nothing without it
