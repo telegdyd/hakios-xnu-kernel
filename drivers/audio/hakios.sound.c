@@ -83,9 +83,12 @@
 #include <sys/hakios.mmio.h>
 #include <vm/vm_kern.h>
 
+extern bool hakios_screen_off(void);
+
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
 extern kern_return_t thread_terminate(thread_t thread);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 extern void loader_log_putc(char c);
 
 /* The SMMU's match registers and contexts are found free and taken by the Wi-Fi's start as well (hakios.wifi.c). */
@@ -700,6 +703,7 @@ events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token,
 		}
 		OSIncrementAtomic((volatile SInt32 *)&written_done);
 		OSBitOrAtomic(1u << (token & 31), &returned);
+		thread_wakeup((event_t)&returned);     /* (the feeder waits for it) */
 		return true;
 	}
 	if (opcode == APR_BASIC_RSP_RESULT && (token & WRITE_TOKEN)) {
@@ -707,6 +711,7 @@ events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token,
 		OSIncrementAtomic((volatile SInt32 *)&write_errors);
 		OSIncrementAtomic((volatile SInt32 *)&written_done);
 		OSBitOrAtomic(1u << (token & 31), &returned);
+		thread_wakeup((event_t)&returned);     /* (the feeder waits for it) */
 		return true;
 	}
 	if (opcode == ASM_SESSION_EVENT_RX_UNDERFLOW) {
@@ -1269,6 +1274,7 @@ ar_events(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const
 	}
 	OSIncrementAtomic((volatile SInt32 *)&written_done);
 	OSBitOrAtomic(1u << (token & 31), &returned);
+	thread_wakeup((event_t)&returned);     /* (the feeder waits for it) */
 	return true;
 }
 
@@ -1527,6 +1533,8 @@ static bool primed;                             /* the ring holds its cushion (p
 #define CUSHION_FRAMES          (2 * PERIOD_FRAMES)   /* (since the last 5 s line) a period cut short in sound; frames the ring had no room for */
 static volatile uint32_t darwin_peak;              /* the largest sample since the amplifiers last started */
 
+static volatile bool guard_on;                  /* (below) */
+
 /* From the writer's thread, under hakios.audio.c's lock: never waits. */
 static uint32_t
 darwin_sink(const int16_t *frames, uint32_t count)
@@ -1551,6 +1559,9 @@ darwin_sink(const int16_t *frames, uint32_t count)
 	dropped_frames += count - taken;
 	if (sound) {
 		last_sound_us = now_us();
+		if (!guard_on) {
+			thread_wakeup((event_t)&last_sound_us);         /* (the watcher, waiting with the amplifiers off) */
+		}
 	}
 	return taken;
 }
@@ -1692,7 +1703,16 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 				}
 			}
 		}
-		sleep_ms(2);
+		/*
+		 * Until the DSP gives a period back (events(): every 20 ms while the stream runs), rather than a look every
+		 * 2 ms (STANDBY-PLAN.md). The 40 ms net (two periods) is for the guard's lines and a missed wake.
+		 */
+		assert_wait_timeout((event_t)&returned, THREAD_UNINT, 40, NSEC_PER_MSEC);
+		if (returned != 0 || stopping) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+		} else {
+			(void)thread_block(THREAD_CONTINUE_NULL);
+		}
 	}
 	say("sound: the feeder stops: %u periods written (%u could not be sent), %u given back (%u with an error), %u underflows; "
 	    "from Darwin %llu frames came, %llu went to the DSP, %llu of silence filled in\n", sent, failed, written_done, write_errors,
@@ -1825,7 +1845,20 @@ watch(void)
 				}
 			}
 		}
-		sleep_ms(5);
+		if (on || given_up) {
+			sleep_ms(5);
+		} else {
+			/*
+			 * The amplifiers off: until Darwin writes something that is not silence (darwin_sink() wakes this), or
+			 * 200 ms (1 s with the screen off) for the volume, rather than a look every 5 ms (STANDBY-PLAN.md).
+			 */
+			assert_wait_timeout((event_t)&last_sound_us, THREAD_UNINT, hakios_screen_off() ? 1000 : 200, NSEC_PER_MSEC);
+			if (last_sound_us != sounded || stopping) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				(void)thread_block(THREAD_CONTINUE_NULL);
+			}
+		}
 	}
 	guard_off(true);
 	say("sound: the watcher stops; the amplifiers were started %u times, Darwin set the volume %u times%s\n", starts, changes,
@@ -1841,6 +1874,8 @@ static void
 take_down(void)
 {
 	stopping = true;
+	thread_wakeup((event_t)&returned);
+	thread_wakeup((event_t)&last_sound_us);
 	if (level >= 4) {
 		hakios_audio_set_sink("nothing", NULL);
 	}
@@ -1953,6 +1988,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 			say("sound: no thread for the feeder\n");
 			goto out;
 		}
+		thread_set_thread_name(feeder, "sound-feeder");
 		thread_deallocate(feeder);
 		watcher_runs = true;
 		hakios_audio_set_sink("the speakers (the audio DSP, hakios.sound.c)", darwin_sink);
@@ -2034,6 +2070,7 @@ hakios_sound_dsp_up(void)
 		say("sound: no thread\n");
 		return;
 	}
+	thread_set_thread_name(thread, "sound-watch");
 	thread_deallocate(thread);
 }
 

@@ -2678,6 +2678,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	case kFBMethodRequestPowerChange:               /* in: 1 the display on, 0 off (backboardd, as the screen locks or wakes) */
 		if (args->scalarInputCount > 0) {
 			hakios_backlight_display(in[0] != 0);
+			psci_smp_display(in[0] != 0);
 		}
 		return kIOReturnSuccess;
 	case kFBMethodSwapSignal:

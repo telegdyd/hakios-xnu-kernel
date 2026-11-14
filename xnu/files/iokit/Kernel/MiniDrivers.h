@@ -24,5 +24,7 @@ void hakios_backlight_display(bool on);         /* RequestPowerChange: the panel
 int hakios_dsi_dcs_write(const uint8_t * buf, uint32_t len, bool lowPower);
 /* MiniIOMobileFramebuffer.cpp: the panel asleep (no TE): no flips until it is woken */
 void hakios_fb_panel_asleep(bool asleep);
+/* osfmk/arm64/psci_smp.c: RequestPowerChange too: the processors of screen_off_cores off while the display is off */
+extern "C" void psci_smp_display(bool on);
 
 #endif /* _IOKIT_MINIDRIVERS_H */

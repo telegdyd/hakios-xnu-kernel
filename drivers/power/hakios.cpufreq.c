@@ -36,6 +36,8 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
+extern void hakios_screen_pause(uint32_t on_ms, uint32_t off_ms);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 /*
  * The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. With
@@ -319,7 +321,7 @@ gov_thread(void *arg __unused, wait_result_t wr __unused)
 		uint32_t busiest[EPSS_DOMAINS] = { 0 };
 		uint64_t now;
 
-		delay_for_interval(gov_ms, NSEC_PER_MSEC);
+		hakios_screen_pause(gov_ms, MAX(gov_ms, 100));        /* (the load is light with the screen off; STANDBY-PLAN.md) */
 		now = mach_absolute_time();
 		if (now == then) {
 			continue;
@@ -386,6 +388,7 @@ gov_start(void)
 		return;
 	}
 	if (kernel_thread_start(gov_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "cpufreq-gov");
 		thread_deallocate(thread);
 		tell("cpufreq: governor every %u ms: the top row above %u%% busy, else about %u%% busy; down after %u periods\n",
 		    gov_ms, GOV_UP, GOV_AIM, GOV_DOWN);

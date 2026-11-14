@@ -1,3 +1,4 @@
+_FP_EXCEPTIONS	arg	-fp_exceptions	CPU, memory and boot	k	(patch)	
 ADRENO	arg	adreno	GPU and display	k	hakios.adreno.c	
 ADRENO_BLIND	arg	adreno_blind	GPU and display	k	hakios.adreno.c	
 ADRENO_DIRTY	arg	adreno_dirty	GPU and display	k	hakios.adreno.c	
@@ -13,6 +14,7 @@ ADRENO_STREAM1	arg	adreno_stream1	GPU and display	k	hakios.adreno.c	step 18 leav
 ADRENO_WATCH	arg	adreno_watch	GPU and display	k	hakios.adreno.c	after the last step, say once a second for S seconds (default 20) that the machine is still alive, and what was written last
 ADSP_AGAIN	arg	adsp_again	Audio and battery	k	hakios.adsp.c	
 ADSP_APR_WAIT	arg	adsp_apr_wait	Audio and battery	k	hakios.adsp.c	
+ADSP_IRQ	arg	adsp_irq	Audio and battery	k	hakios.adsp.c	
 ADSP_KEEP	arg	adsp_keep	Audio and battery	k	hakios.adsp.c	
 ADSP_LISTEN	arg	adsp_listen	Audio and battery	k	hakios.adsp.c	
 ADSP_NEW	arg	adsp_new	Audio and battery	k	hakios.adsp.c	
@@ -68,6 +70,7 @@ BATTMGR_SINK	arg	battmgr_sink	Audio and battery	k	hakios.adsp.c
 BT	arg	bt	User space	k	hakios.bt.c	
 BT_AGAIN	arg	bt_again	User space	k	hakios.bt.c	the second look this many seconds later (0: no second look; 30)
 BUTTONS	arg	buttons	Touch and buttons	k	hakios.buttons.c	
+BUTTONS_IRQ	arg	buttons_irq	Touch and buttons	k	hakios.buttons.c	
 BUTTONS_SOC	arg	buttons_soc	Touch and buttons	k	hakios.buttons.c	the OnePlus 10 Pro's (SM8450) PMIC arbiter instead of the X5 Pro's
 BUTTONS_STEPS	arg	buttons_steps	Touch and buttons	k	hakios.buttons.c	
 CA_METALLIB	arg	ca_metallib	User space	u	inject.c	
@@ -87,6 +90,8 @@ CAM_SETTLE	arg	cam_settle	Cameras	k	hakios.camera.c
 CAM_SHUTTER	arg	cam_shutter	Cameras	k	hakios.camera.c	
 CAM_VBLANK	arg	cam_vblank	Cameras	k	hakios.camera.c	
 CC_FADE	arg	cc_fade	User space	u	inject_sb.c	
+CPU_IDLE	arg	cpu_idle	CPU, memory and boot	k	psci_smp.c	
+CPU_IDLE_CORES	arg	cpu_idle_cores	CPU, memory and boot	k	psci_smp.c	
 CPUFREQ_EPSS	arg	cpufreq_epss	CPU, memory and boot	k	hakios.cpufreq.c	the first domain's registers, when this is not the reference phone (the OnePlus 10 Pro, SM8450: 0x17d91000, dt qcom,cpufreq-hw)
 CPUFREQ_GOV	arg	cpufreq_gov	CPU, memory and boot	k	hakios.cpufreq.c	
 CPUFREQ_GOV_MS	arg	cpufreq_gov_ms	CPU, memory and boot	k	hakios.cpufreq.c	
@@ -251,6 +256,8 @@ REGTRACE	arg	regtrace	CPU, memory and boot	k	(patch)
 RETURN_CPU	arg	return_cpu	CPU, memory and boot	k	loader_return.c	
 RETURN_PANIC	arg	return_panic	CPU, memory and boot	k	loader_return.c	
 ROOT_APFS	arg	root_apfs	User space	u	init.c	the root is to be the Darwin root volume on /dev/DEV -- the phone's flash, read only
+SCREEN_OFF_CORES	arg	screen_off_cores	CPU, memory and boot	k	psci_smp.c	
+SCREEN_OFF_SLOW	arg	screen_off_slow	CPU, memory and boot	k	psci_smp.c	
 SERIAL	arg	serial	Loader	l	loader.c	
 SMALL_CORES	arg	small_cores	CPU, memory and boot	k	(patch)	
 SMALL_CORES_AFTER	arg	small_cores_after	CPU, memory and boot	k	GenericARMPE.cpp	
@@ -292,6 +299,7 @@ TORCH_MAX_S	arg	torch_max_s	Haptics and torch	k	hakios.torch.c
 TORCH_SECS	arg	torch_secs	Haptics and torch	k	hakios.torch.c	
 TOUCH_BUS	arg	touch_bus	User space	k	hakios.s3908.c	before anything else, a look at the hardware a real I2C would need, written to the log (s3908: bus ...)
 TOUCH_FLIP	arg	touch_flip	Touch and buttons	k	hakios.goodix.c,hakios.s3908.c	
+TOUCH_IRQ	arg	touch_irq	User space	k	hakios.s3908.c	the thread looks every 10 ms instead
 TOUCH_LAT	arg	touch_lat	GPU and display	ku	HakiosMetalCA.m,MiniIOMobileFramebuffer.cpp,eagl.c,hakios.goodix.c,hakios.gpu.cpp,hakios.input.c,inject.c,inject_sb.c	a line for every wait of a program's for the GPU that took a millisecond or more ("tl: f KIND US at US"), for telling apart what holds a frame up
 TOUCH_POLL_US	arg	touch_poll_us	Touch and buttons	k	hakios.goodix.c	
 TOUCH_RATE	arg	touch_rate	Touch and buttons	k	hakios.goodix.c	the chip reports twice as often (Xiaomi's game mode; 240 otherwise)

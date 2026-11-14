@@ -2296,6 +2296,62 @@ index e26a1d70f470..ceecfcfea936 100644
  
  #if APPLE_ARM64_ARCH_FAMILY
  	configure_late_apple_regs();
+diff --git a/osfmk/arm/cpu_common.c b/osfmk/arm/cpu_common.c
+index abf7ec7826e8..ee99ba3a7471 100644
+--- a/osfmk/arm/cpu_common.c
++++ b/osfmk/arm/cpu_common.c
+@@ -875,6 +875,12 @@ ml_cpu_can_exit(__unused int cpu_id, processor_reason_t reason)
+ 	if (CpuDataEntries[cpu_id].cpu_data_vaddr != &BootCpuData) {
+ 		return true;
+ 	}
++#elif defined(GENERIC_PSCI_SMP)
++	/* the firmware switches any core but the boot processor off and on again (osfmk/arm64/psci_smp.c) */
++	(void)reason;
++	if (CpuDataEntries[cpu_id].cpu_data_vaddr != &BootCpuData) {
++		return true;
++	}
+ #else
+ 	(void)reason;
+ #endif
+diff --git a/osfmk/arm/io_map.c b/osfmk/arm/io_map.c
+index 18ef2f02122f..b23f87f05185 100644
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -59,10 +59,19 @@
+ #include <vm/vm_map.h>
+ #include <arm/pmap.h>
+ #include <san/kasan.h>
++#include <os/atomic_private.h>
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/*
++ * hakios: 64 MB, not 8. Every ml_io_map() of the drivers lands here, at least a 16 KB page each, and a map that does
++ * not fit panics (KMA_NOFAIL). With the step-2 drivers (the keys' interrupts) 8 MB were all used at boot, measured
++ * 2026-11-14, and the reset into fastboot, which maps the PMIC arbiter last, panicked there (REBOOT-FAULT.md).
++ * io_map_used/io_map_peak: what is in it now and at most (sysctl kern.hakios.io_map_used).
++ */
++#define IO_MAP_SIZE            (64ul << 20)
++vm_size_t io_map_used, io_map_peak;
++const vm_size_t io_map_size = IO_MAP_SIZE;
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
+@@ -127,6 +136,13 @@ io_map(
+ 
+ 		kmem_alloc(unmappable ? kernel_map : io_submap,
+ 		    &start, alloc_size, kmaflags, VM_KERN_MEMORY_IOKIT);
++		if (!unmappable) {
++			vm_size_t used = os_atomic_add(&io_map_used, alloc_size, relaxed);
++
++			if (used > os_atomic_load(&io_map_peak, relaxed)) {
++				os_atomic_store(&io_map_peak, used, relaxed);
++			}
++		}
+ 		pmap_map(start, phys_addr, phys_addr + alloc_size, prot, flags);
+ 	}
+ 	return start + start_offset;
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
 index 39daaf8db949..64ceb1a5f201 100644
 --- a/osfmk/arm/model_dep.c
@@ -2466,10 +2522,21 @@ index b9549da357b4..cca31ea32502 100644
  #else
  #define __USES_V_CRYPTO_INTRINSICS 0
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
-index 94e91306b143..0ec1323086b7 100644
+index 94e91306b143..1a1083a3e189 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
-@@ -568,7 +568,12 @@ cpu_idle(void)
+@@ -330,7 +330,10 @@ cpu_sleep(void)
+ 	kptimer_stop_curcpu();
+ #endif /* KPERF */
+ 
++#if !defined(GENERIC_PSCI_SMP)
++	/* (the firmware cleans a core it switches off; by set and way, under a hypervisor, every operation is a trap) */
+ 	CleanPoC_Dcache();
++#endif
+ 
+ #if USE_APPLEARMSMP
+ 	if (ml_is_quiescing()) {
+@@ -568,7 +571,12 @@ cpu_idle(void)
  #endif /* MONOTONIC */
  
  	if (wfi) {
@@ -2484,7 +2551,7 @@ index 94e91306b143..0ec1323086b7 100644
  #endif
  
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index e76e7e70ab9c..828a51171c7e 100644
+index e76e7e70ab9c..d5d0496221d6 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
 @@ -734,6 +734,9 @@ ml_get_machine_mem(void)
@@ -2507,7 +2574,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  	while (1) {
  		;
  	}
-@@ -932,6 +938,99 @@ ml_read_chip_revision(unsigned int *rev __unused)
+@@ -932,6 +938,104 @@ ml_read_chip_revision(unsigned int *rev __unused)
  #endif
  }
  
@@ -2600,6 +2667,11 @@ index e76e7e70ab9c..828a51171c7e 100644
 +	if (cpu_id < 0 || cpu_id >= MAX_SCHED_CPUS || processor_array[cpu_id] == PROCESSOR_NULL) {
 +		return false;
 +	}
++	/* (one switched off for a while, psci_smp.c's screen_off_cores, is no load: false) */
++	if (processor_array[cpu_id]->state == PROCESSOR_OFF_LINE || processor_array[cpu_id]->state == PROCESSOR_PENDING_OFFLINE ||
++	    processor_array[cpu_id]->state == PROCESSOR_SHUTDOWN) {
++		return false;
++	}
 +	recount_processor_usage(&processor_array[cpu_id]->pr_recount, &usage, idle);
 +	return true;
 +}
@@ -2607,7 +2679,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  void
  ml_parse_cpu_topology(void)
  {
-@@ -945,6 +1044,7 @@ ml_parse_cpu_topology(void)
+@@ -945,6 +1049,7 @@ ml_parse_cpu_topology(void)
  	int64_t cluster_max_cpu_phys_id[MAX_CPU_CLUSTER_PHY_ID + 1];
  	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
  	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
@@ -2615,7 +2687,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  
  	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
  	// so that we trigger a panic later in the boot process, once serial is enabled.
-@@ -1005,6 +1105,20 @@ ml_parse_cpu_topology(void)
+@@ -1005,6 +1110,20 @@ ml_parse_cpu_topology(void)
  		cpu->phys_id = (uint32_t)ml_readprop(child, "reg", ML_READPROP_MANDATORY);
  
  		cpu->l2_access_penalty = (uint32_t)ml_readprop(child, "l2-access-penalty", 0);
@@ -2636,7 +2708,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  		cpu->l2_cache_size = (uint32_t)ml_readprop(child, "l2-cache-size", 0);
  		cpu->l2_cache_id = (uint32_t)ml_readprop(child, "l2-cache-id", 0);
  		cpu->l3_cache_size = (uint32_t)ml_readprop(child, "l3-cache-size", 0);
-@@ -1107,6 +1221,7 @@ ml_parse_cpu_topology(void)
+@@ -1107,6 +1226,7 @@ ml_parse_cpu_topology(void)
  	cluster_offsets[0] = 0;
  #endif
  	assert(topology_info.boot_cpu != NULL);
@@ -2644,7 +2716,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  	ml_read_chip_revision(&topology_info.chip_revision);
  
  	/*
-@@ -1427,17 +1542,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+@@ -1427,17 +1547,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
  	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
  	if (!is_boot_cpu) {
  		processor_init(processor, this_cpu_datap->cpu_number, pset);
@@ -2670,7 +2742,7 @@ index e76e7e70ab9c..828a51171c7e 100644
  
  	*processor_out = processor;
  	*ipi_handler_out = cpu_signal_handler;
-@@ -2237,8 +2350,16 @@ _enable_virtual_timer(void)
+@@ -2237,8 +2355,16 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);

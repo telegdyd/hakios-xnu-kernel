@@ -2,7 +2,7 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **408 arguments**: 337 read by the kernel, 16 by the loader, 67 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **416 arguments**: 345 read by the kernel, 16 by the loader, 67 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
@@ -222,13 +222,14 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `soc_pas_mpss` | K | `hakios.mpss.c` | `CONFIG_SOC_PAS_MPSS` |  |
 | `soc_smem` | K | `hakios.mpss.c`, `hakios.socinfo.c` | `CONFIG_SOC_SMEM` |  |
 
-## Audio and battery (45)
+## Audio and battery (46)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
 | `adsp` | K | `hakios.adsp.c` | `CONFIG_ADSP` |  |
 | `adsp_again` | K | `hakios.adsp.c` | `CONFIG_ADSP_AGAIN` |  |
 | `adsp_apr_wait` | K | `hakios.adsp.c` | `CONFIG_ADSP_APR_WAIT` |  |
+| `adsp_irq` | K | `hakios.adsp.c` | `CONFIG_ADSP_IRQ` |  |
 | `adsp_keep` | K | `hakios.adsp.c` | `CONFIG_ADSP_KEEP` |  |
 | `adsp_listen` | K | `hakios.adsp.c` | `CONFIG_ADSP_LISTEN` |  |
 | `adsp_new` | K | `hakios.adsp.c` | `CONFIG_ADSP_NEW` |  |
@@ -290,11 +291,12 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `cam_shutter` | K | `hakios.camera.c` | `CONFIG_CAM_SHUTTER` |  |
 | `cam_vblank` | K | `hakios.camera.c` | `CONFIG_CAM_VBLANK` |  |
 
-## Touch and buttons (11)
+## Touch and buttons (12)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
 | `buttons` | K | `hakios.buttons.c` | `CONFIG_BUTTONS` |  |
+| `buttons_irq` | K | `hakios.buttons.c` | `CONFIG_BUTTONS_IRQ` |  |
 | `buttons_soc` | K | `hakios.buttons.c` | `CONFIG_BUTTONS_SOC` |  |
 | `buttons_steps` | K | `hakios.buttons.c` | `CONFIG_BUTTONS_STEPS` |  |
 | `press_power` | K | `hakios.buttons.c` | `CONFIG_PRESS_POWER` |  |
@@ -390,13 +392,16 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `thermal_tm0` | K | `hakios.thermal.c` | `CONFIG_THERMAL_TM0` |  |
 | `thermal_tm1` | K | `hakios.thermal.c` | `CONFIG_THERMAL_TM1` |  |
 
-## CPU, memory and boot (27)
+## CPU, memory and boot (32)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
+| `-fp_exceptions` | K | `(patch)` | `CONFIG__FP_EXCEPTIONS` |  |
 | `applog` | K | `(patch)` | `CONFIG_APPLOG` |  |
 | `applog_name` | K | `(patch)` | `CONFIG_APPLOG_NAME` |  |
 | `bootcpu` | KL | `loader.c`, `loader_return.c` | `CONFIG_BOOTCPU` |  |
+| `cpu_idle` | K | `psci_smp.c` | `CONFIG_CPU_IDLE` |  |
+| `cpu_idle_cores` | K | `psci_smp.c` | `CONFIG_CPU_IDLE_CORES` |  |
 | `cpufreq` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ` |  |
 | `cpufreq_epss` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ_EPSS` |  |
 | `cpufreq_gov` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ_GOV` |  |
@@ -415,6 +420,8 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `regtrace` | K | `(patch)` | `CONFIG_REGTRACE` |  |
 | `return_cpu` | K | `loader_return.c` | `CONFIG_RETURN_CPU` |  |
 | `return_panic` | K | `loader_return.c` | `CONFIG_RETURN_PANIC` |  |
+| `screen_off_cores` | K | `psci_smp.c` | `CONFIG_SCREEN_OFF_CORES` |  |
+| `screen_off_slow` | K | `psci_smp.c` | `CONFIG_SCREEN_OFF_SLOW` |  |
 | `small_cores` | K | `(patch)` | `CONFIG_SMALL_CORES` |  |
 | `small_cores_after` | K | `GenericARMPE.cpp` | `CONFIG_SMALL_CORES_AFTER` |  |
 | `syssleep` | K | `(patch)` | `CONFIG_SYSSLEEP` |  |
@@ -446,7 +453,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 | `usb_net` | KL | `hakios.usb_net.c`, `loader.c` | `CONFIG_USB_NET` |  |
 
-## User space (40)
+## User space (41)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -482,6 +489,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `speaker_soc` | K | `hakios.tfa.c` | `CONFIG_SPEAKER_SOC` |  |
 | `switcher_wallpaper` | U | `inject_sb.c` | `CONFIG_SWITCHER_WALLPAPER` |  |
 | `touch_bus` | K | `hakios.s3908.c` | `CONFIG_TOUCH_BUS` |  |
+| `touch_irq` | K | `hakios.s3908.c` | `CONFIG_TOUCH_IRQ` |  |
 | `tu_debug` | U | `HakiosMetalCA.m` | `CONFIG_TU_DEBUG` |  |
 | `ui_lite` | U | `inject_sb.c` | `CONFIG_UI_LITE` |  |
 | `usb_net_ip` | K | `hakios.usb_net.c` | `CONFIG_USB_NET_IP` |  |

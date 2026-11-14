@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 433 symbols in 18 groups; 37 are set, 28 of them drivers built in.
+# 441 symbols in 18 groups; 37 are set, 28 of them drivers built in.
 #
 
 #
@@ -107,7 +107,7 @@ CONFIG_HAKIOS_VIRTIO_BLK=y
 CONFIG_HAKIOS_WIFI=y
 
 #
-# CPU, memory and boot (25)
+# CPU, memory and boot (30)
 #
 
 # CPU cores the kernel uses, 1 to 8; one if not set
@@ -120,10 +120,19 @@ CONFIG_HAKIOS_WIFI=y
 # CONFIG_CPUFREQ is not set
 
 # read by the patch to Apple's files (kernel)
+# CONFIG__FP_EXCEPTIONS is not set
+
+# read by the patch to Apple's files (kernel)
 # CONFIG_APPLOG is not set
 
 # read by the patch to Apple's files (kernel)
 # CONFIG_APPLOG_NAME is not set
+
+# read by psci_smp.c (kernel)
+# CONFIG_CPU_IDLE is not set
+
+# read by psci_smp.c (kernel)
+# CONFIG_CPU_IDLE_CORES is not set
 
 # the first domain's registers, when this is not the reference phone (the OnePlus 10 Pro, SM8450: 0x17d91000, dt ...
 # CONFIG_CPUFREQ_EPSS is not set
@@ -166,6 +175,12 @@ CONFIG_HAKIOS_WIFI=y
 
 # read by loader_return.c (kernel)
 # CONFIG_RETURN_PANIC is not set
+
+# read by psci_smp.c (kernel)
+# CONFIG_SCREEN_OFF_CORES is not set
+
+# read by psci_smp.c (kernel)
+# CONFIG_SCREEN_OFF_SLOW is not set
 
 # read by the patch to Apple's files (kernel)
 # CONFIG_SMALL_CORES is not set
@@ -325,7 +340,7 @@ CONFIG_UFS=2
 # CONFIG_VIRTIO_BLK is not set
 
 #
-# Touch and buttons (11)
+# Touch and buttons (12)
 #
 
 # the touch screen, and the power and volume buttons
@@ -333,6 +348,9 @@ CONFIG_TOUCHSCREEN=y
 
 # read by hakios.buttons.c (kernel)
 # CONFIG_BUTTONS is not set
+
+# read by hakios.buttons.c (kernel)
+# CONFIG_BUTTONS_IRQ is not set
 
 # the OnePlus 10 Pro's (SM8450) PMIC arbiter instead of the X5 Pro's
 # CONFIG_BUTTONS_SOC is not set
@@ -639,7 +657,7 @@ CONFIG_GPU=y
 # CONFIG_VBLUR is not set
 
 #
-# Audio and battery (44)
+# Audio and battery (45)
 #
 
 # the audio DSP; the battery level in the UI and charging state come through it [needs fw-audio/ from the phone]
@@ -662,6 +680,9 @@ CONFIG_SOUND=4
 
 # read by hakios.adsp.c (kernel)
 # CONFIG_ADSP_APR_WAIT is not set
+
+# read by hakios.adsp.c (kernel)
+# CONFIG_ADSP_IRQ is not set
 
 # read by hakios.adsp.c (kernel)
 # CONFIG_ADSP_KEEP is not set
@@ -1252,7 +1273,7 @@ CONFIG_MODEM_AGAIN=y
 # CONFIG_UFS_PROBE is not set
 
 #
-# User space (38)
+# User space (39)
 #
 
 # read by hakios.bt.c (kernel)
@@ -1347,6 +1368,9 @@ CONFIG_MODEM_AGAIN=y
 
 # before anything else, a look at the hardware a real I2C would need, written to the log (s3908: bus ...)
 # CONFIG_TOUCH_BUS is not set
+
+# the thread looks every 10 ms instead
+# CONFIG_TOUCH_IRQ is not set
 
 # Turnip's TU_DEBUG in the window server (sysmem, gmem, forcebin, ...)
 # CONFIG_TU_DEBUG is not set

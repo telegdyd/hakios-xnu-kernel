@@ -20,6 +20,7 @@
 #include <kern/clock.h>
 #include <arm/cpu_internal.h>
 #include <arm/machine_routines.h>
+#include <machine/machine_routines.h>
 #include <arm64/psci_smp.h>
 #include <arm64/proc_reg.h>
 #include <pexpert/pexpert.h>
@@ -686,7 +687,8 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hv_wdt_pet_init);
  * notes the time and where that processor was interrupted, and a thread call notes that threads still run.
  * When the thread call, or a running processor's timer, has been quiet for HANG_LIMIT_MS, the next timer
  * to run panics with every processor's last interrupted place: the panic goes to the loader with the log.
- * It starts HANG_START_SECONDS after boot.
+ * It starts HANG_START_SECONDS after boot. A processor switched off for a while (psci_smp.c's screen_off_cores)
+ * has no timer meanwhile, and gets one again when it is back.
  */
 #include <kern/timer_call.h>
 #include <arm/cpu_data_internal.h>
@@ -712,6 +714,7 @@ static _Atomic uint64_t hang_thread_at;
 static uint64_t hang_tick_abs, hang_limit_abs;
 static uint32_t hang_detect = 1;
 static _Atomic uint32_t hang_fired;
+static _Atomic uint32_t hang_off;       /* a bit per processor that is switched off, or on its way */
 static char hang_text[2048];
 
 /* where this processor was when the timer interrupted it: pc, lr and the first few return addresses */
@@ -761,7 +764,8 @@ hang_check(uint64_t now, int self)
 		cpu_data_t *cd = (cpu_data_t *)CpuDataEntries[i].cpu_data_vaddr;
 		uint64_t a = os_atomic_load(&hang_cpus[i].at, acquire);
 
-		if (i != self && cd != NULL && cd->cpu_running && a != 0 && now > a && now - a > hang_limit_abs) {
+		if (i != self && cd != NULL && cd->cpu_running && a != 0 && now > a && now - a > hang_limit_abs &&
+		    !(os_atomic_load(&hang_off, acquire) & (1u << i))) {
 			why = "a processor's timer has not run";
 			quiet = i;
 		}
@@ -802,6 +806,32 @@ hang_tick(timer_call_param_t p0, __unused timer_call_param_t p1)
 	os_atomic_store(&c->at, now, release);
 	hang_check(now, cpu);
 	timer_call_enter(&hang_timers[(uintptr_t)p0], now + hang_tick_abs, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
+	if (os_atomic_load(&hang_off, seq_cst) & (1u << cpu)) {
+		/* it is leaving: no local timer may be left on it (timer_queue_shutdown()) */
+		timer_call_cancel(&hang_timers[(uintptr_t)p0]);
+	}
+}
+
+/*
+ * A processor leaves for a while (processor_exit(): on the processor that asks) or is back (GenericARMCPU::initCPU(),
+ * on the processor itself, interrupts off).
+ */
+static bool
+hang_cpu_event(__unused void *param, enum cpu_event event, unsigned int cpu)
+{
+	if (cpu >= MAX_CPUS) {
+		return true;
+	}
+	if (event == CPU_EXIT_REQUESTED) {
+		os_atomic_or(&hang_off, 1u << cpu, seq_cst);
+		os_atomic_store(&hang_cpus[cpu].at, 0, release);
+		timer_call_cancel(&hang_timers[cpu]);
+	} else if (event == CPU_BOOTED && (int)cpu == cpu_number()) {
+		os_atomic_store(&hang_cpus[cpu].at, mach_absolute_time(), release);
+		os_atomic_andnot(&hang_off, 1u << cpu, seq_cst);
+		timer_call_enter(&hang_timers[cpu], mach_absolute_time() + hang_tick_abs, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
+	}
+	return true;
 }
 
 /* (in each processor's interrupt context, from the broadcast) */
@@ -826,6 +856,7 @@ static void
 hang_start(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	hang_thread_beat(NULL, NULL);
+	cpu_event_register_callback(hang_cpu_event, NULL);
 	unsigned int armed = cpu_broadcast_xcall_simple(TRUE, hang_arm, NULL);
 	printf("hang detector: on, %u processors, a tick every %u ms, panics after %u ms quiet\n", armed, HANG_TICK_MS,
 	    HANG_LIMIT_MS);

@@ -1,3 +1,4 @@
+-fp_exceptions	k
 adreno	k
 adreno_blind	k
 adreno_dirty	k
@@ -14,6 +15,7 @@ adreno_watch	k
 adsp	k
 adsp_again	k
 adsp_apr_wait	k
+adsp_irq	k
 adsp_keep	k
 adsp_listen	k
 adsp_new	k
@@ -73,6 +75,7 @@ bootcpu	kl
 bt	k
 bt_again	k
 buttons	k
+buttons_irq	k
 buttons_soc	k
 buttons_steps	k
 ca_metallib	u
@@ -93,6 +96,8 @@ cam_settle	k
 cam_shutter	k
 cam_vblank	k
 cc_fade	u
+cpu_idle	k
+cpu_idle_cores	k
 cpufreq	k
 cpufreq_epss	k
 cpufreq_gov	k
@@ -273,6 +278,8 @@ return_cpu	k
 return_panic	k
 root_apfs	u
 sb_delay	u
+screen_off_cores	k
+screen_off_slow	k
 serial	l
 small_cores	k
 small_cores_after	k
@@ -319,6 +326,7 @@ torch_max_s	k
 torch_secs	k
 touch_bus	k
 touch_flip	k
+touch_irq	k
 touch_lat	ku
 touch_poll_us	k
 touch_rate	k

@@ -18,19 +18,23 @@
  * ask for a transfer with. Reads go through the "observer" channels, which every system has for
  * every peripheral, whoever owns it.
  *
- * THIS DRIVER ONLY READS. Nothing is written to either chip, neither a register of a PMIC nor
- * the configuration of the pin: the PMICs make the phone's supplies, and a wrong write there
- * can switch one off. The firmware reads the same keys itself (volume down and volume up choose
- * between fastboot and recovery) and has left both inputs as they are needed; the driver checks
- * that before it believes them, and where it finds something else it says so and leaves that
- * key alone. The only thing written is the command word that asks the arbiter for a read.
+ * What is written. The configuration of the inputs never: the PMICs make the phone's supplies, and
+ * a wrong write there can switch one off. The firmware reads the same keys itself (volume down and
+ * volume up choose between fastboot and recovery) and has left both inputs as they are needed; the
+ * driver checks that before it believes them, and where it finds something else it says so and
+ * leaves that key alone. On the 10 Pro the keys' own interrupt registers are written (type,
+ * polarity, enable, latch clear: 0x11 to 0x15 of the power-on block and of the GPIO, the bits of
+ * the keys only, as Linux's pwrkey and GPIO drivers set them), and the arbiter's per-channel
+ * interrupt enable: see "interrupts" below. Nothing else.
  *
  * What a press is: the PON's "real time status" has a bit per key, set while the key is held
  * (after the block's own debouncing); the GPIO's has the level of the pin. A thread reads the
- * two registers 60 times a second, and a key has changed when two looks in a row say so. A key
+ * two registers, and a key has changed when two looks in a row say so. A key
  * that reads as held before it has ever been seen released is not believed (a pin that is not
  * what it was taken for must not become a volume key held down for the whole session).
- * No interrupt is used; what one would take is said at the end of this file.
+ * When: on the X5 Pro 60 times a second. On the 10 Pro an edge of any key raises the arbiter's
+ * interrupt, which wakes the thread; it looks every 16 ms only until the keys are steady again,
+ * and once a second as a net (16 ms until the line has delivered once). buttons_irq=0: looks only.
  *
  * The mapping: the phone has what the iPhone X has, whose user space runs here -- a side button
  * and two volume keys, no home button. Power is the side button (HAKIOS_BUTTON_LOCK).
@@ -58,6 +62,7 @@
 #include <kern/thread.h>
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
+#include <os/atomic_private.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
@@ -67,6 +72,14 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
+extern void hakios_screen_pause(uint32_t on_ms, uint32_t off_ms);
+extern bool hakios_screen_off(void);
+extern void hakios_spmi_lock(void);
+extern void hakios_spmi_unlock(void);
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 
 /*
  * Every line goes to the loader's log directly as well: without -v the kernel's own messages
@@ -508,6 +521,15 @@ pin_input(void)
 	pin_key->last = !(status & GPIO_LEVEL);
 }
 
+/* the 10 Pro's interrupt (see "interrupts" below) */
+static struct {
+	bool            on;             /* attached and believed */
+	bool            delivered;      /* it has brought a key's edge at least once: the net can be slow */
+	volatile uint32_t rang;
+	uint32_t        count, edges, spurious, nets, period_count;
+	uint64_t        period, second;
+} keys_irq;
+
 static void
 say_summary(void)
 {
@@ -516,6 +538,367 @@ say_summary(void)
 	    power.down ? " power" : "", volume_up.down ? " volume-up" : "", volume_down.down ? " volume-down" : "",
 	    (power.down || volume_up.down || volume_down.down) ? " held" : " none held", bus.reads,
 	    bus.reads ? bus.total_ns / bus.reads / 1000 : 0, bus.longest_ns / 1000, bus.failed);
+	if (arb == &arb_sm8450) {
+		printf("buttons: interrupts %s: %u taken, %u with a key's edge, %u of others, %u nets\n", keys_irq.on ? "on" : "OFF",
+		    keys_irq.count, keys_irq.edges, keys_irq.spurious, keys_irq.nets);
+	}
+}
+
+/* ---- interrupts (the 10 Pro) ---------------------------------------------------------------------- */
+
+/*
+ * The way an edge of a key comes in (Linux v6.12 spmi-pmic-arb.c, version 7; qcom-pdc.c; the phone's tree):
+ *   the peripheral   latches the edge (both edges of the keys' bits: type, polarity high and low) and, enabled,
+ *                    sends an interrupt message on the bus; it raises no other until the latch is cleared (0x14)
+ *   the arbiter      sets that channel's status ("chnls" + 0x1000 per channel: 0x100 enable, 0x104 status, 0x108
+ *                    clear) and its bit in our system's accumulated status ("intr" + 4 per 32 channels), and raises
+ *                    its one line, "periph_irq": PDC pin 1, level high
+ *   the PDC          pin 1 is the GIC's SPI 481 (qcom,pdc-ranges: pins 0-11 are SPIs 480-491), INTID 513; the pin
+ *                    passes only while enabled in the PDC (bank 0 bit 1 before version 3.2, its config's bit 3 after)
+ * The handler masks the GIC line and wakes the thread; the thread clears the arbiter's status and the peripheral's
+ * latch (SPMI writes take a spin lock and tens of microseconds: not in interrupt context), looks, and unmasks.
+ */
+#define ARB8450_CHNLS_PHYS      0x0c500000UL    /* reg-names "chnls" of qcom,spmi@c42d000 */
+#define ARB8450_INTR_PHYS       0x0c4c0000UL    /* "intr"; our system's (0) words first */
+#define CHNL_STRIDE             0x1000UL
+#define CHNL_COMMAND            0x00
+#define CHNL_STATUS             0x08
+#define CHNL_WDATA0             0x10
+#define CHNL_ACC_ENABLE         0x100
+#define CHNL_IRQ_STATUS         0x104
+#define CHNL_IRQ_CLEAR          0x108
+#define COMMAND_WRITE           (0u << 27)      /* "extended register write long" */
+#define REG_INT_LATCHED_CLR     0x14
+#define REG_INT_EN_SET          0x15
+#define PDC_PHYS                0x0b220000UL
+#define PDC_ENABLE_BANK0        0x010
+#define PDC_CFG(pin)            (0x110 + 4 * (pin))
+#define PDC_VERSION             0x1000
+#define PDC_VERSION_3_2         0x30200u
+#define PDC_CFG_ENABLE          (1u << 3)
+#define PDC_LEVEL_HIGH          4u
+#define KEYS_PDC_PIN            1
+#define KEYS_INTID              513             /* SPI 481 */
+#define KEYS_NET_MS             1000
+#define KEYS_STORM              200             /* interrupts in a second: past that, the line is given up */
+#define GPIO_IRQ_BIT            0x01            /* a GPIO's one interrupt */
+
+static vm_offset_t pon_chnl, pin_chnl, arb_intr, keys_pdc;
+static uint32_t arb_channels, pdc_found_bank, pdc_found_cfg;
+
+
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_irq_count, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_irq.count, 0,
+    "the PMIC arbiter's interrupts taken by the buttons");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_irq_edges, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_irq.edges, 0,
+    "of them, ones that brought a key's edge");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_irq_spurious, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_irq.spurious, 0,
+    "another channel's interrupt found and switched off");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_irq_nets, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_irq.nets, 0,
+    "waits ended by the net (no interrupt)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_presses, CTLFLAG_RD | CTLFLAG_LOCKED, &power.presses, 0, "presses of power");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_presses_up, CTLFLAG_RD | CTLFLAG_LOCKED, &volume_up.presses, 0,
+    "presses of volume up");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_presses_down, CTLFLAG_RD | CTLFLAG_LOCKED, &volume_down.presses, 0,
+    "presses of volume down");
+
+/* Write one register of a peripheral through our own (write) channel. NULL, or what went wrong. */
+static const char *
+spmi_write(vm_offset_t channel, uint8_t reg, uint8_t value)
+{
+	uint64_t start = mach_absolute_time(), interval;
+	uint32_t status;
+
+	nanoseconds_to_absolutetime(READ_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
+	hakios_spmi_lock();
+	wr(channel + CHNL_WDATA0, value);
+	wr(channel + CHNL_COMMAND, COMMAND_WRITE | (uint32_t)reg << 4);
+	do {
+		status = rd(channel + CHNL_STATUS);
+	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
+	hakios_spmi_unlock();
+	return !(status & STATUS_DONE) ? "no answer from the arbiter" : (status & STATUS_DENIED) ? "the arbiter refuses" :
+	       (status & STATUS_FAILURE) ? "the transfer failed" : (status & STATUS_DROPPED) ? "the transfer was dropped" : NULL;
+}
+
+/* In interrupt context. */
+static void
+keys_irq_arrived(__unused void *context, uint32_t intid)
+{
+	uint64_t now = mach_absolute_time();
+
+	gic_v3_spi_mask(intid);
+	keys_irq.count++;
+	if (now - keys_irq.period >= keys_irq.second) {
+		keys_irq.period = now;
+		keys_irq.period_count = 0;
+	}
+	if (++keys_irq.period_count > KEYS_STORM) {
+		keys_irq.on = false;            /* (left masked; the thread says so) */
+	}
+	os_atomic_store(&keys_irq.rang, 1, release);
+	thread_wakeup((event_t)&keys_irq.rang);
+}
+
+/* The interrupt's peripheral bits that came in since the last time, per key peripheral; their latches cleared. */
+static void
+keys_irq_service(uint8_t *pon_bits, uint8_t *pin_bits)
+{
+	uint32_t words = (arb_channels + 31) / 32;
+
+	*pon_bits = *pin_bits = 0;
+	for (uint32_t w = 0; w < words; w++) {
+		uint32_t pending = rd(arb_intr + 4 * w);
+
+		while (pending != 0) {
+			uint32_t apid = 32 * w + (uint32_t)__builtin_ctz(pending);
+			vm_offset_t ch;
+			uint32_t status;
+
+			pending &= pending - 1;
+			ch = (pon.found && apid == pon.channel) ? pon_chnl : (pin.found && apid == pin.channel) ? pin_chnl : 0;
+			if (ch == 0) {
+				/* someone else's interrupt left enabled for us: off, as Linux does with one nobody asked for */
+				ch = ml_io_map(ARB8450_CHNLS_PHYS + CHNL_STRIDE * apid, CHNL_STRIDE);
+				status = rd(ch + CHNL_IRQ_STATUS);
+				wr(ch + CHNL_ACC_ENABLE, 0);
+				wr(ch + CHNL_IRQ_CLEAR, status);
+				if (keys_irq.spurious++ < 8) {
+					printf("buttons: interrupt of channel %u (%#x), not a key's: switched off\n", apid,
+					    rd(arb_core + ARB_CHANNEL(apid)));
+				}
+				continue;
+			}
+			status = rd(ch + CHNL_IRQ_STATUS);
+			wr(ch + CHNL_IRQ_CLEAR, status);
+			*(ch == pon_chnl ? pon_bits : pin_bits) |= (uint8_t)status;
+		}
+	}
+	if (*pon_bits != 0) {
+		(void)spmi_write(pon_chnl, REG_INT_LATCHED_CLR, *pon_bits);
+	}
+	if (*pin_bits != 0) {
+		(void)spmi_write(pin_chnl, REG_INT_LATCHED_CLR, *pin_bits);
+	}
+}
+
+/* type, polarity high, polarity low as the firmware left them: put back before a reset (hakios_buttons_quiesce) */
+static uint8_t pon_found[3], pin_found[3];
+static bool pon_written, pin_written;
+
+/* One peripheral's interrupt for `bits`, on both edges: the arbiter's channel enabled, then the peripheral. */
+static bool
+keys_irq_peripheral(const struct peripheral *p, vm_offset_t ch, uint8_t bits, uint8_t found[3], bool *written)
+{
+	static const uint8_t regs[3] = { REG_INT_SET_TYPE, REG_INT_POLARITY_HIGH, REG_INT_POLARITY_LOW };
+	const char *problem = NULL;
+	uint8_t r[8];
+
+	wr(ch + CHNL_IRQ_CLEAR, 0xff);
+	wr(ch + CHNL_ACC_ENABLE, 1);
+	problem = spmi_read(p, REG_RT_STATUS, r, 8);
+	if (problem == NULL) {
+		found[0] = r[1];
+		found[1] = r[2];
+		found[2] = r[3];
+		*written = true;
+	}
+	for (unsigned i = 0; problem == NULL && i < 3; i++) {
+		problem = spmi_write(ch, regs[i], r[regs[i] - REG_RT_STATUS] | bits);
+	}
+	if (problem == NULL) {
+		problem = spmi_write(ch, REG_INT_LATCHED_CLR, bits);
+	}
+	if (problem == NULL) {
+		problem = spmi_write(ch, REG_INT_EN_SET, bits);
+	}
+	if (problem == NULL) {
+		problem = spmi_read(p, REG_RT_STATUS, r, 8);
+	}
+	if (problem != NULL) {
+		printf("buttons: interrupts of %s: %s\n", p->name, problem);
+		return false;
+	}
+	printf("buttons: interrupts of %s (bits %#x): edge %#x, high %#x, low %#x, enabled %#x; arbiter channel %u: enable %#x\n",
+	    p->name, bits, r[1], r[2], r[3], r[5], p->channel, rd(ch + CHNL_ACC_ENABLE));
+	return (r[5] & bits) == bits && (r[1] & bits) == bits;
+}
+
+static void
+keys_irq_start(void)
+{
+	uint32_t wanted = 1, version, bank, cfg;
+	uint8_t pon_bits = (power.usable ? PON_KPDPWR : 0) | (resin_key->usable ? PON_RESIN : 0), a, b;
+	vm_offset_t pdc;
+	bool ok = true;
+
+	PE_parse_boot_argn("buttons_irq", &wanted, sizeof(wanted));
+	if (arb != &arb_sm8450 || !wanted) {
+		printf("buttons: no interrupt (%s): the keys are looked at every %u ms\n", wanted ? "not the 10 Pro" : "buttons_irq=0",
+		    POLL_MS);
+		return;
+	}
+	printf("buttons: interrupts: the arbiter's line (PDC pin %u, GIC %u), channels %u and %u\n", KEYS_PDC_PIN, KEYS_INTID,
+	    pon.channel, pin.channel);
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &keys_irq.second);
+	arb_intr = ml_io_map(ARB8450_INTR_PHYS, 0x1000);
+	pon_chnl = ml_io_map(ARB8450_CHNLS_PHYS + CHNL_STRIDE * pon.channel, CHNL_STRIDE);
+	pin_chnl = ml_io_map(ARB8450_CHNLS_PHYS + CHNL_STRIDE * pin.channel, CHNL_STRIDE);
+
+	pdc = ml_io_map(PDC_PHYS, 0x2000);
+	version = rd(pdc + PDC_VERSION);
+	bank = rd(pdc + PDC_ENABLE_BANK0);
+	cfg = rd(pdc + PDC_CFG(KEYS_PDC_PIN));
+	keys_pdc = pdc;
+	pdc_found_bank = bank;
+	pdc_found_cfg = cfg;
+	if (version >= PDC_VERSION_3_2) {
+		wr(pdc + PDC_CFG(KEYS_PDC_PIN), PDC_LEVEL_HIGH | PDC_CFG_ENABLE);
+	} else {
+		wr(pdc + PDC_CFG(KEYS_PDC_PIN), PDC_LEVEL_HIGH);
+		wr(pdc + PDC_ENABLE_BANK0, bank | 1u << KEYS_PDC_PIN);
+	}
+	printf("buttons: PDC version %#x: pin %u config %#x -> %#x, bank 0 %#x -> %#x\n", version, KEYS_PDC_PIN, cfg,
+	    rd(pdc + PDC_CFG(KEYS_PDC_PIN)), bank, rd(pdc + PDC_ENABLE_BANK0));
+
+	os_atomic_store(&keys_irq.rang, 0, relaxed);
+	keys_irq.on = true;
+	/* (attaching enables the line: anything already pending only wakes the thread) */
+	if (gic_v3_spi_attach(KEYS_INTID, false, keys_irq_arrived, NULL) != KERN_SUCCESS) {
+		keys_irq.on = false;
+		printf("buttons: THE ARBITER'S INTERRUPT (GIC %u) CANNOT BE TAKEN: looking every %u ms\n", KEYS_INTID, POLL_MS);
+		return;
+	}
+	if (pon_bits != 0) {
+		ok = keys_irq_peripheral(&pon, pon_chnl, pon_bits, pon_found, &pon_written);
+	}
+	if (pin_key->usable) {
+		ok = keys_irq_peripheral(&pin, pin_chnl, GPIO_IRQ_BIT, pin_found, &pin_written) && ok;
+	}
+	keys_irq_service(&a, &b);       /* (whatever was latched before) */
+	gic_v3_spi_unmask(KEYS_INTID);
+	if (!ok) {
+		/* (left attached: an edge still wakes the thread early) */
+		printf("buttons: an interrupt is not set as asked: looking every %u ms as well\n", POLL_MS);
+	}
+	keys_irq.delivered = false;
+	printf("buttons: interrupts on: %u taken while setting up; the net is %u ms until one brings an edge, then %u ms\n",
+	    keys_irq.count, POLL_MS, KEYS_NET_MS);
+}
+
+/*
+ * Before a reset (drivers/core/hakios.platform.c, kern.hakios.loader_request): the keys' interrupts off again in the
+ * PMICs, latches cleared, as the firmware left them: PMIC registers live through a warm reset, and the boot loader and
+ * the next kernel find the keys as the firmware gave them. The PDC pin's enable is put back as found too: the PDC keeps
+ * it through the reset. (Not what broke sweet-sh.py reboot after step 2: that was XNU's I/O map running full,
+ * REBOOT-FAULT.md.)
+ */
+#define REG_INT_EN_CLR          0x16
+
+void hakios_buttons_quiesce(void);
+
+void
+hakios_buttons_quiesce(void)
+{
+	uint8_t pon_bits = PON_KPDPWR | PON_RESIN;
+
+	if (arb != &arb_sm8450 || pon_chnl == 0) {
+		return;
+	}
+	keys_irq.on = false;
+	gic_v3_spi_mask(KEYS_INTID);
+	if (pon.found && pon_written) {
+		(void)spmi_write(pon_chnl, REG_INT_EN_CLR, pon_bits);
+		(void)spmi_write(pon_chnl, REG_INT_LATCHED_CLR, pon_bits);
+		(void)spmi_write(pon_chnl, REG_INT_SET_TYPE, pon_found[0]);
+		(void)spmi_write(pon_chnl, REG_INT_POLARITY_HIGH, pon_found[1]);
+		(void)spmi_write(pon_chnl, REG_INT_POLARITY_LOW, pon_found[2]);
+	}
+	if (pon.found) {
+		wr(pon_chnl + CHNL_ACC_ENABLE, 0);
+		wr(pon_chnl + CHNL_IRQ_CLEAR, 0xff);
+	}
+	if (pin.found && pin_chnl != 0 && pin_written) {
+		(void)spmi_write(pin_chnl, REG_INT_EN_CLR, GPIO_IRQ_BIT);
+		(void)spmi_write(pin_chnl, REG_INT_LATCHED_CLR, GPIO_IRQ_BIT);
+		(void)spmi_write(pin_chnl, REG_INT_SET_TYPE, pin_found[0]);
+		(void)spmi_write(pin_chnl, REG_INT_POLARITY_HIGH, pin_found[1]);
+		(void)spmi_write(pin_chnl, REG_INT_POLARITY_LOW, pin_found[2]);
+	}
+	if (pin.found && pin_chnl != 0) {
+		wr(pin_chnl + CHNL_ACC_ENABLE, 0);
+		wr(pin_chnl + CHNL_IRQ_CLEAR, 0xff);
+	}
+	if (keys_pdc != 0) {
+		/* the PDC is in the always-on block: what is left in it is there for the boot loader after a warm reset */
+		wr(keys_pdc + PDC_ENABLE_BANK0, pdc_found_bank);
+		wr(keys_pdc + PDC_CFG(KEYS_PDC_PIN), pdc_found_cfg);
+	}
+	printf("buttons: the keys' interrupts off in the PMICs, PDC pin %u as found (bank 0 %#x) (before a reset)\n", KEYS_PDC_PIN,
+	    rd(keys_pdc + PDC_ENABLE_BANK0));
+}
+
+/* Every usable key's last look is what was reported: nothing in flux, an edge will ring. */
+static bool
+keys_steady(void)
+{
+	struct button *all[3] = { &power, &volume_up, &volume_down };
+
+	for (unsigned i = 0; i < 3; i++) {
+		if (all[i]->usable && all[i]->last != all[i]->down) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* A press and its release both over before the look (the latch says there was an edge; the key is up again). */
+static void
+keys_tap(struct button *b, bool edge)
+{
+	if (edge && b->usable && b->live && !b->down && !b->last) {
+		printf("buttons: %s was pressed and released between two looks\n", b->name);
+		b->last = true;
+		button_look(b, true);
+		b->last = false;
+		button_look(b, false);
+	}
+}
+
+/* Until an edge rings (or the net). Then the latches, and what they say about taps the next look cannot see. */
+static void
+keys_wait(void)
+{
+	uint8_t pon_bits, pin_bits;
+	bool rang;
+
+	assert_wait_timeout((event_t)&keys_irq.rang, THREAD_UNINT,
+	    keys_irq.delivered ? KEYS_NET_MS : hakios_screen_off() ? 3 * POLL_MS : POLL_MS, NSEC_PER_MSEC);
+	if (os_atomic_load(&keys_irq.rang, acquire) != 0) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+	} else {
+		(void)thread_block(THREAD_CONTINUE_NULL);
+	}
+	rang = os_atomic_xchg(&keys_irq.rang, 0, acquire) != 0;
+	if (!rang) {
+		keys_irq.nets++;
+		return;
+	}
+	keys_irq_service(&pon_bits, &pin_bits);
+	if (keys_irq.on) {
+		gic_v3_spi_unmask(KEYS_INTID);
+	} else {
+		printf("buttons: MORE THAN %u INTERRUPTS IN A SECOND: the line is left masked; looking every %u ms\n", KEYS_STORM,
+		    POLL_MS);
+	}
+	if ((pon_bits | pin_bits) == 0) {
+		return;
+	}
+	keys_irq.edges++;
+	keys_irq.delivered = true;
+	buttons_poll();
+	keys_tap(&power, pon_bits & PON_KPDPWR);
+	keys_tap(resin_key, pon_bits & PON_RESIN);
+	keys_tap(pin_key, pin_bits & GPIO_IRQ_BIT);
 }
 
 static void
@@ -599,19 +982,29 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 		goto out;
 	}
 
-	printf("buttons: step 5: watching%s%s%s, every %u ms: power is the side button\n", power.usable ? " power" : "",
-	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", POLL_MS);
-	for (unsigned tick = 1;; tick++) {
+	printf("buttons: step 5: watching%s%s%s: power is the side button\n", power.usable ? " power" : "",
+	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "");
+	arb_channels = channels;
+	keys_irq_start();
+	uint64_t minute, next_summary = mach_absolute_time();
+
+	nanoseconds_to_absolutetime(60 * NSEC_PER_SEC, &minute);
+	next_summary += minute / 6;     /* once early on as well (10 s): a short run is to say what the reads cost too */
+	for (;;) {
 		buttons_poll();
-		/* once early on as well: a short run is to say what the reads cost too */
-		if (tick % MINUTE_TICKS == 0 || tick == 10 * 1000 / POLL_MS) {
+		if (mach_absolute_time() >= next_summary) {
 			say_summary();
+			next_summary = mach_absolute_time() + minute;
 		}
 		if (bus.failed >= 1000 && bus.failed * 2 > bus.reads) {
 			printf("buttons: more than half of %llu reads have failed: giving up\n", bus.reads);
 			break;
 		}
-		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
+		if (keys_irq.on && keys_steady()) {
+			keys_wait();
+		} else {
+			hakios_screen_pause(POLL_MS, 3 * POLL_MS);   /* (48 ms with the screen off: a press still lasts longer) */
+		}
 	}
 out:
 	if (steps < 5) {
@@ -697,30 +1090,14 @@ hakios_buttons_init(void)
 		arb = &arb_sm8450;
 	}
 	if (kernel_thread_start(buttons_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "buttons");
 		thread_deallocate(thread);
 	}
 }
 
 /*
- * What interrupts would take, instead of looking 60 times a second:
- *
- *   - The arbiter has one interrupt line for all the PMICs' peripherals ("periph_irq": through the
- *     power domain controller's pin 1 to the interrupt controller's SPI 481). This kernel has no
- *     driver that takes a hardware interrupt other than the timer's so far; that is the first
- *     thing to add (a handler registered for one more interrupt of the GICv3 the kernel already
- *     drives, and that line unmasked and set to level, high).
- *   - Per channel, the arbiter has an enable bit ("ACC_ENABLE"), a status and a clear register
- *     (in the "chnls" region: 0x100, 0x104, 0x108 of 0x10000 per channel), and per system a
- *     summary of which channels have something. Those are writes to the arbiter, not to a PMIC.
- *   - But the peripheral must be told to raise them as well: for each key a bit in "interrupt
- *     type" (edge), "polarity high" and "polarity low" (both edges), and "enable set". Those are
- *     WRITES TO THE PMIC -- to the power-on block for power and RESIN, to the GPIO for the
- *     other volume key -- unless the firmware has left them set; step 4 prints what it finds there.
- *     After an interrupt the peripheral's latched status is cleared by another write to it.
- *   - Only the system that owns a peripheral's channel gets its interrupts (step 2 prints the
- *     owners).
- * Looking costs two reads of some tens of microseconds each, 60 times a second (the minute's
- * summary line says what they really take), so the reason to want interrupts would not be
- * processor time; it would be a system that sleeps and is to be woken by a key, and this one
- * does not sleep.
+ * Interrupts on the X5 Pro would take the same as on the 10 Pro (see "interrupts" above) with version 5's layout:
+ * "chnls" 0x10000 per channel, "intr" 0x10000 per system, and that phone's PDC pin and GIC number from its tree.
+ * Firmware on the 10 Pro leaves the keys' interrupts off (step 4: enabled 0); our system owns both channels and
+ * gets their interrupts (step 2).
  */

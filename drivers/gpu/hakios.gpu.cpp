@@ -73,6 +73,7 @@ void hakios_gpu_power_start(void);
 void hakios_gpu_power_line(char * line, size_t size);
 int hakios_gpu_control(unsigned kind, int value, bool write);
 bool hakios_gpu_power_tick(void);
+bool hakios_gpu_power_asleep(void);
 void HakiosGPUAssertLocked(void);
 void HakiosGPUPowerLog(void);
 
@@ -261,16 +262,34 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_ifpc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG
 SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_slumber, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
     NULL, 5, gpuLevelSysctl, "I", "Deep idle collapse 0/1; requires gpu_slumber=1, idle 1 second");
 
+/*
+ * The power tick: every 50 ms, every second while the GPU is in slumber (it has nothing to look at then; STANDBY-PLAN.md).
+ * The next submission brings it back to 50 ms (gpuPowerSubmitted()). Under gGPULock.
+ */
+static bool gGPUPowerSlow;
+
 static void
 gpuPowerTick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	IOLockLock(gGPULock);
 	if (gGPUPowerRunning && hakios_gpu_power_tick()) {
 		uint64_t deadline;
-		clock_interval_to_deadline(50, NSEC_PER_MSEC, &deadline);
+		gGPUPowerSlow = hakios_gpu_power_asleep();
+		clock_interval_to_deadline(gGPUPowerSlow ? 1000 : 50, NSEC_PER_MSEC, &deadline);
 		thread_call_enter_delayed(gGPUPowerCall, deadline);
 	}
 	IOLockUnlock(gGPULock);
+}
+
+static void
+gpuPowerSubmitted(void)
+{
+	if (gGPUPowerSlow && gGPUPowerRunning && gGPUPowerCall != NULL) {
+		uint64_t deadline;
+		gGPUPowerSlow = false;
+		clock_interval_to_deadline(50, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(gGPUPowerCall, deadline);
+	}
 }
 
 void
@@ -918,6 +937,7 @@ MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned c
 	}
 	hakios_gpu_to_memory(NULL, 0);          /* (what was written is in memory: a barrier) */
 	fence = hakios_gpu_submit(&address, &words, 1);
+	gpuPowerSubmitted();
 	if (fence == 0) {
 		if (!gGPUReported) {
 			gGPUReported = true;
@@ -1861,6 +1881,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		words[count++] = cmds[i].size / 4;
 	}
 	request->fence = hakios_gpu_submit(addresses, words, count);
+	gpuPowerSubmitted();
 	if (gpu_log && request->fence != 0) {
 		/* "tl: Q FENCE at US: N buffers, B of 4 MB or more, W words of commands": what was given (tl: q: what it took) */
 		uint32_t big = 0, all_words = 0;

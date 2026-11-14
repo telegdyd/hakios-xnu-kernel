@@ -72,7 +72,7 @@ GROUPS = [
     ("Haptics and torch", r"hakios\.(haptic|torch)\."),
     ("Chip, thermal and PMIC", r"hakios\.(socinfo|thermal|pmic)\."),
     ("Version", r"hakios\.version\."),
-    ("CPU, memory and boot", r"hakios\.cpufreq\.|GenericARMPE|loader_return|\(patch\)"),
+    ("CPU, memory and boot", r"hakios\.cpufreq\.|GenericARMPE|loader_return|psci_smp|\(patch\)"),
     ("Debugging", r"user_exception_trace"),
     ("Loader", r"loader\.c"),
     ("User space", r"."),

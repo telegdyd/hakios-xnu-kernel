@@ -4607,6 +4607,13 @@ hakios_gpu_power_tick(void)
 	return !dcvs_failed;
 }
 
+/* In slumber (CX and the GMU off): the power tick has nothing to do until the next submission (hakios.gpu.cpp). */
+bool
+hakios_gpu_power_asleep(void)
+{
+	return power_state == 6;
+}
+
 static void
 gpu_dcvs_submit(void)
 {

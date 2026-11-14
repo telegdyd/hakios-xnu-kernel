@@ -9,7 +9,9 @@
  *            by hand, open drain, with the pull-ups of the TLMM
  *   chip     reset is GPIO20 (low = in reset), the attention line is GPIO21 (low = a message is waiting)
  *   report   a bit stream described by the chip's own "touch report config" (command 0x25), read once at start
- * No interrupt is used: a thread looks at the attention line every 10 ms.
+ * The attention line's interrupt (TLMM GPIO21, level low, on the TLMM's summary line: GIC 240) wakes the thread, which
+ * reads until the line is high again; a net of 1 s (10 ms, 50 ms with the screen off, until the line has delivered once).
+ * touch_irq=0: the thread looks every 10 ms instead.
  * With boot-arg touch_bus=2 the bytes go through the serial engine and the QUP's GPI DMA instead of the wires by hand
  * (see "the serial engine itself" below); touch_bus=1 only looks at that hardware and logs it.
  *
@@ -21,15 +23,23 @@
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
+#include <os/atomic_private.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <mach/vm_param.h>
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_line(const char *line);
+extern void hakios_screen_pause(uint32_t on_ms, uint32_t off_ms);
+extern bool hakios_screen_off(void);
+extern void thread_set_thread_name(thread_t thread, const char *name);
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
 
 /*
  * Each line also into the loader's log, which the live USB log (usb-netlog.py) streams: the console is quiet once
@@ -99,6 +109,123 @@ static bool
 attention(void)
 {
 	return rd(PIN_ATTN + 4) & 1;    /* true = high = nothing waiting */
+}
+
+/*
+ * The attention line's interrupt (Linux pinctrl-msm.c with pinctrl-sm8450.c's layout): a pin's interrupt config at +8,
+ * [0] enable, [1] polarity (0: low), [3:2] detection (0: level), [4] raw status on, [7:5] which processor (3: ours);
+ * its status at +0xc, [0], cleared by writing 0. All pins' interrupts share the TLMM's summary line, SPI 208.
+ * The handler masks the GIC line and wakes the thread; the thread reads, clears the pin's status and unmasks (a line
+ * still low latches again at once, so nothing is lost while the thread reads).
+ */
+#define INTR_CFG                0x8
+#define INTR_STATUS             0xc
+#define INTR_ENABLE             (1u << 0)
+#define INTR_RAW_STATUS         (1u << 4)
+#define INTR_TARGET_APPS        (3u << 5)
+#define TOUCH_INTID             240
+#define TOUCH_NET_MS            1000
+#define TOUCH_STORM             2000            /* in a second: the chip reports at some hundreds while touched */
+
+static struct {
+	bool            on, delivered;
+	volatile uint32_t rang;
+	uint32_t        count, by_line, foreign, nets, period_count;
+	uint64_t        period, second;
+} touch_irq;
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_irq_count, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_irq.count, 0,
+    "the touch attention line's interrupts taken");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_irq_foreign, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_irq.foreign, 0,
+    "TLMM summary interrupts with the attention pin's status clear");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_irq_nets, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_irq.nets, 0,
+    "touch waits ended by the net (no interrupt)");
+
+/* In interrupt context. */
+static void
+touch_irq_arrived(__unused void *context, uint32_t intid)
+{
+	uint64_t now = mach_absolute_time();
+
+	gic_v3_spi_mask(intid);
+	touch_irq.count++;
+	if (now - touch_irq.period >= touch_irq.second) {
+		touch_irq.period = now;
+		touch_irq.period_count = 0;
+	}
+	if (++touch_irq.period_count > TOUCH_STORM) {
+		touch_irq.on = false;           /* (left masked; the thread says so) */
+	}
+	os_atomic_store(&touch_irq.rang, 1, release);
+	thread_wakeup((event_t)&touch_irq.rang);
+}
+
+static void
+touch_irq_start(void)
+{
+	uint32_t wanted = 1, old = rd(PIN_ATTN + INTR_CFG), cfg;
+
+	PE_parse_boot_argn("touch_irq", &wanted, sizeof(wanted));
+	if (!wanted) {
+		printf("s3908: no interrupt (touch_irq=0)\n");
+		return;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &touch_irq.second);
+	cfg = (old & ~0xffu) | INTR_RAW_STATUS | INTR_TARGET_APPS;      /* level, low */
+	wr(PIN_ATTN + INTR_CFG, cfg);
+	wr(PIN_ATTN + INTR_STATUS, 0);
+	wr(PIN_ATTN + INTR_CFG, cfg | INTR_ENABLE);
+	os_atomic_store(&touch_irq.rang, 0, relaxed);
+	touch_irq.on = true;
+	if (gic_v3_spi_attach(TOUCH_INTID, false, touch_irq_arrived, NULL) != KERN_SUCCESS) {
+		touch_irq.on = false;
+		wr(PIN_ATTN + INTR_CFG, old);
+		printf("s3908: THE TLMM'S INTERRUPT (GIC %u) CANNOT BE TAKEN: looking every 10 ms\n", TOUCH_INTID);
+		return;
+	}
+	printf("s3908: interrupts: GPIO21 config %#x -> %#x, status %#x, attention %s; GIC %u\n", old, rd(PIN_ATTN + INTR_CFG),
+	    rd(PIN_ATTN + INTR_STATUS), attention() ? "high" : "low", TOUCH_INTID);
+}
+
+/* Until the chip has something (or the net). */
+static void
+touch_wait(void)
+{
+	uint32_t status;
+
+	static bool said;
+
+	if (!touch_irq.on) {
+		if (touch_irq.count != 0 && !said) {
+			said = true;
+			printf("s3908: MORE THAN %u INTERRUPTS IN A SECOND: the line is left masked; looking every 10 ms\n",
+			    TOUCH_STORM);
+		}
+		hakios_screen_pause(10, 50);     /* (50 ms with the screen off: a tap to wake is still seen; STANDBY-PLAN.md) */
+		return;
+	}
+	/* re-armed only now that what was waiting has been read: a line still low latches again and rings at once */
+	wr(PIN_ATTN + INTR_STATUS, 0);
+	gic_v3_spi_unmask(TOUCH_INTID);
+	assert_wait_timeout((event_t)&touch_irq.rang, THREAD_UNINT,
+	    touch_irq.delivered ? TOUCH_NET_MS : hakios_screen_off() ? 50 : 10, NSEC_PER_MSEC);
+	if (os_atomic_load(&touch_irq.rang, acquire) != 0) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+	} else {
+		(void)thread_block(THREAD_CONTINUE_NULL);
+	}
+	if (os_atomic_xchg(&touch_irq.rang, 0, acquire) == 0) {
+		touch_irq.nets++;
+		return;
+	}
+	status = rd(PIN_ATTN + INTR_STATUS);
+	if (status & 1) {
+		touch_irq.by_line++;
+		touch_irq.delivered = true;
+	} else if (touch_irq.foreign++ < 8) {
+		printf("s3908: the TLMM's interrupt with GPIO21's status clear (another pin's)\n");
+	}
 }
 
 /* ---- I2C by hand: a line is let go (pulled high) or driven low, never driven high ----------------- */
@@ -1453,7 +1580,7 @@ chip_setup(void)
 static void
 s3908_thread(__unused void *argument, __unused wait_result_t wait)
 {
-	uint32_t beat = 0, since_beat = 0;
+	uint32_t beat = 0;
 
 	sleep_ms(5000);         /* the system is up by then, and the screen shows what happens */
 	pins = (volatile uint8_t *)ml_io_map(TLMM_PINS_PHYS, TLMM_PINS_SIZE);
@@ -1489,9 +1616,15 @@ s3908_thread(__unused void *argument, __unused wait_result_t wait)
 			return;
 		}
 	}
-	printf("s3908: running (%d x %d) over %s, looking at the attention line every 10 ms\n", PANEL_MAX_X, PANEL_MAX_Y,
-	    gpi.on ? "the serial engine (GPI DMA)" : "the wires by hand");
+	touch_irq_start();
+	printf("s3908: running (%d x %d) over %s, %s\n", PANEL_MAX_X, PANEL_MAX_Y,
+	    gpi.on ? "the serial engine (GPI DMA)" : "the wires by hand",
+	    touch_irq.on ? "woken by the attention line" : "looking at the attention line every 10 ms");
 
+	uint64_t five_s, next_beat;
+
+	nanoseconds_to_absolutetime(5 * NSEC_PER_SEC, &five_s);
+	next_beat = mach_absolute_time() + five_s;
 	for (;;) {
 		for (unsigned n = 0; n < 4 && !attention(); n++) {
 			uint64_t start = mach_absolute_time(), ns;
@@ -1513,15 +1646,16 @@ s3908_thread(__unused void *argument, __unused wait_result_t wait)
 			}
 		}
 		seen.polls++;
-		sleep_ms(10);
-		if (++since_beat >= 500) {      /* every 5 s: a line for the console, every minute once it is quiet */
-			since_beat = 0;
+		touch_wait();
+		if (mach_absolute_time() >= next_beat) {        /* every 5 s: a line for the console, every minute once it is quiet */
+			next_beat = mach_absolute_time() + five_s;
 			if (beat++ < 24 || beat % 12 == 0) {
 				printf("s3908: %u looks, %u messages, %u finger positions (last %u, %u), %u errors, attention %s, "
-				    "%s, %llu touch reports at %llu us each\n",
+				    "%s, %llu touch reports at %llu us each; interrupts %s: %u, %u by the line, %u of others, %u nets\n",
 				    seen.polls, seen.messages, seen.touches, seen.last_x, seen.last_y, seen.errors,
 				    attention() ? "high" : "low", gpi.on ? "gpi" : "by hand", seen.reports,
-				    seen.reports ? seen.report_ns / seen.reports / 1000 : 0);
+				    seen.reports ? seen.report_ns / seen.reports / 1000 : 0, touch_irq.on ? "on" : "OFF",
+				    touch_irq.count, touch_irq.by_line, touch_irq.foreign, touch_irq.nets);
 			}
 		}
 	}
@@ -1538,6 +1672,7 @@ hakios_s3908_init(void)
 	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
 	if (kernel_thread_start(s3908_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "touch-s3908");
 		thread_deallocate(thread);
 	}
 }

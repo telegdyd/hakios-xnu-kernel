@@ -39,6 +39,7 @@ static LCK_GRP_DECLARE(hakios_platform_lock_group, "hakios-platform");
  */
 extern void loader_request_return(int mode) __attribute__((weak));
 extern void hakios_adsp_stop(void) __attribute__((weak));
+extern void hakios_buttons_quiesce(void) __attribute__((weak));
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 /*
@@ -65,6 +66,8 @@ static uint32_t reboot_fastboot;
 extern void loader_log_putc(char c) __attribute__((weak));
 
 static void fb_say(const char *format, ...) __printflike(1, 2);
+
+/* A line of the reset path, to the console and to the loader's log at once (the live USB log has it). */
 static void
 fb_say(const char *format, ...)
 {
@@ -118,57 +121,112 @@ fb_spmi(vm_offset_t channel, uint32_t command, uint32_t *data, bool write)
 	return status == 1;
 }
 
-static int
-fastboot_reset(void)
-{
-	vm_offset_t core = ml_io_map(FB_ARB_CORE, 0x3000), cnfg = ml_io_map(FB_ARB_CNFG, 0x4000), channel, imem;
-	uint32_t apid = 1024, owner, before = 0, after = 0, value;
+/* What the reset needs mapped, once (a second request maps nothing again). */
+static vm_offset_t fb_core, fb_cnfg, fb_channel, fb_imem;
+static uint32_t fb_apid = 1024, fb_owner = 8;
 
-	for (uint32_t n = 0; n < 1024 && core != 0; n++) {
-		if (((fb_rd(core + FB_ARB_TABLE + 4 * n) >> 8) & 0xfff) == FB_SDAM_PPID) {
-			apid = n;
+static void
+fastboot_map(void)
+{
+	if (fb_core != 0) {
+		return;
+	}
+	fb_core = ml_io_map(FB_ARB_CORE, 0x3000);
+	fb_cnfg = ml_io_map(FB_ARB_CNFG, 0x4000);
+	for (uint32_t n = 0; n < 1024 && fb_core != 0; n++) {
+		if (((fb_rd(fb_core + FB_ARB_TABLE + 4 * n) >> 8) & 0xfff) == FB_SDAM_PPID) {
+			fb_apid = n;
 			break;
 		}
 	}
-	if (apid == 1024 || cnfg == 0) {
+	if (fb_apid < 1024 && fb_cnfg != 0) {
+		fb_owner = fb_rd(fb_cnfg + 4 * fb_apid) & 7;
+		fb_channel = ml_io_map(FB_ARB_CHNLS + 0x1000 * (vm_offset_t)fb_apid, 0x1000);
+	}
+	fb_imem = ml_io_map(FB_IMEM_RESTART & ~0xfffUL, 0x1000);
+}
+
+/*
+ * The reboot reason ("bootloader") into the SDAM and the cookie into IMEM, checked. The first thing of a reset into
+ * fastboot: whatever ends this kernel after it (the reset, or a fault on the way to it) lands in the boot loader's
+ * fastboot, not in the installed system.
+ */
+static int
+fastboot_reason(void)
+{
+	uint32_t before = 0, after = 0, value;
+
+	fastboot_map();
+	if (fb_apid == 1024 || fb_cnfg == 0 || fb_channel == 0) {
 		fb_say("hakios: fastboot: the SDAM 0x7100 has no channel of the arbiter: no reset\n");
 		return ENODEV;
 	}
-	owner = fb_rd(cnfg + 4 * apid) & 7;
-	if (owner != 0) {
-		fb_say("hakios: fastboot: the SDAM 0x7100 (channel %u) belongs to system %u, not ours: no reset\n", apid, owner);
+	if (fb_owner != 0) {
+		fb_say("hakios: fastboot: the SDAM 0x7100 (channel %u) belongs to system %u, not ours: no reset\n", fb_apid,
+		    fb_owner);
 		return EPERM;
 	}
-	channel = ml_io_map(FB_ARB_CHNLS + 0x1000 * (vm_offset_t)apid, 0x1000);
-	if (channel == 0 || !fb_spmi(channel, 1u << 27 | FB_SDAM_REASON << 4, &before, false)) {
-		fb_say("hakios: fastboot: the reason byte cannot be read (channel %u): no reset\n", apid);
+	if (!fb_spmi(fb_channel, 1u << 27 | FB_SDAM_REASON << 4, &before, false)) {
+		fb_say("hakios: fastboot: the reason byte cannot be read (channel %u): no reset\n", fb_apid);
 		return EIO;
 	}
 	value = (before & 1) | FB_REASON_BOOTLOADER << 1;
-	if (!fb_spmi(channel, FB_SDAM_REASON << 4, &value, true) ||
-	    !fb_spmi(channel, 1u << 27 | FB_SDAM_REASON << 4, &after, false) || (after & 0xff) != value) {
+	if (!fb_spmi(fb_channel, FB_SDAM_REASON << 4, &value, true) ||
+	    !fb_spmi(fb_channel, 1u << 27 | FB_SDAM_REASON << 4, &after, false) || (after & 0xff) != value) {
 		fb_say("hakios: fastboot: the reason byte was %#x, written %#x, reads %#x: no reset\n", before & 0xff, value,
 		    after & 0xff);
 		return EIO;
 	}
-	imem = ml_io_map(FB_IMEM_RESTART & ~0xfffUL, 0x1000);
-	if (imem != 0) {
-		fb_wr(imem + (FB_IMEM_RESTART & 0xfff), FB_IMEM_BOOTLOADER);
+	if (fb_imem != 0) {
+		fb_wr(fb_imem + (FB_IMEM_RESTART & 0xfff), FB_IMEM_BOOTLOADER);
 	}
-	fb_say("hakios: fastboot: reboot reason %#x -> %#x (bootloader), IMEM cookie %s; the audio DSP stopped; PSCI reset\n",
-	    before & 0xff, after & 0xff, imem != 0 ? "set" : "NOT set");
+	fb_say("hakios: fastboot: reboot reason %#x -> %#x (bootloader), IMEM cookie %s\n", before & 0xff, after & 0xff,
+	    fb_imem != 0 ? "set" : "NOT set");
+	return 0;
+}
+
+/* The rest: the audio DSP stopped, then PSCI SYSTEM_RESET (fastboot_reason() first). */
+static int
+fastboot_reset(void)
+{
 	if (hakios_adsp_stop != NULL) {
 		hakios_adsp_stop();     /* (for the next kernel to find it stopped, not left running) */
 	}
+	fb_say("hakios: fastboot: the audio DSP stopped; PSCI SYSTEM_RESET now\n");
 	delay_for_interval(200, NSEC_PER_MSEC);  /* (the line out to the USB log) */
 	(void)ml_set_interrupts_enabled(FALSE);
 	{
 		register uint64_t x0 __asm__("x0") = FB_PSCI_SYSTEM_RESET;
 
 		__asm__ volatile ("smc #0" : "+r" (x0) : : "x1", "x2", "x3", "memory");
+		(void)ml_set_interrupts_enabled(TRUE);
+		fb_say("hakios: fastboot: PSCI SYSTEM_RESET RETURNED %#llx\n", (unsigned long long)x0);
 	}
 	return EIO;                     /* (not reached) */
 }
+
+/*
+ * kern.hakios.io_map_used: what the drivers' ml_io_map() calls hold of XNU's I/O map (osfmk/arm/io_map.c), now and at
+ * most, and its size. It was 8 MB, and full at boot with the step-2 kernels: the reset's own maps then panicked
+ * (REBOOT-FAULT.md). It is 64 MB now.
+ */
+extern vm_size_t io_map_used, io_map_peak;
+extern const vm_size_t io_map_size;
+
+static int
+io_map_used_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	char text[96];
+
+	if (req->newptr != USER_ADDR_NULL) {
+		return EPERM;
+	}
+	snprintf(text, sizeof(text), "%lu KB used, %lu KB at most, of %lu KB", (unsigned long)(io_map_used >> 10),
+	    (unsigned long)(io_map_peak >> 10), (unsigned long)(io_map_size >> 10));
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, io_map_used, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, io_map_used_sysctl, "A",
+    "the kernel's I/O map (ml_io_map): used, peak, size");
 
 static int
 hakios_loader_request_sysctl(struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
@@ -184,8 +242,19 @@ hakios_loader_request_sysctl(struct sysctl_oid *oidp, __unused void *arg1, __unu
 		PE_parse_boot_argn("reboot_fastboot", &reboot_fastboot, sizeof(reboot_fastboot));
 		reboot_fastboot = reboot_fastboot == 8450 ? 8450 : 1;
 	}
+	fb_say("hakios: loader_request %d (reboot_fastboot %u); I/O map %lu of %lu KB\n", mode, reboot_fastboot,
+	    (unsigned long)(io_map_used >> 10), (unsigned long)(io_map_size >> 10));
 	if (mode == 2 && reboot_fastboot == 8450) {
 		mode = 3;
+	}
+	if (mode == 3 && reboot_fastboot == 8450) {
+		error = fastboot_reason();
+		if (error != 0) {
+			return error;
+		}
+	}
+	if ((mode == 1 || mode == 2 || mode == 3) && hakios_buttons_quiesce != NULL) {
+		hakios_buttons_quiesce();       /* (the keys' PMIC interrupts as the firmware left them: off) */
 	}
 	if (mode == 3) {
 		return reboot_fastboot == 8450 ? fastboot_reset() : EINVAL;

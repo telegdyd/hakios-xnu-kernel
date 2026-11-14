@@ -42,6 +42,8 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
+extern void thread_set_thread_name(thread_t thread, const char *name);
+extern bool hakios_screen_off(void);
 extern void IOSleep(unsigned int milliseconds);
 extern void loader_log_putc(char c);
 extern uint32_t loader_log_copy(uint64_t *pos, char *out, uint32_t max);
@@ -808,7 +810,8 @@ phyguard_look(uint32_t elapsed_ms)
 
 /*
  * The loop: every millisecond while anything has happened in the last second, every five when it
- * has been quiet (a quiet controller costs one read of GEVNTCOUNT). No interrupt is attached, as in
+ * has been quiet (a quiet controller costs one read of GEVNTCOUNT), every twenty when it has been
+ * quiet with the screen off. No interrupt is attached, as in
  * hakios.ufshc.c and hakios.net.c.
  */
 static void
@@ -840,7 +843,8 @@ event_loop(void)
 		} else if (quiet < 1000) {
 			quiet++;
 		}
-		interval = (count != 0 || quiet < 1000) ? 1 : 5;
+		/* (quiet with the screen off: every 20 ms; STANDBY-PLAN.md) */
+		interval = (count != 0 || quiet < 1000) ? 1 : hakios_screen_off() ? 20 : 5;
 		phyguard.since_ms += interval;
 		if (phyguard.since_ms >= 10) {
 			phyguard_look(phyguard.since_ms);
@@ -2206,6 +2210,7 @@ usbnet_thread(__unused void *parameter, __unused wait_result_t result)
 	usbnet_attached = true;
 	usbnet_ipv4();
 	if (kernel_thread_start(log_port_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "usb-logport");
 		thread_deallocate(thread);
 	}
 	/* (the loader's UEFI cannot run while the kernel is on its core: nothing to wait for or ask) */
@@ -2235,5 +2240,6 @@ hakios_usb_net_init(void)
 		printf("usb_net: the thread cannot be started\n");
 		return;
 	}
+	thread_set_thread_name(thread, "usb-net");
 	thread_deallocate(thread);
 }

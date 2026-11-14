@@ -19,6 +19,8 @@ extern "C" {
 #include <IOKit/IOCPU.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
+#include <sys/errno.h>
+#include <sys/sysctl.h>
 
 #include "MiniDrivers.h"
 
@@ -31,8 +33,15 @@ extern uint32_t processor_avail_count;
 void psci_smp_init(void);
 kern_return_t psci_smp_start_cpu(int cpu);
 void psci_smp_cpu_running(void);
-void psci_smp_cpu_off(void) __dead2;
+void psci_smp_cpu_unplug(void) __dead2;
+void psci_smp_set_screen_off_cores(uint64_t cores);
+uint64_t psci_smp_cores_up(void);
+size_t hakios_wakes_text(char *buf, size_t size);
+extern uint32_t hakios_screen_slow;
+extern uint64_t psci_smp_screen_off_cores;
 void gic_v3_irq_signal(uint32_t phys_id);
+void psci_idle_init(void);
+void psci_idle_notify(cpu_id_t cpu_id, boolean_t enter, uint64_t *new_timeout_ticks);
 }
 
 /*
@@ -102,6 +111,7 @@ GenericARMCPU::start(IOService * provider)
 	info.phys_id = physID;
 	info.cluster_id = topology->cluster_id;
 	info.cluster_type = topology->cluster_type;
+	info.processor_idle = psci_idle_notify;         /* the idle states (psci_smp.c): around cpu_idle()'s WFI */
 	if (ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler) != KERN_SUCCESS) {
 		IOLog("GenericARMCPU: ml_processor_register failed\n");
 		return false;
@@ -138,15 +148,22 @@ GenericARMCPU::initCPU(bool boot)
 		 */
 		gic_v3_irq_signal(physID);
 	}
+	if (!boot) {
+		/* (the hang detector's tick, loader_return.c, is per processor: one that was off has none) */
+		ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
+	}
 }
 
-/* On the processor itself, at the end of processor_exit(): it is to stop for good. */
+/*
+ * On the processor itself, at the end of processor_exit(): it is switched off, and may be started again (while the
+ * display is off, psci_smp.c's screen_off_cores).
+ */
 void
 GenericARMCPU::quiesceCPU(void)
 {
 	if (getCPUNumber() != (UInt32)master_cpu) {
 		setCPUState(kIOCPUStateStopped);
-		psci_smp_cpu_off();
+		psci_smp_cpu_unplug();
 	}
 }
 
@@ -177,6 +194,66 @@ GenericARMCPU::getCPUName(void)
 	snprintf(name, sizeof(name), "Primary%u", (unsigned)getCPUNumber());
 	return OSSymbol::withCString(name);
 }
+
+/*
+ * kern.hakios.screen_off_cores: the processors switched off while the display is off (boot-arg screen_off_cores, a bit
+ * per processor number; 0: none). kern.hakios.cpus_up: the processors that are up now.
+ */
+SYSCTL_DECL(_kern_hakios);
+
+static int
+screenOffCoresSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	uint64_t value = psci_smp_screen_off_cores;
+	int error = sysctl_io_number(req, (long long)value, sizeof(value), &value, NULL);
+
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (value & (1ULL << master_cpu)) {
+		return EINVAL;
+	}
+	psci_smp_set_screen_off_cores(value);
+	return 0;
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, screen_off_cores, CTLTYPE_QUAD | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    screenOffCoresSysctl, "QU", "the processors switched off while the display is off (screen_off_cores)");
+
+static int
+cpusUpSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	uint64_t value = psci_smp_cores_up();
+
+	return SYSCTL_OUT(req, &value, sizeof(value));
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, cpus_up, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
+    cpusUpSysctl, "QU", "the processors that are up now, a bit per processor number");
+
+/* kern.hakios.wakes: interrupts per processor and context switches per kernel thread, as text (psci_smp.c) */
+#define WAKES_TEXT      32768
+
+static int
+wakesSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	char * text = (char *)IOMallocData(WAKES_TEXT);
+	int error;
+
+	if (text == NULL) {
+		return ENOMEM;
+	}
+	size_t length = hakios_wakes_text(text, WAKES_TEXT);
+	error = SYSCTL_OUT(req, text, length + 1);
+	IOFreeData(text, WAKES_TEXT);
+	return error;
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, wakes, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
+    wakesSysctl, "A", "interrupts per processor and context switches per kernel thread (STANDBY-PLAN.md)");
+
+SYSCTL_UINT(_kern_hakios, OID_AUTO, screen_off_slow, CTLFLAG_RW | CTLFLAG_LOCKED, &hakios_screen_slow, 0,
+    "the drivers' loops look less often while the display is off (screen_off_slow)");
 
 class GenericARMPE : public IODTPlatformExpert
 {
@@ -254,6 +331,7 @@ GenericARMPE::start(IOService * provider)
 		ml_set_max_cpus(count);
 		if (count > 1) {
 			psci_smp_init();
+			psci_idle_init();
 		}
 		/*
 		 * The slower cores (an L2 access penalty, the loader's "small-core") are started 28 seconds

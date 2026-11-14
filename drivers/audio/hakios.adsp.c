@@ -89,6 +89,7 @@
 #include <sys/errno.h>
 #include <sys/kauth.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/vnode.h>
 #include <sys/vnode_internal.h>
@@ -102,6 +103,7 @@ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);
 extern void loader_return(void);
 extern kern_return_t thread_terminate(thread_t thread);
+extern void thread_set_thread_name(thread_t thread, const char *name);
 extern vm_offset_t pe_arm_get_soc_base_phys(void);
 extern dev_t mdevlookup(int devid);
 extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
@@ -631,14 +633,17 @@ static struct block aoss = { "mailbox", 0x0c300000, 0x400 };
 static struct block ipcc = { "ipcc", 0x00408000, 0x1000 };
 
 static struct {
-	uint32_t glink, smp2p, said;
+	uint32_t glink, smp2p, aop, said;
 	uint64_t since;
 } doorbell;
 
 /*
  * The audio DSP's rings, counted and cleared. Another's ring (the Wi-Fi DSP's, the always-on
  * processor's) is left for whoever listens for it: IPCC names the same one until it is cleared,
- * so the look ends there.
+ * so the look ends there. On the 10 Pro nobody else listens on this block (its Wi-Fi is on PCIe),
+ * and the always-on processor rings after each mailbox message, which nobody waits for (the
+ * mailbox is read, not rung for): such a ring is cleared here, or it would hold the doorbells'
+ * interrupt high for good (STANDBY-PLAN.md; Linux's IPCC handler clears every ring).
  */
 static void
 doorbells(void)
@@ -646,6 +651,11 @@ doorbells(void)
 	for (unsigned i = 0; i < 8; i++) {
 		uint32_t who = rd(ipcc.base + IPCC_RECEIVED);
 
+		if (who != IPCC_NOBODY && who >> 16 == IPCC_AOP && adsp_soc == 8450) {
+			wr(ipcc.base + IPCC_CLEAR, who);
+			doorbell.aop++;
+			continue;
+		}
 		if (who == IPCC_NOBODY || who >> 16 != IPCC_LPASS) {
 			return;
 		}
@@ -3330,8 +3340,14 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 				tell("adsp: battmgr: full charge %u uAh, as designed %u uAh, %u cycles\n", full, design, cycles);
 			}
 		}
-		for (unsigned ms = 0; ms < BATTMGR_SECONDS * 1000 && battmgr.wanted && glink.up; ms += 50) {
-			sleep_ms(50);
+		/* (one wait, not 50 ms steps: battmgr_stop() ends it at once) */
+		if (battmgr.wanted && glink.up) {
+			assert_wait_timeout((event_t)&battmgr.wanted, THREAD_UNINT, BATTMGR_SECONDS * 1000, NSEC_PER_MSEC);
+			if (!battmgr.wanted) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				(void)thread_block(THREAD_CONTINUE_NULL);
+			}
 		}
 	}
 	battmgr.runs = false;
@@ -3356,6 +3372,7 @@ battmgr_start(void)
 	}
 	battmgr.wanted = true;
 	if (kernel_thread_start(battmgr_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_set_thread_name(thread, "adsp-battmgr");
 		thread_deallocate(thread);
 	}
 }
@@ -3364,14 +3381,180 @@ static void
 battmgr_stop(void)
 {
 	battmgr.wanted = false;
+	thread_wakeup((event_t)&battmgr.wanted);
 	for (unsigned ms = 0; ms < 2000 && battmgr.runs; ms++) {
 		sleep_ms(1);
 	}
 }
 
-/* ---- the link's thread ----------------------------------------------------------------------------- */
+/* ---- the doorbells' interrupt ---------------------------------------------------------------------- */
+
+/*
+ * STANDBY-PLAN.md. On the 10 Pro the IPCC block of the DSP's doorbells interrupts the processors on GIC SPI 229
+ * (qcom,ipcc@ed18000: interrupts <0 0xe5 4>, level) for as long as a signal it listens for (IPCC_ENABLE: the DSP's
+ * GLINK and SMP2P, step 3) is uncleared. The handler masks the line and wakes the link's thread; the thread clears
+ * what rang (doorbells()) and unmasks it. So the thread sleeps until the DSP says something instead of looking every
+ * millisecond. A wait also ends by itself after LINK_NET_MS (LINK_NET_OFF_MS with the screen off), as a net: work that
+ * such a wait finds is counted (kern.hakios.adsp_irq_net_found), a ring the line did not bring. A ring of another
+ * processor's that stays uncleared (nobody here clears it, so the line would not go low) keeps the line masked and the
+ * thread looking every millisecond while it is there. More than LINK_IRQ_STORM interrupts in a second give the line up
+ * for this boot. adsp_irq=0: never taken (the millisecond look). Only adsp_soc=8450.
+ */
+#define LINK_IRQ_INTID          (32 + 229)
+#define LINK_NET_MS             100
+#define LINK_NET_OFF_MS         1000
+#define LINK_IRQ_STORM          5000
 
 static volatile bool link_wanted, link_runs;
+
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
+extern void gic_v3_spi_detach(uint32_t intid);
+extern bool hakios_screen_off(void);
+extern void hakios_screen_pause(uint32_t on_ms, uint32_t off_ms);
+
+static struct {
+	bool attached, given_up, foreign_now;
+	volatile uint32_t on, rang;
+	uint32_t count, period_count, by_line, by_net, net_found, foreign;
+	uint64_t period, second;
+} link_irq;
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, adsp_irq_on, CTLFLAG_RD | CTLFLAG_LOCKED, (uint32_t *)&link_irq.on, 0,
+    "the audio DSP's doorbells wake the link's thread (1) or it looks every millisecond (0)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, adsp_irq_count, CTLFLAG_RD | CTLFLAG_LOCKED, &link_irq.count, 0, "doorbell interrupts taken");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, adsp_irq_by_line, CTLFLAG_RD | CTLFLAG_LOCKED, &link_irq.by_line, 0,
+    "link waits ended by the interrupt");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, adsp_irq_by_net, CTLFLAG_RD | CTLFLAG_LOCKED, &link_irq.by_net, 0, "link waits ended by the net");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, adsp_irq_net_found, CTLFLAG_RD | CTLFLAG_LOCKED, &link_irq.net_found, 0,
+    "net wakes that found work (rings the line did not bring)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, adsp_irq_aop, CTLFLAG_RD | CTLFLAG_LOCKED, &doorbell.aop, 0,
+    "the always-on processor's mailbox rings cleared");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, adsp_irq_foreign, CTLFLAG_RD | CTLFLAG_LOCKED, &link_irq.foreign, 0,
+    "looks that found another processor's ring left uncleared");
+
+/* In interrupt context. */
+static void
+link_irq_arrived(__unused void *context, uint32_t intid)
+{
+	uint64_t now = mach_absolute_time();
+
+	gic_v3_spi_mask(intid);
+	link_irq.count++;
+	if (now - link_irq.period >= link_irq.second) {
+		link_irq.period = now;
+		link_irq.period_count = 0;
+	}
+	if (++link_irq.period_count > LINK_IRQ_STORM) {
+		os_atomic_store(&link_irq.on, 0, release);      /* (left masked; the thread says so) */
+	}
+	os_atomic_store(&link_irq.rang, 1, release);
+	thread_wakeup((event_t)&link_irq.rang);
+}
+
+static void
+link_irq_start(void)
+{
+	uint32_t wanted = 1;
+
+	if (adsp_soc != 8450 || link_irq.attached || link_irq.given_up) {
+		return;
+	}
+	PE_parse_boot_argn("adsp_irq", &wanted, sizeof(wanted));
+	if (wanted == 0) {
+		tell("adsp: link: the doorbells' interrupt is not used (adsp_irq=0): the link's thread looks every millisecond\n");
+		return;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &link_irq.second);
+	link_irq.foreign_now = false;
+	os_atomic_store(&link_irq.rang, 0, relaxed);
+	os_atomic_store(&link_irq.on, 1, release);
+	/* (attaching enables the line: a ring already there comes at once, and only wakes the thread) */
+	if (gic_v3_spi_attach(LINK_IRQ_INTID, false, link_irq_arrived, NULL) != KERN_SUCCESS) {
+		os_atomic_store(&link_irq.on, 0, release);
+		tell("adsp: link: THE DOORBELLS' INTERRUPT (GIC %u) CANNOT BE TAKEN: the link's thread looks every millisecond\n",
+		    LINK_IRQ_INTID);
+		return;
+	}
+	link_irq.attached = true;
+	tell("adsp: link: the doorbells' interrupt (GIC %u, level) wakes the link's thread; a net every %u ms (%u ms with the "
+	    "screen off)\n", LINK_IRQ_INTID, LINK_NET_MS, LINK_NET_OFF_MS);
+}
+
+static void
+link_irq_stop(void)
+{
+	if (link_irq.attached) {
+		gic_v3_spi_detach(LINK_IRQ_INTID);
+		link_irq.attached = false;
+		tell("adsp: link: the doorbells' interrupt: %u taken; waits ended by it %u, by the net %u (of those %u found work); "
+		    "another's ring left uncleared %u times\n", link_irq.count, link_irq.by_line, link_irq.by_net, link_irq.net_found,
+		    link_irq.foreign);
+	}
+	os_atomic_store(&link_irq.on, 0, release);
+}
+
+/* Until the DSP may have said something. True if a ring (or the millisecond look) ended it, false if the net did. */
+static bool
+link_wait(void)
+{
+	if (!link_irq.attached || !os_atomic_load(&link_irq.on, acquire) || link_irq.foreign_now) {
+		sleep_us(1000);
+		return true;
+	}
+	assert_wait_timeout((event_t)&link_irq.rang, THREAD_UNINT, hakios_screen_off() ? LINK_NET_OFF_MS : LINK_NET_MS,
+	    NSEC_PER_MSEC);
+	if (os_atomic_xchg(&link_irq.rang, 0, acquire) != 0 || !link_wanted) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+		link_irq.by_line++;
+		return true;
+	}
+	(void)thread_block(THREAD_CONTINUE_NULL);
+	if (os_atomic_xchg(&link_irq.rang, 0, acquire) != 0) {
+		link_irq.by_line++;
+		return true;
+	}
+	link_irq.by_net++;
+	return false;
+}
+
+/* After doorbells(): the line on again, unless a ring that is not the audio DSP's is left (it would hold the line high). */
+static void
+link_irq_rearm(void)
+{
+	uint32_t who;
+
+	if (!link_irq.attached) {
+		return;
+	}
+	if (!os_atomic_load(&link_irq.on, acquire)) {
+		if (!link_irq.given_up) {
+			link_irq.given_up = true;
+			tell("adsp: link: MORE THAN %u DOORBELL INTERRUPTS IN A SECOND: the line is given up for this boot; the link's "
+			    "thread looks every millisecond\n", LINK_IRQ_STORM);
+		}
+		return;
+	}
+	who = rd(ipcc.base + IPCC_RECEIVED);
+	/* (a ring of the DSP's, or the always-on processor's, since doorbells(): the line brings it again at once) */
+	if (who != IPCC_NOBODY && who >> 16 != IPCC_LPASS && who >> 16 != IPCC_AOP) {
+		if (!link_irq.foreign_now && link_irq.foreign < 4) {
+			tell("adsp: link: a ring of another processor's is left uncleared (%#x): the line stays masked and the link's "
+			    "thread looks every millisecond while it is there\n", who);
+		}
+		link_irq.foreign++;
+		link_irq.foreign_now = true;
+		return;
+	}
+	link_irq.foreign_now = false;
+	gic_v3_spi_unmask(LINK_IRQ_INTID);
+}
+
+/* ---- the link's thread ----------------------------------------------------------------------------- */
+
+/* (link_wanted and link_runs: with the doorbells' interrupt, above) */
 
 static void
 link_thread(__unused void *parameter, __unused wait_result_t result)
@@ -3383,10 +3566,13 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 	bzero(&last, sizeof(last));
 	dsp_words(&last);
 	while (link_wanted) {
-		sleep_us(1000);
+		bool rung = link_wait(), found = false;
+
 		doorbells();
+		link_irq_rearm();
 		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
 			last = words;
+			found = true;
 			dsp_listen(&words);
 			if ((dsp_state(&words) & DSP_FATAL) && !gave_up) {
 				gave_up = true;
@@ -3394,7 +3580,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 				show_crash_reason();
 			}
 		}
-		for (;;) {
+		for (;; found = true) {
 			unsigned from = CHANNELS;
 
 			lck_mtx_lock(&glink_lock);
@@ -3424,6 +3610,9 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 			kfree_data(packet, sizeof(*packet) + packet->length);
 		}
+		if (!rung && found) {
+			link_irq.net_found++;
+		}
 	}
 	link_runs = false;
 	thread_terminate(current_thread());
@@ -3436,8 +3625,12 @@ link_stop(void)
 
 	if (link_runs) {
 		link_wanted = false;
+		thread_wakeup((event_t)&link_irq.rang);
 		for (unsigned ms = 0; ms < 2000 && link_runs; ms++) {
 			sleep_ms(1);
+		}
+		if (!link_runs) {
+			link_irq_stop();
 		}
 		printf("adsp: link: %s; GLINK said %u and heard %u messages, QRTR sent %u and received %u datagrams, APR %u and %u "
 		    "packets; its doorbells heard: GLINK %u, SMP2P %u\n", link_runs ? "THE THREAD DOES NOT END" : "down", glink.said,
@@ -3545,11 +3738,14 @@ step_link(void)
 	glink_say(GLINK_VERSION, GLINK_VERSION_1, glink.features, NULL, 0);
 	lck_mtx_unlock(&glink_lock);
 	link_wanted = link_runs = true;
+	link_irq_start();
 	if (kernel_thread_start(link_thread, NULL, &thread) != KERN_SUCCESS) {
 		link_wanted = link_runs = false;
+		link_irq_stop();
 		printf("adsp: %u: no thread\n", step);
 		return false;
 	}
+	thread_set_thread_name(thread, "adsp-link");
 	thread_deallocate(thread);
 	for (unsigned ms = 0; ms < 5000 && !glink.channel[CHANNEL_QRTR].open && !glink.broken; ms++) {
 		sleep_ms(1);
