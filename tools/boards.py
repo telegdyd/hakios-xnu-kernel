@@ -98,7 +98,7 @@ SOC_SCHEMA = {
     'usb': {'dwc3': (int, True), 'interrupt': (int, False), 'hsphy': (int, False), 'clkref': (int, False)},
     'adreno': {'gpu': (int, True), 'gmu': (int, True), 'gpucc': (int, True), 'cx_misc': (int, True), 'rscc': (int, True),
                'smmu': (int, True), 'pdc': (int, True), 'qfprom': (int, True), 'tsens': (int, False)},
-    'pins': {'tlmm': (int, True)},
+    'pins': {'tlmm': (int, True), 'pdc': (int, False)},
     'smmu': {'apps': (int, True), 'audio_stream': ([int], False), 'wifi_stream': ([int], False),
              'camera_stream': ([int], False)},
     'camera': {'camcc': (int, True), 'ife': (int, True), 'csid': (int, True), 'csiphy': (int, True),
@@ -145,7 +145,12 @@ BOARD_SCHEMA = {
     'touch_i2c': {'sda': (int, True), 'scl': (int, True), 'interrupt': (int, True), 'reset': (int, True),
                   'address': (int, True), 'contacts': (int, True), 'coordinates': ([int], True),
                   'io_supply': (str, False), 'analog_supply': (str, False), 'analog_millivolts': (int, False),
-                  'analog_enable': (int, False)},
+                  'analog_enable': (int, False),
+                  # (touch-s3908 only) the line's interrupt through the PDC, and the bus through its serial engine and the GPI
+                  'interrupt_pdc': ([int], False), 'serial_engine': (int, False), 'gpii': (int, False),
+                  'gpi_streams': ([int], False), 'se_index': (int, False), 'se_function': (int, False),
+                  'clocks': ([int], False), 'vote_register': (int, False), 'votes': ([int], False),
+                  'bus_votes': ([str], False)},
     'bluetooth': {'serial_engine': (int, True), 'wrapper': (int, True), 'clocks': ([int], True),
                   'clock_source': (int, True), 'vote_register': (int, True), 'votes': ([int], True),
                   'uart_pins': ([int], True), 'uart_function': (int, True), 'enable_ppid': (int, True),
@@ -293,6 +298,47 @@ class Problems(list):
         self.append(as_written(f'{where}: {what}'))
 
 
+TOUCH_DMA_KEYS = ('serial_engine', 'gpii', 'gpi_streams', 'se_index', 'se_function', 'clocks', 'vote_register', 'votes',
+                  'bus_votes')
+
+
+def touch_i2c_bus_problems(where, wired, problems):
+    """The optional PDC route and serial engine of touch-i2c { }: all or nothing, and of the right shapes."""
+    pdc = wired.get('interrupt_pdc')
+    if pdc is not None and (len(pdc) != 2 or not 0 < pdc[0] < 256 or not 32 <= pdc[1] < 1020):
+        problems.add(where, "interrupt_pdc is the line's pin in the PDC (1 to 255) and the GIC's SPI it raises (32 to 1019)")
+    given = [key for key in TOUCH_DMA_KEYS if key in wired]
+    if given and len(given) != len(TOUCH_DMA_KEYS):
+        problems.add(where, 'the serial engine wants all of ' + ', '.join(TOUCH_DMA_KEYS) + '; missing: ' +
+                     ', '.join(key for key in TOUCH_DMA_KEYS if key not in wired))
+    elif given:
+        if wired['serial_engine'] & 0xfff or wired['gpii'] & 0xfff or not wired['serial_engine'] or not wired['gpii']:
+            problems.add(where, 'serial_engine and gpii are where their registers are: pages, not 0')
+        if len(wired['gpi_streams']) != 2 or len(wired['clocks']) != 3 or len(wired['votes']) != 5 or \
+                len(wired['bus_votes']) != 3:
+            problems.add(where, 'gpi_streams are two, clocks three, votes five, bus_votes three')
+        elif any(not 0 <= v <= 31 for v in wired['votes']) or any(not 0 < c < 0x100000 for c in wired['clocks']):
+            problems.add(where, 'votes are bits 0 to 31; clocks offsets in the clock controller')
+        if not 1 <= wired['se_function'] <= 15 or not 0 <= wired['se_index'] <= 15:
+            problems.add(where, "se_function is one of the pins' functions, 1 to 15; se_index the engine's number, 0 to 15")
+
+
+def touch_i2c_extras(wired):
+    """The S3908's optional lines of .touch_i2c: its PDC route, its serial engine and GPI."""
+    out = []
+    if 'interrupt_pdc' in wired:
+        out.append(f'\t\t\t.pdc_pin = {wired["interrupt_pdc"][0]}, .pdc_intid = {wired["interrupt_pdc"][1]},')
+    if 'serial_engine' in wired:
+        streams, clocks = wired['gpi_streams'], wired['clocks']
+        out += [f'\t\t\t.serial_engine = {wired["serial_engine"]:#010x}, .gpii = {wired["gpii"]:#010x},',
+                f'\t\t\t.gpi_stream = {streams[0]:#x}, .qup_stream = {streams[1]:#x}, '
+                f'.se_index = {wired["se_index"]}, .se_function = {wired["se_function"]},',
+                f'\t\t\t.clocks = {{ {", ".join(f"{c:#x}" for c in clocks)} }}, .vote_register = {wired["vote_register"]:#x}, '
+                f'.votes = {{ {", ".join(str(v) for v in wired["votes"])} }},',
+                f'\t\t\t.bus_votes = {{ {", ".join(c_string(n) for n in wired["bus_votes"])} }},']
+    return out
+
+
 def feature_bits():
     """The features the kernel knows, HAKIOS_HAS_* of board/board.h: [(bit, name as board.dts spells it)]."""
     found = re.findall(r'^\s*HAKIOS_HAS_([A-Z0-9_]+)\s*=\s*1u\s*<<\s*(\d+)', BOARD_HEADER.read_text(), re.M)
@@ -331,6 +377,12 @@ def feature_needs(feature, board, soc):
     if feature == 'touch-ft5x06' and isinstance(wired, dict) and ('io_supply' in wired or 'analog_supply' in wired) and \
             'rpmh' not in soc:
         needs.append(f'[rpmh] in {soc_file} (its [touch_i2c] names a supply, which is asked of RPMh)')
+    if feature == 'touch-s3908' and isinstance(wired, dict):
+        for section in ('clocks', 'smmu', 'rpmh'):
+            if 'serial_engine' in wired and section not in soc:
+                needs.append(f'[{section}] in {soc_file} (its [touch_i2c] has a serial engine, fed by the GPI)')
+        if 'interrupt_pdc' in wired and 'pdc' not in soc.get('pins', {}):
+            needs.append(f'pdc in [pins] of {soc_file} (its [touch_i2c] has interrupt_pdc)')
     spmi, display = soc.get('spmi'), soc.get('display')
     if feature in WRITES_TO_PMIC and isinstance(spmi, dict) and 'channels' not in spmi:
         needs.append(f'channels in [spmi] of {soc_file}')
@@ -762,6 +814,8 @@ def load(problems=None):
             if len(set(names)) != len(names) or any(not re.fullmatch(r'[a-z0-9.]{1,7}', name) for name in names):
                 problems.add(f'{rel} [touch_i2c]', 'io_supply and analog_supply are two different names of RPMh regulators, as the '
                              'command database has them ("ldoc2": up to 7 lower-case letters, digits and dots)')
+        if wired is not None:
+            touch_i2c_bus_problems(f'{rel} [touch_i2c]', wired, problems)
         amps = data.get('speaker')
         if amps is not None:
             wires = [amps['sda'], amps['scl']] + list(amps['interrupts']) + list(amps['sound_pins'])
@@ -1034,7 +1088,7 @@ def table_text(socs, boards):
                     '\t\t},']
         pins = soc.get('pins')
         if pins:
-            out.append(f'\t\t.pins = {{ .tlmm = {pins["tlmm"]:#010x} }},')
+            out.append(f'\t\t.pins = {{ .tlmm = {pins["tlmm"]:#010x}, .pdc = {pins.get("pdc", 0):#010x} }},')
         camera = soc.get('camera')
         if camera:
             out += ['\t\t.camera = {',
@@ -1131,6 +1185,7 @@ def table_text(socs, boards):
                 f'.analog_enable = {wired.get("analog_enable", -1)},',
                 f'\t\t\t{supplies.strip() + " " if supplies else ""}.analog_mv = {wired.get("analog_millivolts", 0)},',
                 f'\t\t\t.max_x = {wired["coordinates"][0]}, .max_y = {wired["coordinates"][1]},',
+                *touch_i2c_extras(wired),
                 '\t\t},',
             ]
         amps = board.get('speaker')

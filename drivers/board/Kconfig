@@ -205,9 +205,13 @@ config TOUCH_S3908
 	bool "Synaptics S3908 touch screen on I2C"
 	default y
 	select QCOM_TLMM
+	select QCOM_GENI
+	select QCOM_RPMH
+	select QCOM_SMMU
 	help
-	  A Synaptics S3908 speaking TouchComm v1 on two of the SoC's pins as I2C, driven by hand (board/s3908.c, the
-	  board's "touch-s3908" and touch-i2c { }): the OnePlus 10 Pro's. The firmware has powered it.
+	  A Synaptics S3908 speaking TouchComm v1 on I2C (board/s3908.c, the board's "touch-s3908" and touch-i2c { }):
+	  the OnePlus 10 Pro's. Through its serial engine and the QUP's GPI DMA and woken through the PDC where the board
+	  says, else on two of the SoC's pins driven by hand and polled. The firmware has powered it.
 
 config ADRENO_A6XX
 	bool "Adreno 6xx GPU (A660 family): started, and Metal's device for Darwin"

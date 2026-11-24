@@ -166,6 +166,7 @@ struct hakios_board {
 	/* the SoC's own pins (soc: pins { }) */
 	struct {
 		uint32_t tlmm;                  /* where GPIO 0's registers are; GPIO n's are 0x1000 n further */
+		uint32_t pdc;                   /* the power domain controller that wakes on pins (qcom,pdc); 0: not said */
 	} pins;
 
 	/* the SMMU that stands between the SoC's devices and memory (soc: smmu { }); the GPU has its own (adreno { }) */
@@ -292,6 +293,17 @@ struct hakios_board {
 		                                 * this driver's to switch (always on, or switched by the pin above) */
 		uint16_t analog_mv;             /* what the analog supply is asked for, in millivolts; 0 without one */
 		uint32_t max_x, max_y;          /* the largest coordinates the controller reports */
+		/* optional, for "touch-s3908": the interrupt line through the PDC (its pin there, the GIC's SPI it raises) */
+		uint16_t pdc_pin, pdc_intid;    /* 0: polled */
+		/* optional, for "touch-s3908": the bus's own serial engine, fed by the QUP's GPI DMA */
+		uint32_t serial_engine;         /* the engine's registers; 0: none, the bus by hand only */
+		uint32_t gpii;                  /* the GPI's channel group bound to that engine (its registers) */
+		uint16_t gpi_stream, qup_stream;        /* the SMMU streams of the GPI (rings) and of the QUP (the bytes) */
+		uint8_t se_index, se_function;  /* the engine's number in its QUP; the pins' function that is the engine's */
+		uint32_t clocks[3];             /* GCC offsets: the wrapper's two bus clocks, the engine's own (its RCG 8 on) */
+		uint32_t vote_register;         /* the GCC's register the application processor votes in */
+		uint8_t votes[5];               /* its bits: the two bus clocks, core, core 2x, the engine */
+		const char *bus_votes[3];       /* the BCMs on the QUP's way to memory, by their names in the command database */
 	} touch_i2c;
 
 	/* Bluetooth H4 wiring (board: bluetooth { }); GCC offsets are explicit, including the RCG. */
