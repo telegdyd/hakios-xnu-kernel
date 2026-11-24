@@ -257,12 +257,46 @@ wait_for(struct block *b, uint32_t offset, uint32_t mask, uint32_t value, uint32
  * gcc-sc7280.c. The touch screen driver uses this controller too.
  */
 static struct block gcc = { "gcc", 0, 0x80000 };                        /* soc: clocks { } gcc */
-#define GCC_PLL_VOTE            0x52000         /* bit 15: gcc_gpu_gpll0_clk_src (600 MHz), bit 16: ..._div_clk_src (300 MHz) */
+
+/*
+ * Where the GPU's clocks are, by the SoC's clock drivers in Linux: the SoC file's adreno { clock-layout } picks
+ * one (board.h HAKIOS_GPU_CLOCKS_*). A gpucc offset of 0 is a clock that controller does not have. has_counter:
+ * the frequency counter of measure() is where its registers say (debugcc-yupik.c); SM8450's is not known
+ * (gcc 0x62000 is the PLL votes there), and its clocks are judged by their control registers instead.
+ */
+struct gpu_clocks {
+	uint32_t gcc_size, pll_vote, cfg_ahb, memnoc_gfx, snoc_dvm_gfx, ddrss_gpu_axi;
+	uint32_t gpucc_size, pll0, pll1, cxo_aon, gx_sw_reset, gx_gdscr, gx_gmu, cx_gdscr, ahb, cx_gmu, cxo, gmu_rcgr, cb,
+	    hub_aon, hub_rcgr, hub_cx_int, cx_hw_ctrl, gx_domain_misc, smmu_vote, cc_memnoc_gfx, cc_cx_snoc_dvm;
+	bool has_counter;
+};
+static const struct gpu_clocks gpu_clocks_of[] = {
+	[HAKIOS_GPU_CLOCKS_SC7280] = {          /* gcc-sc7280.c, gpucc-sc7280.c; dt: qcom,yupik-gcc, qcom,yupik-gpucc */
+		.gcc_size = 0x80000, .pll_vote = 0x52000, .cfg_ahb = 0x71004, .memnoc_gfx = 0x7100c, .snoc_dvm_gfx = 0x71018,
+		.ddrss_gpu_axi = 0x71154,
+		.gpucc_size = 0x9000, .pll0 = 0x0000, .pll1 = 0x0100, .cxo_aon = 0x1004, .gx_sw_reset = 0x1008,
+		.gx_gdscr = 0x100c, .gx_gmu = 0x1064, .cx_gdscr = 0x106c, .ahb = 0x1078, .cx_gmu = 0x1098, .cxo = 0x109c,
+		.gmu_rcgr = 0x1120, .cb = 0x1170, .hub_aon = 0x1178, .hub_rcgr = 0x117c, .hub_cx_int = 0x1204,
+		.cx_hw_ctrl = 0x1540, .gx_domain_misc = 0x158c, .smmu_vote = 0x5000, .has_counter = true,
+	},
+	[HAKIOS_GPU_CLOCKS_SM8450] = {          /* gcc-sm8450.c, gpucc-sm8450.c; dt: qcom,waipio-gpucc-v2 and its nodes */
+		.gcc_size = 0x1f4200, .pll_vote = 0x62000, .cfg_ahb = 0x81004, .memnoc_gfx = 0x81010, .snoc_dvm_gfx = 0x81018,
+		.ddrss_gpu_axi = 0x81154,
+		.gpucc_size = 0xa000, .pll0 = 0x0000, .pll1 = 0x1000, .cxo_aon = 0x9004, .gx_sw_reset = 0x9058,
+		.gx_gdscr = 0x905c, .gx_gmu = 0x90bc, .cx_gdscr = 0x9108, .ahb = 0x911c, .cx_gmu = 0x913c, .cxo = 0x9144,
+		.gmu_rcgr = 0x9318, .cb = 0, .hub_aon = 0x93e8, .hub_rcgr = 0x93ec, .hub_cx_int = 0x9148,
+		.cx_hw_ctrl = 0x953c, .gx_domain_misc = 0x9504, .smmu_vote = 0x7000,
+		.cc_memnoc_gfx = 0x9150, .cc_cx_snoc_dvm = 0x9130, .has_counter = false,
+	},
+};
+static const struct gpu_clocks *clk = &gpu_clocks_of[HAKIOS_GPU_CLOCKS_SC7280];  /* blocks_of_board() picks the board's */
+
+#define GCC_PLL_VOTE            (clk->pll_vote) /* bit 15: gcc_gpu_gpll0_clk_src (600 MHz), bit 16: ..._div_clk_src (300 MHz) */
 #define GCC_PLL_VOTE_GPU_DIV    (1u << 16)
-#define GCC_GPU_CFG_AHB_CBCR    0x71004
-#define GCC_GPU_MEMNOC_GFX_CBCR 0x7100c
-#define GCC_GPU_SNOC_DVM_GFX_CBCR 0x71018
-#define GCC_DDRSS_GPU_AXI_CBCR  0x71154
+#define GCC_GPU_CFG_AHB_CBCR    (clk->cfg_ahb)
+#define GCC_GPU_MEMNOC_GFX_CBCR (clk->memnoc_gfx)
+#define GCC_GPU_SNOC_DVM_GFX_CBCR (clk->snoc_dvm_gfx)
+#define GCC_DDRSS_GPU_AXI_CBCR  (clk->ddrss_gpu_axi)
 #define CBCR_ENABLE             (1u << 0)       /* a clock's control register: on */
 #define CBCR_OFF                (1u << 31)      /* ... and whether it is in fact off */
 
@@ -358,6 +392,11 @@ step_fuses(void)
 {
 	uint32_t bin, gaming;
 
+	if (gpu_profile != NULL && gpu_profile->speed_fuse == 0) {
+		/* (the A730's: its node has no nvmem cell and one set of power levels, no bin to tell apart) */
+		printf("adreno: %u: %s has no speed-bin fuse (gpu { } speed-fuse 0): nothing to read\n", step, gpu_profile->model);
+		return true;
+	}
 	announce("read the GPU's fuses in the error-corrected copy (0x784000), which Linux reads");
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
@@ -386,24 +425,24 @@ step_fuses(void)
  * starts (gcc-sc7280.c, the end of the probe function).
  */
 static struct block gpucc = { "gpucc", 0, 0x9000 };                     /* soc: adreno { } gpucc */
-#define GPUCC_PLL0_MODE         0x0000          /* the 3D core's PLL: bit 31 locked, bit 0 output on; +4: times 19.2 MHz */
-#define GPUCC_PLL1_MODE         0x0100          /* a 500 MHz PLL, an alternative source for the GMU's clock */
-#define GPUCC_CXO_AON_CBCR      0x1004
-#define GPUCC_GX_SW_RESET       0x1008          /* dt: gpu_gx_sw_reset */
-#define GPUCC_GX_GDSCR          0x100c          /* dt: gpu_gx_gdsc, the 3D core's power switch: the GMU's to operate */
-#define GPUCC_GX_GMU_CBCR       0x1064
-#define GPUCC_CX_GDSCR          0x106c          /* dt: gpu_cx_gdsc */
-#define GPUCC_AHB_CBCR          0x1078          /* gpu_cc_ahb_clk: the register bus inside the GPU block */
-#define GPUCC_CX_GMU_CBCR       0x1098          /* gpu_cc_cx_gmu_clk: the GMU */
-#define GPUCC_CXO_CBCR          0x109c          /* gpu_cc_cxo_clk: the crystal, for the GMU's timers */
-#define GPUCC_GMU_RCGR          0x1120          /* gpu_cc_gmu_clk_src: +0 command, +4 source and divider */
-#define GPUCC_CB_CBCR           0x1170          /* gpu_cc_cb_clk: Linux keeps it on always */
-#define GPUCC_HUB_AON_CBCR      0x1178          /* gpu_cc_hub_aon_clk */
-#define GPUCC_HUB_RCGR          0x117c          /* gpu_cc_hub_clk_src */
-#define GPUCC_HUB_CX_INT_CBCR   0x1204          /* gpu_cc_hub_cx_int_clk */
-#define GPUCC_CX_HW_CTRL        0x1540          /* dt: gpu_cx_hw_ctrl: bit 31 is where the vendor's driver sees CX come on */
-#define GPUCC_GX_DOMAIN_MISC    0x158c          /* dt: gpu_gx_domain_addr */
-#define GPUCC_SMMU_VOTE_CBCR    0x5000          /* gpu_cc_hlos1_vote_gpu_smmu_clk: our vote for the SMMU's clock */
+#define GPUCC_PLL0_MODE         (clk->pll0)     /* the 3D core's PLL: bit 31 locked, bit 0 output on; +4: times 19.2 MHz */
+#define GPUCC_PLL1_MODE         (clk->pll1)     /* a 500 MHz PLL, an alternative source for the GMU's clock */
+#define GPUCC_CXO_AON_CBCR      (clk->cxo_aon)
+#define GPUCC_GX_SW_RESET       (clk->gx_sw_reset)      /* dt: gpu_gx_sw_reset */
+#define GPUCC_GX_GDSCR          (clk->gx_gdscr) /* dt: gpu_gx_gdsc, the 3D core's power switch: the GMU's to operate */
+#define GPUCC_GX_GMU_CBCR       (clk->gx_gmu)
+#define GPUCC_CX_GDSCR          (clk->cx_gdscr) /* dt: gpu_cx_gdsc */
+#define GPUCC_AHB_CBCR          (clk->ahb)      /* gpu_cc_ahb_clk: the register bus inside the GPU block */
+#define GPUCC_CX_GMU_CBCR       (clk->cx_gmu)   /* gpu_cc_cx_gmu_clk: the GMU */
+#define GPUCC_CXO_CBCR          (clk->cxo)      /* gpu_cc_cxo_clk: the crystal, for the GMU's timers */
+#define GPUCC_GMU_RCGR          (clk->gmu_rcgr) /* gpu_cc_gmu_clk_src: +0 command, +4 source and divider */
+#define GPUCC_CB_CBCR           (clk->cb)       /* gpu_cc_cb_clk: Linux keeps it on always (SM8450: none, 0) */
+#define GPUCC_HUB_AON_CBCR      (clk->hub_aon)  /* gpu_cc_hub_aon_clk */
+#define GPUCC_HUB_RCGR          (clk->hub_rcgr) /* gpu_cc_hub_clk_src */
+#define GPUCC_HUB_CX_INT_CBCR   (clk->hub_cx_int)       /* gpu_cc_hub_cx_int_clk */
+#define GPUCC_CX_HW_CTRL        (clk->cx_hw_ctrl)       /* dt: gpu_cx_hw_ctrl: bit 31 is where the vendor's driver sees CX come on */
+#define GPUCC_GX_DOMAIN_MISC    (clk->gx_domain_misc)   /* dt: gpu_gx_domain_addr */
+#define GPUCC_SMMU_VOTE_CBCR    (clk->smmu_vote)        /* gpu_cc_hlos1_vote_gpu_smmu_clk: our vote for the SMMU's clock */
 
 #define GDSC_SW_COLLAPSE        (1u << 0)       /* a power switch's control register (gdsc.c): off, by software */
 #define GDSC_HW_CONTROL         (1u << 1)       /* something else than software operates it */
@@ -439,7 +478,13 @@ step_gpucc(void)
 	get(&gpucc, "ahb", GPUCC_AHB_CBCR);
 	get(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR);
 	get(&gpucc, "cxo", GPUCC_CXO_CBCR);
-	get(&gpucc, "cb", GPUCC_CB_CBCR);
+	if (GPUCC_CB_CBCR != 0) {
+		get(&gpucc, "cb", GPUCC_CB_CBCR);
+	}
+	if (clk->cc_memnoc_gfx != 0) {
+		get(&gpucc, "memnoc_gfx", clk->cc_memnoc_gfx);
+		get(&gpucc, "cx_snoc_dvm", clk->cc_cx_snoc_dvm);
+	}
 	get(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR);
 	get(&gpucc, "hub_cx_int", GPUCC_HUB_CX_INT_CBCR);
 	get(&gpucc, "smmu vote", GPUCC_SMMU_VOTE_CBCR);
@@ -614,7 +659,7 @@ step_clocks(void)
 	}
 
 	announce("in the GPU's clock controller: the clocks of the GMU and of the SMMU on");
-	if (!clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false) ||
+	if ((GPUCC_CB_CBCR != 0 && !clock_on(&gpucc, "cb", GPUCC_CB_CBCR, false)) ||
 	    !clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) ||
 	    !clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false) ||
 	    !clock_on(&gpucc, "hub_aon", GPUCC_HUB_AON_CBCR, true) ||
@@ -694,6 +739,9 @@ measure(uint32_t select)
 {
 	uint32_t hz;
 
+	if (!clk->has_counter) {
+		return MEASURE_FAILED;          /* (none where struct gpu_clocks knows it) */
+	}
 	lck_mtx_lock(&measure_lock);
 	hz = measure_locked(select);
 	lck_mtx_unlock(&measure_lock);
@@ -766,6 +814,22 @@ measure_clocks(void)
 	};
 	uint32_t hz, ahb_hz = MEASURE_FAILED;
 
+	if (!clk->has_counter) {
+		/*
+		 * No frequency counter known (SM8450): what the control registers say. ahb's reads 0 before and after
+		 * its enable bit is written, as on the SC7280, so only a set bit 31 says anything; the GMU answering in
+		 * step 6 is what shows the bus has its clock.
+		 */
+		printf("adreno: %u: no frequency counter on this SoC; by their control registers: ahb %#x cxo %#x hub_aon %#x "
+		    "hub_cx_int %#x cx_gmu %#x gx_gmu %#x (bit 31: off)\n", step, rd(gpucc.base + GPUCC_AHB_CBCR),
+		    rd(gpucc.base + GPUCC_CXO_CBCR), rd(gpucc.base + GPUCC_HUB_AON_CBCR), rd(gpucc.base + GPUCC_HUB_CX_INT_CBCR),
+		    rd(gpucc.base + GPUCC_CX_GMU_CBCR), rd(gpucc.base + GPUCC_GX_GMU_CBCR));
+		if (rd(gpucc.base + GPUCC_AHB_CBCR) & CBCR_OFF) {
+			printf("adreno: %u: the register bus of the GPU block has no clock\n", step);
+			return false;
+		}
+		return true;
+	}
 	announce("measure the GPU block's clocks with the SoC's frequency counter (the debug registers of gcc and of "
 	    "gpucc)");
 	hz = measure(GPUCC_DEBUG_CXO);
@@ -824,6 +888,15 @@ cx_ready(void)
 		printf("adreno: %u: needs CX on (it is %s) and the GMU's clock running (cx_gmu %#x): steps 4 and 5\n", step,
 		    cx_is_on() ? "on" : "off", gmu_clock);
 		return false;
+	}
+	if (!clk->has_counter) {
+		/* no counter: only ahb's bit 31 can say no (measure_clocks()) */
+		if (rd(gpucc.base + GPUCC_AHB_CBCR) & CBCR_OFF) {
+			printf("adreno: %u: the GPU block's register bus clock is off (ahb %#x): not touching it\n", step,
+			    rd(gpucc.base + GPUCC_AHB_CBCR));
+			return false;
+		}
+		return true;
 	}
 	ahb_hz = measure_quietly(GPUCC_DEBUG_AHB);
 	if (ahb_hz == MEASURE_FAILED) {
@@ -3902,6 +3975,12 @@ static bool(*const steps[])(void) = {
 	step_frame,
 };
 #define STEPS                   ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
+/*
+ * The steps that are the same on a gen7 Adreno (the A730) but for the board's numbers: the clocks, fuses, CX,
+ * the GMU's first words, the RSCC, the SMMU and the GMU's data memory. From 11 on gen7 has its own firmware,
+ * memory layout, start, tables and core setup, not yet here.
+ */
+#define GEN7_STEPS              10u
 
 /* ---- beside the steps: how warm the GPU is ------------------------------------------------------------------ */
 
@@ -4249,6 +4328,13 @@ blocks_of_board(void)
 	    board->adreno.qfprom == 0 || board->clocks.gcc == 0 || board->rpmh.cmd_db == 0 || board->rpmh.cmd_db_size == 0) {
 		return false;
 	}
+	if (board->adreno.clock_layout >= sizeof(gpu_clocks_of) / sizeof(gpu_clocks_of[0])) {
+		return false;
+	}
+	clk = &gpu_clocks_of[board->adreno.clock_layout];
+	gcc.size = clk->gcc_size;
+	gpucc.size = clk->gpucc_size;
+	smmu.size = board->adreno.smmu_size != 0 ? board->adreno.smmu_size : 0x20000;
 	gcc.phys = board->clocks.gcc;
 	dispcc.phys = board->clocks.dispcc;     /* (0 without a display block described: display_layout_known() says) */
 	qfprom.phys = board->adreno.qfprom;
@@ -4276,12 +4362,13 @@ hakios_adreno_init(void)
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
 
-	if (!hakios_board_has(HAKIOS_HAS_GPU_A660)) {
+	if (!hakios_board_has(HAKIOS_HAS_GPU_A660) && !hakios_board_has(HAKIOS_HAS_GPU_A730)) {
 		return;                 /* no Adreno on this board: nothing to say */
 	}
 	gpu_profile = adreno_profile_for_board();
 	if (gpu_profile == NULL) {
-		printf("adreno: disabled: the board lists \"gpu-a660\" but its board.dts has no usable gpu { } section\n");
+		printf("adreno: disabled: the board lists \"gpu-a660\" or \"gpu-a730\" but its board.dts has no usable gpu { } "
+		    "section\n");
 		return;
 	}
 	if (!blocks_of_board()) {
@@ -4320,7 +4407,15 @@ hakios_adreno_init(void)
 		}
 	}
 	if (!PE_parse_boot_argn("adreno", &last_step, sizeof(last_step))) {
-		if (!(PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) || !start_by_itself()) {
+		if (!(PE_parse_boot_argn("gpu", &only, sizeof(only)) && only)) {
+			return;
+		}
+		if (gpu_profile->generation == 7) {
+			printf("adreno: gpu=1: on the %s only steps 1 to %u are ported: the GPU is left alone\n", gpu_profile->model,
+			    GEN7_STEPS);
+			return;
+		}
+		if (!start_by_itself()) {
 			return;
 		}
 		by_itself = true;
@@ -4342,6 +4437,11 @@ hakios_adreno_init(void)
 	}
 	if (last_step > STEPS) {
 		last_step = STEPS;
+	}
+	if (gpu_profile->generation == 7 && last_step > GEN7_STEPS) {
+		printf("adreno: adreno=%u asked for, but on the %s the steps after %u are not ported yet: up to %u\n", last_step,
+		    gpu_profile->model, GEN7_STEPS, GEN7_STEPS);
+		last_step = GEN7_STEPS;
 	}
 	PE_parse_boot_argn("adreno_watch", &watch_seconds, sizeof(watch_seconds));
 	for (newest_step = last_step; newest_step > 0 && (skip_steps & 1u << newest_step); newest_step--) {

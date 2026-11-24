@@ -79,6 +79,7 @@ CAMCC_SOURCES = ('pll0_even_source', 'pll0_odd_source', 'pll2_source')
 # the layouts of the cores' frequency hardware (board/cpufreq_hw.h): EPSS (the default), the OSM's firmware before it;
 # and how far into a group's block each reaches (its last register, the row wanted, and 4)
 CPUFREQ_BLOCKS = ('epss', 'osm')
+GPU_CLOCK_LAYOUTS = ('sc7280', 'sm8450')      # board.h HAKIOS_GPU_CLOCKS_*, in that order
 CPUFREQ_EXTENT = {'epss': 0x324, 'osm': 0x924}
 
 SOC_SCHEMA = {
@@ -97,7 +98,8 @@ SOC_SCHEMA = {
              'ee': (int, False), 'channel_map': (int, False), 'bus': (int, False)},
     'usb': {'dwc3': (int, True), 'interrupt': (int, False), 'hsphy': (int, False), 'clkref': (int, False)},
     'adreno': {'gpu': (int, True), 'gmu': (int, True), 'gpucc': (int, True), 'cx_misc': (int, True), 'rscc': (int, True),
-               'smmu': (int, True), 'pdc': (int, True), 'qfprom': (int, True), 'tsens': (int, False)},
+               'smmu': (int, True), 'pdc': (int, True), 'qfprom': (int, True), 'tsens': (int, False),
+               'smmu_size': (int, False), 'clock_layout': (GPU_CLOCK_LAYOUTS, False)},
     'pins': {'tlmm': (int, True), 'pdc': (int, False)},
     'smmu': {'apps': (int, True), 'audio_stream': ([int], False), 'wifi_stream': ([int], False),
              'camera_stream': ([int], False)},
@@ -194,7 +196,7 @@ KEY_WITH_UNDERSCORE = re.compile(r'(?<![\w.])(' + '|'.join(sorted(
 FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virtio': ('virtio',), 'cpufreq-scmi': ('scmi_perf',), 'cpufreq-epss': ('cpufreq',), 'display-scan': ('display',), 'buttons-pmic': ('spmi',),
                  'torch-pm8350c': ('spmi',), 'ddr-rpmh': ('rpmh',),
                  'camera-sm7325': ('spmi', 'pins', 'clocks', 'rpmh', 'smmu', 'camera'),
-                 'gpu-a660': ('adreno', 'clocks', 'rpmh'),
+                 'gpu-a660': ('adreno', 'clocks', 'rpmh'), 'gpu-a730': ('adreno', 'clocks', 'rpmh'),
                  # the part drivers that drive the SoC's pins, switch a bus's clocks on in the GCC, ask RPMh
                  # for a part's supply, and give a device its addresses in the SMMU
                  'touch-goodix': ('pins', 'clocks', 'rpmh'), 'touch-ft3658u': ('pins', 'clocks', 'rpmh'),
@@ -218,6 +220,7 @@ FEATURE_BOOTARGS = {
     'adsp': 'adsp=1',
     'display-scan': 'fb_scan=1, the default',
     'gpu-a660': 'gpu=1',
+    'gpu-a730': 'adreno=10, its steps so far',
     'virtio': 'virtio_net=1, virtio_input=1',
     'touch-goodix': 'touchscreen=1',
     'touch-ft3658u': 'touchscreen=1',
@@ -236,7 +239,7 @@ FEATURE_BOOTARGS = {
 # features that are a driver of one part as one phone has it wired, by the first word of their names
 PART_DRIVERS = ('bluetooth', 'touch', 'speaker', 'haptic', 'imu', 'torch', 'camera', 'wifi', 'mic', 'modem')
 # ... and of the board's own file
-FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'gpu-a660': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
+FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'gpu-a660': 'gpu', 'gpu-a730': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
                           'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
                           'touch-ft3658u': 'touch', 'touch-ft5x06': 'touch_i2c', 'touch-s3908': 'touch_i2c', 'camera-sm7325': 'camera', 'imu-lsm6dso': 'imu',
                           'imu-bmi160': 'imu'}
@@ -396,7 +399,7 @@ def feature_needs(feature, board, soc):
         needs.append(f'intf1 in [display] and [clocks] in {soc_file}')
     if feature == 'display-scan' and clocks_missing(soc):
         needs.append(f'{clocks_missing(soc)} in [clocks] of {soc_file}')
-    if feature == 'gpu-a660' and clocks_missing(soc, ('gcc_disp_ahb_cbcr',)):
+    if feature in ('gpu-a660', 'gpu-a730') and clocks_missing(soc, ('gcc_disp_ahb_cbcr',)):
         needs.append(f'gcc_disp_ahb_cbcr in [clocks] of {soc_file}')
     radio = board.get('wifi')
     if feature == 'wifi-wcn6750' and not (isinstance(radio, dict) and 'dsp_memory' in radio and 'dsp_memory_size' in radio):
@@ -418,7 +421,7 @@ def feature_requirements(feature):
     if feature == 'display-scan':
         of_soc['display'].append('intf1')
         of_soc['clocks'] = list(DISPLAY_CLOCKS)
-    if feature == 'gpu-a660':
+    if feature in ('gpu-a660', 'gpu-a730'):
         of_soc['clocks'].append('gcc_disp_ahb_cbcr')
     of_board = {}
     section = FEATURE_NEEDS_OF_BOARD.get(feature)
@@ -1089,8 +1092,11 @@ def table_text(socs, boards):
             out += ['\t\t.adreno = {',
                     f'\t\t\t.gpu = {adreno["gpu"]:#010x}, .gmu = {adreno["gmu"]:#010x}, .gpucc = {adreno["gpucc"]:#010x},',
                     f'\t\t\t.cx_misc = {adreno["cx_misc"]:#010x}, .rscc = {adreno["rscc"]:#010x}, .smmu = {adreno["smmu"]:#010x},',
-                    f'\t\t\t.pdc = {adreno["pdc"]:#010x}, .qfprom = {adreno["qfprom"]:#010x}, .tsens = {adreno.get("tsens", 0):#010x},',
-                    '\t\t},']
+                    f'\t\t\t.pdc = {adreno["pdc"]:#010x}, .qfprom = {adreno["qfprom"]:#010x}, .tsens = {adreno.get("tsens", 0):#010x},']
+            if 'smmu_size' in adreno or adreno.get('clock_layout', 'sc7280') != 'sc7280':
+                out.append(f'\t\t\t.smmu_size = {adreno.get("smmu_size", 0):#x}, '
+                           f'.clock_layout = HAKIOS_GPU_CLOCKS_{adreno.get("clock_layout", "sc7280").upper()},')
+            out.append('\t\t},')
         pins = soc.get('pins')
         if pins:
             pdc = f', .pdc = {pins["pdc"]:#010x}' if 'pdc' in pins else ''

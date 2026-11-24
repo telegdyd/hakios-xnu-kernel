@@ -42,6 +42,8 @@ enum {
 	                                         * and keyboard (board/virtio_net.c, board/virtio_input.c) */
 	HAKIOS_HAS_GPU_A660     = 1u << 14,     /* an Adreno of the A660 family behind a GMU; what differs from one to
 	                                         * the next is the board's gpu { } (board/adreno.c, gpu=1) */
+	HAKIOS_HAS_GPU_A730     = 1u << 23,     /* an Adreno 730 (gen7) behind a GMU: the same driver, board data and
+	                                         * steps, with gen7's own parts; steps 1 to 10 so far (board/adreno.c) */
 	/*
 	 * Drivers of one part, wired the way one phone has it (the pins, the bus, the chip): a board lists
 	 * one only if it has that part wired that way. Asked for on any other board, the driver says so and
@@ -94,6 +96,12 @@ enum {
 	HAKIOS_CPUFREQ_OSM  = 1,                /* "osm": the OSM's firmware of the SDM845 to the SM8250 */
 };
 
+/* where the GPU's clocks are in the global and the GPU's clock controllers (soc: adreno { clock-layout }) */
+enum {
+	HAKIOS_GPU_CLOCKS_SC7280 = 0,           /* "sc7280" (the default): gcc-sc7280.c, gpucc-sc7280.c (SM7325 too) */
+	HAKIOS_GPU_CLOCKS_SM8450 = 1,           /* "sm8450": gcc-sm8450.c, gpucc-sm8450.c */
+};
+
 struct hakios_board {
 	const char *name;                       /* /chosen/darwin-board */
 	const char *description;
@@ -128,6 +136,8 @@ struct hakios_board {
 		uint32_t gpu, gmu, gpucc, cx_misc, rscc, smmu, pdc;
 		uint32_t qfprom;                /* the fuses, where the speed and gaming bins are */
 		uint32_t tsens;                 /* the TSENS controller with the GPU's two sensors; 0: not read */
+		uint32_t smmu_size;             /* the GPU's SMMU's extent; 0: 0x20000 */
+		uint8_t clock_layout;           /* HAKIOS_GPU_CLOCKS_* */
 	} adreno;
 
 	/* the GPU (board: gpu { }) */

@@ -2,7 +2,7 @@
  * What differs between the Adrenos this driver starts, as the driver wants it. The values are the
  * board's (gpu { } of arch/arm64/boot/dts/NAME/board.dts, through board/board.h); they come from the phone's device
  * tree (the SoC's -gpu.dtsi), Linux's adreno-gpulist.h and adreno_a6xx_gmu.c. A board has a profile
- * only if it lists the feature "gpu-a660" and has a gpu { } section.
+ * only if it lists the feature "gpu-a660" (generation 6) or "gpu-a730" (7) and has a gpu { } section.
  */
 #ifndef HAKIOS_ADRENO_PROFILE_H
 #define HAKIOS_ADRENO_PROFILE_H
@@ -12,6 +12,7 @@
 struct adreno_speed { uint32_t khz, level; };
 struct adreno_board_profile {
 	const char *board, *model, *firmware_directory;
+	uint32_t generation;                    /* 6: the A660 family; 7: the A730 (gen7) */
 	const char *alt_model;                  /* what the speed bins alt_bins are sold as (NULL: none) */
 	uint32_t alt_bins[2];
 	uint32_t chip_id, gmem_bytes, primitive_fifo, hang_cycles;
@@ -40,11 +41,12 @@ adreno_profile_for_board(void)
 	const struct hakios_board *board = hakios_board();
 	struct adreno_board_profile *p = &adreno_of_board;
 
-	if (!hakios_board_has(HAKIOS_HAS_GPU_A660) || board->gpu.chip_id == 0 || board->gpu.speed_count == 0 ||
+	if ((!hakios_board_has(HAKIOS_HAS_GPU_A660) && !hakios_board_has(HAKIOS_HAS_GPU_A730)) || board->gpu.chip_id == 0 || board->gpu.speed_count == 0 ||
 	    board->gpu.speed_count > 5) {
 		return NULL;
 	}
 	p->board = board->name;
+	p->generation = hakios_board_has(HAKIOS_HAS_GPU_A730) ? 7 : 6;
 	p->model = board->gpu.model;
 	p->firmware_directory = board->gpu.firmware;
 	p->alt_model = board->gpu.alt_model;
