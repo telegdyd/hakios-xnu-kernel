@@ -556,7 +556,7 @@ beside the code, so the file named in each heading has the full explanation.
 | Argument | What the source says |
 | --- | --- |
 | `s3908_trace` | s3908_trace=1 the first 40 fingers down, as the chip gives them, in the log |
-| `touch_bus` | Not ported from negroni's tree: touch_bus=1's look at the hardware, and the slower look while the screen is off. |
+| `touch_bus` | touch_bus=0 the wires by hand even where the board has the serial engine (default 2: the engine and the GPI) |
 | `touch_flip` | touch_flip=N bit 0 mirrors the touches left to right, bit 1 top to bottom (as the other touch drivers) |
 | `touch_idle_ms` | touch_idle_ms=N the bus votes for the QUP's way to memory let go after N ms without a transfer (default 250; 0: held) |
 | `touch_irq` | touch_irq=0 the attention line looked at every POLL_MS even where the board has its PDC route (default 1) |
