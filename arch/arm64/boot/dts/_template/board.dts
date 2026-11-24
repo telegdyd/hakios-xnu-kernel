@@ -60,6 +60,8 @@
 		// volume-up = <0x18d>;         // the GPIO of gpio_keys' volume-up: GPIO n of pinctrl@8800 is 0x88 + n - 1,
 		//                              // on the slave its PMIC is (qcom,pm8350@1: 1)
 		// volume-up-name = "GPIO6 of the PM8350";
+		// resin-volume-up;             // the other way round: RESIN_N is volume up and the GPIO volume down (gpio_keys
+		//                              // gives the GPIO KEY_VOLUMEDOWN, 0x72; qcom,pon's resin KEY_VOLUMEUP, 0x73)
 	// };
 
 	// The PMIC's real-time clock: a count of seconds that runs on while the phone is off, read once at boot

@@ -152,7 +152,8 @@ BOARD_SCHEMA = {
                   'firmware': (str, False), 'rampatch': (str, False), 'nvm': (str, False)},
     'speaker': {'sda': (int, True), 'scl': (int, True), 'addresses': ([int], True), 'interrupts': ([int], True),
                 'sound_pins': ([int], True), 'sound_function': (int, True), 'tdm': (int, False)},
-    'buttons': {'pon': (int, True), 'volume_up': (int, True), 'pon_name': (str, False), 'volume_up_name': (str, False)},
+    'buttons': {'pon': (int, True), 'volume_up': (int, True), 'pon_name': (str, False), 'volume_up_name': (str, False),
+                'resin_volume_up': (bool, False)},
     'rtc': {'peripheral': (int, True), 'name': (str, False)},
     'adsp': {'firmware': (str, True), 'memory': (int, True), 'memory_size': (int, True),
              'charge_counter_divisor': (int, False)},
@@ -1059,7 +1060,8 @@ def table_text(socs, boards):
         keys = board.get('buttons')
         if keys:
             names = ''.join(f', .{key} = {c_string(keys[key])}' for key in ('pon_name', 'volume_up_name') if key in keys)
-            out.append(f'\t\t.buttons = {{ .pon = {keys["pon"]:#05x}, .volume_up = {keys["volume_up"]:#05x}{names} }},')
+            swapped = ', .resin_volume_up = true' if keys.get('resin_volume_up') else ''
+            out.append(f'\t\t.buttons = {{ .pon = {keys["pon"]:#05x}, .volume_up = {keys["volume_up"]:#05x}{names}{swapped} }},')
         clock = board.get('rtc')
         if clock:
             name = f', .name = {c_string(clock["name"])}' if 'name' in clock else ''

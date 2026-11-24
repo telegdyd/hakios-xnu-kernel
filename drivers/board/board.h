@@ -217,6 +217,7 @@ struct hakios_board {
 		uint16_t pon;                   /* the power-on block: power, and volume down on its RESIN_N */
 		uint16_t volume_up;             /* the GPIO volume up pulls low */
 		const char *pon_name, *volume_up_name;  /* for the log: "GPIO6 of the PM8350" */
+		bool resin_volume_up;           /* the other way round: RESIN_N is volume up, the GPIO volume down */
 	} buttons;
 
 	/* the PMIC's real-time clock (board: rtc { }); a peripheral as in buttons { }. 0: the board names none, nothing is read */

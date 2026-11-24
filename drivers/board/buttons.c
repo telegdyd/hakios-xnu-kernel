@@ -582,6 +582,17 @@ hakios_buttons_init(void)
 	if (board->buttons.volume_up_name != NULL) {
 		pin.name = board->buttons.volume_up_name;
 	}
+	/*
+	 * A board whose keys are the other way round (the OnePlus 10 Pro: its stock tree gives RESIN KEY_VOLUMEUP and the
+	 * GPIO KEY_VOLUMEDOWN, as a hand on the phone confirmed): what each input reports is swapped here, and the rest of
+	 * the driver keeps calling the power-on block's second key "volume down" and the GPIO "volume up".
+	 */
+	if (board->buttons.resin_volume_up) {
+		volume_down.name = "volume up (RESIN)";
+		volume_down.record = HAKIOS_BUTTON_VOLUME_UP;
+		volume_up.name = "volume down (the GPIO)";
+		volume_up.record = HAKIOS_BUTTON_VOLUME_DOWN;
+	}
 	PE_parse_boot_argn("buttons_steps", &steps, sizeof(steps));
 	if (steps == 0) {
 		return;
