@@ -137,6 +137,7 @@ struct hakios_board {
 		uint32_t qfprom;                /* the fuses, where the speed and gaming bins are */
 		uint32_t tsens;                 /* the TSENS controller with the GPU's two sensors; 0: not read */
 		uint32_t smmu_size;             /* the GPU's SMMU's extent; 0: 0x20000 */
+		uint64_t zap_memory;            /* physical base of the reserved zap shader region */
 		uint8_t clock_layout;           /* HAKIOS_GPU_CLOCKS_* */
 	} adreno;
 

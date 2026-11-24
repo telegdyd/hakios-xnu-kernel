@@ -124,6 +124,7 @@ uint64_t kvtophys(vm_offset_t va) { return va; }
 void loader_return(void) {}
 void MiniIOMobileFramebufferShow(const uint8_t *pixels __unused, uint32_t width __unused, uint32_t height __unused,
     uint32_t row_bytes __unused) {}
+void MiniIOMobileFramebufferPanel(uint32_t *width, uint32_t *height) { *width = 1080; *height = 2412; }
 void HakiosGPUStart(void) {}
 void HakiosGPUStop(void) {}
 void hakios_tl(const char *format __unused, ...) {}

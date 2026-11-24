@@ -99,7 +99,8 @@ SOC_SCHEMA = {
     'usb': {'dwc3': (int, True), 'interrupt': (int, False), 'hsphy': (int, False), 'clkref': (int, False)},
     'adreno': {'gpu': (int, True), 'gmu': (int, True), 'gpucc': (int, True), 'cx_misc': (int, True), 'rscc': (int, True),
                'smmu': (int, True), 'pdc': (int, True), 'qfprom': (int, True), 'tsens': (int, False),
-               'smmu_size': (int, False), 'clock_layout': (GPU_CLOCK_LAYOUTS, False)},
+               'smmu_size': (int, False), 'clock_layout': (GPU_CLOCK_LAYOUTS, False),
+               'zap_memory': (int, False)},
     'pins': {'tlmm': (int, True), 'pdc': (int, False)},
     'smmu': {'apps': (int, True), 'audio_stream': ([int], False), 'wifi_stream': ([int], False),
              'camera_stream': ([int], False)},
@@ -220,7 +221,7 @@ FEATURE_BOOTARGS = {
     'adsp': 'adsp=1',
     'display-scan': 'fb_scan=1, the default',
     'gpu-a660': 'gpu=1',
-    'gpu-a730': 'adreno=10, its steps so far',
+    'gpu-a730': 'adreno=22, through the first fill',
     'virtio': 'virtio_net=1, virtio_input=1',
     'touch-goodix': 'touchscreen=1',
     'touch-ft3658u': 'touchscreen=1',
@@ -1096,6 +1097,8 @@ def table_text(socs, boards):
             if 'smmu_size' in adreno or adreno.get('clock_layout', 'sc7280') != 'sc7280':
                 out.append(f'\t\t\t.smmu_size = {adreno.get("smmu_size", 0):#x}, '
                            f'.clock_layout = HAKIOS_GPU_CLOCKS_{adreno.get("clock_layout", "sc7280").upper()},')
+            if 'zap_memory' in adreno:
+                out.append(f'\t\t\t.zap_memory = {adreno["zap_memory"]:#x}ull,')
             out.append('\t\t},')
         pins = soc.get('pins')
         if pins:
