@@ -170,20 +170,23 @@ SYSCTL_PROC(_hw_board, OID_AUTO, features, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG
  * the phone (Android) once it has the log. Root only (no CTLFLAG_ANYBODY); written by sweetd for "loader" and
  * "reboot". Reads as 0. The return itself is loader_return.c's, within a second.
  */
-extern void loader_request_return(int mode);   /* osfmk/arm64/loader_return.c */
+extern void loader_request_return(int mode) __attribute__((weak));     /* osfmk/arm64/loader_return.c */
 
 static int
 sysctl_loader_request SYSCTL_HANDLER_ARGS
 {
-#pragma unused(arg1, arg2)
-	int mode = 0, error;
+#pragma unused(oidp, arg1, arg2)
+	int mode = 0, changed = 0, error;
 
-	error = sysctl_handle_int(oidp, &mode, 0, req);
-	if (error || req->newptr == USER_ADDR_NULL) {
+	error = sysctl_io_number(req, 0, sizeof(mode), &mode, &changed);
+	if (error || !changed) {
 		return error;
 	}
 	if (mode != 1 && mode != 2) {
 		return EINVAL;
+	}
+	if (loader_request_return == NULL) {
+		return ENOTSUP;         /* (a kernel without the loader's return path) */
 	}
 	hakios_say("board: loader_request %d: %s\n", mode, mode == 2 ? "back to the loader, then a reset" : "back to the loader");
 	loader_request_return(mode);
