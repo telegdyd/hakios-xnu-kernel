@@ -54,7 +54,7 @@ global surfaces.
 | File | Part | Feature / boot argument | Portability |
 | --- | --- | --- | --- |
 | `bsd/dev/board/backlight.c` | Panel brightness: MIPI DCS through a Qualcomm DSI controller, or software. Automatic brightness. | `backlight { }` / `backlight=` | data |
-| `bsd/dev/board/adreno.c` | Adreno 642/642L and A730 bring-up through the first frame. | `gpu-a660` / `gpu=1`, `adreno=`; `gpu-a730` / `adreno=22` | `gpu { }` for the board profile and `adreno { }` for the block addresses and reserved zap memory |
+| `bsd/dev/board/adreno.c` | Adreno 642/642L and A730 bring-up, diagnostic fill and BoardGPU. | `gpu-a660`, `gpu-a730` / `gpu=1`, `adreno=`; A730 `gpu_irq=1` | `gpu { }` for the board profile and `adreno { }` for the block addresses and reserved zap memory |
 | `bsd/dev/board/input.c` | `/dev/hakios-touch`: the queue of touches and button presses every source feeds. | — | any |
 | `bsd/dev/board/goodix.c` | Goodix GT9916 or FocalTech FT3680 touch controller on an SPI serial engine. | `touch-goodix` / `touchscreen=1`; `touchscreen=-1` only looks | part; which engine, its clocks, the pins and the supply are data (`touch { }`) |
 | `bsd/dev/board/fts.c` | FocalTech FT3658U touch controller on an SPI serial engine. | `touch-ft3658u` / `touchscreen=1`; `touchscreen=-1` only looks | part; which engine, its clocks, the pins and the supplies are data (`touch { }`) |

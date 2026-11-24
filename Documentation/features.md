@@ -34,7 +34,7 @@ the two the same. What each key means is in `arch/arm64/boot/dts/_template/soc.d
 | `imu-bmi160` | `pins { }` | `imu { }`: `sda`, `scl`, `interrupt`, `address`, `full-scale`, `mount` | `sensors=1 looks; sensors=2 follows the orientation` |
 | `touch-ft5x06` | `pins { }` | `touch-i2c { }`: `sda`, `scl`, `interrupt`, `reset`, `address`, `contacts`, `coordinates` | `touchscreen=-1 looks; touchscreen=1` |
 | `touch-s3908` | `pins { }` | `touch-i2c { }`: `sda`, `scl`, `interrupt`, `reset`, `address`, `contacts`, `coordinates` | `touchscreen=-1 looks; touchscreen=1` |
-| `gpu-a730` | `adreno { }`; `clocks { }`: `gcc-disp-ahb-cbcr`; `rpmh { }` | `gpu { }`: `model`, `chip-id`, `firmware`, `gmem-kb`, `primitive-fifo`, `hang-cycles`, `speed-fuse`, `gaming-fuse`, `highest-bank-bit`, `gcc-debug-gpucc`, `speeds-khz`, `speed-levels`, `default-speed` | `adreno=22, through the first fill` |
+| `gpu-a730` | `adreno { }`; `clocks { }`: `gcc-disp-ahb-cbcr`; `rpmh { }` | `gpu { }`: `model`, `chip-id`, `firmware`, `gmem-kb`, `primitive-fifo`, `hang-cycles`, `speed-fuse`, `gaming-fuse`, `highest-bank-bit`, `gcc-debug-gpucc`, `speeds-khz`, `speed-levels`, `default-speed` | `gpu=1 or adreno=22; gpu_irq=1 for completion interrupts` |
 
 The brightness (`backlight { }`), the thermal floors (`thermal { }`), the PMIC's clock (`rtc { }`, which
 needs `spmi { }` in the SoC file) and the partition that may be written (`storage { }`) are not

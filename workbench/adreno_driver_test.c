@@ -526,6 +526,39 @@ display_probe_bounded(void)
 	CHECK(logged("the interface's counters"), "and the probe got to its end: %s", log_text);
 }
 
+/* The ring budget must cover a wrapped submission, with the IRQ only on the final BR event. */
+static void
+a730_submission(void)
+{
+	static uint32_t commands[RING_WORDS];
+	const uint64_t address = 0x123456789ull;
+	const uint32_t words = 16;
+	const uint32_t start = RING_WORDS - 8;
+	unsigned bv = 0, wait = 0, br = 0;
+
+	core_ring.memory = (vm_offset_t)commands;
+	ring_at = start;
+	gpu_fence = 42;
+	gpu_exact = 1;
+	gpu_irq_state = 1;
+	gpu_submit_a730(&address, &words, 1);
+	CHECK(ring_at == (start + A730_SUBMIT_WORDS + 4) % RING_WORDS, "the ring budget covers the emitted words");
+	for (unsigned i = 1; i < A730_SUBMIT_WORDS + 4; i++) {
+		uint32_t word = commands[(start + i) % RING_WORDS];
+		uint32_t previous = commands[(start + i - 1) % RING_WORDS];
+
+		if (word == CORE_SCRATCH_ADDRESS + GPU_BV_FENCE_AT && previous == (EVENT_CACHE_CLEAN | EVENT_WRITE_ENABLED)) {
+			bv = i;
+		} else if (word == CORE_SCRATCH_ADDRESS + GPU_BV_FENCE_AT && previous == 0) {
+			wait = i;
+		} else if (word == CORE_SCRATCH_ADDRESS + GPU_FENCE_AT &&
+		    previous == (EVENT_CACHE_CLEAN | EVENT_WRITE_ENABLED | GPU_EVENT_IRQ)) {
+			br = i;
+		}
+	}
+	CHECK(bv != 0 && bv < wait && wait < br, "BV fence, BR wait and final BR IRQ were emitted in order");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -536,6 +569,7 @@ main(int argc, char **argv)
 		{ "stop_as_asked_keeps_cx", stop_as_asked_keeps_cx },
 		{ "stop_with_cx_not_ours", stop_with_cx_not_ours }, { "short_answer", short_answer }, { "error_text", error_text },
 		{ "zap_header_short", zap_header_short }, { "display_probe_bounded", display_probe_bounded },
+		{ "a730_submission", a730_submission },
 	};
 
 	if (argc < 2) {

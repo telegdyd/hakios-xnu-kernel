@@ -100,7 +100,7 @@ SOC_SCHEMA = {
     'adreno': {'gpu': (int, True), 'gmu': (int, True), 'gpucc': (int, True), 'cx_misc': (int, True), 'rscc': (int, True),
                'smmu': (int, True), 'pdc': (int, True), 'qfprom': (int, True), 'tsens': (int, False),
                'smmu_size': (int, False), 'clock_layout': (GPU_CLOCK_LAYOUTS, False),
-               'zap_memory': (int, False)},
+               'zap_memory': (int, False), 'interrupt': (int, False)},
     'pins': {'tlmm': (int, True), 'pdc': (int, False)},
     'smmu': {'apps': (int, True), 'audio_stream': ([int], False), 'wifi_stream': ([int], False),
              'camera_stream': ([int], False)},
@@ -221,7 +221,7 @@ FEATURE_BOOTARGS = {
     'adsp': 'adsp=1',
     'display-scan': 'fb_scan=1, the default',
     'gpu-a660': 'gpu=1',
-    'gpu-a730': 'adreno=22, through the first fill',
+    'gpu-a730': 'gpu=1 or adreno=22; gpu_irq=1 for completion interrupts',
     'virtio': 'virtio_net=1, virtio_input=1',
     'touch-goodix': 'touchscreen=1',
     'touch-ft3658u': 'touchscreen=1',
@@ -855,6 +855,9 @@ def load(problems=None):
         if clock is not None and (not 0 < clock['peripheral'] <= 0xfff or clock['peripheral'] & 0xff == 0):
             problems.add(f'{rel} [rtc]', f'peripheral = {clock["peripheral"]:#x}: SPMI slave << 8 | the high byte of the '
                                          "RTC's registers (0x061: slave 0, registers 0x6100)")
+        adreno = data.get('adreno')
+        if adreno is not None and 'interrupt' in adreno and not 32 <= adreno['interrupt'] <= 1019:
+            problems.add(f'{rel} [adreno]', "interrupt: the completion line as the GIC numbers it (an SPI: 32 to 1019)")
         adsp = data.get('adsp')
         if adsp is not None:
             if adsp['memory_size'] == 0 or adsp['memory_size'] & 0xfff:
@@ -1097,6 +1100,8 @@ def table_text(socs, boards):
             if 'smmu_size' in adreno or adreno.get('clock_layout', 'sc7280') != 'sc7280':
                 out.append(f'\t\t\t.smmu_size = {adreno.get("smmu_size", 0):#x}, '
                            f'.clock_layout = HAKIOS_GPU_CLOCKS_{adreno.get("clock_layout", "sc7280").upper()},')
+            if 'interrupt' in adreno:
+                out.append(f'\t\t\t.interrupt = {adreno["interrupt"]},')
             if 'zap_memory' in adreno:
                 out.append(f'\t\t\t.zap_memory = {adreno["zap_memory"]:#x}ull,')
             out.append('\t\t},')
