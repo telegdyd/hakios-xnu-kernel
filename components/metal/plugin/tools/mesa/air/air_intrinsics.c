@@ -2667,6 +2667,39 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    return true;
 }
 
+/* -- sine and cosine at once -------------------------------------------- */
+
+/* T air.[fast_]sincos.<type>(T x, ptr cos_out)
+ *
+ * Metal's sincos(x, cosval): the sine returned, the cosine written through the
+ * pointer (a private alloca in every caller seen: Mercury's Celosia, fluidity
+ * and pro24 vertex shaders). Handled before math_op, which reads every argument
+ * as a number and refused the pointer as "a pointer where a number belongs".
+ */
+static bool
+sincos_op(struct air_ctx *c, const struct air_inst *in)
+{
+   if (in->num_operands != 3)
+      return air_error(c, "intrinsic: air.sincos of %u arguments", in->num_operands - 1);
+   nir_def *x = air_get_ssa(c, in->operands[1]);
+   if (!x)
+      return false;
+   struct air_val *pv = air_get(c, in->operands[2]);
+   if (!pv)
+      return false;
+   if (pv->kind != AIR_VAL_PTR)
+      return air_error(c, "intrinsic: air.sincos whose cosine goes to something that is not a pointer");
+   bool was_exact = c->b.exact;
+   c->b.exact = false;
+   nir_def *sine = nir_fsin(&c->b, x);
+   nir_def *cosine = nir_fcos(&c->b, x);
+   c->b.exact = was_exact;
+   if (!air_store_ptr(c, pv->ptr, cosine, x->bit_size / 8))
+      return false;
+   air_set(c, &in->base, air_val_ssa(c, sine));
+   return true;
+}
+
 /* -- the dispatcher ----------------------------------------------------- */
 
 bool
@@ -2684,6 +2717,8 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
 
    if (!strcmp(n.part[0], "is_function_constant_defined"))
       return fc_defined_op(c, in);
+   if (!strcmp(n.part[0], "sincos") || !strcmp(n.part[0], "fast_sincos"))
+      return sincos_op(c, in);
    if (n.num >= 2 && !strcmp(n.part[0], "wg") && !strcmp(n.part[1], "barrier"))
       return barrier_op(c, in, false);
    if (n.num >= 2 && !strcmp(n.part[0], "simdgroup") && !strcmp(n.part[1], "barrier"))
