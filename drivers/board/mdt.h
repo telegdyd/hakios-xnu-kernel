@@ -78,8 +78,10 @@ mdt_apart(uint32_t a, uint32_t a_size, uint32_t b, uint32_t b_size)
 
 /*
  * Is the header file the ELF header, the table and the block of hashes, and nothing else: one segment of hashes
- * and only one, of some bytes, whose place in the file is right after the table, and the file ending with it?
- * `hashes': its size, or 0.
+ * and only one, of some bytes, right after the table in the header file, and the file ending with it? Its offset in
+ * the ELF is not looked at: the header file is the image's headers and hashes put together, and where the hashes are
+ * in the whole ELF says nothing of where they are in it (Linux's qcom_mdt_read_metadata() goes by the sizes alone;
+ * the OnePlus 10 Pro's audio DSP image has its hashes last, at 0x11d5000). `hashes': its size, or 0.
  */
 static inline bool
 mdt_header_whole(const uint8_t *header, uint32_t count, uint64_t size, uint32_t *hashes)
@@ -95,7 +97,7 @@ mdt_header_whole(const uint8_t *header, uint32_t count, uint64_t size, uint32_t 
 		}
 	}
 	*hashes = seen == 1 ? found.file_size : 0;
-	return seen == 1 && found.file_size != 0 && found.offset == MDT_ELF_HEADER + (uint64_t)MDT_SEGMENT * count &&
+	return seen == 1 && found.file_size != 0 &&
 	       MDT_ELF_HEADER + (uint64_t)MDT_SEGMENT * count + found.file_size == size;
 }
 

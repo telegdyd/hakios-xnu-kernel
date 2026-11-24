@@ -167,8 +167,10 @@ whole(void)
 	size = header(4, 0);
 	CHECK(!mdt_header_whole(file, 4, size, &hashes) && hashes == 0, "no block of hashes, and nothing after the table");
 	size = header(4, 200);
-	hashes_at(1, TABLE_END(4) + 8, 200);
-	CHECK(!mdt_header_whole(file, 4, size, &hashes), "hashes said to be elsewhere than after the table");
+	hashes_at(3, 0x11d5000u, 200);
+	CHECK(mdt_header_whole(file, 4, size, &hashes) && hashes == 200,
+	    "hashes last, at their place in the whole ELF (the 10 Pro's audio DSP image): the header file is still whole");
+	segment(3, 0, 0, 0, 0, 0);
 	hashes_at(1, TABLE_END(4), 200);
 	hashes_at(2, TABLE_END(4), 200);
 	CHECK(!mdt_header_whole(file, 4, size, &hashes), "two blocks of hashes");
