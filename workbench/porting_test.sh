@@ -138,7 +138,7 @@ refuses "the I/O window, which no tree has, is asked for when the loader is to k
 sed -i -e 's|// io-base = <0x00400000>;|io-base = <0x01000000>;|' -e 's|// io-size = <0x3fc00000>;|io-size = <0x3F000000>;|' "$R/arch/arm64/boot/dts/testphone/soc.dtsi"
 check "with its framebuffer base it does" sh -c "\"$B\" gen && grep -q '&platform_testphone,' \"$R/build/boards/platforms.h\""
 check "... with the machine as the SoC file has it" \
-	sh -c "grep -A14 'platform_testphone = ' \"$R/build/boards/platforms.h\" | tr -d '\n\t' | grep -q '.io_base = 0x01000000,.io_size = 0x3f000000,.gic_dist = 0x17100000,.gic_redist = 0x17180000,.psci_hvc = 0,.log_other_cpu = 0,.uefi_charger = 0,.cores = 6,.core_shift = 8,.timeout_scale = 0,.small_cores = 0xf,.fb_base = 0x9c000000,'"
+	sh -c "grep -A16 'platform_testphone = ' \"$R/build/boards/platforms.h\" | tr -d '\n\t' | grep -q '.io_base = 0x01000000,.io_size = 0x3f000000,.gic_dist = 0x17100000,.gic_redist = 0x17180000,.psci_hvc = 0,.log_other_cpu = 0,.uefi_charger = 0,.firmware_quiet_at_once = 0,.usb_restart_after_run = 0,.cores = 6,.core_shift = 8,.timeout_scale = 0,.small_cores = 0xf,.fb_base = 0x9c000000,'"
 if command -v clang > /dev/null && command -v lld-link > /dev/null; then
 	check "the loader builds with the new board" \
 		sh -c "clang --target=aarch64-unknown-windows -ffreestanding -fno-builtin -fno-stack-protector -fshort-wchar -mgeneral-regs-only -O1 -Wall -Wextra -Werror -Wno-unused-parameter -I\"$R/build/boards\" -c \"$R/arch/arm64/boot/loader.c\" -o \"$W/loader.obj\" && lld-link /subsystem:efi_application /entry:efi_main /nodefaultlib /base:0xA1000000 /Brepro \"/out:$W/loader.efi\" \"$W/loader.obj\""

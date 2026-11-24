@@ -123,7 +123,10 @@ write_logs(const char *klog, uint64_t klog_len)
 			uint64_t shown = klog_len < sizeof(out_buf) ? klog_len : sizeof(out_buf);
 			uint64_t from = shown > 3000 ? shown - 3000 : 0;
 
-			print("\n== KERNEL LOG (the last %d of %d bytes; all of it over USB) ==\n", shown - from, klog_len);
+			print("\n== KERNEL LOG ==\n");
+			if (from != 0) {
+				print("(the last %d of %d bytes; all of it over USB)\n", shown - from, klog_len);
+			}
 			for (uint64_t i = from; i < shown; i++) {
 				put_char(klog[i]);
 			}
