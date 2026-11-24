@@ -152,6 +152,11 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * After that a kernel that neither returns nor hangs visibly meets the watchdog.
 		 */
 		if (wdt_armed && seconds_since(last_pet) >= 5 && (budget == 0 || seconds_since(started) < budget + 60)) {
+			/* (usb_net=1: the host talks to the kernel over the cable, not to this loader; its silence here is not
+			 * a host that went away, and the dead-man rule would leave the watchdog unfed after 180 s) */
+			if (usb_kernel_owned) {
+				host_last_cmd = READ_SYSREG(CNTVCT_EL0);
+			}
 			wdt_pet();
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 		}

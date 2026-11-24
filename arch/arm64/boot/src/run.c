@@ -736,6 +736,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	/* --- the kernel came back ------------------------------------------- */
 	usb_restart_wanted = PLAT->usb_restart_after_run && (kernel_mpidr == this_mpidr || usb_kernel_owned) &&
 	    checkpoint != CHECKPOINT_SELFTEST;
+	if (usb_kernel_owned) {
+		/* the host was the kernel's until now: it has HOST_SILENCE_SECONDS from here to find this loader again */
+		host_last_cmd = READ_SYSREG(CNTVCT_EL0);
+	}
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */
 	if (hc_known) {
