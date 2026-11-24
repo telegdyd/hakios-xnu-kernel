@@ -201,19 +201,22 @@ fb_command(char *cmd)
 				got += (uint64_t)r;
 				host_last_cmd = READ_SYSREG(CNTVCT_EL0);        /* (a host sending is a host there: the watchdog is petted) */
 			}
-			if (!to_ramdisk && (got != total || patch_data != NULL)) {
-				/* the payload's area holds no payload now -- part of one, or the patch's bytes: "oem run" says so */
+			if (!to_ramdisk && got != total) {
+				/* the payload's area holds only part of one: "oem run" says so */
 				((struct payload_header *)PAYLOAD_BASE)->magic = 0;
 			}
 			if (got == total && patch_data != NULL) {
 				efi_block_io *data = patch_data;
+				int ok = dsu_write(data, dsu_patch_offset, dest, total);
 
-				if (!dsu_write(data, dsu_patch_offset, dest, total)) {
+				if (ok && resident_rd_size >= dsu_patch_offset + total) {
+					memcpy((uint8_t *)(win_base + RESIDENT_RD_OFFSET + dsu_patch_offset), dest, total);
+				}
+				/* the payload's area holds the patch's bytes, not a payload: "oem run" says so */
+				((struct payload_header *)PAYLOAD_BASE)->magic = 0;
+				if (!ok) {
 					fb_reply("FAIL", "patch not written (oem log)");
 					return;
-				}
-				if (resident_rd_size >= dsu_patch_offset + total) {
-					memcpy((uint8_t *)(win_base + RESIDENT_RD_OFFSET + dsu_patch_offset), dest, total);
 				}
 				fb_reply("OKAY", "");
 				return;
