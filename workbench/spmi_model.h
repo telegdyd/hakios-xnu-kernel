@@ -147,7 +147,7 @@ spmi_model_has(uintptr_t address)
 {
 	uint32_t tables = spmi.channel_map ? 0x8000 : 0x1000;
 
-	return (spmi.core != 0 && address >= spmi.core && address < spmi.core + 0x2800) ||
+	return (spmi.core != 0 && address >= spmi.core && address < spmi.core + 0x3000) ||
 	       (spmi.cnfg != 0 && address >= spmi.cnfg && address < spmi.cnfg + tables) ||
 	       (spmi.channel_map != 0 && address >= spmi.channel_map && address < spmi.channel_map + tables) ||
 	       (spmi.observer != 0 && address >= spmi.observer && address < spmi.observer + 0x80 * SPMI_CHANNELS) ||

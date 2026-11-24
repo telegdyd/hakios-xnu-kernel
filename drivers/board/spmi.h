@@ -55,7 +55,7 @@
 #define ARB_VERSION             0x000
 #define ARB_VERSION_5           0x50000000u     /* what is here is version 5's; 7 moved things again */
 #define ARB_VERSION_7           0x70000000u
-#define ARB_V7_CORE_SIZE        0x2800UL        /* the version, the two counts, and the table of channels at 0x2000 */
+#define ARB_V7_CORE_SIZE        0x3000UL        /* the version, the two counts, and the table of channels at 0x2000 */
 #define ARB_V7_FEATURES1        0x008           /* [10:0] the number of channels of the second bus */
 #define ARB_V7_CHANNEL(n)       (0x2000 + 4 * (n))      /* core: the word ARB_CHANNEL(n) is in version 5 */
 #define ARB_V7_OBSERVER_SIZE    0x8000UL        /* one system's part of the observer block */
@@ -66,6 +66,7 @@
 #define ARB_CHANNEL_INTERRUPTS  (1u << 24)
 #define ARB_OWNER(n)            (0x700 + 4 * (n))       /* cnfg: [2:0] the system that may write through channel n */
 #define ARB_MAX_CHANNELS        512
+#define ARB_V7_MAX_CHANNELS     1024
 #define ARB_VERSION_8           0x80000000u
 #define ARB_V8_TABLE_SIZE       0x8000UL        /* channel-map and cnfg: 4 bytes a channel */
 #define ARB_V8_OBSERVER_CHANNEL 0x20UL
@@ -123,7 +124,7 @@ hakios_spmi_map_v7(struct hakios_spmi *arb, const struct hakios_board *board)
 		before = arb->channels;
 		arb->channels = rd(arb->core + ARB_V7_FEATURES1) & 0x7ff;
 	}
-	if (board->spmi.bus > 1 || arb->channels == 0 || before + arb->channels > ARB_MAX_CHANNELS) {
+	if (board->spmi.bus > 1 || arb->channels == 0 || before + arb->channels > ARB_V7_MAX_CHANNELS) {
 		return false;
 	}
 	arb->first = before;
