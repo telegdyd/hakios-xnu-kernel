@@ -24,7 +24,7 @@
 	// gpu-a660        an Adreno of the A660 family (642, 642L, 643, 660 ...) behind a GMU (gpu=1); needs gpu { }
 	// and these, each a driver of one part wired the way one phone has it -- list one only if your phone
 	// has that part on the same pins and bus (drivers/board/board.h, Documentation/drivers.md):
-	// touch-goodix, touch-ft3658u, touch-ft5x06, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,
+	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-s3908, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,
 	// camera-sm7325, wifi-wcn6750, mic-wcd938x, modem-sm7325, bluetooth-wcn-uart
 	// Documentation/features.md has what each needs written down first; tools/boards.py status NAME says it for
 	// this board.
@@ -127,6 +127,18 @@
 		// analog-supply = "ldoa17";    // optional: its analog supply (vdd-supply) the same way, with what it is asked for:
 		// analog-millivolts = <3008>;  // ... the regulator's voltage in the device tree, 2600 to 3600
 		// analog-enable = <78>;        // optional: a GPIO that switches its analog supply on, high
+		// For "touch-s3908" (a Synaptics S3908, TouchComm v1) the same section, and optionally:
+		// interrupt-pdc = <132 754>;   // the interrupt GPIO's pin in the PDC (pinctrl-CODENAME.c's wakeirq map) and
+		//                              // the GIC interrupt it raises (pdc-ranges, + 32); needs pins { pdc } in soc.dtsi
+		// serial-engine = <0x00990000>; // the bus's own engine (the i2c@ node's reg), fed by the QUP's GPI DMA:
+		// gpii = <0x00910000>;         // ... the GPI's channel group bound to it (gpi-dma reg + 0x10000 + 0x4000 n)
+		// gpi-streams = <0x5b6 0x5a3>; // ... the SMMU streams of the gpi-dma node and of the QUP wrapper (iommus)
+		// se-index = <4>;              // ... the engine's number in its QUP; se-function: the pins' function for it
+		// se-function = <1>;
+		// clocks = <0x27004 0x27008 0x274dc>; // ... GCC offsets: the wrapper's m and s AHB clocks, the engine's own
+		// vote-register = <0x62008>;   // ... the GCC's APCS vote register, and its bits for the two AHB clocks, core,
+		// votes = <6 7 8 9 14>;        //     core 2x and the engine
+		// bus-votes = "QUP0", "SN3", "SN0"; // ... the BCMs on the QUP's way to memory; needs clocks, smmu, rpmh { }
 	// };
 
 	// The microphones' codec, for the feature "mic-wcd938x": a WCD938x on the SoC's SoundWire.

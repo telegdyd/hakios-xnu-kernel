@@ -1088,7 +1088,8 @@ def table_text(socs, boards):
                     '\t\t},']
         pins = soc.get('pins')
         if pins:
-            out.append(f'\t\t.pins = {{ .tlmm = {pins["tlmm"]:#010x}, .pdc = {pins.get("pdc", 0):#010x} }},')
+            pdc = f', .pdc = {pins["pdc"]:#010x}' if 'pdc' in pins else ''
+            out.append(f'\t\t.pins = {{ .tlmm = {pins["tlmm"]:#010x}{pdc} }},')
         camera = soc.get('camera')
         if camera:
             out += ['\t\t.camera = {',

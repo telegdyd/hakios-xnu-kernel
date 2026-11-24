@@ -35,6 +35,7 @@
 		tlmm = <0x0f100000>;            // where GPIO 0's registers are; GPIO n's are 0x1000 n further. The pin
 		                                // controller's node (qcom,CODENAME-pinctrl): in Linux's trees its reg; in
 		                                // the vendor's, whose reg is the whole 16 MiB block, 0x100000 above it
+		// pdc = <0x0b220000>;          // optional: the qcom,pdc interrupt controller's reg, for touch-i2c { interrupt-pdc }
 	};
 
 	// The PMIC arbiter (qcom,spmi-pmic-arb), by its reg-names: for the features "buttons-pmic",

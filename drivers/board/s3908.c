@@ -1488,7 +1488,15 @@ hakios_s3908_quiesce(void)
 		irq_restore();
 	}
 	if (gpi.gpii != 0 && gpi.on) {
-		/* (the other cores are stopped, perhaps one in the SMMU's lock: not taken) */
+		/*
+		 * (the other cores are stopped, perhaps one in the SMMU's lock: not taken). The GPII's registers only with the
+		 * QUP's way voted on, as for every transfer: let go when idle, a read of them stalls the core for good
+		 * (2026-11-24, run-20261124-190926: the way back hung, the watchdog reset the phone).
+		 */
+		if (!gpi.votes_on && !votes_set(true)) {
+			say("s3908: at the run's end: the QUP's way could not be voted: the GPII left as it is\n");
+			return;
+		}
 		gpi_release();
 		gpi.on = false;
 		if (gpi.smmu_on) {
