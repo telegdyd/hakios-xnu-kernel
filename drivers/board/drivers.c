@@ -55,8 +55,7 @@ touch_controller_init(void)
 		if (CONFIG_TOUCH_S3908) {
 			hakios_s3908_init();
 		} else {
-			hakios_say("touch: this board's Synaptics S3908 has no driver in this kernel (CONFIG_TOUCH_S3908)
-");
+			hakios_say("touch: this board's Synaptics S3908 has no driver in this kernel (CONFIG_TOUCH_S3908)\n");
 		}
 	} else if (hakios_board_has(HAKIOS_HAS_TOUCH_GOODIX)) {
 		if (CONFIG_TOUCH_GOODIX) {
