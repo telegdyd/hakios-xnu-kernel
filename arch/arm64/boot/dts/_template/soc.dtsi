@@ -58,17 +58,17 @@
 
 	// The USB controller the boot loader's UEFI runs, for usb_net=1 (board/usb_net.c): the kernel takes it over
 	// from the loader as it left it (clocks, PHY and power on) and shows the host a CDC-NCM network adapter, en2.
-	// Leave the section out and usb_net=1 does nothing.
-	// usb {
-		// dwc3 = <0x0a600000>;         // the DWC3 core: the reg of the snps,dwc3 node (dwc3@a600000)
-		// interrupt = <165>;           // its event interrupt, the GIC's number: the node's interrupts = <0 SPI 4>,
+	// Leave the section out and usb_net=1 does nothing. (The values are the OnePlus 10 Pro's, SM8450.)
+	usb {
+		dwc3 = <0x0a600000>;         // the DWC3 core: the reg of the snps,dwc3 node (dwc3@a600000)
+		interrupt = <165>;           // its event interrupt, the GIC's number: the node's interrupts = <0 SPI 4>,
 		//                              // SPI + 32. Optional; 0 or left out: the driver polls
-		// hsphy = <0x088e3000>;        // the high-speed PHY (qcom,usb-hsphy-snps-femto); optional, for
+		hsphy = <0x088e3000>;        // the high-speed PHY (qcom,usb-hsphy-snps-femto); optional, for
 		//                              // usb_phyguard=1 only: something on the SoC (the audio DSP's charger
 		//                              // detection) rewrites its UTMI overrides and the host loses the phone
-		// clkref = <0x0019c00c>;       // the GCC register that enables the PHY's reference clock (the
+		clkref = <0x0019c00c>;       // the GCC register that enables the PHY's reference clock (the
 		//                              // CLKREF_EN of GCC's USB); optional, for usb_phyguard=1 only
-	// };
+	};
 
 	// The SMMU between the SoC's devices and memory, for the part drivers that give a device its addresses
 	// (the speakers' audio path, the cameras, Wi-Fi). The GPU's own is in adreno { }.
