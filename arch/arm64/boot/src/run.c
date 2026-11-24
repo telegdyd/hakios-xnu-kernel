@@ -162,7 +162,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	block_write_part = -1;
 	block_probe_requested = 0;      /* (ufs_probe=, ufs_native=: as asked for this run, not the one before) */
 	hc_requested = 0;
+	usb_kernel_owned = 0;
 	for (const char *c = pi.cmdline; *c; c++) {
+		usb_kernel_owned |= starts_with(c, "usb_net=1") && (c == pi.cmdline || c[-1] == ' ') && (c[9] == 0 || c[9] == ' ');
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
 		}
@@ -698,6 +700,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		if (kernel_mpidr != this_mpidr) {
 			int64_t status = run_on_other_cpu(kernel_mpidr, entry_va + slide, ba_pa, kernel_live, slide, kernel_budget);
 
+			/* (also when it hung or never started: whatever the kernel did to the controller, bring it up again) */
+			usb_restart_wanted = PLAT->usb_restart_after_run && usb_kernel_owned;
+
 			wdt_set_ms(WDT_BITE_MS);
 			if (status != 0) {
 				/* a kernel that hung may have left its own transfer list in the controller */
@@ -729,6 +734,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 
 	/* --- the kernel came back ------------------------------------------- */
+	usb_restart_wanted = PLAT->usb_restart_after_run && (kernel_mpidr == this_mpidr || usb_kernel_owned) &&
+	    checkpoint != CHECKPOINT_SELFTEST;
 	wdt_set_ms(WDT_BITE_MS);
 	hc_take_back("the kernel came back");   /* before anything here touches the storage */
 	if (hc_known) {
@@ -819,6 +826,9 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 			print("  (pa-va slide %x: subtract it from physical addresses to symbolicate)\n", slide);
 			set_result("early-exception", 0, loader_ctx[CTX_ELR]);
 			klog_len = klog_len > (1u << 20) ? 0 : klog_len;
+		} else if (reason == 3) {
+			print("the kernel asked for a reset\n");
+			set_result("returned", klog_len, 0);
 		} else {
 			set_result("returned", klog_len, 0);
 		}
@@ -832,5 +842,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 #undef KERNEL_WORDS
 #undef IN_RAM
 	write_logs(klog, klog_len);
+	if (reason == 3 && checkpoint != CHECKPOINT_SELFTEST) {
+		reboot();       /* Android again; the log was the kernel's to keep, as for any run */
+	}
 	return 1;
 }

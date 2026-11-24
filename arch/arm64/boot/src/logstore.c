@@ -5,6 +5,9 @@
 static efi_block_io *
 find_log_partition(void)
 {
+#if LOADER_READ_ONLY
+	return NULL;
+#endif
 	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
 	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
 	static const char16 want[] = LOG_PARTITION;
@@ -113,8 +116,15 @@ write_logs(const char *klog, uint64_t klog_len)
 	if (bio == NULL) {
 		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
 		if (klog != NULL) {
-			print("\n== KERNEL LOG ==\n");
-			for (uint64_t i = 0; i < klog_len && i < sizeof(out_buf); i++) {      /* (as much as is staged, no more) */
+			/*
+			 * Drawing every character is slow (a long session's log is megabytes: minutes with the loader looking
+			 * hung, no USB served). The whole log is staged for the host (fastboot get_staged); the screen gets its end.
+			 */
+			uint64_t shown = klog_len < sizeof(out_buf) ? klog_len : sizeof(out_buf);
+			uint64_t from = shown > 3000 ? shown - 3000 : 0;
+
+			print("\n== KERNEL LOG (the last %d of %d bytes; all of it over USB) ==\n", shown - from, klog_len);
+			for (uint64_t i = from; i < shown; i++) {
 				put_char(klog[i]);
 			}
 			print("\n== END OF LOG ==\n");

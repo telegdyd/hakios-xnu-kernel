@@ -125,7 +125,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * After that this core only watches: no interrupts (the kernel reprograms the interrupt
 		 * controller's shared half; UEFI's handlers had better not run on top of that for long).
 		 */
-		if (!watching_only && seconds_since(started) >= NOTE_SECONDS) {
+		if (!watching_only && (PLAT->firmware_quiet_at_once || seconds_since(started) >= NOTE_SECONDS)) {
 			watching_only = 1;
 			daif = READ_SYSREG(DAIF);
 			__asm__ volatile ("msr daifset, #0xf");
@@ -151,7 +151,7 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		 * the kernel does it too, but whether that counts from another core is not known.
 		 * After that a kernel that neither returns nor hangs visibly meets the watchdog.
 		 */
-		if (wdt_armed && seconds_since(last_pet) >= 5 && seconds_since(started) < budget + 60) {
+		if (wdt_armed && seconds_since(last_pet) >= 5 && (budget == 0 || seconds_since(started) < budget + 60)) {
 			wdt_pet();
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 		}
@@ -183,7 +183,9 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		if (block_enabled) {
 			block_poll();
 		}
-		usb_poll_command();
+		if (!usb_kernel_owned) {
+			usb_poll_command();
+		}
 		if (block_enabled) {
 			/*
 			 * The pause is spent looking at the kernel's mailbox: with one look a pass, a

@@ -283,6 +283,10 @@
 		// log-other-cpu;               // keep notes in the log partition while a kernel starts on another core
 		// uefi-charger;                // the firmware has Qualcomm's charger protocols: the loader reads the battery
 		//                              // through them and hands it to the kernel (feature "battery-uefi")
+		// firmware-quiet-at-once;      // a kernel on another core: this core takes no interrupts from the start (the
+		//                              // firmware's own touch and key drivers keep polling what the kernel drives)
+		// usb-restart-after-run;       // the USB controller does not answer after a kernel had it: stopped and started
+		//                              // again before the next command (and after a run with usb_net=1)
 	// };
 
 	// Its UEFI, as arch/arm64/boot/mkboot.py packs it for `fastboot boot`; the build itself is in firmware/NAME/uefi/.

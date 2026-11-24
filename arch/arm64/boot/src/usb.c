@@ -88,8 +88,9 @@ usb_start(void)
 		print("usb: start failed %x\n", s);
 		return 0;
 	}
-	if (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
-	    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf))) {
+	/* (a restart of the controller keeps the buffers it has) */
+	if (usb_rx_buf == NULL && (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
+	    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf)))) {
 		print("usb: no transfer buffers\n");
 		return 0;
 	}
@@ -102,6 +103,8 @@ usb_start(void)
  * Returns the byte count, or -1 if the transfer was cancelled or the cable
  * state changed. Keeps the watchdog fed while idle.
  */
+static uint64_t loader_session_start;    /* when efi_main began: LOADER_SESSION_SECONDS counts from it */
+
 static int64_t
 usb_wait(uint8_t endpoint)
 {
@@ -114,6 +117,10 @@ usb_wait(uint8_t endpoint)
 		uint64_t size = 0;
 		usb_device_event_data data;
 
+		if (LOADER_SESSION_SECONDS &&
+		    READ_SYSREG(CNTVCT_EL0) - loader_session_start >= (uint64_t)LOADER_SESSION_SECONDS * freq) {
+			reboot();
+		}
 		USB->handle_event(&msg, &size, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);

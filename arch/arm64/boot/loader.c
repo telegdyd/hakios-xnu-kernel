@@ -60,6 +60,47 @@
 #include "src/commands.c"         /* the commands taken over USB */
 #include "src/ramfb.c"            /* QEMU's display in the shape of the phone's screen */
 
+/*
+ * The one-shot boot's USB, on a usb-restart-after-run board: started, stopped and started once (usb_restart's way), then
+ * two seconds of the driver's events only (this boot takes no host command, so no receive is queued). Each event is
+ * shown, so a stop names its call (a boot after a reset stopped in Qualcomm's USB driver, 2026-11-23).
+ */
+static int
+oneshot_usb(void)
+{
+	if (!usb_start()) {
+		return 0;
+	}
+	efi_status s = USB->stop();
+	usb_connected = 0;
+	usb_rx_queued = 0;
+	print("one-shot: USB stopped (%x), starting again\n", (uint64_t)s);
+	if (!usb_start()) {
+		return 0;
+	}
+	uint64_t began = READ_SYSREG(CNTVCT_EL0);
+	unsigned shown = 0;
+	while (seconds_since(began) < 2) {
+		uint32_t msg = UsbDeviceEventNoEvent;
+		uint64_t size = 0;
+		usb_device_event_data data;
+
+		USB->handle_event(&msg, &size, &data);
+		if (msg != UsbDeviceEventNoEvent && shown < 16) {
+			shown++;
+			print("one-shot: %d ms event %d state %d endpoint %d\n",
+			    (READ_SYSREG(CNTVCT_EL0) - began) * 1000 / READ_SYSREG(CNTFRQ_EL0), (uint64_t)msg,
+			    (uint64_t)(msg == UsbDeviceEventDeviceStateChange ? data.device_state : 0),
+			    (uint64_t)(msg == UsbDeviceEventTransferNotification ? data.transfer.endpoint_index : 0));
+		}
+		if (msg == UsbDeviceEventDeviceStateChange) {
+			usb_connected = (data.device_state == UsbDeviceStateConnected);
+		}
+		BS->stall(1000);
+	}
+	return 1;
+}
+
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
 {
@@ -70,7 +111,8 @@ efi_main(efi_handle image, efi_system_table *st)
 	BS = st->bs;
 	IMAGE = image;
 
-	BS->set_watchdog_timer(0, 0, 0, NULL);
+	loader_session_start = READ_SYSREG(CNTVCT_EL0);
+	BS->set_watchdog_timer(LOADER_SESSION_SECONDS, LOADER_SESSION_SECONDS ? 0x10000 : 0, 0, NULL);
 	console_banner();
 	print("XNULOADER v3  |  UEFI recovery\n");
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
@@ -103,6 +145,10 @@ efi_main(efi_handle image, efi_system_table *st)
 	wdt_arm();
 
 	int have_payload = parse_payload(&pi, 0);
+	/* an installed one-shot boot has no host session deadline: the hardware watchdog and the kernel's heartbeat watch it */
+	if (have_payload && !pi.usb_mode) {
+		BS->set_watchdog_timer(0, 0, 0, NULL);
+	}
 	/* ABL/U-Boot may start the loader without an XNUP payload. That is a
 	 * recoverable packaging or transfer error, not a reason to cold-reset the
 	 * phone: bring up the same fastboot channel used by --usb payloads so the
@@ -125,7 +171,23 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
+		/*
+		 * Qualcomm's USB firmware also prepares the PHY, which the kernel's USB network driver needs before it takes the
+		 * controller; a boot that never visited the command loop has not had it done (usb-restart-after-run boards).
+		 */
+		if (PLAT->usb_restart_after_run) {
+			(void)oneshot_usb();
+		}
 		run_kernel(0, 0);
+		/* boot-arg loader_stay=1 (a test of a boot-partition image): a kernel that came back is followed by this
+		 * loader's USB commands, not a reset, so that the host can fetch the log (fastboot get_staged) */
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "loader_stay=1") && (c == pi.cmdline || c[-1] == ' ') && usb_start()) {
+				print("loader_stay: the kernel came back; USB commands, no reset\n");
+				flush_log();
+				usb_command_loop();
+			}
+		}
 	}
 	reboot();
 	return 0;

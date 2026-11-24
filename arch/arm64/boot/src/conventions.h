@@ -38,6 +38,20 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define PANIC_LOG_BASE      (win_base + win_size - PANIC_LOG_RESERVE)
 /* RAM reserved for the payload in the UEFI memory map. -DPAYLOAD_MAX_SIZE=... where the reservation is
  * bigger. */
+/*
+ * A loader built into an image installed on the phone (the package's boot.conf): -DLOADER_READ_ONLY=1 writes no log to
+ * the phone's storage; -DLOADER_DARWIN_WRITE=1 still serves the kernel's writes to darwin (ufs_write=1, the data
+ * volume); -DLOADER_SESSION_SECONDS=N resets the phone when a session of the USB command loop has lasted N seconds.
+ */
+#ifndef LOADER_READ_ONLY
+#define LOADER_READ_ONLY 0
+#endif
+#ifndef LOADER_DARWIN_WRITE
+#define LOADER_DARWIN_WRITE (!LOADER_READ_ONLY)
+#endif
+#ifndef LOADER_SESSION_SECONDS
+#define LOADER_SESSION_SECONDS 0
+#endif
 #ifndef PAYLOAD_MAX_SIZE
 #define PAYLOAD_MAX_SIZE    0x04000000ULL
 #endif

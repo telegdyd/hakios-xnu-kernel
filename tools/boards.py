@@ -171,7 +171,8 @@ BOARD_SCHEMA = {
              'dsp_memory_size': (int, False), 'pins': ([int], False), 'supplies': ([str], False)},
     'storage': {'type_guid': (str, True), 'unique_guid': (str, True), 'first_lba': (U64, True), 'last_lba': (U64, True),
                 'write_first': (U64, True)},
-    'loader': {'fb_base': (U64, False), 'log_other_cpu': (bool, False), 'uefi_charger': (bool, False)},
+    'loader': {'fb_base': (U64, False), 'log_other_cpu': (bool, False), 'uefi_charger': (bool, False),
+               'firmware_quiet_at_once': (bool, False), 'usb_restart_after_run': (bool, False)},
     'uefi': {'fd_base': (U64, True), 'fd_size': (int, True), 'header_version': (int, False)},
     'boot': {'fastboot_product': (str, True), 'cpus': (int, True), 'bootargs': ([str], True)},
 }
@@ -1239,6 +1240,8 @@ def platforms_text(socs, boards):
         fields += [f'.psci_hvc = {int(platform["psci"] == "hvc")}',
                    f'.log_other_cpu = {int(loader.get("log_other_cpu", False))}',
                    f'.uefi_charger = {int(loader.get("uefi_charger", False))}',
+                   f'.firmware_quiet_at_once = {int(loader.get("firmware_quiet_at_once", False))}',
+                   f'.usb_restart_after_run = {int(loader.get("usb_restart_after_run", False))}',
                    f'.cores = {platform["cores"]}', f'.core_shift = {platform["core_shift"]}',
                    f'.timeout_scale = {platform.get("timeout_scale", 0)}',
                    f'.small_cores = {platform.get("small_cores", 0):#x}',

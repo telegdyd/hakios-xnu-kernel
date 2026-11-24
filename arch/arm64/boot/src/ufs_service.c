@@ -173,7 +173,7 @@ block_start(void)
 			}
 		}
 		if (block_write_requested && block_is_darwin(info, bio, bp)) {
-			block_write_part = (int)block_shared.parts;
+			if (LOADER_DARWIN_WRITE) block_write_part = (int)block_shared.parts;
 		}
 		block_bios[block_shared.parts++] = bio;
 		block_keep_last();

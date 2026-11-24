@@ -71,6 +71,6 @@ wdt_arm(void)
 	uint64_t r_pet = smc_call(VIRT_WDT_PET, 0, 0, NULL, NULL);
 	print("watchdog: status ret=%x ctl=%x since_pet=%x; set_time=%x enable=%x pet=%x\n", st, ctl, since, r_time,
 	    r_ctl, r_pet);
-	wdt_armed = (r_pet == 0);
+	wdt_armed = (r_time == 0 && r_ctl == 0 && r_pet == 0);
 	host_last_cmd = READ_SYSREG(CNTVCT_EL0);
 }

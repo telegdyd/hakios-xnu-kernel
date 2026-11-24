@@ -350,6 +350,11 @@ static uint64_t host_last_cmd;
 static const struct kernel_live *running_live;
 static uint64_t running_slide;
 static void usb_poll_command(void);
+/* the run asked for usb_net=1: the kernel drives the USB controller itself, so the watching core does not poll it
+ * (the two would fight over the controller), and the loader brings it up again afterwards (usb_restart) */
+static int usb_kernel_owned;
+/* the kernel has had the controller, or the core that serves it: usb_restart() before the next command */
+static int usb_restart_wanted;
 
 static uint64_t
 seconds_since(uint64_t then)

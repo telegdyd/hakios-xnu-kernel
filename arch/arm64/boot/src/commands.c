@@ -280,6 +280,10 @@ fb_command(char *cmd)
 			}
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem run") || starts_with(cmd, "oem selftest")) {
+			if (PLAT != &platform_qemu_virt && !wdt_armed) {
+				fb_reply("FAIL", "hardware watchdog not armed");
+				return;
+			}
 			int selftest = starts_with(cmd, "oem selftest");
 			const char *arg = cmd + 7;
 			while (*arg == ' ') {
@@ -306,7 +310,12 @@ fb_command(char *cmd)
 				compose_logs(NULL, 0);
 			}
 		} else if (starts_with(cmd, "oem hang")) {
+			if (PLAT != &platform_qemu_virt && !wdt_armed) {
+				fb_reply("FAIL", "hardware watchdog not armed");
+				return;
+			}
 			fb_reply("OKAY", "watchdog test: not petting any more");
+			__asm__ volatile ("msr daifset, #0xf");  /* (nothing of the firmware's may pet it either) */
 			for (;;) {
 			}
 		} else if (starts_with(cmd, "oem ufs") && !busy) {
@@ -374,6 +383,28 @@ usb_poll_command(void)
 	fb_command(cmd);
 }
 
+/*
+ * After a kernel had the controller, or the core that serves it, the controller may not answer the host (the OnePlus 10
+ * Pro's after a minute of userland; after 8 seconds it does): taken down and brought up again, the host sees the device
+ * leave and come back. The board's usb-restart-after-run.
+ */
+static void
+usb_restart(void)
+{
+	efi_status s;
+
+	usb_restart_wanted = 0;
+	s = USB->stop();
+	if (EFI_ERROR(s)) {
+		print("usb: stop failed %x\n", s);
+	}
+	usb_connected = 0;
+	usb_rx_queued = 0;
+	if (!usb_start()) {
+		reboot();       /* without USB nobody can reach this loader */
+	}
+}
+
 static void
 usb_command_loop(void)
 {
@@ -382,6 +413,10 @@ usb_command_loop(void)
 		char cmd[128];
 		int64_t n;
 
+		if (usb_restart_wanted) {
+			usb_restart();
+			continue;
+		}
 		if (!usb_connected) {
 			usb_wait(0xff); /* returns on the next cable state change */
 			continue;
