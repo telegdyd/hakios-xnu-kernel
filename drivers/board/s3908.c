@@ -43,7 +43,7 @@
  * the bus's pins as the run found them. The chip is left running: the firmware's touch driver reads it again after the
  * run.
  *
- * Not ported from negroni's tree: touch_bus=1's look at the hardware, and the slower look while the screen is off.
+ * Not ported from negroni's tree: its read-only look at the bus hardware, and the slower look while the screen is off.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
