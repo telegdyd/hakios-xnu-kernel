@@ -20,6 +20,7 @@
 #include <machine/machine_routines.h>
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
