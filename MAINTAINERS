@@ -432,6 +432,7 @@ F:	drivers/board/lx.c
 F:	drivers/board/sta.c
 F:	drivers/board/apple80211.c
 F:	drivers/board/net.c
+F:	drivers/board/usb_net.c
 F:	drivers/iokit/BoardWLAN.cpp
 F:	drivers/iokit/MiniIONetworkStack.cpp
 F:	include/board/lx.h
