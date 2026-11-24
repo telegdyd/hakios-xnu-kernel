@@ -3111,9 +3111,9 @@ link_irq_arrived(__unused void *context, uint32_t intid)
 		link_irq.period_count = 0;
 	}
 	if (++link_irq.period_count > LINK_IRQ_STORM) {
-		os_atomic_store(&link_irq.on, 0, release);      /* (left masked; the thread says so) */
+		__atomic_store_n(&link_irq.on, 0, __ATOMIC_RELEASE);      /* (left masked; the thread says so) */
 	}
-	os_atomic_store(&link_irq.rang, 1, release);
+	__atomic_store_n(&link_irq.rang, 1, __ATOMIC_RELEASE);
 	thread_wakeup((event_t)&link_irq.rang);
 }
 
@@ -3132,11 +3132,11 @@ link_irq_start(void)
 	}
 	nanoseconds_to_absolutetime(NSEC_PER_SEC, &link_irq.second);
 	link_irq.foreign_now = false;
-	os_atomic_store(&link_irq.rang, 0, relaxed);
-	os_atomic_store(&link_irq.on, 1, release);
+	__atomic_store_n(&link_irq.rang, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&link_irq.on, 1, __ATOMIC_RELEASE);
 	/* (attaching enables the line: a ring already there comes at once, and only wakes the thread) */
 	if (gic_v3_spi_attach(link_irq.intid, false, link_irq_arrived, NULL) != KERN_SUCCESS) {
-		os_atomic_store(&link_irq.on, 0, release);
+		__atomic_store_n(&link_irq.on, 0, __ATOMIC_RELEASE);
 		tell("adsp: link: THE DOORBELLS' INTERRUPT (GIC %u) CANNOT BE TAKEN: the link's thread looks every millisecond\n",
 		    link_irq.intid);
 		return;
@@ -3156,25 +3156,25 @@ link_irq_stop(void)
 		    "another's ring left uncleared %u times; the always-on processor's rings cleared %u\n", link_irq.count,
 		    link_irq.by_line, link_irq.by_net, link_irq.net_found, link_irq.foreign, doorbell.aop);
 	}
-	os_atomic_store(&link_irq.on, 0, release);
+	__atomic_store_n(&link_irq.on, 0, __ATOMIC_RELEASE);
 }
 
 /* Until the DSP may have said something. True if a ring (or the millisecond look) ended it, false if the net did. */
 static bool
 link_wait(void)
 {
-	if (!link_irq.attached || !os_atomic_load(&link_irq.on, acquire) || link_irq.foreign_now) {
+	if (!link_irq.attached || !__atomic_load_n(&link_irq.on, __ATOMIC_ACQUIRE) || link_irq.foreign_now) {
 		sleep_us(1000);
 		return true;
 	}
 	assert_wait_timeout((event_t)&link_irq.rang, THREAD_UNINT, LINK_NET_MS, NSEC_PER_MSEC);
-	if (os_atomic_xchg(&link_irq.rang, 0, acquire) != 0 || !link_wanted) {
+	if (__atomic_exchange_n(&link_irq.rang, 0, __ATOMIC_ACQUIRE) != 0 || !link_wanted) {
 		clear_wait(current_thread(), THREAD_AWAKENED);
 		link_irq.by_line++;
 		return true;
 	}
 	(void)thread_block(THREAD_CONTINUE_NULL);
-	if (os_atomic_xchg(&link_irq.rang, 0, acquire) != 0) {
+	if (__atomic_exchange_n(&link_irq.rang, 0, __ATOMIC_ACQUIRE) != 0) {
 		link_irq.by_line++;
 		return true;
 	}
@@ -3191,7 +3191,7 @@ link_irq_rearm(void)
 	if (!link_irq.attached) {
 		return;
 	}
-	if (!os_atomic_load(&link_irq.on, acquire)) {
+	if (!__atomic_load_n(&link_irq.on, __ATOMIC_ACQUIRE)) {
 		if (!link_irq.given_up) {
 			link_irq.given_up = true;
 			tell("adsp: link: MORE THAN %u DOORBELL INTERRUPTS IN A SECOND: the line is given up for this boot; the link's "

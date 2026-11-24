@@ -99,6 +99,12 @@ void hakios_sound_quiesce(void) { }
 void hakios_mic_dsp_up(void) { }
 void hakios_mic_dsp_down(void) { }
 void loader_return(void) { }
+/* (the doorbells' interrupt, adsp { } interrupt: none on the tests' phones, so never attached) */
+kern_return_t gic_v3_spi_attach(uint32_t intid __unused, bool edge __unused, void (*handler)(void *, uint32_t) __unused,
+    void *context __unused) { return KERN_FAILURE; }
+void gic_v3_spi_mask(uint32_t intid __unused) { }
+void gic_v3_spi_unmask(uint32_t intid __unused) { }
+void gic_v3_spi_detach(uint32_t intid __unused) { }
 
 #pragma GCC diagnostic ignored "-Wformat"
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
