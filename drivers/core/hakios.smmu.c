@@ -47,16 +47,19 @@ extern void loader_log_putc(char);
 #define ADDRESS 0x0000fffffffff000ull
 #define PAGE 4096ul
 #define VALID (1u<<31)
-#define MAX_CONTEXTS 8
+#define MAX_CONTEXTS 16 /* the bookkeeping table: Wi-Fi, audio, the camera, Iris2 (3 in an encode) and the ICP service at once */
 
 struct hakios_smmu_context {
-	bool allocated, active, quarantined, stream_written;
+	bool allocated, active, quarantined, stream_written, tables_shared;
 	unsigned sid, mask, match, bank;
 	unsigned old_smr, old_s2cr;
+	/* more stream matches routed to this bank (hakios_smmu_add_stream), invalidated first on release */
+	unsigned extras, extra_match[4], extra_old_smr[4], extra_old_s2cr[4];
 	const char *who;
 	uint64_t base, end;
 	vm_offset_t tables, cb;
 	unsigned long table_bytes, n2, n3;
+	hakios_smmu_table_ownership_fn table_ownership;
 };
 static struct hakios_smmu_context contexts[MAX_CONTEXTS];
 static vm_offset_t regs;
@@ -122,26 +125,45 @@ clean(struct hakios_smmu_context *c)
 	__asm__ volatile("dsb sy" ::: "memory");
 }
 
-static int
-sync_context(struct hakios_smmu_context *c)
-{
-	int error = write32(c->cb+TLBIASID, c->bank);
-	if (!error) error = write32(c->cb+TLBSYNC, 1);
-	for (unsigned ms = 0; !error; ms++) {
-		unsigned status;
-		error = read32(c->cb+TLBSTATUS, &status);
-		if (error || !(status & 1)) return error;
-		if (ms == 500) return ETIMEDOUT;
-		delay_for_interval(1, NSEC_PER_MSEC);
-	}
-	return error;
-}
-
 static uint64_t *
 pte(struct hakios_smmu_context *c, uint64_t iova)
 {
 	unsigned long table = 1+c->n2+((iova>>21)-(c->base>>21));
 	return (uint64_t *)(c->tables+table*PAGE) + ((iova>>12)&511);
+}
+
+/* Only the leaf entries of [iova, iova+size): the root and level-2 tables were cleaned when allocated. */
+static void
+clean_leaves(struct hakios_smmu_context *c, uint64_t iova, unsigned long size)
+{
+	for (uint64_t at = iova, end = iova+size; at < end; ) {
+		uint64_t table_end = (at | (512ull*PAGE-1)) + 1, stop = end < table_end ? end : table_end;
+		vm_offset_t from = (vm_offset_t)pte(c, at), to = from + ((stop-at)/PAGE)*sizeof(uint64_t);
+		for (vm_offset_t a = from & ~(vm_offset_t)63; a < to; a += 64)
+			__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+		at = stop;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static int
+sync_context(struct hakios_smmu_context *c)
+{
+	int error = write32(c->cb+TLBIASID, c->bank);
+	if (!error) error = write32(c->cb+TLBSYNC, 1);
+	/* A sync usually completes in microseconds; delay(1 ms) costs several, so spin first. */
+	uint64_t spin_end;
+	nanoseconds_to_absolutetime(200*NSEC_PER_USEC, &spin_end);
+	spin_end += mach_absolute_time();
+	for (unsigned ms = 0; !error; ) {
+		unsigned status;
+		error = read32(c->cb+TLBSTATUS, &status);
+		if (error || !(status & 1)) return error;
+		if (mach_absolute_time() < spin_end) continue;
+		if (ms++ == 500) return ETIMEDOUT;
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	return error;
 }
 
 static int
@@ -152,8 +174,16 @@ allocate_tables(struct hakios_smmu_context *c)
 	/* A bounded reservation, sufficient for the 64MiB Wi-Fi and audio pools. */
 	if (c->n3 > 4096) return ENOMEM;
 	c->table_bytes = (1+c->n2+c->n3)*PAGE;
-	if (kmem_alloc(kernel_map, &c->tables, c->table_bytes,
-	    KMA_KOBJECT|KMA_ZERO|KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return ENOMEM;
+	const unsigned flags = KMA_KOBJECT | KMA_ZERO | KMA_DATA;
+	kern_return_t kr;
+	if (c->table_ownership) {
+		c->table_bytes = round_page(c->table_bytes);
+		kr = kmem_alloc_contig(kernel_map, &c->tables, c->table_bytes, 0, 0, 0,
+		    flags, VM_KERN_MEMORY_IOKIT);
+	} else {
+		kr = kmem_alloc(kernel_map, &c->tables, c->table_bytes, flags, VM_KERN_MEMORY_IOKIT);
+	}
+	if (kr != KERN_SUCCESS) return ENOMEM;
 	uint64_t *root = (uint64_t *)c->tables;
 	for (unsigned n = 0; n < c->n2; n++)
 		root[((c->base>>30)+n)&511] = kvtophys(c->tables+(1+n)*PAGE)|3;
@@ -163,34 +193,49 @@ allocate_tables(struct hakios_smmu_context *c)
 		l2[(addr>>21)&511] = kvtophys(c->tables+(1+c->n2+n)*PAGE)|3;
 	}
 	clean(c);
+	if (c->table_ownership) {
+		uint64_t pa = kvtophys(c->tables);
+		if (!pa) return EFAULT;
+		c->tables_shared = true;
+		if (!c->table_ownership(pa, c->table_bytes, true)) return EIO;
+	}
 	return 0;
 }
 
 /* Caller holds shared lock; never return table memory to VM on uncertain stop. */
-static void
+static int
 release_locked(struct hakios_smmu_context *c)
 {
 	int error = 0;
-	if (c->stream_written) {
+	while (!error && c->extras) {
+		unsigned n = --c->extras;
+		error = put(regs+SMR(c->extra_match[n]), c->extra_old_smr[n] & ~VALID, ~0u);
+		if (!error) error = put(regs+S2CR(c->extra_match[n]), c->extra_old_s2cr[n], 0x300ff);
+		if (error) c->extras++;
+	}
+	if (!error && c->stream_written) {
 		/* Invalidate our match before changing its route back to its original value. */
 		error = put(regs+SMR(c->match), c->old_smr & ~VALID, ~0u);
 		if (!error) error = put(regs+S2CR(c->match), c->old_s2cr, 0x300ff);
 	}
 	if (!error && c->cb) error = put(c->cb+SCTLR, 0, 1);
 	if (!error && c->cb) error = sync_context(c);
+	if (!error && c->tables_shared &&
+	    !c->table_ownership(kvtophys(c->tables), c->table_bytes, false)) error = EIO;
 	if (error) {
 		c->quarantined = true;
-		say("smmu: %s context %u quarantined: stop/sync error %d; tables retained\n", c->who, c->bank, error);
-		return;
+		say("smmu: %s context %u quarantined: stop/sync/ownership error %d; tables retained\n", c->who, c->bank, error);
+		return error;
 	}
 	if (c->cb) avoided[c->bank]=false;
 	if (c->tables) kmem_free(kernel_map, c->tables, c->table_bytes);
 	bzero(c, sizeof(*c));
+	return 0;
 }
 
 struct hakios_smmu_context *
-hakios_smmu_claim(unsigned sid, unsigned mask, unsigned long long base,
-    unsigned long size, const char *who)
+hakios_smmu_claim_with_table_ownership(unsigned sid, unsigned mask, unsigned long long base,
+    unsigned long size, const char *who, hakios_smmu_table_ownership_fn ownership)
 {
 	struct hakios_smmu_context *c = NULL;
 	bool used[256] = {false}; unsigned match = ~0u, old_smr = 0, old_s2cr = 0;
@@ -212,6 +257,7 @@ hakios_smmu_claim(unsigned sid, unsigned mask, unsigned long long base,
 	if (!c) { error=ENOSPC; goto fail; }
 	c->allocated=true; c->sid=sid; c->mask=mask; c->base=base; c->end=base+size;
 	c->who=who ? who : "anonymous"; c->match=match; c->old_smr=old_smr; c->old_s2cr=old_s2cr;
+	c->table_ownership = ownership;
 	if ((error=allocate_tables(c))) goto fail;
 	for (unsigned bank = first_bank; bank < bank_count; bank++) {
 		unsigned cbar, cba2r, ctl, tlb;
@@ -253,6 +299,13 @@ fail:
 	return NULL;
 }
 
+struct hakios_smmu_context *
+hakios_smmu_claim(unsigned sid, unsigned mask, unsigned long long base,
+    unsigned long size, const char *who)
+{
+	return hakios_smmu_claim_with_table_ownership(sid, mask, base, size, who, NULL);
+}
+
 static bool
 range_ok(struct hakios_smmu_context *c, uint64_t iova, unsigned long size)
 {
@@ -267,7 +320,8 @@ hakios_smmu_map(struct hakios_smmu_context *c, unsigned long long iova,
 	int error=EINVAL;
 	lck_mtx_lock(&hakios_smmu_lock);
 	if (!range_ok(c,iova,size) || pa&(PAGE-1) || pa >= (1ull<<36) || size-1 > ((1ull<<36)-1)-pa ||
-	    !prot || prot&~(HAKIOS_SMMU_READ|HAKIOS_SMMU_WRITE|HAKIOS_SMMU_MMIO)) goto out;
+	    !prot || prot&~(HAKIOS_SMMU_READ|HAKIOS_SMMU_WRITE|HAKIOS_SMMU_MMIO|HAKIOS_SMMU_COHERENT) ||
+	    ((prot&HAKIOS_SMMU_MMIO) && (prot&HAKIOS_SMMU_COHERENT))) goto out;
 	for (unsigned long n=0;n<size;n+=PAGE) if (*pte(c,iova+n)) { error=EEXIST; goto out; }
 	/* SMMUv2 stage-1 AP[2:1]: RW=1, RO=3 (both privilege levels).
 	 * Stage 1 cannot enforce write-only: reject rather than silently grant reads. */
@@ -276,15 +330,45 @@ hakios_smmu_map(struct hakios_smmu_context *c, unsigned long long iova,
 	if (!(prot&HAKIOS_SMMU_WRITE)) attrs|=1ull<<7;
 	/* MAIR0 attribute 2 is 0x04, device nGnRE: an MSI doorbell (the ITS), not memory */
 	if (prot&HAKIOS_SMMU_MMIO) attrs=(attrs&~(3ull<<8))|(2ull<<2);
+	/* MAIR0 attribute 1 is 0xff, write-back read/write-allocate; inner shareable, as a coherent master expects */
+	if (prot&HAKIOS_SMMU_COHERENT) attrs=(attrs&~(3ull<<8))|(3ull<<8)|(1ull<<2);
 	for (unsigned long n=0;n<size;n+=PAGE) *pte(c,iova+n)=(pa+n)|attrs;
-	clean(c); error=sync_context(c);
+	clean_leaves(c,iova,size); error=sync_context(c);
 	if (error) {
 		for (unsigned long n=0;n<size;n+=PAGE) *pte(c,iova+n)=0;
-		clean(c);
+		clean_leaves(c,iova,size);
 		if (sync_context(c)) { c->quarantined=true; (void)write32(c->cb+SCTLR,0); }
 	}
 	if (!error && c->sid==0x1801 && iova+size==c->end)
 		say("sound: THE AUDIO STREAM GOES THROUGH CONTEXT %u of the SMMU, with our page tables\n",c->bank);
+out:
+	lck_mtx_unlock(&hakios_smmu_lock);
+	return error;
+}
+
+/* A wired kernel buffer, page by page (it need not be physically contiguous): one clean, one sync. */
+int
+hakios_smmu_map_kva(struct hakios_smmu_context *c, unsigned long long iova,
+    unsigned long kva, unsigned long size, unsigned prot)
+{
+	int error=EINVAL;
+	lck_mtx_lock(&hakios_smmu_lock);
+	if (!range_ok(c,iova,size) || kva&(PAGE-1) || prot&~(HAKIOS_SMMU_READ|HAKIOS_SMMU_WRITE)) goto out;
+	if (!(prot&HAKIOS_SMMU_READ)) { error=ENOTSUP; goto out; }
+	for (unsigned long n=0;n<size;n+=PAGE) {
+		uint64_t pa=kvtophys(kva+n);
+		if (*pte(c,iova+n)) { error=EEXIST; goto out; }
+		if (!pa || pa&(PAGE-1) || pa >= (1ull<<36)) { error=EFAULT; goto out; }
+	}
+	uint64_t attrs=3ull|(1ull<<6)|(2ull<<8)|(1ull<<10)|(1ull<<11);
+	if (!(prot&HAKIOS_SMMU_WRITE)) attrs|=1ull<<7;
+	for (unsigned long n=0;n<size;n+=PAGE) *pte(c,iova+n)=kvtophys(kva+n)|attrs;
+	clean_leaves(c,iova,size); error=sync_context(c);
+	if (error) {
+		for (unsigned long n=0;n<size;n+=PAGE) *pte(c,iova+n)=0;
+		clean_leaves(c,iova,size);
+		if (sync_context(c)) { c->quarantined=true; (void)write32(c->cb+SCTLR,0); }
+	}
 out:
 	lck_mtx_unlock(&hakios_smmu_lock);
 	return error;
@@ -302,10 +386,10 @@ hakios_smmu_unmap(struct hakios_smmu_context *c, unsigned long long iova, unsign
 	for (unsigned long n=0;n<size;n+=PAGE) {
 		((uint64_t *)backup)[n/PAGE]=*pte(c,iova+n); *pte(c,iova+n)=0;
 	}
-	clean(c); error=sync_context(c);
+	clean_leaves(c,iova,size); error=sync_context(c);
 	if (error) {
 		for (unsigned long n=0;n<size;n+=PAGE) *pte(c,iova+n)=((uint64_t *)backup)[n/PAGE];
-		clean(c);
+		clean_leaves(c,iova,size);
 		if (sync_context(c)) { c->quarantined=true; (void)write32(c->cb+SCTLR,0); }
 	}
 	kmem_free(kernel_map,backup,bytes);
@@ -314,9 +398,10 @@ out:
 	return error;
 }
 
-void
+bool
 hakios_smmu_faults(struct hakios_smmu_context *c)
 {
+	bool clean = false;
 	lck_mtx_lock(&hakios_smmu_lock);
 	if (c && c->allocated && c->cb) {
 		unsigned fsr=0,lo=0,hi=0,syn=0,global=0;
@@ -326,18 +411,76 @@ hakios_smmu_faults(struct hakios_smmu_context *c)
 		    c->who,c->bank,fsr,((uint64_t)hi<<32)|lo,syn,global,error);
 		if (!error && c->sid==0x1801 && !(fsr&FSR_ALL) && !global)
 			say("sound: the SMMU has refused the DSP nothing (context %u: fsr %#x; sgfsr 0)\n",c->bank,fsr);
+		clean = !error && !(fsr & FSR_ALL) && !global;
 		if (!error) { (void)write32(c->cb+FSR,fsr&FSR_ALL); (void)write32(regs+0x48,global); }
 	}
 	lck_mtx_unlock(&hakios_smmu_lock);
+	return clean;
 }
 
-void
+int
+hakios_smmu_context_attributes(struct hakios_smmu_context *c, unsigned sctlr, unsigned actlr)
+{
+	int error;
+	if (!c || !(sctlr & 1)) return EINVAL;
+	lck_mtx_lock(&hakios_smmu_lock);
+	if (!c->allocated || !c->cb) error = EINVAL;
+	else if (!(error = put(c->cb+0x04, actlr, ~0u))) error = put(c->cb+SCTLR, sctlr, ~0u);
+	lck_mtx_unlock(&hakios_smmu_lock);
+	return error;
+}
+
+int
+hakios_smmu_fault_state(struct hakios_smmu_context *c, unsigned *fsr, unsigned long long *far, unsigned *fsynr0)
+{
+	unsigned f = 0, lo = 0, hi = 0, syn = 0;
+	if (!c || !c->allocated || !c->cb) return EINVAL;
+	if (read32(c->cb+FSR,&f) || read32(c->cb+FAR,&lo) || read32(c->cb+FAR+4,&hi) || read32(c->cb+FSYNR0,&syn))
+		return EIO;
+	*fsr = f; *far = ((unsigned long long)hi<<32)|lo; *fsynr0 = syn;
+	return 0;
+}
+
+int
 hakios_smmu_release(struct hakios_smmu_context *c)
 {
-	if (!c) return;
+	if (!c) return 0;
 	lck_mtx_lock(&hakios_smmu_lock);
-	if (c->allocated) release_locked(c);
+	int error = c->allocated ? release_locked(c) : 0;
 	lck_mtx_unlock(&hakios_smmu_lock);
+	return error;
+}
+
+int
+hakios_smmu_add_stream(struct hakios_smmu_context *c, unsigned sid, unsigned mask)
+{
+	int error = EINVAL;
+	unsigned match = ~0u, old_smr = 0, old_s2cr = 0;
+	if (sid > 0x7fff || mask > 0x7fff) return EINVAL;
+	lck_mtx_lock(&hakios_smmu_lock);
+	if (!c || !c->active || c->quarantined || c->extras == sizeof(c->extra_match) / sizeof(c->extra_match[0])) goto out;
+	for (unsigned n = 0; n < match_count; n++) {
+		unsigned smr, s2cr;
+		if ((error = read32(regs+SMR(n), &smr)) || (error = read32(regs+S2CR(n), &s2cr))) goto out;
+		if (smr & VALID) {
+			if (!(((smr ^ sid)&0x7fff) & ~((smr>>16)|mask))) { error=EBUSY; goto out; }
+		} else if (match == ~0u) { match=n; old_smr=smr; old_s2cr=s2cr; }
+	}
+	if (match == ~0u) { error=ENOSPC; goto out; }
+	unsigned k = c->extras++;
+	c->extra_match[k]=match; c->extra_old_smr[k]=old_smr; c->extra_old_s2cr[k]=old_s2cr;
+	if ((error=put(regs+S2CR(match),c->bank,0x300ff)) ||
+	    (error=put(regs+SMR(match),VALID|(mask<<16)|sid,~0u))) {
+		(void)put(regs+SMR(match),old_smr&~VALID,~0u);
+		(void)put(regs+S2CR(match),old_s2cr,0x300ff);
+		c->extras--;
+		goto out;
+	}
+	say("smmu: %#x also to context %u (%s)\n",sid,c->bank,c->who);
+out:
+	if (error) say("smmu: %s stream %#x not added: %d\n",c && c->who ? c->who : "anonymous",sid,error);
+	lck_mtx_unlock(&hakios_smmu_lock);
+	return error;
 }
 
 int

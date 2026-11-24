@@ -19,6 +19,8 @@ storage  bsd/dev/hakios.ufs.c
 storage  bsd/dev/hakios.ufshc.c
 storage  bsd/dev/hakios.ufshc.h
 storage  bsd/dev/hakios.ufshc-write.h
+storage  bsd/dev/hakios.ufshc-clock.h
+storage  bsd/dev/hakios.ufshc-power.h
 storage  bsd/dev/hakios.sparse.c
 storage  bsd/dev/hakios.image.c
 storage  bsd/dev/hakios.apfs_check.c
@@ -29,9 +31,13 @@ gpu      bsd/dev/hakios.dcvs.h
 gpu      bsd/dev/hakios.ifpc.h
 gpu      iokit/Kernel/hakios.gpu.cpp
 gpu      iokit/Kernel/hakios.backlight.cpp
+gpu      iokit/Kernel/hakios.display-power.h
 
 camera   bsd/dev/hakios.camera.c
 camera   bsd/dev/hakios.torch.c
+camera   bsd/dev/hakios.cam_probe.c
+camera   bsd/dev/hakios.iris_probe.c
+camera   bsd/dev/hakios.icp_probe.c
 
 haptic   bsd/dev/hakios.haptic.c
 
@@ -48,6 +54,8 @@ power    bsd/dev/hakios.battery.c
 power    bsd/dev/hakios.battery_bcl.c
 power    iokit/Kernel/hakios.battery.cpp
 power    bsd/dev/hakios.cpufreq.c
+power    bsd/dev/hakios.rpmh-arc.h
+power    bsd/dev/hakios.gcc8450.h
 
 wifi     bsd/dev/hakios.wifi.c
 wifi     bsd/dev/hakios.wlfw.c
@@ -55,6 +63,7 @@ wifi     bsd/dev/hakios.wifi.stage.c
 wifi     bsd/dev/hakios.wifi.pci.c
 wifi     bsd/dev/hakios.qrtr.c
 wifi     bsd/dev/hakios.pcie.c
+wifi     bsd/dev/hakios.pcie-pm.h
 wifi     bsd/dev/hakios.lx.c
 wifi     bsd/dev/hakios.sta.c
 wifi     bsd/dev/hakios.apple80211.c

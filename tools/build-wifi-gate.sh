@@ -78,6 +78,7 @@ install -m 0644 userland/com.hakios.clock.plist "$STAGE/LaunchDaemons/"
 for f in amss.bin amss20.bin m3.bin regdb.bin bdwlang.b0e; do
   cmp "fw-wifi/$f" "$STAGE/fw/$f"
 done
+[ ! -f fw-video/vpu20_4v.mbn ] || cmp fw-video/vpu20_4v.mbn "$STAGE/fw/vpu20_4v.mbn"
 test ! -e "$STAGE/fw/network"
 for f in sbin/init lib/HakiosMetal.bundle/HakiosMetal lib/libOSMesa.8.dylib lib/libhakios.gl.dylib \
          bin/net_test bin/sweetd bin/wifi_start bin/clock_keep LaunchDaemons/com.hakios.wifi.plist LaunchDaemons/com.hakios.clock.plist \

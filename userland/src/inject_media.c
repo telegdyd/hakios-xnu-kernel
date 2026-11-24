@@ -38,27 +38,55 @@
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
+#include <sys/ucontext.h>
 #include <unistd.h>
+
+/*
+ * cam_save_trace=1: every line said here and by camera_device.c (hakios_camera_say) starts with the time since
+ * boot, "[t=1234.567] ", on mach_absolute_time's clock, which savetrace (src/savetrace.c) and the other programs
+ * share; and each step of a photograph through the capture graph is said (trace_photo_step below). What a
+ * photograph's two seconds between the shutter and DCIM were spent on.
+ */
+bool hakios_save_trace;
+
+int
+hakios_trace_stamp(char *line, size_t size)
+{
+	static mach_timebase_info_data_t base;
+
+	if (!hakios_save_trace) {
+		return 0;
+	}
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	uint64_t us = mach_absolute_time() * base.numer / base.denom / 1000;
+	return snprintf(line, size, "[t=%llu.%03llu] ", (unsigned long long)(us / 1000), (unsigned long long)(us % 1000));
+}
 
 static void
 say(const char *format, ...)
 {
-	char line[256];
+	char line[320];
 	va_list ap;
-	int n;
+	int n = hakios_trace_stamp(line, sizeof(line));
 
 	va_start(ap, format);
-	n = vsnprintf(line, sizeof(line), format, ap);
+	n += vsnprintf(line + n, sizeof(line) - (size_t)n, format, ap);
 	va_end(ap);
 	if (n > (int)sizeof(line) - 1) {
 		n = sizeof(line) - 1;
@@ -337,6 +365,37 @@ gnr_render(id self, SEL selector, void *sample_buffer, id input)
 	}
 }
 
+/*
+ * The filter picker's live thumbnails (BWMultiFilterThumbnailNode): its colour cube filter is a
+ * FigColorCubeMetalFilter, which is not made here (nil), and the node writes into it anyway --
+ * mediaserverd died of SIGSEGV at 0x8 (CMCapture+0x61370) a moment after Camera.app's first preview
+ * picture, every time, and the preview "restarted" with each new mediaserverd. Without the filter
+ * the node makes no thumbnails: its frames are dropped, and the method that sets the filter up
+ * (v16@0:8 at CMCapture+0x61248, its name not in this cache) does nothing.
+ */
+static void
+thumbnail_render(__unused id self, __unused SEL selector, __unused void *sample_buffer, __unused id input)
+{
+	static bool said;
+
+	if (!said) {
+		said = true;
+		say("hakios: mediaserverd: the filter thumbnails are not made (no colour cube filter here)\n");
+	}
+}
+
+static void
+thumbnail_nothing(__unused id self, SEL selector)
+{
+	static bool said;
+
+	if (!said) {
+		said = true;
+		say("hakios: mediaserverd: -[BWMultiFilterThumbnailNode %s] does nothing (no colour cube filter here)\n",
+		    sel_getName(selector));
+	}
+}
+
 static bool
 is_node(id node, const char *name)
 {
@@ -377,6 +436,54 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
 }
 
 /*
+ * cam_save_trace=1: a photograph's steps. Every sample buffer a node emits that holds a picture 2000 or more wide,
+ * and for four seconds after one, every one that holds no picture at all (an encoded photograph, its metadata),
+ * by the node that emitted it and the node it goes to. The preview's buffers are left out: they hold pictures, and
+ * small ones.
+ */
+static void
+trace_photo_step(id output, CMSampleBufferRef sample_buffer)
+{
+	static uint64_t last_photo;
+	static unsigned said;
+	static mach_timebase_info_data_t base;
+	CVImageBufferRef image = CMSampleBufferGetImageBuffer(sample_buffer);
+	uint64_t now = mach_absolute_time();
+	size_t width = image != NULL ? CVPixelBufferGetWidth(image) : 0, height = image != NULL ? CVPixelBufferGetHeight(image) : 0;
+	id node, connection, input, to;
+
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	if (image != NULL && width < 2000) {
+		return;
+	}
+	if (image == NULL && (last_photo == 0 || (now - last_photo) * base.numer / base.denom > 4000000000ull)) {
+		return;
+	}
+	node = ((id (*)(id, SEL))objc_msgSend)(output, sel_registerName("node"));
+	if (node != nil && strncmp(object_getClassName(node), "BWAudio", 7) == 0) {
+		return;
+	}
+	if (image != NULL) {
+		if (last_photo == 0 || (now - last_photo) * base.numer / base.denom > 4000000000ull) {
+			said = 0;
+		}
+		last_photo = now;
+	}
+	if (said++ >= 80) {
+		return;
+	}
+	connection = ((id (*)(id, SEL))objc_msgSend)(output, sel_registerName("connection"));
+	input = connection != nil ? ((id (*)(id, SEL))objc_msgSend)(connection, sel_registerName("input")) : nil;
+	to = input != nil ? ((id (*)(id, SEL))objc_msgSend)(input, sel_registerName("node")) : nil;
+	CMBlockBufferRef data = CMSampleBufferGetDataBuffer(sample_buffer);
+	say("hakios: save trace: %s -> %s: %zux%zu%s, %zu bytes of data\n", node != nil ? object_getClassName(node) : "?",
+	    to != nil ? object_getClassName(to) : "(nothing)", width, height, image != NULL ? "" : " (no picture)",
+	    data != NULL ? CMBlockBufferGetDataLength(data) : 0);
+}
+
+/*
  * A node's output given no sample buffer at all, which no node takes: the session's audio source
  * (-[BWAudioSourceNode _generateSamples]), whose audio unit never started here (see audio_source_start
  * above), fills the silence by a timer with buffers it fails to make and emits them all the same --
@@ -385,6 +492,54 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  * preview black for a second each time. A NULL is not passed on.
  */
 static IMP original_emit_sample_buffer;
+
+/*
+ * No Live Photo (Iris) with the kernel's camera. D22's AVCaptureSession.plist gives the 12MP format IrisSupported,
+ * and the plist's word wins over the stream's own format. There is no capture audio here (see audio_source_start),
+ * so Live Photo's staging node never became ready: every photograph's _captureSession_captureStillImageNow waited out
+ * -[BWIrisStagingNode waitUntilReadyToReceiveRequestsWithTimeout:], a second, and no movie was ever written. The
+ * staging node also took every preview frame. The format's dictionary says no instead, before the format keeps it:
+ * the applications' copies come from it (by XPC), so Camera offers no Live Photo and asks for none.
+ */
+static IMP original_format_init, original_format_init_override;
+
+static CFDictionaryRef
+without_iris(CFDictionaryRef dictionary)
+{
+	if (!camera || dictionary == NULL || CFGetTypeID(dictionary) != CFDictionaryGetTypeID() ||
+	    CFDictionaryGetValue(dictionary, CFSTR("IrisSupported")) != kCFBooleanTrue) {
+		return dictionary != NULL ? CFRetain(dictionary) : NULL;
+	}
+	CFMutableDictionaryRef copy = CFDictionaryCreateMutableCopy(NULL, 0, dictionary);
+	CFDictionarySetValue(copy, CFSTR("IrisSupported"), kCFBooleanFalse);
+	CFDictionarySetValue(copy, CFSTR("IrisVideoStabilizationSupported"), kCFBooleanFalse);
+	return copy;
+}
+
+static id
+format_init(id self, SEL selector, CFDictionaryRef dictionary)
+{
+	CFDictionaryRef changed = without_iris(dictionary);
+	id format = ((id (*)(id, SEL, CFDictionaryRef))original_format_init)(self, selector, changed);
+
+	if (changed != NULL) {
+		CFRelease(changed);
+	}
+	return format;
+}
+
+static id
+format_init_override(id self, SEL selector, CFDictionaryRef dictionary, uint32_t pixel_format)
+{
+	CFDictionaryRef changed = without_iris(dictionary);
+	id format = ((id (*)(id, SEL, CFDictionaryRef, uint32_t))original_format_init_override)(self, selector, changed,
+	    pixel_format);
+
+	if (changed != NULL) {
+		CFRelease(changed);
+	}
+	return format;
+}
 
 static void
 emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
@@ -399,6 +554,9 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		return;
 	}
 	time_photo_encoder(self, sample_buffer);
+	if (hakios_save_trace) {
+		trace_photo_step(self, sample_buffer);
+	}
 	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);
 }
 
@@ -412,13 +570,76 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
  * the codec's VCPHEVCRegisterEncoder is an empty function. It is registered here, as the codec
  * registers its decoder (VTRegisterVideoDecoderWithInfo, not hardware accelerated).
  */
+typedef OSStatus (*hevc_create_fn)(const void *, CFAllocatorRef, void **);
+static hevc_create_fn software_hevc_create;
+
+/* Record the callers of the existing encoder without changing the codec selected by VideoToolbox. */
+static OSStatus
+trace_hevc_create(const void *specification, CFAllocatorRef allocator, void **encoder)
+{
+	void *frames[10];
+	OSStatus status = software_hevc_create(specification, allocator, encoder);
+	int count = backtrace(frames, sizeof(frames) / sizeof(frames[0]));
+	char stack[168];
+	size_t used = 0;
+
+	stack[0] = '\0';
+	for (int i = 1; i < count && sizeof(stack) - used >= 20; i++) {
+		used += (size_t)snprintf(stack + used, sizeof(stack) - used, " %#lx", (uintptr_t)frames[i] - slide);
+	}
+	say("hakios: heic trace: software factory status=%d, unslid callers%s\n", status, stack);
+	return status;
+}
+
+/* The software encoder with Iris2 in front of its HEIC tiles (iris_tiles.c). */
+extern void hakios_iris_wrap_encoder(void *encoder, void (*log)(const char *, ...));
+static hevc_create_fn traced_or_software_create;
+
+static OSStatus
+iris_hevc_create(const void *specification, CFAllocatorRef allocator, void **encoder)
+{
+	OSStatus status = traced_or_software_create(specification, allocator, encoder);
+
+	if (status == noErr && encoder != NULL && *encoder != NULL) {
+		hakios_iris_wrap_encoder(*encoder, say);
+	}
+	return status;
+}
+
+static bool boot_word(const char *wanted);
+
+static bool
+heic_trace_enabled(void)
+{
+	return boot_word("cam_heic_trace=1");
+}
+
+static bool
+boot_word(const char *wanted)
+{
+	char arguments[2048];
+	size_t length = sizeof(arguments);
+	char *state;
+
+	if (sysctlbyname("kern.bootargs", arguments, &length, NULL, 0) != 0) {
+		return false;
+	}
+	for (char *word = strtok_r(arguments, " ", &state); word != NULL; word = strtok_r(NULL, " ", &state)) {
+		if (strcmp(word, wanted) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void
 register_hevc_encoder(void)
 {
 	void *codec = dlopen("/System/Library/VideoCodecs/VCPHEVC.videocodec", RTLD_NOW | RTLD_LOCAL);
 	void *vt = dlopen("/System/Library/Frameworks/VideoToolbox.framework/VideoToolbox", RTLD_NOW | RTLD_GLOBAL);
-	void *create = codec != NULL ? dlsym(codec, "HEVCVideoEncoder_CreateInstance") : NULL;
-	int (*register_encoder)(uint32_t, CFDictionaryRef, void *) = vt != NULL ? dlsym(vt, "VTRegisterVideoEncoderWithInfo") : NULL;
+	hevc_create_fn create = codec != NULL ? dlsym(codec, "HEVCVideoEncoder_CreateInstance") : NULL;
+	int (*register_encoder)(uint32_t, CFDictionaryRef, hevc_create_fn) =
+	    vt != NULL ? dlsym(vt, "VTRegisterVideoEncoderWithInfo") : NULL;
 	CFStringRef *id_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_EncoderID") : NULL;
 	CFStringRef *name_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_EncoderName") : NULL;
 	CFStringRef *hardware_key = vt != NULL ? dlsym(vt, "kVTVideoEncoderList_IsHardwareAccelerated") : NULL;
@@ -435,7 +656,10 @@ register_hevc_encoder(void)
 	CFDictionaryRef info = CFDictionaryCreate(NULL, keys, values, 3, &kCFTypeDictionaryKeyCallBacks,
 	    &kCFTypeDictionaryValueCallBacks);
 
-	status = register_encoder('hvc1', info, create);
+	software_hevc_create = create;
+	traced_or_software_create = heic_trace_enabled() ? trace_hevc_create : create;
+	status = register_encoder('hvc1', info,
+	    access("/dev/hakios-iris", F_OK) == 0 ? iris_hevc_create : traced_or_software_create);
 	CFRelease(info);
 	say("hakios: mediaserverd: the software HEVC encoder of VCPHEVC.videocodec registered for 'hvc1' (%d)\n", status);
 }
@@ -502,7 +726,14 @@ static struct replacement {
 	{ "FigCaptureStillImageSettings", "qualityPrioritization", 0x1a1f533dcUL,
 	  (IMP)quality_prioritization, &original_quality_prioritization, true, false },
 	{ "BWGNRNode", "renderSampleBuffer:forInput:", 0x1a1ec83b8UL, (IMP)gnr_render, NULL, true, false },
+	{ "BWMultiFilterThumbnailNode", "renderSampleBuffer:forInput:", 0x1a203d680UL, (IMP)thumbnail_render, NULL, true, false },
+	/* (no selector: the instance method whose code is at `expected`) */
+	{ "BWMultiFilterThumbnailNode", NULL, 0x1a1ef7248UL, (IMP)thumbnail_nothing, NULL, true, false },
 	{ "BWNodeOutput", "emitSampleBuffer:", 0x1a1ea37e0UL, (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
+	{ "FigCaptureSourceVideoFormat", "initWithFigCaptureStreamFormatDictionary:", 0x1a1e99518UL, (IMP)format_init,
+	  &original_format_init, true, false },
+	{ "FigCaptureSourceVideoFormat", "initWithFigCaptureStreamFormatDictionary:pixelFormatOverride:", 0x1a2035f4cUL,
+	  (IMP)format_init_override, &original_format_init_override, true, false },
 };
 
 static void
@@ -518,6 +749,26 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 			continue;
 		}
 		r->done = true;
+		if (r->selector == NULL) {
+			unsigned count = 0;
+			Method *list = class_copyMethodList(cls, &count);
+
+			method = NULL;
+			for (unsigned j = 0; list != NULL && j < count; j++) {
+				if ((uintptr_t)method_getImplementation(list[j]) == r->expected + slide) {
+					method = list[j];
+				}
+			}
+			free(list);
+			if (method == NULL) {
+				say("hakios: -[%s (code at %#lx)]: not found; left alone\n", r->class_name, r->expected);
+				continue;
+			}
+			method_setImplementation(method, r->replacement);
+			say("hakios: mediaserverd: -[%s %s] (at %#lx) replaced\n", r->class_name, sel_getName(method_getName(method)),
+			    r->expected);
+			continue;
+		}
 		method = r->instance ? class_getInstanceMethod(cls, sel_registerName(r->selector)) :
 		    class_getClassMethod(cls, sel_registerName(r->selector));
 		original = method ? method_getImplementation(method) : NULL;
@@ -535,6 +786,74 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 	}
 }
 
+/* An address as "image+offset" (our dylib's own code is not in the shared cache) or unslid in the cache. */
+static void
+where(uintptr_t address, char *out, size_t size)
+{
+	Dl_info info;
+
+	if (address != 0 && dladdr((const void *)address, &info) && info.dli_fname != NULL && info.dli_fbase != NULL) {
+		const char *base = strrchr(info.dli_fname, '/');
+		snprintf(out, size, "%s+%#lx", base ? base + 1 : info.dli_fname, address - (uintptr_t)info.dli_fbase);
+	} else {
+		snprintf(out, size, "%#lx", address - slide);
+	}
+}
+
+/*
+ * Where mediaserverd died (as inject.c does for the window server): its crash reports never arrive
+ * ("Failed to send exception EXC_CORPSE_NOTIFY"), and Camera.app's preview restarting every few
+ * seconds was mediaserverd dying of SIGSEGV with nothing to go on. One line, then the signal kills it.
+ */
+static void
+say_the_fault(int signal_number, siginfo_t *info, void *context_in)
+{
+	ucontext_t *context = context_in;
+	uintptr_t pc = 0, lr = 0, fp = 0;
+	char line[512], spot[96];
+	size_t used;
+
+	if (context != NULL && context->uc_mcontext != NULL) {
+		pc = (uintptr_t)context->uc_mcontext->__ss.__pc;
+		lr = (uintptr_t)context->uc_mcontext->__ss.__lr;
+		fp = (uintptr_t)context->uc_mcontext->__ss.__fp;
+	}
+	used = (size_t)snprintf(line, sizeof(line), "hakios: mediaserverd: signal %d at %p, pc ", signal_number,
+	    info != NULL ? info->si_addr : NULL);
+	where(pc, spot, sizeof(spot));
+	used += (size_t)snprintf(line + used, sizeof(line) - used, "%s, lr ", spot);
+	where(lr, spot, sizeof(spot));
+	used += (size_t)snprintf(line + used, sizeof(line) - used, "%s, called from", spot);
+	for (unsigned i = 0; i < 6 && fp != 0 && (fp & 7) == 0 && used < sizeof(line) - 100; i++) {
+		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
+
+		if (ret == 0) {
+			break;
+		}
+		where(ret, spot, sizeof(spot));
+		used += (size_t)snprintf(line + used, sizeof(line) - used, " %s", spot);
+		fp = next > fp ? next : 0;
+	}
+	say("%s (cache addresses unslid)\n", line);
+	signal(signal_number, SIG_DFL);
+	raise(signal_number);
+}
+
+static void
+watch_for_faults(void)
+{
+	struct sigaction action;
+
+	memset(&action, 0, sizeof(action));
+	action.sa_sigaction = say_the_fault;
+	action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+	sigaction(SIGSEGV, &action, NULL);
+	sigaction(SIGBUS, &action, NULL);
+	sigaction(SIGABRT, &action, NULL);
+	sigaction(SIGILL, &action, NULL);
+	sigaction(SIGTRAP, &action, NULL);
+}
+
 __attribute__((constructor))
 static void
 hakios_media_init(void)
@@ -545,7 +864,11 @@ hakios_media_init(void)
 	if (name == NULL || strcmp(name, "mediaserverd") != 0) {
 		return;
 	}
+	hakios_save_trace = boot_word("cam_save_trace=1");
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+	if (hakios_save_trace) {
+		say("hakios: save trace: mediaserverd pid %d, the shared cache's slide %#lx\n", getpid(), (unsigned long)slide);
+	}
 	torch = open("/dev/hakios-torch", O_WRONLY);
 	camera = access("/dev/hakios-camera", F_OK) == 0;
 	if (torch >= 0) {
@@ -553,6 +876,7 @@ hakios_media_init(void)
 		say("hakios: mediaserverd: the kernel has a flashlight (/dev/hakios-torch)\n");
 	}
 	if (camera) {
+		watch_for_faults();
 		say("hakios: mediaserverd: the kernel has a camera (/dev/hakios-camera)\n");
 		register_hevc_encoder();
 	}

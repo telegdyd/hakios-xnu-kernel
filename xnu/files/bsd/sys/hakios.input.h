@@ -80,9 +80,41 @@ void hakios_battery_report(const struct hakios_battery_state *state);
 /* the charge (0..100, -1 unknown), whether a battery and a charger are there, as last reported; false before the first report */
 bool hakios_battery_get(int *soc, int *present, int *charger);
 bool hakios_battery_gauge_live(void);   /* the DSP's fuel gauge reported in the last minute (hakios.battery.c) */
+bool hakios_battery_power(int *ma, int *mv, int *charger);     /* current, voltage, charger as last reported; false before */
+bool hakios_aop_message(const char *text);     /* a message to the always-on processor, no log lines (hakios.adsp.c, 8450) */
+/* one user's vote on a BCM of the APSS DRV, in its units; summed with the others' (hakios.cpufreq.c, 8450) */
+#define HAKIOS_RPMH_CPU         0               /* the DDR/LLCC floor; only while the processors run (not in the sleep set) */
+#define HAKIOS_RPMH_TOUCH       1
+#define HAKIOS_RPMH_MODEM       2
+#define HAKIOS_RPMH_DISPLAY     3               /* scanout's DDR and MMNoC while the screen is on (hakios.cpufreq.c) */
+#define HAKIOS_RPMH_USB         4               /* the USB/storage NoC while a cable is in (hakios.cpufreq.c) */
+#define HAKIOS_RPMH_PCIE        5               /* RC0's shared SFNoC floor while in use, including APSS idle */
+#define HAKIOS_RPMH_CAMERA      6
+#define HAKIOS_RPMH_IRIS        7
+#define HAKIOS_RPMH_ICP         8               /* the camera ICP's still service, beside a live camera session */
+#define HAKIOS_RPMH_CLIENTS     9
+bool hakios_rpmh_bw(unsigned client, const char *bcm, uint32_t ab, uint32_t ib);
+bool hakios_pcie_bandwidth(bool on);  /* on synchronously; off only flags a governor-side release (panic safe) */
 bool hakios_battery_bcl_init(void);    /* boot-arg battery_soc=8450: the OnePlus 10 Pro's estimate (hakios.battery_bcl.c) */
 void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
 void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor clocks (and cpufreq_gov: by load) */
+#ifdef HAKIOS_CAM_PROBE
+void hakios_cam_probe_init(void);
+void hakios_iris_probe_init(uint32_t level);
+void hakios_icp_probe_init(uint32_t level);
+void hakios_icp_service_init(void);    /* icp=1 with cam=5: /dev/hakios-icp, Camera.app's stills through BPS and IPE */
+bool hakios_cam_rails_ready(void);
+struct hakios_cam_rail {
+	uint32_t address, voltage, enable, mode;
+	bool changed;
+};
+int hakios_cam_rail_vote(const char *name, uint32_t mv, int mode, struct hakios_cam_rail *saved, bool on);
+struct hakios_cam_power {
+	bool claimed;
+	bool bandwidth_attempted;
+};
+bool hakios_cam_power_vote(struct hakios_cam_power *saved, unsigned client, bool on);
+#endif
 void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
 void hakios_adreno_quiesce(void);      /* on the way back to the loader: the GPU block stopped, out of our memory */
 void hakios_adreno_stop(void);         /* before that, where the ending is no panic's: the GPU given back in order */

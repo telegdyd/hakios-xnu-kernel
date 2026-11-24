@@ -3,6 +3,8 @@
  *
  * usage: camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]
  *        camera_test cycle [FRAMES]
+       camera_test focus [STEP]
+ *        camera_test focus [STEP]
  *        camera_test noise [SENSOR|all]
  *   raw: reads FRAMES frames (default 150) from the kernel's /dev/hakios-camera, with src/camera_isp.c's
  *   exposure (unless noae: the kernel's, boot-args cam_shutter and cam_gain) and white balance working
@@ -14,6 +16,9 @@
  *   colour matrix M (nine numbers, row by row, separated by commas: a check of the matrix's path).
  *   cycle: each of the four sensors in turn, FRAMES frames each (default 30), the kernel's exposure:
  *   what came of each, and how long the change from one to the next took.
+ *   focus: the lens walked from 0 (the furthest) to 1023 in steps of STEP (default 64) and back to the
+ *   sharpest, with the exposure working: at each place, two frames later, the frame's focus and the
+ *   middle's sharpness (camera_isp.c's isp_sharpness, the middle fifth); a lens that moves changes it.
  *   noise: the sensor's black level and noise in the dark (the lens covered, or a dark room): at the
  *   longest exposure of its usual frame and 1x, 2x, 4x, 8x and its most gain, two frames each: per
  *   site of the 2x2 cell the mean (the black level), the temporal noise (the two frames' difference,
@@ -67,6 +72,94 @@ choose_sensor(int device, unsigned n)
 		return false;
 	}
 	return true;
+}
+
+static int
+focus_sweep(unsigned step)
+{
+	struct hakios_camera_frame head, *f;
+	struct isp isp;
+	struct isp_stats s;
+	int device = open(HAKIOS_CAMERA_DEVICE, O_RDWR);
+	float best_sharpness = -1, low = 1e30f, high = 0;
+	uint32_t best = 0, reported_mismatch = 0;
+	ssize_t n;
+
+	if (device < 0) {
+		perror("camera_test: " HAKIOS_CAMERA_DEVICE);
+		return 1;
+	}
+	for (int tries = 0; (n = read(device, &head, sizeof(head))) < 0 && errno == EAGAIN && tries < 3; tries++) {
+	}
+	if (n != (ssize_t)sizeof(head) || memcmp(head.magic, HAKIOS_CAMERA_MAGIC, 8) != 0) {
+		perror("camera_test: the first frame's header");
+		return 1;
+	}
+	if (head.focus == HAKIOS_CAMERA_NO_FOCUS) {
+		printf("camera_test: focus: the frames say there is no lens motor\n");
+		close(device);
+		return 1;
+	}
+	printf("camera_test: focus: the lens starts at %u\n", head.focus);
+	size_t bytes = sizeof(head) + (size_t)head.stride * head.height;
+	f = malloc(bytes);
+	isp_init(&isp);
+	/* the exposure first: 30 frames */
+	for (int i = 0; i < 30; i++) {
+		struct hakios_camera_command c;
+		if (read(device, f, bytes) != (ssize_t)bytes) {
+			continue;
+		}
+		isp_measure(&isp, f, (const uint8_t *)f + f->header_bytes, NULL, &s);
+		if (isp_ae(&isp, f, &s, &c)) {
+			(void)write(device, &c, sizeof(c));
+		}
+	}
+	step = step ? step : 64;
+	for (uint32_t at = 0;; at = at + step > 1023 && at != 1023 ? 1023 : at + step) {
+		struct hakios_camera_command c = { .command = HAKIOS_CAMERA_FOCUS, .a = at };
+		float level = 0, sharpness = 0;
+		uint32_t said = 0;
+
+		(void)write(device, &c, sizeof(c));
+		for (int i = 0; i < 4; i++) {
+			if (read(device, f, bytes) != (ssize_t)bytes) {
+				continue;
+			}
+			said = f->focus;
+			if (i >= 2) {
+				sharpness += isp_sharpness(f, (const uint8_t *)f + f->header_bytes, 0.4f, 0.4f, 0.6f, 0.6f, &level) / 2;
+			}
+		}
+		if (said != at && reported_mismatch++ < 3) {
+			printf("camera_test: focus: asked for %u, the frame says %u\n", at, said);
+		}
+		printf("camera_test: focus: %4u sharpness %.4f level %.1f\n", at, sharpness, level);
+		if (sharpness > best_sharpness) {
+			best_sharpness = sharpness;
+			best = at;
+		}
+		low = sharpness < low ? sharpness : low;
+		high = sharpness > high ? sharpness : high;
+		if (at >= 1023) {
+			break;
+		}
+	}
+	/* back down to the sharpest a step at a time */
+	for (uint32_t at = 1023; at > best;) {
+		at = at - best > step ? at - step : best;
+		struct hakios_camera_command c = { .command = HAKIOS_CAMERA_FOCUS, .a = at };
+		(void)write(device, &c, sizeof(c));
+		(void)read(device, f, bytes);
+	}
+	for (int i = 0; i < 3; i++) {
+		(void)read(device, f, bytes);
+	}
+	printf("camera_test: focus: sharpest at %u (%.4f; least %.4f, %.1fx), the lens now at %u\n", best, best_sharpness, low,
+	    low > 0 ? high / low : 0.0, f->focus);
+	free(f);
+	close(device);
+	return high > low * 1.3f ? 0 : 1;
 }
 
 static int
@@ -128,7 +221,7 @@ cycle(int frames)
 			failures++;
 			continue;
 		}
-		isp_measure(NULL, f, buffer + f->header_bytes, &s);
+		isp_measure(NULL, f, buffer + f->header_bytes, NULL, &s);
 		printf("camera_test: the %s camera (sensor %u): %ux%u, stride %u, Bayer %u; the first frame %.0f ms after it was asked "
 		    "for; %d frames of %llu in %.2f s (%.1f a second); R %.1f G %.1f B %.1f above black\n", sensor_names[n], f->sensor,
 		    f->width, f->height, f->stride, f->bayer, changed_ms, got, last_seq - first_seq + 1, ticks_ms(f->time - first) / 1000,
@@ -336,7 +429,7 @@ raw(int frames, bool ae, bool awb, bool keep_raw, bool full, int sensor)
 
 		got++;
 		first_seq = first_seq ? first_seq : f->sequence;
-		isp_measure(&isp, f, raw, &s);
+		isp_measure(&isp, f, raw, NULL, &s);
 		if (awb) {
 			isp_awb(&isp, &s);
 		}
@@ -441,6 +534,9 @@ main(int argc, char **argv)
 	}
 	if (argc >= 2 && strcmp(argv[1], "noise") == 0) {
 		return noise(argc >= 3 ? argv[2] : "all");
+	}
+	if (argc >= 2 && strcmp(argv[1], "focus") == 0) {
+		return focus_sweep(argc >= 3 ? (unsigned)atoi(argv[2]) : 64);
 	}
 	if (argc >= 2 && strcmp(argv[1], "cycle") == 0) {
 		return cycle(argc >= 3 ? atoi(argv[2]) : 30);

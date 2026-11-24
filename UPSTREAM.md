@@ -1,5 +1,43 @@
 # Changes on negroni-dev
 
+- Rear IMX789 detection on the OnePlus 10 Pro (`drivers/camera/hakios.cam_probe.c`,
+  `cam_probe=1`). Uses the NE2213 module power table, polls CCI0 master 0 and
+  verifies cleanup of camera clocks, pins, and RPMh rail settings. The
+  diagnostic defaults to off. RAM-tested on NE2213 with ID `0x0789` and
+  successful cleanup.
+
+- USB networking (`drivers/net/hakios.usb_net.c`): DWC3 event-buffer interrupts on negroni's
+  GIC 165 wake the existing worker, which drains and acknowledges batches before sleeping.
+  The wait is registered before re-arming the level interrupt and rechecks the hardware count.
+  A 1 s recovery timeout preserves charger-DSP PHY repair, using elapsed time; `usb_irq=0`
+  preserves polling. `kern.hakios.usb_irq_*`, `usb_empty_polls` and `usb_event_batches`
+  expose delivery and recovery. Periodic traffic-generating counter messages require `usb_stats=1`.
+  Kernel and catalogue checks passed. Two RAM boots: display-off worker wakes 79.34/s -> 1.29-1.39/s;
+  exact 512 KiB round trip, IRQ delivery, lock/wake, CPU work, PHY recovery and loader handover checked.
+  Not installed; phone validation recorded in `POWER-COLLAPSE-PLAN.md` beside this checkout.
+
+- Enhanced Open (P2c): group-19 OWE association ECDH, HKDF PMK/PMKID,
+  passwordless station selection, SHA256 PTK and HMAC-SHA256/version-0
+  four-way/group-key handshakes. Strict response validation and secret cleanup;
+  no downgrade to plaintext. Host validation and remaining hardware gates:
+  `docs/wifi-owe.md`. No phone used or image installed.
+
+- WPA3-Personal (P2b): group-19 SAE authentication, hunting-and-pecking and H2E,
+  token retries, required PMF, transition-mode SAE preference, SHA256 PTK /
+  AKM-defined AES-CMAC key exchange, and a bounded PMKSA cache. Apple80211 carries
+  the password and WPA3-only policy and reports the selected AKM. Host vectors,
+  production MLME/RX tests and WPA2/PMF regressions pass; both driver buses build
+  without stubs and both kernel executables rebuild. No phone used or image
+  installed; hardware gates and provenance: `docs/wifi-sae.md`.
+
+- Screen-off cores (`psci_smp.c`, boot-arg `screen_off_cores`, negroni default `0xf0`): while the display is off
+  (RequestPowerChange), the four fast cores are switched off through PSCI CPU_OFF and started again on wake, by the
+  scheduler's own temporary powerdown (`sched_perfcontrol_update_powered_cores`; `hw.activecpu` unchanged). Made
+  hotplug-safe: `ml_cpu_can_exit` allows non-boot cores on PSCI boards, the CPU-down wait gets its sleep token, a
+  leaving core's SPIs go to the boot core and come back, its GIC CPU interface is set up again on restart, the hang
+  detector stops and re-arms its tick, the cpufreq governor skips offline cores, `cpu_sleep` no longer cleans by set
+  and way. `kern.hakios.screen_off_cores` (RW), `kern.hakios.cpus_up`. RAM-tested and installed on the phone.
+
 - Built-in boot-argument defaults: `tools/hakios-config.py kernel` writes the `.config`'s arguments to
   `pexpert/gen/hakios.defaults.h` (generated, not in the patch), and `PE_parse_boot_argn` /
   `PE_parse_boot_arg_str` read them when the command line does not name the argument. The command line

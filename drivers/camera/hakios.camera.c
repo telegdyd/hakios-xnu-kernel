@@ -86,6 +86,8 @@
 #include <sys/hakios.input.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern void hakios_rpmh_arc_active(uint32_t address, uint32_t value) __attribute__((weak));     /* power/hakios.rpmh-arc.h */
+extern lck_mtx_t hakios_rsc_lock;
 extern kern_return_t thread_terminate(thread_t thread);
 extern void loader_log_putc(char c);
 
@@ -1830,6 +1832,13 @@ rails(bool on)
 	values[1] = on ? (uint32_t)mx : 0;
 	rails_voted |= on;
 	done = rpmh_write(2, addresses, values);
+	/* (the APSS sleep and wake sets follow this vote: drivers/power/hakios.rpmh-arc.h) */
+	if (hakios_rpmh_arc_active != NULL) {
+		lck_mtx_lock(&hakios_rsc_lock);
+		hakios_rpmh_arc_active(addresses[0], values[0]);
+		hakios_rpmh_arc_active(addresses[1], values[1]);
+		lck_mtx_unlock(&hakios_rsc_lock);
+	}
 	say("camera: RPMh %s CX (%#x) position %u and MX (%#x) position %u%s\n", done ? "took" : "DID NOT SAY IT TOOK", addresses[0],
 	    values[0], addresses[1], values[1], on ? "" : " (given back)");
 	return done;

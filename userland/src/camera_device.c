@@ -40,22 +40,29 @@
 #include <fcntl.h>
 #include <mach/mach_time.h>
 #include <math.h>
+#include <notify.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include "camera_isp.h"
+#include "camera_tap.h"
 
 void hakios_camera_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
+int hakios_trace_stamp(char *line, size_t size);         /* inject_media.c: "[t=...] " with cam_save_trace=1 */
 
 void
 hakios_camera_say(const char *format, ...)
 {
-	char line[400];
+	char line[440];
 	va_list ap;
-	int n = snprintf(line, sizeof(line), "hakios: camera: ");
+	int n = hakios_trace_stamp(line, sizeof(line));
+
+	n += snprintf(line + n, sizeof(line) - (size_t)n, "hakios: camera: ");
 
 	va_start(ap, format);
 	n += vsnprintf(line + n, sizeof(line) - (size_t)n, format, ap);
@@ -135,7 +142,7 @@ static CFStringRef port_front;          /* kFigCapturePortType_FrontFacingCamera
  */
 enum {
 	MD_PORT, MD_PTS, MD_EXPOSURE, MD_AGC, MD_ISP_DGAIN, MD_SENSOR_DGAIN, MD_ISO_BASE, MD_FRAME_RATE, MD_LUX, MD_SNR,
-	MD_AF_STATUS, MD_FOCUSING, MD_AE_STABLE, MD_AE_LOCKED, MD_AWB_STABLE, MD_AWB_LOCKED, MD_AF_LOCKED, MD_ZOOM, MD_KEYS
+	MD_AF_STATUS, MD_FOCUSING, MD_AE_STABLE, MD_AE_LOCKED, MD_AWB_STABLE, MD_AWB_LOCKED, MD_AF_LOCKED, MD_ZOOM, MD_EXPOSURE_BIAS, MD_EXPOSURE_BIAS_ID, MD_KEYS
 };
 static const char *const md_names[MD_KEYS] = {
 	"kFigCaptureStreamMetadata_PortType", "kFigCaptureSampleBufferAttachmentKey_OriginalPresentationTimeStamp",
@@ -144,7 +151,8 @@ static const char *const md_names[MD_KEYS] = {
 	"kFigCaptureStreamMetadata_LuxLevel", "kFigCaptureStreamMetadata_NormalizedSNR", "kFigCaptureStreamMetadata_AFStatus",
 	"kFigCaptureStreamMetadata_FocusingMethod", "kFigCaptureStreamMetadata_AEStable", "kFigCaptureStreamMetadata_AELocked",
 	"kFigCaptureStreamMetadata_AWBStable", "kFigCaptureStreamMetadata_AWBLocked", "kFigCaptureStreamMetadata_AFLocked",
-	"kFigCaptureStreamMetadata_ZoomFactor",
+	"kFigCaptureStreamMetadata_ZoomFactor", "kFigCaptureStreamMetadata_ExposureBias",
+	"kFigCaptureStreamMetadata_ExposureBiasCommandID",
 };
 static CFStringRef md_key[MD_KEYS];
 static CFStringRef md_attachment;       /* kFigCaptureSampleBufferAttachmentKey_MetadataDictionary */
@@ -405,7 +413,9 @@ struct output {
 	bool            enabled;
 	void *          handler;                /* a block: ^(CVPixelBufferRef, CMTime) */
 	bool            said_shape;
+	float           measured_bias;  /* most recent preview compensation sampled at the output */
 	uint64_t        delivered, refused;
+	uint64_t        render_ns, render_count;
 	CVPixelBufferRef held[HELD];            /* the pictures given last, kept from the pool (see deliver) */
 	unsigned        held_next;
 	bool            said_pool;
@@ -437,6 +447,12 @@ static const struct camera {
 	  { { 3088, 2320, 30 }, { 3840, 2160, 30 } } },        /* "Photo", "Video-30" */
 };
 
+/* ExposureBias is an unsigned 8.8 gain. The optional command ID is echoed on an applied frame. */
+struct exposure_bias {
+	uint16_t gain;
+	int32_t command_id;
+};
+
 struct stream {
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
@@ -449,6 +465,9 @@ struct stream {
 	float           zoom;           /* ZoomFactor: the picture is the middle 1/zoom of the sensor each way */
 	const struct camera *camera;
 	CFStringRef     port;
+	pthread_mutex_t controls_lock;
+	bool            ae_spot, ae_locked;
+	struct exposure_bias exposure_bias;
 	bool            af_now;         /* a focus asked for (AutoFocusNow and the like): a search at the next frame */
 	bool            af_locked;      /* LockAFNow: no search but one asked for */
 	float           af_window[4];   /* AFWindowParams: where to focus, as fractions of the frame (x0, y0, x1, y1) */
@@ -460,6 +479,9 @@ struct stream {
 	bool            worker_started;
 	int             torch;
 	uint64_t        frames, stills_given;
+	uint64_t        graph_started_at, graph_first_seq, graph_last_seq;
+	uint64_t        graph_frames, graph_delivered_at_start, graph_refused_at_start;
+	uint64_t        graph_render_ns_at_start, graph_render_count_at_start;
 };
 
 static struct stream *
@@ -504,8 +526,12 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		value = number_f(s->max_fps);
 	} else if (key_is(key, "Clock")) {
 		value = CFRetain(CMClockGetHostTimeClock());
-	} else if (key_is(key, "TorchLevel") || key_is(key, "ExposureBias")) {
+	} else if (key_is(key, "TorchLevel")) {
 		value = number_f(0);
+	} else if (key_is(key, "ExposureBias")) {
+		pthread_mutex_lock(&s->controls_lock);
+		value = number_i(s->exposure_bias.gain);
+		pthread_mutex_unlock(&s->controls_lock);
 	} else if (key_is(key, "VideoOutputConfigurations") || key_is(key, "VideoOutputsEnabled")) {
 		/*
 		 * ReadWrite, but the capture-graph builder READS these back while it builds the graph
@@ -615,8 +641,10 @@ af_window(struct stream *s, CFTypeRef value)
 	}
 	x0 = dict_number(w, "hStart", 0) / 1000;
 	y0 = dict_number(w, "vStart", 0) / 1000;
-	width /= 1000;
-	height /= 1000;
+	width = fmin(width / 1000, 1);
+	height = fmin(height / 1000, 1);
+	x0 = isfinite(x0) ? x0 : 0;
+	y0 = isfinite(y0) ? y0 : 0;
 	/* (at least a tenth of the frame each way, about the middle of what was asked) */
 	if (width < 0.1) {
 		x0 -= (0.1 - width) / 2;
@@ -757,6 +785,37 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		torch_set(s, value);
 		return 0;
 	}
+	if (key_is(key, "AEMeteringMode") || key_is(key, "ExposureBias") ||
+	    key_is(key, "LockAENow") || key_is(key, "UnlockAENow")) {
+		pthread_mutex_lock(&s->controls_lock);
+		if (key_is(key, "AEMeteringMode")) {
+			s->ae_spot = value != NULL && CFGetTypeID(value) == CFStringGetTypeID() &&
+			    CFEqual(value, CFSTR("MeteringModeSpot"));
+		} else if (key_is(key, "ExposureBias")) {
+			CFTypeRef gain_value = value, id_value = NULL;
+			if (value != NULL && CFGetTypeID(value) == CFDictionaryGetTypeID()) {
+				gain_value = CFDictionaryGetValue(value, CFSTR("ExposureBias"));
+				id_value = CFDictionaryGetValue(value, CFSTR("CommandID"));
+			}
+			int32_t gain = 0, command_id = 0;
+			if (id_value != NULL && CFGetTypeID(id_value) == CFNumberGetTypeID()) {
+				(void)CFNumberGetValue(id_value, kCFNumberSInt32Type, &command_id);
+			}
+			if (gain_value == NULL || CFGetTypeID(gain_value) != CFNumberGetTypeID() ||
+			    !CFNumberGetValue(gain_value, kCFNumberSInt32Type, &gain) || gain < 1 || gain > UINT16_MAX) {
+				pthread_mutex_unlock(&s->controls_lock);
+				return ERR_PARAM;
+			}
+			if (s->exposure_bias.gain != gain || s->exposure_bias.command_id != command_id) {
+				say("exposure bias: %+.2f EV (gain %d/256, command %d)", log2(gain / 256.0), gain, command_id);
+			}
+			s->exposure_bias = (struct exposure_bias){ (uint16_t)gain, command_id };
+		} else {
+			s->ae_locked = key_is(key, "LockAENow") && value != kCFBooleanFalse;
+		}
+		pthread_mutex_unlock(&s->controls_lock);
+		return 0;
+	}
 	if (key_is(key, "AutoFocusNow") || key_is(key, "ContinuousAutoFocusNow") || key_is(key, "FocusNow") ||
 	    key_is(key, "PeakTrackingFocusNow") || key_is(key, "LockAFNow") || key_is(key, "ManualFocusNow") ||
 	    key_is(key, "AFWindowParams") || key_is(key, "AutoFocusMode")) {
@@ -770,15 +829,22 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		    CFArrayGetCount(value) > 0)) {
 			say_value("stream: focus:", key, value);        /* (an empty window, the middle: often, unsaid) */
 		}
+		pthread_mutex_lock(&s->controls_lock);
 		if (key_is(key, "AFWindowParams")) {
 			af_window(s, value);
 		} else if (key_is(key, "LockAFNow")) {
-			s->af_locked = true;
+			s->af_locked = value != kCFBooleanFalse;
+			if (s->af_locked) {
+				s->af_now = false;
+			}
 		} else if (key_is(key, "AutoFocusNow") || key_is(key, "ContinuousAutoFocusNow") || key_is(key, "FocusNow") ||
 		    key_is(key, "PeakTrackingFocusNow")) {
 			s->af_locked = false;
-			s->af_now = true;
+			if (value != kCFBooleanFalse) {
+				s->af_now = true;
+			}
 		}
+		pthread_mutex_unlock(&s->controls_lock);
 		return 0;
 	}
 	say_once("stream: set (not used)", key, value);
@@ -809,6 +875,73 @@ torch_set(struct stream *s, CFTypeRef value)
 
 /* ---- the frames ------------------------------------------------------------------------------------- */
 
+/*
+ * The photograph through the camera ISP's BPS and IPE (/dev/hakios-icp, CONFIG_ICP): the shutter frame's RAW10 in,
+ * the IPE's 4000 x 3008 NV12 back, with stock's processing settings (stock's white balance too, for now). NULL
+ * when the kernel has no such service or this one failed: the IFE's own still is given then.
+ */
+struct icp_raw_header {
+	char magic[8];
+	uint32_t width, height, stride, reserved;
+};
+struct icp_nv12_header {
+	char magic[8];
+	uint32_t width, height, stride, luma, chroma, reserved[3];
+};
+static bool icp_absent, still_from_icp;
+
+static const uint8_t *
+icp_still(const struct hakios_camera_frame *f, const uint8_t *raw, struct hakios_camera_frame *icp_f)
+{
+	static uint8_t *image;
+	static size_t capacity;
+	if (icp_absent || f->format != 1 || f->width != 4000 || f->height != 3008) {
+		return NULL;
+	}
+	int fd = open("/dev/hakios-icp", O_RDWR);
+	if (fd < 0) {
+		icp_absent = errno == ENOENT;
+		say("the photograph: no ICP (%s), the IFE's still instead", strerror(errno));
+		return NULL;
+	}
+	uint64_t began = mach_absolute_time();
+	struct icp_raw_header h = { "ICPRAW10", f->width, f->height, f->stride, 0 };
+	struct iovec iov[2] = { { &h, sizeof(h) }, { (void *)raw, (size_t)f->stride * f->height } };
+	ssize_t wrote = writev(fd, iov, 2);
+	const uint8_t *planes = NULL;
+	if (wrote < 0) {
+		say("the photograph: ICP failed (%s), the IFE's still instead", strerror(errno));
+	} else {
+		size_t want = sizeof(struct icp_nv12_header) + (size_t)4032 * 3008 * 3 / 2;
+		if (capacity < want) {
+			free(image);
+			image = malloc(want);
+			capacity = image ? want : 0;
+		}
+		ssize_t got = image ? pread(fd, image, capacity, 0) : -1;
+		const struct icp_nv12_header *n = (const void *)image;
+		if (got >= (ssize_t)sizeof(*n) && memcmp(n->magic, "NV12BPS1", 8) == 0 && n->width == f->width &&
+		    n->height == f->height && n->stride >= n->width &&
+		    (size_t)got >= sizeof(*n) + (size_t)n->luma + n->chroma && n->luma == n->stride * n->height &&
+		    n->chroma == n->stride * (n->height / 2)) {
+			*icp_f = *f;
+			icp_f->preview_width = n->width;
+			icp_f->preview_height = n->height;
+			icp_f->preview_stride = n->stride;
+			planes = image + sizeof(*n);
+			static mach_timebase_info_data_t tb;
+			if (tb.denom == 0) {
+				mach_timebase_info(&tb);
+			}
+			say("the photograph: ICP BPS and IPE in %.0f ms", (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
+		} else {
+			say("the photograph: ICP image unreadable (%zd bytes), the IFE's still instead", got);
+		}
+	}
+	close(fd);
+	return planes;
+}
+
 struct render_job {
 	const struct isp *isp;
 	const struct hakios_camera_frame *f;
@@ -816,7 +949,64 @@ struct render_job {
 	CVPixelBufferRef pb;
 	uint32_t format, width, height, pieces;
 	bool still;                     /* the photograph: every pixel of the sensor (isp_render_still_nv12) */
+	const uint8_t *preview;
+	const uint8_t *preview_luma;
 };
+
+/* Resize the paired IFE NV12 frame into the graph's own buffer. Chroma is sampled as UV pairs. */
+static void
+render_preview(const struct render_job *j, const uint8_t *preview, uint32_t first, uint32_t end)
+{
+	const struct hakios_camera_frame *f = j->f;
+	uint32_t sw = f->preview_width, sh = f->preview_height, stride = f->preview_stride;
+	uint32_t cw = sw, ch = sh;
+	if ((uint64_t)j->width * sh > (uint64_t)j->height * sw) {
+		ch = (uint32_t)((uint64_t)sw * j->height / j->width);
+	} else {
+		cw = (uint32_t)((uint64_t)sh * j->width / j->height);
+	}
+	float zoom = fmaxf(1.0f, j->isp->zoom);
+	cw = (uint32_t)fmaxf(2.0f, cw / zoom) & ~1u;
+	ch = (uint32_t)fmaxf(2.0f, ch / zoom) & ~1u;
+	uint32_t x0 = ((sw - cw) / 2) & ~1u, y0 = ((sh - ch) / 2) & ~1u;
+	bool limited = j->format == PF_420V;
+
+	for (unsigned plane = 0; plane < 2; plane++) {
+		uint32_t scale = 1u << plane;
+		uint32_t w = j->width / scale, h = j->height / scale;
+		uint32_t src_w = cw / scale, src_h = ch / scale;
+		uint32_t dx = (src_w << 16) / w;
+		uint8_t *dst = CVPixelBufferGetBaseAddressOfPlane(j->pb, plane);
+		size_t dst_stride = CVPixelBufferGetBytesPerRowOfPlane(j->pb, plane);
+		const uint8_t *src = preview + (plane ? (size_t)stride * sh : 0) + (size_t)(y0 / scale) * stride + x0;
+		for (uint32_t y = first / scale; y < end / scale; y++) {
+			uint32_t sy = y * src_h / h;
+			if (j->isp->turned) {
+				sy = src_h - 1 - sy;
+			}
+			const uint8_t *row = src + (size_t)sy * stride;
+			uint8_t *out = dst + (size_t)y * dst_stride;
+			if (src_w == w && !j->isp->turned && (plane ? !limited : !j->preview_luma)) {
+				memcpy(out, row, j->width);
+				continue;
+			}
+			for (uint32_t x = 0, sx_fp = dx / 2; x < w; x++, sx_fp += dx) {
+				uint32_t sx = sx_fp >> 16;
+				if (j->isp->turned) {
+					sx = src_w - 1 - sx;
+				}
+				if (plane == 0) {
+					unsigned v = row[sx];
+					out[x] = j->preview_luma ? j->preview_luma[v] : (uint8_t)v;
+				} else {
+					unsigned u = row[2 * sx], v = row[2 * sx + 1];
+					out[2 * x] = limited ? (uint8_t)(16 + (224 * u + 127) / 255) : (uint8_t)u;
+					out[2 * x + 1] = limited ? (uint8_t)(16 + (224 * v + 127) / 255) : (uint8_t)v;
+				}
+			}
+		}
+	}
+}
 
 static void
 render_piece(void *context, size_t i)
@@ -826,7 +1016,9 @@ render_piece(void *context, size_t i)
 
 	first &= ~1u;
 	end = i + 1 == j->pieces ? j->height : end & ~1u;
-	if (j->format == PF_BGRA) {
+	if (j->preview) {
+		render_preview(j, j->preview, first, end);
+	} else if (j->format == PF_BGRA) {
 		isp_render_bgra(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddress(j->pb), CVPixelBufferGetBytesPerRow(j->pb), j->width,
 		    j->height, first, end);
 	} else if (j->still) {
@@ -918,7 +1110,8 @@ md_put(CFMutableDictionaryRef m, int key, CFTypeRef value)
 
 /* the frame's metadata, as H10ISP's stream gives them (see md_names) */
 static CFDictionaryRef
-frame_metadata(const struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *st, CFStringRef port)
+frame_metadata(const struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *st, CFStringRef port,
+    bool ae_locked, bool af_locked, bool focusing, struct exposure_bias bias)
 {
 	CFMutableDictionaryRef m;
 	double exposure = f->exposure_lines * (double)f->line_ns / 1e9, analog = f->gain_unity ? (double)f->gain / f->gain_unity : 1;
@@ -940,13 +1133,18 @@ frame_metadata(const struct isp *isp, const struct hakios_camera_frame *f, const
 	md_put(m, MD_FRAME_RATE, number_f(fps));
 	md_put(m, MD_LUX, number_i((int64_t)(lux + 0.5)));
 	md_put(m, MD_SNR, number_f(40 - 10 * log10(total < 1 ? 1 : total)));
-	md_put(m, MD_AF_STATUS, number_i(0));
+	/* Frame statistics use AFStatus 2 for an active scan, then 1 for the settled lens. */
+	md_put(m, MD_AF_STATUS, number_i(f->focus == HAKIOS_CAMERA_NO_FOCUS ? 0 : focusing ? 2 : 1));
 	md_put(m, MD_FOCUSING, number_i(0));
-	md_put(m, MD_AE_STABLE, CFRetain(kCFBooleanTrue));
-	md_put(m, MD_AE_LOCKED, CFRetain(kCFBooleanFalse));
+	md_put(m, MD_AE_STABLE, CFRetain(ae_locked || !isp->asked ? kCFBooleanTrue : kCFBooleanFalse));
+	md_put(m, MD_AE_LOCKED, CFRetain(ae_locked ? kCFBooleanTrue : kCFBooleanFalse));
+	md_put(m, MD_EXPOSURE_BIAS, number_i(bias.gain));
+	if (bias.command_id != 0) {
+		md_put(m, MD_EXPOSURE_BIAS_ID, number_i(bias.command_id));
+	}
 	md_put(m, MD_AWB_STABLE, CFRetain(kCFBooleanTrue));
 	md_put(m, MD_AWB_LOCKED, CFRetain(kCFBooleanFalse));
-	md_put(m, MD_AF_LOCKED, CFRetain(kCFBooleanFalse));
+	md_put(m, MD_AF_LOCKED, CFRetain(af_locked ? kCFBooleanTrue : kCFBooleanFalse));
 	/*
 	 * The zoom the picture was made with: the source node takes it for what the ISP applied
 	 * (-[BWMultiStreamCameraSourceNode _ispAppliedZoomFactorFromSampleBufferMetadataDictionary:outputIndex:])
@@ -956,16 +1154,15 @@ frame_metadata(const struct isp *isp, const struct hakios_camera_frame *f, const
 	return m;
 }
 
-static void
+static bool
 deliver(struct stream *s, struct output *out, const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw,
-    CFDictionaryRef metadata)
+    const uint8_t *preview, CFDictionaryRef metadata)
 {
 	CVPixelBufferRef pb = output_buffer(out);
 	uint32_t pf, width, height;
 
-	(void)s;
 	if (pb == NULL) {
-		return;
+		return false;
 	}
 	pf = CVPixelBufferGetPixelFormatType(pb);
 	width = (uint32_t)CVPixelBufferGetWidth(pb);
@@ -977,22 +1174,62 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 			    pf >> 8 & 255, pf & 255);
 		}
 		CVPixelBufferRelease(pb);
-		return;
+		return false;
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
+	const bool still = strcmp(out->name, "StillImage") == 0;
+	const bool use_preview = preview && pf != PF_BGRA && width >= 2 && height >= 2 && !(width & 1) && !(height & 1);
+	uint8_t luma[256];
+	bool remap = use_preview && (isp->digital != 1 || pf == PF_420V);
+	if (remap) {
+		/* IFE luma is already gamma encoded. Approximate digital gain in linear light. */
+		for (unsigned i = 0; i < sizeof(luma); i++) {
+			unsigned v = i;
+			if (isp->digital != 1) {
+				float y = i / 255.0f;
+				float linear = y <= 0.04045f ? y / 12.92f : powf((y + 0.055f) / 1.055f, 2.4f);
+				linear = fminf(1, linear * isp->digital);
+				y = linear <= 0.0031308f ? 12.92f * linear : 1.055f * powf(linear, 1 / 2.4f) - 0.055f;
+				v = (unsigned)(y * 255 + 0.5f);
+			}
+			luma[i] = pf == PF_420V ? (uint8_t)(16 + (219 * v + 127) / 255) : (uint8_t)v;
+		}
+	}
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8,
+	    still && pf != PF_BGRA, use_preview ? preview : NULL, remap ? luma : NULL };
 	uint64_t began = mach_absolute_time();
 
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
-	if (job.still) {
+	{
 		static mach_timebase_info_data_t tb;
+		uint64_t elapsed_ns;
 
 		if (tb.denom == 0) {
 			mach_timebase_info(&tb);
 		}
-		say("%s: %ux%u made of every pixel in %.0f ms", out->name, width, height,
-		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
+		elapsed_ns = (uint64_t)((double)(mach_absolute_time() - began) * tb.numer / tb.denom);
+		out->render_ns += elapsed_ns;
+		out->render_count++;
+		if (still) {
+			say("%s: %ux%u via %s in %.0f ms", out->name, width, height,
+			    !use_preview ? "CPU ISP" : still_from_icp ? "ICP NV12" : "native IFE NV12", (double)elapsed_ns / 1e6);
+		}
+	}
+	if (use_preview && out == &s->out[0] && (out->delivered == 0 || isp->exposure_bias != out->measured_bias)) {
+		const uint8_t *luma_plane = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+		size_t stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+		uint64_t sum = 0, count = 0;
+		for (uint32_t y = 0; y < height; y += 32) {
+			const uint8_t *row = luma_plane + (size_t)y * stride;
+			for (uint32_t x = 0; x < width; x += 32) {
+				sum += row[x];
+				count++;
+			}
+		}
+		out->measured_bias = isp->exposure_bias;
+		say("preview output: mean Y %.1f/255 at %+.2f EV (digital gain %.2fx)", (double)sum / count,
+		    isp->exposure_bias, isp->digital);
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVAttachmentMode_ShouldPropagate);
@@ -1017,7 +1254,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	 * the window server copying it), and the next frame drawn into it showed as bands of two frames,
 	 * torn across. Kept, they make the pool take others. (One kept was not enough.)
 	 */
-	if (strcmp(out->name, "StillImage") != 0) {
+	if (!still) {
 		if (out->held[out->held_next] != NULL) {
 			CVPixelBufferRelease(out->held[out->held_next]);
 		}
@@ -1027,9 +1264,10 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		CVPixelBufferRelease(pb);
 	}
 	if (out->delivered++ == 0) {
-		say("%s: the first picture given (%ux%u %c%c%c%c)", out->name, width, height, pf >> 24, pf >> 16 & 255,
-		    pf >> 8 & 255, pf & 255);
+		say("%s: the first picture given (%ux%u %c%c%c%c, %s)", out->name, width, height, pf >> 24, pf >> 16 & 255,
+		    pf >> 8 & 255, pf & 255, use_preview ? "IFE NV12" : "CPU ISP");
 	}
+	return true;
 }
 
 /*
@@ -1081,11 +1319,11 @@ colour_temperature(const struct isp *isp)
  * pixels are not read. A search climbs from where the lens is: a step of AF_STEP one way, on that way
  * while the middle of the picture gets sharper, back the other way if the first step was not, until
  * two steps in a row are less sharp than the sharpest (or the travel, AF_NEAR to AF_FAR, ends); then
- * around the sharpest in steps of AF_FINE, and there it stays. Each place is measured two frames after
- * the lens was told to go there (it settles in less than one). The lens is only ever moved a step at a
+ * around the sharpest in steps of AF_FINE, and there it stays. A position is measured once the frame
+ * metadata confirms the lens got there and it had time to settle. The lens is only ever moved a step at a
  * time: thrown across its travel it knocked, audibly, against its stop at 0. In focus, it stays until
- * the middle has been a good deal less sharp or quite differently lit for a second, and then until
- * the picture has kept still for a third of one: no searching while the phone is being moved.
+ * the middle's contrast or brightness changes for about half a second and stays steady for another
+ * quarter second: no searching while the phone is being moved.
  * A focus asked for (a tap: AutoFocusNow, on the window AFWindowParams gave) sweeps instead: the
  * lens is walked to the nearer end of its travel, then measured towards the other in steps of
  * AF_STEP until it is past the sharpest (two steps in a row well under it), then around the sharpest
@@ -1093,15 +1331,23 @@ colour_temperature(const struct isp *isp)
  * of the curve.
  */
 enum { AF_WATCH, AF_STEADY, AF_CLIMB, AF_SWEEP, AF_FINE_SEARCH, AF_SETTLE };
-#define AF_NEAR         16              /* (off the stop at 0) */
-#define AF_FAR          768             /* (its module file's actuator region goes to 700; near 1023 the PM8008i's LDO5 said over-current) */
+/*
+ * The travel: the whole of 0..1023 (the IMX789's AK7377 codes; it focuses far at about 200 and near
+ * towards 900), except on the POCO's s5khm2sd lens: 16 (off the stop at 0) to 768 (its module file's actuator region
+ * goes to 700; near 1023 the PM8008i's LDO5 said over-current).
+ */
+static int AF_NEAR = 0, AF_FAR = 1023;
+static const char *sensor_name_for(uint32_t sensor);
 #define AF_STEP         48
 #define AF_FINE         12
 
 struct af {
 	int             state;
-	uint32_t        at, target;     /* where the lens was told to go; where it is going a step at a time */
-	unsigned        wait;           /* frames before the next measurement */
+	bool            known;          /* at has been taken from the frames */
+	uint32_t        at, target;     /* confirmed position and final target */
+	uint32_t        commanded;
+	unsigned        waiting;        /* frame reads since a position was requested */
+	bool            pending;
 	int             way;            /* +1 nearer, -1 further */
 	bool            turned;
 	unsigned        worse;          /* steps in a row less sharp than the sharpest */
@@ -1109,7 +1355,8 @@ struct af {
 	float           best_sharpness;
 	float           sharpness, level;       /* in focus: the middle's, to watch */
 	float           last_sharpness, last_level;
-	unsigned        unlike, steady, steps;
+	uint64_t        unlike_ns, steady_ns;
+	unsigned        steps;
 	bool            now;            /* asked for: no waiting for the picture to keep still */
 	bool            sweep;          /* ... and the whole travel measured */
 	float           sum_sharpness, sum_level;
@@ -1124,13 +1371,9 @@ af_go(int device, struct af *af, uint32_t target)
 	af->target = target < AF_NEAR ? AF_NEAR : target > AF_FAR ? AF_FAR : target;
 	c.a = af->at < af->target ? (af->target - af->at > AF_STEP ? af->at + AF_STEP : af->target) :
 	    (af->at - af->target > AF_STEP ? af->at - AF_STEP : af->target);
-	af->at = c.a;
-	/*
-	 * The lens settles in a few milliseconds; what is spoilt is the frame being exposed while it moved
-	 * (written at a frame's end, the next one's exposure has begun): one frame let go by before a
-	 * measurement, none on the way.
-	 */
-	af->wait = af->at == af->target ? 1 : 0;
+	af->commanded = c.a;
+	af->pending = true;
+	af->waiting = 0;
 	af->steps++;
 	af->sum_sharpness = af->sum_level = 0;
 	af->measured = 0;
@@ -1138,20 +1381,63 @@ af_go(int device, struct af *af, uint32_t target)
 }
 
 static void
-af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const uint8_t *raw, const float window[4], bool locked)
+af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const uint8_t *raw, const float window[4], bool locked,
+    bool requested)
 {
 	float level, sharpness;
+	uint64_t frame_ns = (uint64_t)f->frame_lines * f->line_ns;
 	unsigned needed = f->gain >= 16 * f->gain_unity ? 2 : 1;      /* (in the dark, two frames to a measurement) */
 
 	if (f->focus == HAKIOS_CAMERA_NO_FOCUS) {
 		return;
 	}
-	if (af->at == 0 && af->target == 0) {
-		af->at = af->target = f->focus;         /* (where the kernel put it) */
+	{
+		const char *name = sensor_name_for(f->sensor);
+		bool full = name == NULL || strcmp(name, "s5khm2sd") != 0;
+		static int said_travel = -1;
+
+		AF_NEAR = full ? 0 : 16;
+		AF_FAR = full ? 1023 : 768;
+		if (said_travel != (int)full) {
+			said_travel = full;
+			say("focus: the %s lens (sensor %u): travel %d..%d", name ? name : "unnamed", f->sensor, AF_NEAR, AF_FAR);
+		}
 	}
-	if (af->wait > 0) {
-		af->wait--;
+	af->at = f->focus;
+	if (locked) {
+		af->known = false;
+		af->pending = false;
+		af->state = AF_WATCH;
 		return;
+	}
+	if (!af->known || requested) {
+		af->known = true;
+		af->target = af->at;
+		af->pending = false;
+		af->sum_sharpness = af->sum_level = 0;
+		af->measured = 0;
+	}
+	if (requested) {
+		af->state = AF_STEADY;
+		af->steady_ns = 0;
+		af->now = true;
+		af->sweep = true;
+	}
+	if (af->pending) {
+		if (af->at != af->commanded) {
+			if (++af->waiting < 5) {
+				return;
+			}
+			say("focus: lens stayed at %u when asked for %u", af->at, af->commanded);
+			af->target = af->at;
+			af->state = AF_WATCH;
+			af->pending = false;
+			return;
+		}
+		af->pending = false;
+		if (af->waiting == 0 && af->at == af->target) {
+			return; /* give the lens a frame to settle after the move */
+		}
 	}
 	if (af->at != af->target) {
 		af_go(device, af, af->target);          /* (the next step of a longer way) */
@@ -1169,28 +1455,30 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 	af->measured = 0;
 	switch (af->state) {
 	case AF_WATCH:
-		if (locked || (af->sharpness > 0 && sharpness > af->sharpness * 0.6f && level > af->level * 0.7f &&
-		    level < af->level * 1.4f)) {
-			af->unlike = 0;
+		if (af->sharpness > 0 && sharpness > af->sharpness * 0.72f && sharpness < af->sharpness * 1.6f &&
+		    fabsf(level - af->level) < fmaxf(4.0f, af->level * 0.35f)) {
+			af->unlike_ns = 0;
 			return;
 		}
-		if (af->sharpness > 0 && ++af->unlike < 30) {
+		af->unlike_ns += frame_ns * needed;
+		if (af->sharpness > 0 && af->unlike_ns < 550000000) {
 			return;
 		}
 		af->state = AF_STEADY;
-		af->steady = 0;
+		af->steady_ns = 0;
 		af->last_sharpness = sharpness;
 		af->last_level = level;
 		return;
 	case AF_STEADY:
-		if (fabsf(sharpness - af->last_sharpness) < 0.15f * af->last_sharpness && fabsf(level - af->last_level) < 0.1f * af->last_level) {
-			af->steady++;
+		if (fabsf(sharpness - af->last_sharpness) < fmaxf(0.01f, 0.20f * af->last_sharpness) &&
+		    fabsf(level - af->last_level) < fmaxf(3.0f, 0.15f * af->last_level)) {
+			af->steady_ns += frame_ns * needed;
 		} else {
-			af->steady = 0;
+			af->steady_ns = 0;
 		}
 		af->last_sharpness = sharpness;
 		af->last_level = level;
-		if (af->steady < 10 && !af->now) {
+		if (af->steady_ns < 280000000 && !af->now) {
 			return;
 		}
 		af->now = false;
@@ -1205,6 +1493,7 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 			return;
 		}
 		af->state = AF_CLIMB;
+		say("focus: continuous scan from %u (sharpness %.3f)", af->at, sharpness);
 		af->best = af->start = af->at;
 		af->best_sharpness = sharpness;
 		af->way = af->at + AF_STEP > AF_FAR ? -1 : 1;
@@ -1275,28 +1564,102 @@ af_frame(int device, struct af *af, const struct hakios_camera_frame *f, const u
 		af->state = AF_WATCH;
 		af->sharpness = sharpness;
 		af->level = level;
-		af->unlike = 0;
+		af->unlike_ns = 0;
 		say("focus: the lens at %u after %u moves (sharpness %.3f)", af->at, af->steps, sharpness);
 		return;
 	}
+}
+
+/*
+ * Which cameras the kernel actually serves and their sensor names, from kern.hakios.cameras
+ * ("sensor:name ..." e.g. "1:imx789"). When the sysctl is absent (older/redwood kernels), keep the
+ * original POCO X5 Pro defaults (back s5khm2sd and front ov16a1q).
+ */
+static uint32_t kernel_sensor_mask;
+static char kernel_sensor_names[4][32];
+static char kernel_device_desc[128];
+
+static void
+discover_cameras(void)
+{
+	char buf[128];
+	size_t len = sizeof(buf) - 1;
+
+	memset(kernel_sensor_names, 0, sizeof(kernel_sensor_names));
+	kernel_sensor_mask = 0;
+	if (sysctlbyname("kern.hakios.cameras", buf, &len, NULL, 0) == 0 && len > 0) {
+		buf[len] = '\0';
+		char *p = buf;
+		while (*p != '\0') {
+			while (*p == ' ' || *p == '\t' || *p == '\n') {
+				p++;
+			}
+			if (*p == '\0') {
+				break;
+			}
+			char *end = NULL;
+			unsigned long id = strtoul(p, &end, 10);
+			if (end != p && *end == ':' && id < 4) {
+				const char *name = end + 1;
+				size_t n = 0;
+				while (name[n] != '\0' && name[n] != ' ' && name[n] != '\t' && name[n] != '\n' && n + 1 < sizeof(kernel_sensor_names[0])) {
+					kernel_sensor_names[id][n] = name[n];
+					n++;
+				}
+				kernel_sensor_names[id][n] = '\0';
+				if (n > 0) {
+					kernel_sensor_mask |= (1u << id);
+				}
+				p = (char *)(name + n);
+			}
+			while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n') {
+				p++;
+			}
+		}
+	} else {
+		static const char *const fallback[4] = { "ov02b10", "s5khm2sd", "ov16a1q", "s5k4h7" };
+		for (int i = 0; i < 4; i++) {
+			strlcpy(kernel_sensor_names[i], fallback[i], sizeof(kernel_sensor_names[i]));
+		}
+		kernel_sensor_mask = (1u << 1) | (1u << 2);
+	}
+	size_t pos = (size_t)snprintf(kernel_device_desc, sizeof(kernel_device_desc), "<HakiosCaptureDevice:");
+	bool any = false;
+	for (int i = 0; i < 4; i++) {
+		if ((kernel_sensor_mask & (1u << i)) != 0 && kernel_sensor_names[i][0] != '\0' && pos + 2 < sizeof(kernel_device_desc)) {
+			pos += (size_t)snprintf(kernel_device_desc + pos, sizeof(kernel_device_desc) - pos, "%s %s", any ? "," : "",
+			    kernel_sensor_names[i]);
+			any = true;
+		}
+	}
+	snprintf(kernel_device_desc + pos, sizeof(kernel_device_desc) - pos, "%s>", any ? "" : " none");
+}
+
+static const char *
+sensor_name_for(uint32_t sensor)
+{
+	if (sensor < 4 && kernel_sensor_names[sensor][0] != '\0') {
+		return kernel_sensor_names[sensor];
+	}
+	return NULL;
 }
 
 /* the sensor's colour tuning, when the image has one (fw/camera-<sensor>.isp, tools/camtuning.py) */
 static void
 load_tuning(struct isp *isp, uint32_t sensor)
 {
-	static const char *const names[] = { "ov02b10", "s5khm2sd", "ov16a1q", "s5k4h7" };
+	const char *name = sensor_name_for(sensor);
 	char path[96];
 
-	if (sensor >= sizeof(names) / sizeof(names[0])) {
+	if (name == NULL) {
 		return;
 	}
-	snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", names[sensor]);
+	snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", name);
 	if (isp_load_tuning(isp, path)) {
-		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", names[sensor], path,
+		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", name, path,
 		    isp->tuning->ccm.lights, isp->tuning->lsc.lights);
 	} else {
-		say("no colour tuning for the %s (%s): no colour matrix, no lens shading", names[sensor], path);
+		say("no colour tuning for the %s (%s): no colour matrix, no lens shading", name, path);
 		isp_set_ccm(isp, (const float[9]){ 1, 0, 0, 0, 1, 0, 0, 0, 1 });
 		isp->lsc.on = false;
 	}
@@ -1313,15 +1676,25 @@ worker(void *context)
 	uint8_t *buffer = NULL;
 	size_t bytes = 0;
 	uint32_t tuned_for = ~0u;
-	bool switched = false;
+	bool switched = false, has_preview = false, preview_using_raw = false;
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
+	struct exposure_bias current_bias = { .gain = 256 }, applied_bias = current_bias;
+	uint64_t bias_sequence = 0;
+	float locked_base_bias = 0;
+	bool was_ae_locked = false;
 	int device = open(HAKIOS_CAMERA_DEVICE, O_RDWR), failures = 0;
 
 	pthread_setname_np("hakios-camera");
 	if (device < 0) {
 		say("no %s (%s): no frames", HAKIOS_CAMERA_DEVICE, strerror(errno));
 		return NULL;
+	}
+	int tap_token = -1, tap_changed;
+	const char *sensor_name = sensor_name_for(s->camera->sensor);
+	if (sensor_name != NULL && strcmp(sensor_name, "imx789") == 0 &&
+	    notify_register_check(HAKIOS_CAMERA_TAP_NAME, &tap_token) == NOTIFY_STATUS_OK) {
+		(void)notify_check(tap_token, &tap_changed); /* drain the initial notification */
 	}
 	isp_init(&isp);
 	while (s->running && failures < 5) {
@@ -1349,7 +1722,16 @@ worker(void *context)
 				continue;
 			}
 			bytes = sizeof(head) + (size_t)head.stride * head.height;
+			if (head.preview_width >= 2 && !(head.preview_width & 1) && head.preview_height >= 2 &&
+			    !(head.preview_height & 1) && head.preview_stride >= head.preview_width) {
+				bytes += (size_t)head.preview_stride * head.preview_height * 3 / 2;
+				has_preview = true;
+			}
 			buffer = malloc(bytes);
+			if (buffer == NULL) {
+				say("could not allocate %zu bytes for a camera frame", bytes);
+				break;
+			}
 			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
 			continue;
 		}
@@ -1366,9 +1748,47 @@ worker(void *context)
 
 		const struct hakios_camera_frame *f = (const void *)buffer;
 		const uint8_t *raw = buffer + f->header_bytes;
+		const uint8_t *preview = has_preview ? raw + (size_t)f->stride * f->height : NULL;
+		bool native_ife = preview != NULL && f->preview_width == f->width && f->preview_height == f->height;
 		struct hakios_camera_command c;
 
-		isp_measure(&isp, f, raw, &st);
+		float window[4];
+		pthread_mutex_lock(&s->controls_lock);
+		uint64_t tap;
+		if (tap_token >= 0 && notify_check(tap_token, &tap_changed) == NOTIFY_STATUS_OK && tap_changed &&
+		    notify_get_state(tap_token, &tap) == NOTIFY_STATUS_OK) {
+			float x = (float)(tap >> 16) / HAKIOS_CAMERA_TAP_SCALE;
+			float y = (float)(tap & HAKIOS_CAMERA_TAP_SCALE) / HAKIOS_CAMERA_TAP_SCALE;
+			if (x <= 1) {
+				/* The same 187 x 250 thousandths window that the capture service uses for a tap. */
+				s->af_window[0] = fminf(0.813f, fmaxf(0, x - 0.0935f));
+				s->af_window[1] = fminf(0.75f, fmaxf(0, y - 0.125f));
+				s->af_window[2] = s->af_window[0] + 0.187f;
+				s->af_window[3] = s->af_window[1] + 0.25f;
+				s->af_now = true;
+				s->af_locked = s->ae_locked = false;
+				s->ae_spot = true;
+				say("focus: repeated tap at %.3f %.3f", x, y);
+			}
+		}
+		memcpy(window, s->af_window, sizeof(window));
+		bool af_now = s->af_now, af_locked = s->af_locked, ae_locked = s->ae_locked, ae_spot = s->ae_spot;
+		s->af_now = false;
+		struct exposure_bias requested_bias = s->exposure_bias;
+		pthread_mutex_unlock(&s->controls_lock);
+
+		isp_measure(&isp, f, raw, ae_spot ? window : NULL, &st);
+		struct isp_stats preview_stats = { 0 };
+		if (preview != NULL) {
+			isp_measure_preview(&isp, f, preview, ae_spot ? window : NULL, &preview_stats);
+			bool overbright = isp_preview_overbright(&st, &preview_stats, preview_using_raw);
+			if (overbright != preview_using_raw) {
+				say("preview: switching to %s (IFE/RAW10 mean %.0f/%.0f, near white %.1f%%/%.1f%%)",
+				    overbright ? "RAW10" : "IFE", preview_stats.mean[1], st.mean[1], 100 * preview_stats.near_white,
+				    100 * st.near_white);
+				preview_using_raw = overbright;
+			}
+		}
 		isp_awb(&isp, &st);
 		if (f->sensor != tuned_for) {
 			tuned_for = f->sensor;
@@ -1383,20 +1803,42 @@ worker(void *context)
 		isp_tune(&isp, lux, cct);
 		isp.zoom = s->zoom;
 		isp.turned = s->camera->turned;
-		if (isp_ae(&isp, f, &st, &c)) {
-			(void)write(device, &c, sizeof(c));
+		float bias = log2f(requested_bias.gain / 256.0f);
+		if (ae_locked && !was_ae_locked) {
+			locked_base_bias = isp.exposure_bias;
 		}
-		if (s->af_now) {
-			s->af_now = false;
-			/* (whatever it was doing: at once, from the next frame) */
-			af.state = AF_STEADY;
-			af.now = true;
-			af.sweep = true;
+		was_ae_locked = ae_locked;
+		isp.exposure_bias = bias;
+		if (requested_bias.gain != current_bias.gain || requested_bias.command_id != current_bias.command_id) {
+			current_bias = requested_bias;
+			bias_sequence = f->sequence;
 		}
-		af_frame(device, &af, f, raw, s->af_window, s->af_locked);
+		if (af_now) {
+			say("tap controls: focus %u, exposure %u lines gain %u/%u, spot %s (green %.0f of frame mean %.0f), bias %+.2f EV",
+			    f->focus, f->exposure_lines, f->gain, f->gain_unity, ae_spot ? "on" : "off", st.spot_green, st.mean[1], bias);
+		}
+		bool exposure_arrived = isp.asked && f->sequence > isp.asked_sequence &&
+		    f->exposure_lines == isp.asked_lines && f->gain == isp.asked_gain && f->frame_lines == isp.asked_frame_lines;
+		/* Both preview paths share the RAW10 exposure used by still capture. */
+		if (!ae_locked && isp_ae(&isp, f, &st, &c) && write(device, &c, sizeof(c)) != (ssize_t)sizeof(c)) {
+			isp.asked = false;
+		}
+		if (ae_locked || !isp.asked || (exposure_arrived && f->sequence > bias_sequence)) {
+			if (applied_bias.gain != current_bias.gain || applied_bias.command_id != current_bias.command_id) {
+				say("exposure bias applied: %+.2f EV at frame %llu (meter level %.1f)", bias,
+				    (unsigned long long)f->sequence, st.mean[1]);
+			}
+			applied_bias = current_bias;
+		}
+		float auto_digital = isp.digital;
+		if (ae_locked) {
+			/* A slider movement can trim the locked exposure without re-metering the scene. */
+			isp.digital = fminf(16, fmaxf(1.0f / 16, auto_digital * exp2f(bias - locked_base_bias)));
+		}
+		af_frame(device, &af, f, raw, window, af_locked, af_now);
 		s->frames++;
 
-		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port);
+		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port, ae_locked, af_locked, af.state >= AF_CLIMB, applied_bias);
 
 		/*
 		 * Only once the graph has started the stream. Its PixelBufferHandler blocks hand the buffer
@@ -1413,7 +1855,18 @@ worker(void *context)
 			s->metadata = CFRetain(metadata);
 			pthread_mutex_unlock(&s->metadata_lock);
 		}
+		/* The photograph's BPS and IPE pass, before the stream lock: it takes a few hundred milliseconds. */
+		struct hakios_camera_frame icp_f;
+		const uint8_t *icp = s->graph_running && s->stills_wanted > 0 ? icp_still(f, raw, &icp_f) : NULL;
 		pthread_mutex_lock(&s->lock);
+		if (s->graph_running) {
+			if (s->graph_first_seq == 0) {
+				s->graph_first_seq = f->sequence;
+				s->graph_started_at = mach_absolute_time();
+			}
+			s->graph_last_seq = f->sequence;
+			s->graph_frames++;
+		}
 		for (int i = 0; s->graph_running && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
 
@@ -1430,11 +1883,33 @@ worker(void *context)
 			if (still && s->stills_wanted == 0) {
 				continue;
 			}
-			deliver(s, out, &isp, f, raw, metadata);
-			if (still) {
+			/* Keep CPU stills when the IFE would blow out the same frame's highlights. */
+			const uint8_t *processed = preview_using_raw || (still && !native_ife) ? NULL : preview;
+			still_from_icp = still && icp != NULL;
+			bool delivered = still_from_icp ? deliver(s, out, &isp, &icp_f, raw, icp, metadata) :
+			    deliver(s, out, &isp, f, raw, processed, metadata);
+			still_from_icp = false;
+			if (still && delivered) {
 				s->stills_wanted--;
 				say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
 			}
+		}
+		if (s->graph_running && s->graph_frames > 0 && s->graph_frames % 150 == 0) {
+			static mach_timebase_info_data_t tb;
+			if (tb.denom == 0) {
+				mach_timebase_info(&tb);
+			}
+			double secs = (double)(mach_absolute_time() - s->graph_started_at) * tb.numer / tb.denom / 1e9;
+			uint64_t deliv = s->out[0].delivered - s->graph_delivered_at_start;
+			uint64_t ref = s->out[0].refused - s->graph_refused_at_start;
+			uint64_t rns = s->out[0].render_ns - s->graph_render_ns_at_start;
+			uint64_t rcnt = s->out[0].render_count - s->graph_render_count_at_start;
+			uint64_t span = s->graph_last_seq >= s->graph_first_seq ? s->graph_last_seq - s->graph_first_seq + 1 : s->graph_frames;
+			uint64_t skipped = span > s->graph_frames ? span - s->graph_frames : 0;
+			say("preview: %.2f fps over %.2f s (%llu delivered, %llu skipped, %llu refused, seq %llu..%llu, render avg %.1f ms)",
+			    secs > 0 ? (double)deliv / secs : 0.0, secs, (unsigned long long)deliv, (unsigned long long)skipped,
+			    (unsigned long long)ref, (unsigned long long)s->graph_first_seq, (unsigned long long)s->graph_last_seq,
+			    rcnt > 0 ? (double)rns / (double)rcnt / 1e6 : 0.0);
 		}
 		pthread_mutex_unlock(&s->lock);
 		if (metadata != NULL) {
@@ -1444,7 +1919,15 @@ worker(void *context)
 			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black; white balance R %.2f "
 			    "B %.2f, lux index %.0f, about %.0f K", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
 			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], isp.wb[0], isp.wb[2], lux, cct);
+			if (preview != NULL) {
+				say("IFE preview stats: linearized luma %.0f, spot %.0f, highlight %.0f / 959, near white %.1f%%, bias %+.2f EV",
+				    preview_stats.mean[1], preview_stats.spot_green, preview_stats.bright, 100 * preview_stats.near_white, bias);
+			}
 		}
+		isp.digital = auto_digital;
+	}
+	if (tap_token >= 0) {
+		notify_cancel(tap_token);
 	}
 	free(buffer);
 	close(device);
@@ -1469,6 +1952,14 @@ stream_begin(CMBaseObjectRef o, bool graph)
 	if (graph) {
 		pthread_mutex_lock(&s->lock);
 		s->graph_running = true;
+		s->graph_started_at = 0;
+		s->graph_first_seq = 0;
+		s->graph_last_seq = 0;
+		s->graph_frames = 0;
+		s->graph_delivered_at_start = s->out[0].delivered;
+		s->graph_refused_at_start = s->out[0].refused;
+		s->graph_render_ns_at_start = s->out[0].render_ns;
+		s->graph_render_count_at_start = s->out[0].render_count;
 		pthread_mutex_unlock(&s->lock);
 		say("stream: the graph starts the stream (format %d)", s->format_index);
 	}
@@ -1504,9 +1995,27 @@ stream_stop(CMBaseObjectRef o)
 {
 	struct stream *s = stream_of(o);
 
-	say("stream: stop (%llu frames, %llu pictures given)", (unsigned long long)s->frames,
-	    (unsigned long long)s->out[0].delivered);
 	pthread_mutex_lock(&s->lock);
+	if (s->graph_frames > 0 && s->graph_started_at != 0) {
+		static mach_timebase_info_data_t tb;
+		if (tb.denom == 0) {
+			mach_timebase_info(&tb);
+		}
+		double secs = (double)(mach_absolute_time() - s->graph_started_at) * tb.numer / tb.denom / 1e9;
+		uint64_t deliv = s->out[0].delivered - s->graph_delivered_at_start;
+		uint64_t ref = s->out[0].refused - s->graph_refused_at_start;
+		uint64_t rns = s->out[0].render_ns - s->graph_render_ns_at_start;
+		uint64_t rcnt = s->out[0].render_count - s->graph_render_count_at_start;
+		uint64_t span = s->graph_last_seq >= s->graph_first_seq ? s->graph_last_seq - s->graph_first_seq + 1 : s->graph_frames;
+		uint64_t skipped = span > s->graph_frames ? span - s->graph_frames : 0;
+		say("stream: stop (%llu frames, %llu pictures given; session %.2f fps over %.2f s, %llu delivered, %llu skipped, "
+		    "%llu refused, render avg %.1f ms)", (unsigned long long)s->frames, (unsigned long long)s->out[0].delivered,
+		    secs > 0 ? (double)deliv / secs : 0.0, secs, (unsigned long long)deliv, (unsigned long long)skipped,
+		    (unsigned long long)ref, rcnt > 0 ? (double)rns / (double)rcnt / 1e6 : 0.0);
+	} else {
+		say("stream: stop (%llu frames, %llu pictures given)", (unsigned long long)s->frames,
+		    (unsigned long long)s->out[0].delivered);
+	}
 	s->graph_running = false;
 	for (int i = 0; i < OUTPUTS; i++) {
 		let_go(&s->out[i]);
@@ -1618,8 +2127,13 @@ stream_finalize(CMBaseObjectRef o)
 static CFStringRef
 stream_description(CMBaseObjectRef o)
 {
-	(void)o;
-	return CFRetain(CFSTR("<HakiosCaptureStream: the wide camera>"));
+	struct stream *s = stream_of(o);
+	const char *sensor = s && s->camera ? sensor_name_for(s->camera->sensor) : NULL;
+
+	if (s && s->camera && sensor != NULL) {
+		return CFStringCreateWithFormat(NULL, NULL, CFSTR("<HakiosCaptureStream: %s (%s)>"), s->camera->name, sensor);
+	}
+	return CFRetain(CFSTR("<HakiosCaptureStream: camera>"));
 }
 
 static const struct base_class stream_base = {
@@ -1643,7 +2157,9 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	memset(s, 0, sizeof(*s));
 	pthread_mutex_init(&s->lock, NULL);
 	pthread_mutex_init(&s->metadata_lock, NULL);
+	pthread_mutex_init(&s->controls_lock, NULL);
 	s->torch = -1;
+	s->exposure_bias.gain = 256;
 	s->min_fps = 2;
 	s->zoom = 1;
 	s->af_window[0] = s->af_window[1] = 0.3f;
@@ -1773,7 +2289,8 @@ static CFStringRef
 device_description(CMBaseObjectRef o)
 {
 	(void)o;
-	return CFRetain(CFSTR("<HakiosCaptureDevice: the POCO X5 Pro's wide camera>"));
+	return CFStringCreateWithCString(NULL, kernel_device_desc[0] ? kernel_device_desc : "<HakiosCaptureDevice>",
+	    kCFStringEncodingUTF8);
 }
 
 static const struct base_class device_base = {
@@ -1790,39 +2307,61 @@ OSStatus
 hakios_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBaseObjectRef *out)
 {
 	static bool found, usable;
-	CMBaseObjectRef device = NULL, stream[2];
+	CMBaseObjectRef device = NULL, stream[2] = { NULL, NULL };
+	CFStringRef ports[2];
 	struct device *d;
+	CFIndex count = 0;
+	char summary[160] = "";
+	size_t spos = 0;
 
 	(void)options;
 	if (!found) {
 		found = true;
 		usable = find_functions();
+		discover_cameras();
 	}
 	if (!usable || out == NULL) {
 		return ERR_UNSUPPORTED;
 	}
-	if ((stream[0] = stream_create(allocator, &cameras[0], port_back)) == NULL) {
-		return ERR_UNSUPPORTED;
+	ports[0] = port_back;
+	ports[1] = port_front;
+	for (int i = 0; i < 2; i++) {
+		if ((kernel_sensor_mask & (1u << cameras[i].sensor)) == 0) {
+			continue;
+		}
+		stream[count] = stream_create(allocator, &cameras[i], ports[i]);
+		if (stream[count] == NULL) {
+			for (CFIndex j = 0; j < count; j++) {
+				CFRelease(stream[j]);
+			}
+			return ERR_UNSUPPORTED;
+		}
+		const char *sname = sensor_name_for(cameras[i].sensor);
+		spos += (size_t)snprintf(summary + spos, sizeof(summary) - spos, "%s%s: %s", count > 0 ? ", " : "",
+		    cameras[i].name, sname ? sname : "unknown");
+		count++;
 	}
-	if ((stream[1] = stream_create(allocator, &cameras[1], port_front)) == NULL) {
-		CFRelease(stream[0]);
+	if (count == 0) {
+		say("the kernel advertises no supported cameras: device not made");
 		return ERR_UNSUPPORTED;
 	}
 	if (derived_create(allocator, &device_vtable, device_class_id(), &device) != 0 || device == NULL) {
-		CFRelease(stream[0]);
-		CFRelease(stream[1]);
+		for (CFIndex j = 0; j < count; j++) {
+			CFRelease(stream[j]);
+		}
 		say("the device cannot be made");
 		return ERR_UNSUPPORTED;
 	}
 	d = derived_storage(device);
 	memset(d, 0, sizeof(*d));
-	d->streams = CFArrayCreate(NULL, (const void **)stream, 2, &kCFTypeArrayCallBacks);
-	all_streams[0] = stream[0];             /* (kept by the device's array) */
-	all_streams[1] = stream[1];
+	d->streams = CFArrayCreate(NULL, (const void **)stream, count, &kCFTypeArrayCallBacks);
+	all_streams[0] = count > 0 ? stream[0] : NULL;
+	all_streams[1] = count > 1 ? stream[1] : NULL;
 	d->supported = supported(device_props, sizeof(device_props) / sizeof(device_props[0]));
-	CFRelease(stream[0]);
-	CFRelease(stream[1]);
+	for (CFIndex j = 0; j < count; j++) {
+		CFRelease(stream[j]);
+	}
 	*out = device;
-	say("the device made: two streams, the back camera and the front one");
+	say("the device made: %ld stream%s (%s)", (long)count, count == 1 ? "" : "s", summary);
 	return 0;
 }

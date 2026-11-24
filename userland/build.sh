@@ -137,10 +137,14 @@ SILEO_BIN="chmod cp mkdir mv rm"
 # (libhakios.tweaks is the tweak loader of the package manager's prefix, src/inject_tweaks.c: in
 # SpringBoard the library above opens it, here it is named for the programs that have no library of
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
+CAMERA_APP=
+if [ -r ../.config ] && grep -qx 'CONFIG_HAKIOS_CAM_PROBE=y' ../.config; then
+	CAMERA_APP=" Camera"
+fi
 INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
-/redwood/lib/libhakios.app.dylib Sileo
+/redwood/lib/libhakios.app.dylib Sileo$CAMERA_APP
 /redwood/lib/libhakios.tweaks.dylib Preferences"}
 mkdir -p obj
 
@@ -216,6 +220,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework IOKit -o obj/gpu_test src/gpu_test.c
 		# which processes take the processors, every few seconds (src/cputop.c; rc.jobs.cputop)
 		$DYN -o obj/cputop src/cputop.c
+		# where a photograph's time between the shutter and DCIM goes (src/savetrace.c; cam_save_trace=1)
+		$DYN -o obj/savetrace src/savetrace.c
 		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/cow_test.c
 		$DYN -framework CoreFoundation -framework CoreGraphics -framework IOSurface -o obj/cg_test src/cg_test.c
 		# what Darwin here believes about Metal, and what CoreImage does without it (src/metal_test.m);
@@ -260,7 +266,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			-o obj/libhakios.app.dylib src/inject_app.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
-			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
+			-o obj/libhakios.media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c src/iris_tiles.c
 		# the output device of the audio server: a plug-in for CoreAudio's HAL
 		$DYN -bundle -framework CoreFoundation -o obj/HakiosAudio src/audio_plugin.c
 		# the plug-in Metal loads when the kernel names it (boot-arg metal=1): a device, its buffers and the libraries it reads
@@ -371,6 +377,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/gpu_test ] && cp obj/gpu_test root/bin/
 	[ -f obj/cputop ] && cp obj/cputop root/bin/
+	[ -f obj/savetrace ] && cp obj/savetrace root/bin/
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
 	[ -f obj/shm_test ] && cp obj/shm_test root/bin/
@@ -538,6 +545,23 @@ fi
 if [ -f ../fw-haptic/aw8697_haptic.bin ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-haptic/aw8697_haptic.bin root/fw/
+fi
+# ... and the video codec's firmware, the NE2213's /vendor/firmware/vpu20_4v.mbn (Iris2, PAS 9; 2 MB), from ../fw-video
+# (drivers/camera/hakios.iris_probe.c splits it into the PAS metadata and image; the vendor's, not in the repository)
+if [ -f ../fw-video/vpu20_4v.mbn ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-video/vpu20_4v.mbn root/fw/
+fi
+# ... and the camera ISP processor's firmware, the NE2213's /vendor/firmware/CAMERA_ICP.mbn (LX7, PAS 33; 0.9 MB),
+# from ../fw-icp (drivers/camera/hakios.icp_probe.c; the vendor's, not in the repository)
+if [ -f ../fw-icp/CAMERA_ICP.mbn ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-icp/CAMERA_ICP.mbn root/fw/
+fi
+# ... and, for icp_probe=5 only, the stock BPS frame to replay (device-info/.../isp/icp/make-bps-replay.py; build-icp.sh
+# stages it in ../fw-icp for its own volume and takes it out again)
+if [ -f ../fw-icp/BPS_REPLAY.bin ]; then
+	install -m 0644 ../fw-icp/BPS_REPLAY.bin root/fw/
 fi
 # ... and the cameras' register tables (drivers/camera/hakios.camera.c, cam=2 and up), made by tools/camsensor.py out of
 # the sensors' module files of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.

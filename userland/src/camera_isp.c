@@ -27,6 +27,11 @@ isp_init(struct isp *isp)
 	for (int i = 0; i < 3; i++) {
 		isp->ccm[i][i] = 1;
 	}
+	for (unsigned i = 0; i < 256; i++) {
+		double y = i / 255.0;
+		double linear = y <= 0.04045 ? y / 12.92 : pow((y + 0.055) / 1.055, 2.4);
+		isp->preview_linear[i] = (uint16_t)(linear * WHITE + 0.5);
+	}
 	for (int i = 0; i < 4096; i++) {
 		double v = i >= LUT_WHITE ? 1 : (double)i / LUT_WHITE;
 
@@ -123,10 +128,17 @@ isp_sharpness(const struct hakios_camera_frame *f, const uint8_t *raw, float x0,
 static inline void lsc_at(const struct isp *isp, float u, float v, float g[3]);
 
 void
-isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, struct isp_stats *s)
+isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *raw, const float window[4], struct isp_stats *s)
 {
 	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
 	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 };
+	uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+	if (window != NULL) {
+		x0 = (uint32_t)(window[0] * cells_w);
+		y0 = (uint32_t)(window[1] * cells_h);
+		x1 = (uint32_t)(window[2] * cells_w);
+		y1 = (uint32_t)(window[3] * cells_h);
+	}
 	float gains[3] = { 1, 1, 1 };
 	int r, b;
 
@@ -135,6 +147,7 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 	for (uint32_t cy = 0; cy < cells_h; cy += 4) {
 		const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
 		float v_pos = cells_h > 1 ? (float)cy / (cells_h - 1) : 0;
+		bool spot_row = cy >= y0 && cy < y1;
 
 		for (uint32_t cx = 0; cx < cells_w; cx += 4) {
 			int v[4], g = 0, top_v = 0;
@@ -148,6 +161,10 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 			sum[0] += v[r];
 			sum[1] += g;
 			sum[2] += v[b];
+			if (spot_row && cx >= x0 && cx < x1) {
+				s->spot_green += g;
+				s->spot_cells++;
+			}
 			/*
 			 * The white balance leaves out a cell with a colour near white -- a lamp, a screen:
 			 * green, the most sensitive, stops there first and the cell would count as magenta --
@@ -196,6 +213,13 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 	for (int c = 0; c < 3; c++) {
 		s->mean[c] = s->cells ? sum[c] / s->cells : 0;
 	}
+	if (s->spot_cells) {
+		s->spot_green /= s->spot_cells;
+	}
+	if (s->cells) {
+		/* RAW10 green within the last 16 levels above black. */
+		s->near_white = (double)s->hist[WHITE >> 4] / s->cells;
+	}
 	for (int c = 0; c < 2; c++) {
 		s->grey[c] = s->grey_cells ? grey[c] / s->grey_cells : 0;
 		s->neutral[c] = s->neutral_cells ? neutral[c] / s->neutral_cells : 0;
@@ -209,37 +233,112 @@ isp_measure(const struct isp *isp, const struct hakios_camera_frame *f, const ui
 	}
 }
 
+void
+isp_measure_preview(const struct isp *isp, const struct hakios_camera_frame *f, const uint8_t *luma, const float window[4],
+    struct isp_stats *s)
+{
+	uint32_t width = f->preview_width, height = f->preview_height;
+	uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0, total = 0, spot_total = 0;
+	uint32_t sum = 0, spot_sum = 0, hist[256] = { 0 }, spot_hist[256] = { 0 };
+	if (window != NULL) {
+		x0 = (uint32_t)(window[0] * width);
+		y0 = (uint32_t)(window[1] * height);
+		x1 = (uint32_t)(window[2] * width);
+		y1 = (uint32_t)(window[3] * height);
+	}
+	for (uint32_t y = 4; y < height; y += 8) {
+		const uint8_t *row = luma + (size_t)y * f->preview_stride;
+		bool spot_row = y >= y0 && y < y1;
+		for (uint32_t x = 4; x < width; x += 8) {
+			uint8_t value = row[x];
+			uint16_t linear = isp->preview_linear[value];
+			sum += linear;
+			hist[value]++;
+			total++;
+			if (spot_row && x >= x0 && x < x1) {
+				spot_sum += linear;
+				spot_hist[value]++;
+				spot_total++;
+			}
+		}
+	}
+	if (total == 0) {
+		return;
+	}
+	s->mean[1] = (double)sum / total;
+	s->spot_cells = spot_total;
+	s->spot_green = spot_total ? (double)spot_sum / spot_total : 0;
+	uint32_t near_white = 0;
+	for (unsigned i = 250; i < 256; i++) {
+		near_white += hist[i];
+	}
+	s->near_white = (double)near_white / total;
+	/* When metering a tap, preserve highlights in the subject the user picked. */
+	const uint32_t *highlights = spot_total ? spot_hist : hist;
+	uint32_t rank = spot_total ? (spot_total + 19) / 20 : (total + 99) / 100;
+	for (int i = 255; i >= 0; i--) {
+		if (highlights[i] >= rank) {
+			s->bright = isp->preview_linear[i];
+			break;
+		}
+		rank -= highlights[i];
+	}
+}
+
+bool
+isp_preview_overbright(const struct isp_stats *raw, const struct isp_stats *preview, bool using_raw)
+{
+	/* Leave a margin before switching back so alternating frames don't change the rendering path. */
+	double extra_white = using_raw ? 0.01 : 0.03;
+	double brightness_ratio = using_raw ? 1.5 : 2.0;
+
+	return preview->near_white > raw->near_white + extra_white ||
+	    (preview->mean[1] > 0.25 * WHITE && preview->mean[1] > brightness_ratio * raw->mean[1]);
+}
+
 /*
  * Green's mean towards 15 % of white, unless that would put 1 % of the picture into white. The
  * exposure, longest first: the frame's lines at the shortest frame, then gain to 16x, then frames up
- * to max_frame_lines, then gain to the most; beyond that, digital gain (up to 4x).
+ * to max_frame_lines, then gain to the most; beyond that, digital gain (up to 4x at neutral bias).
  */
 bool
 isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_stats *s, struct hakios_camera_command *c)
 {
 	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
-	double target = 0.15 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
-	double bright = s->bright * isp->digital;
+	double target = 0.15 * WHITE, compensation = exp2(isp->exposure_bias);
+	double green = s->spot_cells ? 0.75 * s->spot_green + 0.25 * s->mean[1] : s->mean[1];
+	double mean = fmax(0.5, green * isp->digital), bright = s->bright * isp->digital;
 	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
-	uint32_t lines, gain, frame_lines = 0;
+	uint32_t minimum = f->exposure_lines_min ? f->exposure_lines_min : 4;
+	uint32_t lines, gain, frame_lines = f->frame_lines_min;
 	double digital = 1;
 
-	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
-		return false;                   /* (the last change not in the frames yet) */
+	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain ||
+	    f->frame_lines != isp->asked_frame_lines) && f->sequence >= isp->asked_sequence &&
+	    f->sequence - isp->asked_sequence < 5) {
+		return false;
+	}
+	isp->asked = false;
+	if (f->frame_lines_max && longest > f->frame_lines_max) {
+		longest = f->frame_lines_max;
 	}
 	/* (the measured levels are the sensor's: digital gain is applied to the picture only) */
 	ratio = target / mean;
 	if (bright * ratio > 0.9 * WHITE && bright > 0) {
 		ratio = 0.9 * WHITE / bright > target / mean * 0.5 ? 0.9 * WHITE / bright : target / mean * 0.5;
 	}
+	ratio *= compensation;
 	ratio = ratio < 0.25 ? 0.25 : ratio > 4 ? 4 : ratio;
 	if (ratio > 0.94 && ratio < 1.06) {
 		return false;
 	}
 	want = now * pow(ratio, 0.7);
 	if (want <= fast) {
-		lines = want < 4 ? 4 : (uint32_t)want;
+		lines = want < minimum ? minimum : (uint32_t)want;
 		gain = f->gain_unity;
+		if (want < minimum && compensation < 1) {
+			digital = fmax(compensation, want / minimum);
+		}
 	} else if (want <= (double)fast * 16) {
 		lines = fast;
 		gain = (uint32_t)(want / fast * f->gain_unity);
@@ -251,12 +350,17 @@ isp_ae(struct isp *isp, const struct hakios_camera_frame *f, const struct isp_st
 
 		if (g > (double)f->gain_max / f->gain_unity) {
 			digital = g / ((double)f->gain_max / f->gain_unity);
-			digital = digital > 4 ? 4 : digital;
+			/* Give manual compensation room at the sensor's upper limit. */
+			digital = fmin(digital, fmin(16, fmax(1, 4 * compensation)));
 			g = (double)f->gain_max / f->gain_unity;
 		}
 		gain = (uint32_t)(g * f->gain_unity);
 	}
 	isp->digital = (float)digital;
+	if (lines == f->exposure_lines && gain == f->gain && frame_lines == f->frame_lines) {
+		return false;
+	}
+	isp->asked_sequence = f->sequence;
 	isp->asked_lines = lines;
 	isp->asked_gain = gain;
 	isp->asked_frame_lines = frame_lines;

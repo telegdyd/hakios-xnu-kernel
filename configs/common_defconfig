@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 441 symbols in 18 groups; 37 are set, 28 of them drivers built in.
+# 446 symbols in 18 groups; 37 are set, 29 of them drivers built in.
 #
 
 #
@@ -19,7 +19,7 @@
 CONFIG_FIRMWARE="device"
 
 #
-# Drivers built in (28)
+# Drivers built in (29)
 #
 
 # the audio DSP started and linked (adsp=1, adsp_step=N); the battery's state comes through it too. Needs the DSP's ... [hakios.adsp.c]
@@ -45,6 +45,9 @@ CONFIG_HAKIOS_CAMERA=y
 
 # the flashlight: the flash LED module of the PM8350C (torch=1); it stays off while the battery is too warm [hakios.torch.c]
 CONFIG_HAKIOS_TORCH=y
+
+# OnePlus 10 Pro rear IMX789 chip ID (cam_probe=1) and IFE RAW10 test pattern (cam_probe=2) [hakios.cam_probe.c; requires CONFIG_HAKIOS_CPUFREQ]
+# CONFIG_HAKIOS_CAM_PROBE is not set
 
 # the chip's identity from the firmware's shared memory: kern.hakios.soc_* (socinfo=1). Any Qualcomm SoC that keeps ... [hakios.socinfo.c]
 CONFIG_HAKIOS_SOCINFO=y
@@ -120,9 +123,6 @@ CONFIG_HAKIOS_WIFI=y
 # CONFIG_CPUFREQ is not set
 
 # read by the patch to Apple's files (kernel)
-# CONFIG__FP_EXCEPTIONS is not set
-
-# read by the patch to Apple's files (kernel)
 # CONFIG_APPLOG is not set
 
 # read by the patch to Apple's files (kernel)
@@ -133,6 +133,9 @@ CONFIG_HAKIOS_WIFI=y
 
 # read by psci_smp.c (kernel)
 # CONFIG_CPU_IDLE_CORES is not set
+
+# read by psci_smp.c (kernel)
+# CONFIG_CPU_IDLE_STATES is not set
 
 # the first domain's registers, when this is not the reference phone (the OnePlus 10 Pro, SM8450: 0x17d91000, dt ...
 # CONFIG_CPUFREQ_EPSS is not set
@@ -657,7 +660,7 @@ CONFIG_GPU=y
 # CONFIG_VBLUR is not set
 
 #
-# Audio and battery (45)
+# Audio and battery (46)
 #
 
 # the audio DSP; the battery level in the UI and charging state come through it [needs fw-audio/ from the phone]
@@ -779,6 +782,9 @@ CONFIG_SOUND=4
 
 # read by hakios.sound.c (kernel)
 # CONFIG_SOUND_GUARD_AS is not set
+
+# read by hakios.sound.c (kernel)
+# CONFIG_SOUND_IDLE is not set
 
 # read by hakios.sound.c (kernel)
 # CONFIG_SOUND_PAUSE is not set
@@ -1107,7 +1113,7 @@ CONFIG_MODEM_AGAIN=y
 # CONFIG_SOC_SMEM is not set
 
 #
-# Cameras (13)
+# Cameras (14)
 #
 
 # the cameras (5 is what the README uses) [needs fw-camera/ from the phone]
@@ -1136,6 +1142,9 @@ CONFIG_MODEM_AGAIN=y
 
 # read by hakios.camera.c (kernel)
 # CONFIG_CAM_PATTERN is not set
+
+# Read the rear IMX789 chip ID once (default off)
+# CONFIG_CAM_PROBE is not set
 
 # read by hakios.camera.c (kernel)
 # CONFIG_CAM_SENSOR is not set
@@ -1273,7 +1282,7 @@ CONFIG_MODEM_AGAIN=y
 # CONFIG_UFS_PROBE is not set
 
 #
-# User space (39)
+# User space (41)
 #
 
 # read by hakios.bt.c (kernel)
@@ -1378,11 +1387,17 @@ CONFIG_MODEM_AGAIN=y
 # the system's own "Reduce Transparency" and "Reduce Motion" (Settings, Accessibility), for this
 # CONFIG_UI_LITE is not set
 
+# Wake on event interrupts, with a 1 s recovery timeout; 0 keeps polling
+# CONFIG_USB_IRQ is not set
+
 # read by hakios.usb_net.c (kernel)
 # CONFIG_USB_NET_IP is not set
 
 # read by hakios.usb_net.c (kernel)
 # CONFIG_USB_PHYGUARD is not set
+
+# Keep periodic counter messages off; 1 prints them every 30 s
+# CONFIG_USB_STATS is not set
 
 # read by init.c (user space)
 # CONFIG_VAR_HFS is not set

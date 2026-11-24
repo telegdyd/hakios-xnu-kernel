@@ -8,8 +8,15 @@
  * and says the frames of the stack when a signal kills it, under the dyld shared cache's slide,
  * which `ipsw dyld a2s <cache> <address>` turns back into names.
  */
+#include <Block.h>
+#include <CoreGraphics/CGGeometry.h>
 #include <dispatch/dispatch.h>
+#include <mach/mach_time.h>
+#include <math.h>
+#include <notify.h>
+#include <sys/sysctl.h>
 #include <spawn.h>
+#include <stdbool.h>
 #include <sys/stat.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -22,6 +29,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include "camera_tap.h"
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
@@ -332,6 +340,223 @@ watch(const char *name, const char *selector, IMP ours, void *theirs)
 	}
 }
 
+/*
+ * The iOS 16.5 capture service submits the first single autofocus operation but can suppress
+ * repeats with new points while it stays in that mode. Camera has already converted each
+ * tap to a normalized capture point. Relay repeated requests to the active HakiOS stream.
+ */
+enum { CAMERA_FOCUS_SINGLE = 1 };
+static int (*camera_set_focus)(id, SEL, long, float, int);
+static char camera_single_focus_key;
+static int camera_tap_token = -1;
+
+static int
+camera_repeat_focus(id device, SEL cmd, long mode, float position, int request)
+{
+	bool repeated = mode == CAMERA_FOCUS_SINGLE && objc_getAssociatedObject(device, &camera_single_focus_key) != NULL;
+	int result = camera_set_focus(device, cmd, mode, position, request);
+	if (result != 0) {
+		return result;
+	}
+	objc_setAssociatedObject(device, &camera_single_focus_key, mode == CAMERA_FOCUS_SINGLE ? device : nil,
+	    OBJC_ASSOCIATION_ASSIGN);
+	if (repeated) {
+		CGPoint (*get_point)(id, SEL) = (CGPoint (*)(id, SEL))objc_msgSend;
+		CGPoint point = get_point(device, sel_registerName("focusPointOfInterest"));
+		if (point.x >= 0 && point.x <= 1 && point.y >= 0 && point.y <= 1) {
+			uint64_t x = (uint64_t)lround(point.x * HAKIOS_CAMERA_TAP_SCALE);
+			uint64_t y = (uint64_t)lround(point.y * HAKIOS_CAMERA_TAP_SCALE);
+			if (notify_set_state(camera_tap_token, x << 16 | y) == NOTIFY_STATUS_OK) {
+				(void)notify_post(HAKIOS_CAMERA_TAP_NAME);
+			}
+		}
+	}
+	return result;
+}
+
+static void
+camera_enable_repeat_focus(void)
+{
+	if (notify_register_check(HAKIOS_CAMERA_TAP_NAME, &camera_tap_token) != NOTIFY_STATUS_OK) {
+		return;
+	}
+	watch("AVCaptureFigVideoDevice", "_setFocusWithMode:lensPosition:requestID:", (IMP)camera_repeat_focus,
+	    &camera_set_focus);
+	if (camera_set_focus != NULL) {
+		static const char line[] = "hakios: Camera: repeat tap-to-focus enabled\n";
+
+		say(line, sizeof(line) - 1);
+	}
+}
+
+/*
+ * cam_save_trace=1: Camera's side of a photograph, on mach_absolute_time's clock like mediaserverd's lines and
+ * savetrace's ("[t=...]"): when a touch reaches the application, the shutter button's action, the requests to
+ * AVCapturePhotoOutput and each of the photograph's delegate calls.
+ */
+static void
+trace_say(const char *format, ...)
+{
+	static mach_timebase_info_data_t base;
+	char line[300];
+	va_list ap;
+
+	if (base.denom == 0) {
+		mach_timebase_info(&base);
+	}
+	uint64_t us = mach_absolute_time() * base.numer / base.denom / 1000;
+	int n = snprintf(line, sizeof(line), "[t=%llu.%03llu] hakios: Camera: ", (unsigned long long)(us / 1000),
+	    (unsigned long long)(us % 1000));
+	va_start(ap, format);
+	n += vsnprintf(line + n, sizeof(line) - (size_t)n - 1, format, ap);
+	va_end(ap);
+	if (n > (int)sizeof(line) - 2) {
+		n = sizeof(line) - 2;
+	}
+	line[n++] = '\n';
+	say(line, (size_t)n);
+}
+
+static void (*send_event)(id, SEL, id);
+static void (*send_action)(id, SEL, SEL, id, id);
+static void (*capture_photo)(id, SEL, id, id);
+static void (*prepare_photos)(id, SEL, id, id);
+
+static void
+traced_send_event(id app, SEL cmd, id event)
+{
+	long type = ((long (*)(id, SEL))objc_msgSend)(event, sel_registerName("type"));
+	if (type == 0) {        /* UIEventTypeTouches */
+		id touches = ((id (*)(id, SEL))objc_msgSend)(event, sel_registerName("allTouches"));
+		id touch = ((id (*)(id, SEL))objc_msgSend)(touches, sel_registerName("anyObject"));
+		long phase = touch != nil ? ((long (*)(id, SEL))objc_msgSend)(touch, sel_registerName("phase")) : -1;
+		if (phase == 0 || phase == 3 || phase == 4) {
+			trace_say("touch %s reaches the application", phase == 0 ? "began" : phase == 3 ? "ended" : "cancelled");
+		}
+	}
+	send_event(app, cmd, event);
+	if (type == 0) {
+		trace_say("touch event handled");
+	}
+}
+
+static void
+traced_send_action(id control, SEL cmd, SEL action, id target, id event)
+{
+	trace_say("%s sends %s to %s", object_getClassName(control), sel_getName(action),
+	    target != nil ? object_getClassName(target) : "(the responder chain)");
+	send_action(control, cmd, action, target, event);
+	trace_say("%s returned", sel_getName(action));
+}
+
+/* The photograph's delegate's methods, each class's own once: (output, settings or photo[, error]). */
+#define DELEGATE_SELECTORS 5
+static const char *const delegate_selectors[DELEGATE_SELECTORS] = {
+	"captureOutput:willBeginCaptureForResolvedSettings:",
+	"captureOutput:willCapturePhotoForResolvedSettings:",
+	"captureOutput:didCapturePhotoForResolvedSettings:",
+	"captureOutput:didFinishProcessingPhoto:error:",
+	"captureOutput:didFinishCaptureForResolvedSettings:error:",
+};
+
+static void
+hook_delegate(Class class)
+{
+	static Class hooked[8];
+	static unsigned count;
+
+	for (unsigned i = 0; i < count; i++) {
+		if (hooked[i] == class) {
+			return;
+		}
+	}
+	if (count == sizeof(hooked) / sizeof(hooked[0])) {
+		return;
+	}
+	hooked[count++] = class;
+	for (unsigned i = 0; i < DELEGATE_SELECTORS; i++) {
+		SEL selector = sel_registerName(delegate_selectors[i]);
+		Method method = class_getInstanceMethod(class, selector);
+		if (method == NULL) {
+			continue;
+		}
+		void (*original)(id, SEL, id, id, id) = (void (*)(id, SEL, id, id, id))method_getImplementation(method);
+		const char *name = delegate_selectors[i];
+		void (^body)(id, id, id, id) = ^(id self, id output, id a, id b) {
+			trace_say("delegate %s", name);
+			original(self, selector, output, a, b);
+			trace_say("delegate %s returned", name);
+		};
+		IMP traced = imp_implementationWithBlock((id)body);
+		method_setImplementation(method, traced);
+	}
+	trace_say("photograph delegate %s traced", class_getName(class));
+}
+
+static void
+traced_capture_photo(id output, SEL cmd, id settings, id delegate)
+{
+	static unsigned shots;
+	SEL url = sel_registerName("livePhotoMovieFileURL");
+	id movie = settings != nil && class_respondsToSelector(object_getClass(settings), url) ?
+	    ((id (*)(id, SEL))objc_msgSend)(settings, url) : nil;
+	long flash = ((long (*)(id, SEL))objc_msgSend)(settings, sel_registerName("flashMode"));
+
+	trace_say("photograph %u: flash mode %ld, %s", ++shots, flash, movie != nil ? "with a Live Photo movie" : "no Live Photo");
+	trace_say("capturePhotoWithSettings: asked (delegate %s)", delegate != nil ? object_getClassName(delegate) : "nil");
+	if (delegate != nil) {
+		hook_delegate(object_getClass(delegate));
+	}
+	capture_photo(output, cmd, settings, delegate);
+	trace_say("capturePhotoWithSettings: returned");
+}
+
+static void
+traced_prepare_photos(id output, SEL cmd, id settings, id completion)
+{
+	trace_say("setPreparedPhotoSettingsArray: asked");
+	if (completion == nil) {
+		prepare_photos(output, cmd, settings, completion);
+		return;
+	}
+	void (^handler)(BOOL, id) = (void (^)(BOOL, id))completion;
+	void (^wrapped)(BOOL, id) = Block_copy(^(BOOL prepared, id error) {
+		trace_say("setPreparedPhotoSettingsArray: completed (%s)", prepared ? "prepared" : "not prepared");
+		handler(prepared, error);
+	});
+	prepare_photos(output, cmd, settings, (id)wrapped);
+}
+
+static bool
+save_trace_enabled(void)
+{
+	char arguments[2048];
+	size_t length = sizeof(arguments);
+	char *state;
+
+	if (sysctlbyname("kern.bootargs", arguments, &length, NULL, 0) != 0) {
+		return false;
+	}
+	for (char *word = strtok_r(arguments, " ", &state); word != NULL; word = strtok_r(NULL, " ", &state)) {
+		if (strcmp(word, "cam_save_trace=1") == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+camera_enable_save_trace(void)
+{
+	watch("UIApplication", "sendEvent:", (IMP)traced_send_event, &send_event);
+	watch("UIControl", "sendAction:to:forEvent:", (IMP)traced_send_action, &send_action);
+	watch("AVCapturePhotoOutput", "capturePhotoWithSettings:delegate:", (IMP)traced_capture_photo, &capture_photo);
+	watch("AVCapturePhotoOutput", "setPreparedPhotoSettingsArray:completionHandler:", (IMP)traced_prepare_photos,
+	    &prepare_photos);
+	trace_say("save trace on (sendEvent %s, sendAction %s, capturePhoto %s, prepare %s)", send_event ? "yes" : "no",
+	    send_action ? "yes" : "no", capture_photo ? "yes" : "no", prepare_photos ? "yes" : "no");
+}
+
 __attribute__((constructor))
 static void
 hakios_app_init(void)
@@ -344,6 +569,16 @@ hakios_app_init(void)
 	int n;
 
 	if (name == NULL) {
+		return;
+	}
+	if (strcmp(name, "Camera") == 0) {
+		bool trace = save_trace_enabled();
+		dispatch_async(dispatch_get_main_queue(), ^{
+			camera_enable_repeat_focus();
+			if (trace) {
+				camera_enable_save_trace();
+			}
+		});
 		return;
 	}
 	who = name;

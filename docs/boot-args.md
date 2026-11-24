@@ -2,13 +2,13 @@
 
 Made by `tools/boot-args.py --markdown`; CI fails if it is out of date with the source (`tools/boot-args.py --check`).
 
-Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **416 arguments**: 345 read by the kernel, 16 by the loader, 67 by user space (one is read in more than one place).
+Every argument that the kernel, the loader or user space of this port reads, and which file reads it. **446 arguments**: 375 read by the kernel, 16 by the loader, 67 by user space (one is read in more than one place).
 
 This is a catalogue of what exists and who reads it, not a manual. What an argument means is in the head of the file that reads it. The stable switches have a symbol in the configuration (`tools/hakios-config.py help SYMBOL`, `docs/configs.md`); the rest are the knobs of bring-up (a driver's steps, pauses, traces, test modes) and can change with the driver. Any of them can be given in a configuration with `CONFIG_BOOTARGS="name=value ..."`, which checks that each name is in this list. What the arguments of the two Metal paths do: [Metal on the Adreno](reference/metal.md#boot-arguments).
 
 Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl kern.bootargs`).
 
-## GPU and display (92)
+## GPU and display (93)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -28,6 +28,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `backlight` | K | `hakios.backlight.cpp` | `CONFIG_BACKLIGHT` |  |
 | `backlight_max` | K | `hakios.backlight.cpp` | `CONFIG_BACKLIGHT_MAX` |  |
 | `backlight_min` | K | `hakios.backlight.cpp` | `CONFIG_BACKLIGHT_MIN` |  |
+| `display_power_down` | K | `hakios.backlight.cpp` | `CONFIG_DISPLAY_POWER_DOWN` |  |
 | `display_probe` | K | `hakios.adreno.c` | `CONFIG_DISPLAY_PROBE` |  |
 | `fb_beam` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_FB_BEAM` |  |
 | `fb_beat` | K | `MiniIOMobileFramebuffer.cpp` | `CONFIG_FB_BEAT` |  |
@@ -111,14 +112,14 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 |---|---|---|---|---|
 | `privs` | K | `kern_minimac.c` | `CONFIG_PRIVS` |  |
 
-## Wi-Fi (48)
+## Wi-Fi (54)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
-| `pcie` | K | `hakios.wifi.pci.c` | `CONFIG_PCIE` |  |
-| `pcie_gen` | K | `hakios.wifi.pci.c` | `CONFIG_PCIE_GEN` |  |
+| `pcie` | K | `hakios.pcie.c`, `hakios.wifi.pci.c` | `CONFIG_PCIE` |  |
+| `pcie_gen` | K | `hakios.pcie.c`, `hakios.wifi.pci.c` | `CONFIG_PCIE_GEN` |  |
 | `pcie_pause` | K | `hakios.pcie.c`, `hakios.wifi.pci.c` | `CONFIG_PCIE_PAUSE` |  |
-| `wifi` | K | `hakios.wifi.c`, `hakios.wifi.pci.c` | `CONFIG_WIFI` |  |
+| `wifi` | K | `hakios.pcie.c`, `hakios.wifi.c`, `hakios.wifi.pci.c` | `CONFIG_WIFI` |  |
 | `wifi_again` | K | `hakios.wifi.c` | `CONFIG_WIFI_AGAIN` |  |
 | `wifi_ask` | K | `hakios.wifi.c` | `CONFIG_WIFI_ASK` |  |
 | `wifi_ba` | K | `lx_80211.c` | `CONFIG_WIFI_BA` | implied by wifi=1 |
@@ -130,6 +131,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `wifi_dirty` | K | `hakios.wifi.c` | `CONFIG_WIFI_DIRTY` |  |
 | `wifi_file` | K | `hakios.wifi.c` | `CONFIG_WIFI_FILE` |  |
 | `wifi_fine` | K | `hakios.wifi.c` | `CONFIG_WIFI_FINE` |  |
+| `wifi_fwlog` | K | `lx_bus.c` | `CONFIG_WIFI_FWLOG` |  |
 | `wifi_hold` | K | `lx_bus.c` | `CONFIG_WIFI_HOLD` |  |
 | `wifi_hostcap_ath` | K | `lx_bus.c` | `CONFIG_WIFI_HOSTCAP_ATH` |  |
 | `wifi_irq` | K | `lx_bus.c` | `CONFIG_WIFI_IRQ` | implied by wifi=1 |
@@ -143,16 +145,20 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `wifi_mac` | K | `hakios.wifi.c`, `hakios.wifi.pci.c` | `CONFIG_WIFI_MAC` |  |
 | `wifi_mhi_dump` | K | `hakios.wifi.pci.c`, `lx_mhi.c` | `CONFIG_WIFI_MHI_DUMP` |  |
 | `wifi_mhi_fail` | K | `lx_mhi.c` | `CONFIG_WIFI_MHI_FAIL` |  |
+| `wifi_mhi_idle` | K | `lx_mhi.c` | `CONFIG_WIFI_MHI_IDLE` |  |
+| `wifi_mhi_m3` | K | `lx_mhi.c` | `CONFIG_WIFI_MHI_M3` |  |
 | `wifi_mission` | K | `hakios.wlfw.c` | `CONFIG_WIFI_MISSION` |  |
 | `wifi_msi` | K | `hakios.wifi.pci.c`, `lx_pci.c` | `CONFIG_WIFI_MSI` |  |
 | `wifi_new` | K | `hakios.wifi.c` | `CONFIG_WIFI_NEW` |  |
 | `wifi_offload` | K | `hakios.lx.c` | `CONFIG_WIFI_OFFLOAD` |  |
 | `wifi_pause` | K | `hakios.wifi.c` | `CONFIG_WIFI_PAUSE` |  |
+| `wifi_pcie_off` | K | `lx_80211.c` | `CONFIG_WIFI_PCIE_OFF` | implied by wifi=1; full PCIe off/on with wifi_soc=8450 (0: station only) |
 | `wifi_psk` | K | `hakios.wifi.pci.c` | `CONFIG_WIFI_PSK` |  |
 | `wifi_quiet` | K | `lx_bus.c` | `CONFIG_WIFI_QUIET` |  |
 | `wifi_radio_read` | K | `hakios.wifi.c` | `CONFIG_WIFI_RADIO_READ` |  |
 | `wifi_ready` | K | `hakios.wlfw.c` | `CONFIG_WIFI_READY` |  |
 | `wifi_return` | K | `hakios.wifi.c` | `CONFIG_WIFI_RETURN` |  |
+| `wifi_rx_eth` | K | `lx_80211.c` | `CONFIG_WIFI_RX_ETH` |  |
 | `wifi_scan` | K | `lx_bus.c` | `CONFIG_WIFI_SCAN` |  |
 | `wifi_smmu` | K | `hakios.wifi.c`, `hakios.wifi.pci.c` | `CONFIG_WIFI_SMMU` | implied by wifi=1 (as 2); with wifi_soc=8450 a string: translate or bypass |
 | `wifi_soc` | K | `hakios.wifi.pci.c`, `lx_80211.c`, `lx_base.c`, `lx_bus.c`, `lx_pci.c` | `CONFIG_WIFI_SOC` |  |
@@ -162,6 +168,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `wifi_wait` | K | `hakios.wifi.c` | `CONFIG_WIFI_WAIT` |  |
 | `wifi_watch` | K | `hakios.wifi.c` | `CONFIG_WIFI_WATCH` |  |
 | `wifi_wide` | K | `lx_80211.c` | `CONFIG_WIFI_WIDE` | implied by wifi=1 |
+| `wifi_wmi_debug` | K | `lx_bus.c` | `CONFIG_WIFI_WMI_DEBUG` |  |
 | `wifi_wmm` | K | `hakios.lx.c` | `CONFIG_WIFI_WMM` |  |
 
 ## Cellular (53)
@@ -222,7 +229,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `soc_pas_mpss` | K | `hakios.mpss.c` | `CONFIG_SOC_PAS_MPSS` |  |
 | `soc_smem` | K | `hakios.mpss.c`, `hakios.socinfo.c` | `CONFIG_SOC_SMEM` |  |
 
-## Audio and battery (46)
+## Audio and battery (47)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -267,29 +274,42 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `sound_below` | K | `hakios.sound.c` | `CONFIG_SOUND_BELOW` |  |
 | `sound_gain` | K | `hakios.sound.c` | `CONFIG_SOUND_GAIN` |  |
 | `sound_guard_as` | K | `hakios.sound.c` | `CONFIG_SOUND_GUARD_AS` |  |
+| `sound_idle` | K | `hakios.sound.c` | `CONFIG_SOUND_IDLE` |  |
 | `sound_pause` | K | `hakios.sound.c` | `CONFIG_SOUND_PAUSE` |  |
 | `sound_secs` | K | `hakios.sound.c` | `CONFIG_SOUND_SECS` |  |
 | `sound_soc` | K | `hakios.sound.c` | `CONFIG_SOUND_SOC` |  |
 | `speaker_probe` | K | `hakios.speaker.c` | `CONFIG_SPEAKER_PROBE` |  |
 | `virtio_sound` | K | `hakios.virtio_sound.c` | `CONFIG_VIRTIO_SOUND` |  |
 
-## Cameras (13)
+## Cameras (19)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
-| `cam` | KL | `hakios.camera.c`, `loader.c` | `CONFIG_CAM` |  |
+| `cam` | KL | `hakios.cam_probe.c`, `hakios.camera.c`, `loader.c` | `CONFIG_CAM` |  |
 | `cam_after` | K | `hakios.camera.c` | `CONFIG_CAM_AFTER` |  |
 | `cam_fake` | K | `hakios.camera.c` | `CONFIG_CAM_FAKE` |  |
 | `cam_fake_fps` | K | `hakios.camera.c` | `CONFIG_CAM_FAKE_FPS` |  |
 | `cam_frames` | K | `hakios.camera.c` | `CONFIG_CAM_FRAMES` |  |
 | `cam_gain` | K | `hakios.camera.c` | `CONFIG_CAM_GAIN` |  |
+| `cam_ife_cdm` | K | `hakios.cam_probe.c` | `CONFIG_CAM_IFE_CDM` |  |
+| `cam_ife_preview` | K | `hakios.cam_probe.c` | `CONFIG_CAM_IFE_PREVIEW` |  |
 | `cam_keep_mb` | K | `hakios.camera.c` | `CONFIG_CAM_KEEP_MB` |  |
 | `cam_mode` | K | `hakios.camera.c` | `CONFIG_CAM_MODE` |  |
 | `cam_pattern` | K | `hakios.camera.c` | `CONFIG_CAM_PATTERN` |  |
+| `cam_probe` | K | `hakios.cam_probe.c` | `CONFIG_CAM_PROBE` |  |
+| `cam_probe_fail` | K | `hakios.cam_probe.c` | `CONFIG_CAM_PROBE_FAIL` |  |
 | `cam_sensor` | K | `hakios.camera.c` | `CONFIG_CAM_SENSOR` |  |
 | `cam_settle` | K | `hakios.camera.c` | `CONFIG_CAM_SETTLE` |  |
 | `cam_shutter` | K | `hakios.camera.c` | `CONFIG_CAM_SHUTTER` |  |
 | `cam_vblank` | K | `hakios.camera.c` | `CONFIG_CAM_VBLANK` |  |
+| `iris` | K | `hakios.cam_probe.c` | `CONFIG_IRIS` |  |
+| `icp` | K | `hakios.cam_probe.c` | `CONFIG_ICP` |  |
+| `iris_probe` | K | `hakios.cam_probe.c` | `CONFIG_IRIS_PROBE` |  |
+| `icp_probe` | K | `hakios.cam_probe.c` | `CONFIG_ICP_PROBE` |  |
+| `icp_slow` | K | `hakios.icp_probe.c` | `CONFIG_ICP_SLOW` |  |
+| `icp_no_ipe_bps` | K | `hakios.icp_probe.c` | `CONFIG_ICP_NO_IPE_BPS` |  |
+| `icp_start` | K | `hakios.icp_probe.c` | `CONFIG_ICP_START` |  |
+| `icp_first` | K | `hakios.icp_probe.c` | `CONFIG_ICP_FIRST` |  |
 
 ## Touch and buttons (12)
 
@@ -308,7 +328,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `touchscreen` | K | `hakios.buttons.c`, `hakios.goodix.c`, `hakios.s3908.c` | `CONFIG_TOUCHSCREEN` |  |
 | `virtio_input` | K | `hakios.virtio_input.c` | `CONFIG_VIRTIO_INPUT` |  |
 
-## Storage and APFS (44)
+## Storage and APFS (47)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -341,8 +361,10 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `apfs_write_byte` | K | `hakios.apfs_check.c` | `CONFIG_APFS_WRITE_BYTE` |  |
 | `apfs_write_len` | K | `hakios.apfs_check.c` | `CONFIG_APFS_WRITE_LEN` |  |
 | `apfs_write_path` | K | `hakios.apfs_check.c` | `CONFIG_APFS_WRITE_PATH` |  |
+| `ufs_auto_hibern8_ms` | K | `hakios.ufshc.c` | `CONFIG_UFS_AUTO_HIBERN8_MS` |  |
 | `ufs_bench` | K | `hakios.ufs.c` | `CONFIG_UFS_BENCH` |  |
 | `ufs_check` | K | `hakios.ufs.c` | `CONFIG_UFS_CHECK` |  |
+| `ufs_clock_gating` | K | `hakios.ufshc.c` | `CONFIG_UFS_CLOCK_GATING` |  |
 | `ufs_native` | KL | `hakios.ufs.c`, `loader.c` | `CONFIG_UFS_NATIVE` |  |
 | `ufs_native_bench` | K | `hakios.ufs.c` | `CONFIG_UFS_NATIVE_BENCH` |  |
 | `ufs_native_buffer` | K | `hakios.ufshc.c` | `CONFIG_UFS_NATIVE_BUFFER` |  |
@@ -352,6 +374,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs_native_slots` | K | `hakios.ufshc.c` | `CONFIG_UFS_NATIVE_SLOTS` |  |
 | `ufs_native_spin` | K | `hakios.ufshc.c` | `CONFIG_UFS_NATIVE_SPIN` |  |
 | `ufs_native_write` | K | `hakios.ufs.c` | `CONFIG_UFS_NATIVE_WRITE` |  |
+| `ufs_power_down` | K | `hakios.ufshc.c` | `CONFIG_UFS_POWER_DOWN` |  |
 | `ufs_shared_pa` | K | `hakios.ufs.c` |  | the loader (the address of its block-service page) |
 | `ufs_write` | KL | `hakios.ufs.c`, `loader.c` | `CONFIG_UFS_WRITE` |  |
 | `var_save_ms` | K | `hakios.ufs.c` | `CONFIG_VAR_SAVE_MS` |  |
@@ -392,22 +415,23 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `thermal_tm0` | K | `hakios.thermal.c` | `CONFIG_THERMAL_TM0` |  |
 | `thermal_tm1` | K | `hakios.thermal.c` | `CONFIG_THERMAL_TM1` |  |
 
-## CPU, memory and boot (32)
+## CPU, memory and boot (35)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
-| `-fp_exceptions` | K | `(patch)` | `CONFIG__FP_EXCEPTIONS` |  |
 | `applog` | K | `(patch)` | `CONFIG_APPLOG` |  |
 | `applog_name` | K | `(patch)` | `CONFIG_APPLOG_NAME` |  |
 | `bootcpu` | KL | `loader.c`, `loader_return.c` | `CONFIG_BOOTCPU` |  |
 | `cpu_idle` | K | `psci_smp.c` | `CONFIG_CPU_IDLE` |  |
 | `cpu_idle_cores` | K | `psci_smp.c` | `CONFIG_CPU_IDLE_CORES` |  |
+| `cpu_idle_states` | K | `psci_smp.c` | `CONFIG_CPU_IDLE_STATES` |  |
 | `cpufreq` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ` |  |
 | `cpufreq_epss` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ_EPSS` |  |
 | `cpufreq_gov` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ_GOV` |  |
 | `cpufreq_gov_ms` | K | `hakios.cpufreq.c` | `CONFIG_CPUFREQ_GOV_MS` |  |
 | `cpuload` | K | `hakios.cpufreq.c` | `CONFIG_CPULOAD` |  |
 | `ddr` | K | `hakios.cpufreq.c` | `CONFIG_DDR` |  |
+| `ddr_floor` | K | `hakios.cpufreq.c` | `CONFIG_DDR_FLOOR` |  |
 | `ddr_rest` | K | `hakios.cpufreq.c` | `CONFIG_DDR_REST` |  |
 | `ddr_vote` | K | `hakios.cpufreq.c` | `CONFIG_DDR_VOTE` |  |
 | `epoch` | K | `GenericARMPE.cpp` |  | xl (the host's clock) |
@@ -420,6 +444,8 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `regtrace` | K | `(patch)` | `CONFIG_REGTRACE` |  |
 | `return_cpu` | K | `loader_return.c` | `CONFIG_RETURN_CPU` |  |
 | `return_panic` | K | `loader_return.c` | `CONFIG_RETURN_PANIC` |  |
+| `rpmh_sets` | K | `hakios.cpufreq.c` | `CONFIG_RPMH_SETS` |  |
+| `rpmh_sleep_probe` | K | `hakios.cpufreq.c` | `CONFIG_RPMH_SLEEP_PROBE` |  |
 | `screen_off_cores` | K | `psci_smp.c` | `CONFIG_SCREEN_OFF_CORES` |  |
 | `screen_off_slow` | K | `psci_smp.c` | `CONFIG_SCREEN_OFF_SLOW` |  |
 | `small_cores` | K | `(patch)` | `CONFIG_SMALL_CORES` |  |
@@ -453,7 +479,7 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `ufs_probe` | L | `loader.c` | `CONFIG_UFS_PROBE` |  |
 | `usb_net` | KL | `hakios.usb_net.c`, `loader.c` | `CONFIG_USB_NET` |  |
 
-## User space (41)
+## User space (51)
 
 | Argument | Layer | Read by | Configuration | Set by |
 |---|---|---|---|---|
@@ -483,17 +509,27 @@ Layers: **K** the kernel, **L** the loader, **U** user space (through `sysctl ke
 | `metal_skip` | U | `HakiosMetalCA.m` | `CONFIG_METAL_SKIP` |  |
 | `metal_trace` | U | `HakiosMetalCA.m` | `CONFIG_METAL_TRACE` |  |
 | `metal_watch` | U | `inject.c` | `CONFIG_METAL_WATCH` |  |
+| `pcie_aspm` | K | `hakios.pcie.c` | `CONFIG_PCIE_ASPM` |  |
 | `reboot_fastboot` | K | `hakios.platform.c` | `CONFIG_REBOOT_FASTBOOT` |  |
 | `root_apfs` | U | `init.c` | `CONFIG_ROOT_APFS` |  |
+| `rpmh_cx_collapse` | K | `hakios.rpmh-arc.h` | `CONFIG_RPMH_CX_COLLAPSE` |  |
+| `rpmh_sleep_arc` | K | `hakios.rpmh-arc.h` | `CONFIG_RPMH_SLEEP_ARC` |  |
 | `sb_delay` | U | `inject_sb.c` |  | xl (XL_SB_DELAY) |
 | `speaker_soc` | K | `hakios.tfa.c` | `CONFIG_SPEAKER_SOC` |  |
 | `switcher_wallpaper` | U | `inject_sb.c` | `CONFIG_SWITCHER_WALLPAPER` |  |
 | `touch_bus` | K | `hakios.s3908.c` | `CONFIG_TOUCH_BUS` |  |
+| `touch_idle_keep` | K | `hakios.s3908.c` | `CONFIG_TOUCH_IDLE_KEEP` |  |
+| `touch_idle_ms` | K | `hakios.s3908.c` | `CONFIG_TOUCH_IDLE_MS` |  |
 | `touch_irq` | K | `hakios.s3908.c` | `CONFIG_TOUCH_IRQ` |  |
+| `touch_pdc` | K | `hakios.s3908.c` | `CONFIG_TOUCH_PDC` |  |
 | `tu_debug` | U | `HakiosMetalCA.m` | `CONFIG_TU_DEBUG` |  |
 | `ui_lite` | U | `inject_sb.c` | `CONFIG_UI_LITE` |  |
+| `usb_irq` | K | `hakios.usb_net.c` | `CONFIG_USB_IRQ` |  |
 | `usb_net_ip` | K | `hakios.usb_net.c` | `CONFIG_USB_NET_IP` |  |
+| `usb_park` | K | `hakios.usb_net.c` | `CONFIG_USB_PARK` |  |
+| `usb_park_trace` | K | `hakios.usb_net.c` | `CONFIG_USB_PARK_TRACE` |  |
 | `usb_phyguard` | K | `hakios.usb_net.c` | `CONFIG_USB_PHYGUARD` |  |
+| `usb_stats` | K | `hakios.usb_net.c` | `CONFIG_USB_STATS` |  |
 | `var_hfs` | U | `init.c` | `CONFIG_VAR_HFS` |  |
 | `var_store` | U | `init.c` | `CONFIG_VAR_STORE` |  |
 | `wallpaper_cache` | U | `inject_sb.c` | `CONFIG_WALLPAPER_CACHE` |  |

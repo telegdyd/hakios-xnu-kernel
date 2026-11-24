@@ -1,4 +1,3 @@
-_FP_EXCEPTIONS	arg	-fp_exceptions	CPU, memory and boot	k	(patch)	
 ADRENO	arg	adreno	GPU and display	k	hakios.adreno.c	
 ADRENO_BLIND	arg	adreno_blind	GPU and display	k	hakios.adreno.c	
 ADRENO_DIRTY	arg	adreno_dirty	GPU and display	k	hakios.adreno.c	
@@ -82,9 +81,13 @@ CAM_FAKE	arg	cam_fake	Cameras	k	hakios.camera.c
 CAM_FAKE_FPS	arg	cam_fake_fps	Cameras	k	hakios.camera.c	
 CAM_FRAMES	arg	cam_frames	Cameras	k	hakios.camera.c	
 CAM_GAIN	arg	cam_gain	Cameras	k	hakios.camera.c	
+CAM_IFE_CDM	arg	cam_ife_cdm	Cameras	k	hakios.cam_probe.c	Run level 5's captured IFE register and DMI writes through RT CDM0
+CAM_IFE_PREVIEW	arg	cam_ife_preview	Cameras	k	hakios.cam_probe.c	Serve IFE FULL NV12 alongside RAW10 on ordinary camera boots
 CAM_KEEP_MB	arg	cam_keep_mb	Cameras	k	hakios.camera.c	
 CAM_MODE	arg	cam_mode	Cameras	k	hakios.camera.c	
 CAM_PATTERN	arg	cam_pattern	Cameras	k	hakios.camera.c	
+CAM_PROBE	arg	cam_probe	Cameras	k	hakios.cam_probe.c	Rear IMX789 chip ID at 1, then IFE test-pattern capture at 2, then IMX789 mode 1 (4000 x 3008 RAW10, three-trio C-PHY on CSIPHY1) at 3, then
+CAM_PROBE_FAIL	arg	cam_probe_fail	Cameras	k	hakios.cam_probe.c	
 CAM_SENSOR	arg	cam_sensor	Cameras	k	hakios.camera.c	
 CAM_SETTLE	arg	cam_settle	Cameras	k	hakios.camera.c	
 CAM_SHUTTER	arg	cam_shutter	Cameras	k	hakios.camera.c	
@@ -92,14 +95,17 @@ CAM_VBLANK	arg	cam_vblank	Cameras	k	hakios.camera.c
 CC_FADE	arg	cc_fade	User space	u	inject_sb.c	
 CPU_IDLE	arg	cpu_idle	CPU, memory and boot	k	psci_smp.c	
 CPU_IDLE_CORES	arg	cpu_idle_cores	CPU, memory and boot	k	psci_smp.c	
+CPU_IDLE_STATES	arg	cpu_idle_states	CPU, memory and boot	k	psci_smp.c	
 CPUFREQ_EPSS	arg	cpufreq_epss	CPU, memory and boot	k	hakios.cpufreq.c	the first domain's registers, when this is not the reference phone (the OnePlus 10 Pro, SM8450: 0x17d91000, dt qcom,cpufreq-hw)
 CPUFREQ_GOV	arg	cpufreq_gov	CPU, memory and boot	k	hakios.cpufreq.c	
 CPUFREQ_GOV_MS	arg	cpufreq_gov_ms	CPU, memory and boot	k	hakios.cpufreq.c	
 CPULOAD	arg	cpuload	CPU, memory and boot	k	hakios.cpufreq.c	every MS milliseconds, how busy each of our cores was meanwhile, in percent, to the loader's log (tools/frames.py shows it per gesture)
 CPUMASK	arg	cpumask	Loader	l	loader.c	
 DDR	arg	ddr	CPU, memory and boot	k	hakios.cpufreq.c	the memory's bus clock managers ("BCM") in the command database the boot loader left, with what is needed to vote for bandwidth on them -- only read
+DDR_FLOOR	arg	ddr_floor	CPU, memory and boot	k	hakios.cpufreq.c	
 DDR_REST	arg	ddr_rest	CPU, memory and boot	k	hakios.cpufreq.c	
 DDR_VOTE	arg	ddr_vote	CPU, memory and boot	k	hakios.cpufreq.c	
+DISPLAY_POWER_DOWN	arg	display_power_down	GPU and display	k	hakios.backlight.cpp	the display's hardware stays on while the panel sleeps (hakios.display-power.h)
 DISPLAY_PROBE	arg	display_probe	GPU and display	k	hakios.adreno.c	before any step: read what the firmware left the display controller doing (display_probe() below; two clocks are turned on, nothing else written)
 FB_BEAM	arg	fb_beam	GPU and display	k	MiniIOMobileFramebuffer.cpp	frames written to the panel's memory whenever their beat comes, as before
 FB_BEAT	arg	fb_beat	GPU and display	k	MiniIOMobileFramebuffer.cpp	
@@ -170,6 +176,14 @@ GPU_POWER_CONTROL	arg	gpu_power_control	GPU and display	k	hakios.adreno.c	A730 r
 GPU_SLUMBER	arg	gpu_slumber	GPU and display	k	hakios.adreno.c	A730 experimental deeper idle collapse after 1 second; default 0
 HANG_DETECT	arg	hang_detect	CPU, memory and boot	k	loader_return.c	
 HAPTIC_EFFECT	arg	haptic_effect	Haptics and torch	k	hakios.haptic.c	
+IRIS	arg	iris	Cameras	k	hakios.cam_probe.c	Serve Iris2 still encoding on /dev/hakios-iris with cam=5 (hakios.iris_probe.c level 7)
+ICP	arg	icp	Cameras	k	hakios.cam_probe.c	Camera.app stills through the ISP's BPS and IPE on /dev/hakios-icp with cam=5 (hakios.icp_probe.c), IFE still on failure
+IRIS_PROBE	arg	iris_probe	Cameras	k	hakios.cam_probe.c	Iris2 diagnostic levels 1-6 with cam=0 (hakios.iris_probe.c); 7 is the iris=1 service
+ICP_SLOW	arg	icp_slow	Cameras	k	hakios.icp_probe.c	ICP diagnostic: pause this many ms after each log line
+ICP_NO_IPE_BPS	arg	icp_no_ipe_bps	Cameras	k	hakios.icp_probe.c	ICP diagnostic: leave BPS and IPE powered off
+ICP_START	arg	icp_start	Cameras	k	hakios.icp_probe.c	ICP diagnostic: start this many seconds after boot
+ICP_FIRST	arg	icp_first	Cameras	k	hakios.icp_probe.c	ICP diagnostic level 4: start at this firmware window
+ICP_PROBE	arg	icp_probe	Cameras	k	hakios.cam_probe.c	Camera ICP diagnostic with cam=0 (hakios.icp_probe.c): 1 power, 2 CAMERA_ICP firmware, SYS_INIT and ping, 3 firmware start and stop, 4 timed firmware windows, 5 one stock BPS frame (fw/BPS_REPLAY.bin)
 ITS_PROBE	arg	its_probe	User space	k	hakios.its.c	a second after start: the GIC's registers said, then the self-test (DeviceID 1, one event, the ITS's own INT command, the handler must run) -> "its:
 LOADER_STAY	arg	loader_stay	Loader	l	loader.c	
 M2V_UTRACE	arg	m2v_utrace	User space	u	HakiosMetalCA.m	Turnip's GPU trace of every render pass (u_trace) into a file, printed during the run
@@ -235,8 +249,9 @@ MODEM_SIM_SWITCH_OFF	arg	modem_sim_switch_off	Cellular	k	hakios.mpss.c
 MODEM_STEP	arg	modem_step	Cellular	k	hakios.mpss.c	the steps once the root is there, then back to the loader if modem_return=1 says so
 MODEM_WAIT	arg	modem_wait	Cellular	k	hakios.mpss.c	
 MODEM_WDA_OFF	arg	modem_wda_off	Cellular	k	hakios.mpss.c	
-PCIE	arg	pcie	Wi-Fi	k	hakios.wifi.pci.c	only the link test, C2 up and down without Wi-Fi (hakios.pcie.c); it excludes wifi=1
-PCIE_GEN	arg	pcie_gen	Wi-Fi	k	hakios.wifi.pci.c	the highest link generation, 1 or 2; default 2
+PCIE	arg	pcie	Wi-Fi	k	hakios.pcie.c,hakios.wifi.pci.c	only the link test, C2 up and down without Wi-Fi (hakios.pcie.c); it excludes wifi=1
+PCIE_ASPM	arg	pcie_aspm	User space	k	hakios.pcie.c	
+PCIE_GEN	arg	pcie_gen	Wi-Fi	k	hakios.pcie.c,hakios.wifi.pci.c	the highest link generation, 1 or 2; default 2
 PCIE_PAUSE	arg	pcie_pause	Wi-Fi	k	hakios.pcie.c,hakios.wifi.pci.c	a line before each group of accesses of stage 1, then that long a wait, so that the last line
 PMIC_LIST	arg	pmic_list	Chip, thermal and PMIC	k	hakios.pmic.c	only the clock, not the inventory of every block
 PRESS_POWER	arg	press_power	Touch and buttons	k	hakios.buttons.c	a short press of the power key that many seconds after boot, and another ten seconds later, given to Darwin as the key's own are (hakios_touch_post):
@@ -256,6 +271,10 @@ REGTRACE	arg	regtrace	CPU, memory and boot	k	(patch)
 RETURN_CPU	arg	return_cpu	CPU, memory and boot	k	loader_return.c	
 RETURN_PANIC	arg	return_panic	CPU, memory and boot	k	loader_return.c	
 ROOT_APFS	arg	root_apfs	User space	u	init.c	the root is to be the Darwin root volume on /dev/DEV -- the phone's flash, read only
+RPMH_CX_COLLAPSE	arg	rpmh_cx_collapse	User space	k	hakios.rpmh-arc.h	
+RPMH_SETS	arg	rpmh_sets	CPU, memory and boot	k	hakios.cpufreq.c	
+RPMH_SLEEP_ARC	arg	rpmh_sleep_arc	User space	k	hakios.rpmh-arc.h	
+RPMH_SLEEP_PROBE	arg	rpmh_sleep_probe	CPU, memory and boot	k	hakios.cpufreq.c	
 SCREEN_OFF_CORES	arg	screen_off_cores	CPU, memory and boot	k	psci_smp.c	
 SCREEN_OFF_SLOW	arg	screen_off_slow	CPU, memory and boot	k	psci_smp.c	
 SERIAL	arg	serial	Loader	l	loader.c	
@@ -276,6 +295,7 @@ SOC_SMEM_SIZE	hex	soc_smem_size	Chip, thermal and PMIC	k	hakios.socinfo.c
 SOUND_BELOW	arg	sound_below	Audio and battery	k	hakios.sound.c	
 SOUND_GAIN	arg	sound_gain	Audio and battery	k	hakios.sound.c	
 SOUND_GUARD_AS	arg	sound_guard_as	Audio and battery	k	hakios.sound.c	
+SOUND_IDLE	arg	sound_idle	Audio and battery	k	hakios.sound.c	
 SOUND_PAUSE	arg	sound_pause	Audio and battery	k	hakios.sound.c	
 SOUND_SECS	arg	sound_secs	Audio and battery	k	hakios.sound.c	
 SOUND_SOC	arg	sound_soc	Audio and battery	k	hakios.sound.c	
@@ -299,14 +319,19 @@ TORCH_MAX_S	arg	torch_max_s	Haptics and torch	k	hakios.torch.c
 TORCH_SECS	arg	torch_secs	Haptics and torch	k	hakios.torch.c	
 TOUCH_BUS	arg	touch_bus	User space	k	hakios.s3908.c	before anything else, a look at the hardware a real I2C would need, written to the log (s3908: bus ...)
 TOUCH_FLIP	arg	touch_flip	Touch and buttons	k	hakios.goodix.c,hakios.s3908.c	
+TOUCH_IDLE_KEEP	arg	touch_idle_keep	User space	k	hakios.s3908.c	
+TOUCH_IDLE_MS	arg	touch_idle_ms	User space	k	hakios.s3908.c	
 TOUCH_IRQ	arg	touch_irq	User space	k	hakios.s3908.c	the thread looks every 10 ms instead
 TOUCH_LAT	arg	touch_lat	GPU and display	ku	HakiosMetalCA.m,MiniIOMobileFramebuffer.cpp,eagl.c,hakios.goodix.c,hakios.gpu.cpp,hakios.input.c,inject.c,inject_sb.c	a line for every wait of a program's for the GPU that took a millisecond or more ("tl: f KIND US at US"), for telling apart what holds a frame up
+TOUCH_PDC	arg	touch_pdc	User space	k	hakios.s3908.c	use the old TLMM summary interrupt (GIC 240); it cannot wake a collapsed CX domain
 TOUCH_POLL_US	arg	touch_poll_us	Touch and buttons	k	hakios.goodix.c	
 TOUCH_RATE	arg	touch_rate	Touch and buttons	k	hakios.goodix.c	the chip reports twice as often (Xiaomi's game mode; 240 otherwise)
 TOUCH_SPI_HZ	arg	touch_spi_hz	Touch and buttons	k	hakios.goodix.c	the bus at N Hz (Android's device tree gives the chip 5 MHz)
 TU_DEBUG	arg	tu_debug	User space	u	HakiosMetalCA.m	Turnip's TU_DEBUG in the window server (sysmem, gmem, forcebin, ...)
+UFS_AUTO_HIBERN8_MS	arg	ufs_auto_hibern8_ms	Storage and APFS	k	hakios.ufshc.c	
 UFS_BENCH	arg	ufs_bench	Storage and APFS	k	hakios.ufs.c	what one request through the loader costs, by size
 UFS_CHECK	arg	ufs_check	Storage and APFS	k	hakios.ufs.c	
+UFS_CLOCK_GATING	arg	ufs_clock_gating	Storage and APFS	k	hakios.ufshc.c	
 UFS_NATIVE	arg	ufs_native	Storage and APFS	kl	hakios.ufs.c,loader.c	through this kernel's own driver instead, its own transfer list in the controller for the run, if all is as expected; 2: only look; 3: a dry run --
 UFS_NATIVE_BENCH	arg	ufs_native_bench	Storage and APFS	k	hakios.ufs.c	
 UFS_NATIVE_BUFFER	hex	ufs_native_buffer	Storage and APFS	k	hakios.ufshc.c	
@@ -316,10 +341,15 @@ UFS_NATIVE_LEAVE	arg	ufs_native_leave	Storage and APFS	k	hakios.ufshc.c
 UFS_NATIVE_SLOTS	arg	ufs_native_slots	Storage and APFS	k	hakios.ufshc.c	
 UFS_NATIVE_SPIN	arg	ufs_native_spin	Storage and APFS	k	hakios.ufshc.c	
 UFS_NATIVE_WRITE	arg	ufs_native_write	Storage and APFS	k	hakios.ufs.c	Native reads, writes and flushes without a loader storage service
+UFS_POWER_DOWN	arg	ufs_power_down	Storage and APFS	k	hakios.ufshc.c	
 UFS_PROBE	arg	ufs_probe	Loader	l	loader.c	
 UI_LITE	arg	ui_lite	User space	u	inject_sb.c	the system's own "Reduce Transparency" and "Reduce Motion" (Settings, Accessibility), for this
+USB_IRQ	arg	usb_irq	User space	k	hakios.usb_net.c	Wake on event interrupts, with a 1 s recovery timeout; 0 keeps polling
 USB_NET_IP	arg	usb_net_ip	User space	k	hakios.usb_net.c	
+USB_PARK	arg	usb_park	User space	k	hakios.usb_net.c	
+USB_PARK_TRACE	arg	usb_park_trace	User space	k	hakios.usb_net.c	
 USB_PHYGUARD	arg	usb_phyguard	User space	k	hakios.usb_net.c	
+USB_STATS	arg	usb_stats	User space	k	hakios.usb_net.c	Keep periodic counter messages off; 1 prints them every 30 s
 USTACKS	arg	ustacks	Debugging	k	user_exception_trace.c	
 USTACKS_AT	arg	ustacks_at	Debugging	k	user_exception_trace.c	
 USTACKS_COUNT	arg	ustacks_count	Debugging	k	user_exception_trace.c	
@@ -345,6 +375,7 @@ WIFI_DELAY	arg	wifi_delay	Wi-Fi	k	hakios.wifi.pci.c	the chain waits S seconds be
 WIFI_DIRTY	arg	wifi_dirty	Wi-Fi	k	hakios.wifi.c	
 WIFI_FILE	arg	wifi_file	Wi-Fi	k	hakios.wifi.c	with wifi=1: the network of fw/network is not joined at the start
 WIFI_FINE	arg	wifi_fine	Wi-Fi	k	hakios.wifi.c	such a step waits like that before every single write and call
+WIFI_FWLOG	arg	wifi_fwlog	Wi-Fi	k	lx_bus.c	
 WIFI_HOLD	arg	wifi_hold	Wi-Fi	k	lx_bus.c	
 WIFI_HOSTCAP_ATH	arg	wifi_hostcap_ath	Wi-Fi	k	lx_bus.c	
 WIFI_IRQ	arg	wifi_irq	Wi-Fi	k	lx_bus.c	
@@ -358,16 +389,20 @@ WIFI_LX_STEP	arg	wifi_lx_step	Wi-Fi	k	lx_base.c
 WIFI_MAC	arg	wifi_mac	Wi-Fi	k	hakios.wifi.c,hakios.wifi.pci.c	the radio's own address for the driver (hakios_wifi_radio_address() below; xl takes it from a file that is not in the repository)
 WIFI_MHI_DUMP	arg	wifi_mhi_dump	Wi-Fi	k	hakios.wifi.pci.c,lx_mhi.c	the registers the BHI/MHI keep of a failed or stalled boot (iOSPlus10 0339/0343)
 WIFI_MHI_FAIL	arg	wifi_mhi_fail	Wi-Fi	k	lx_mhi.c	the first power-up of the boot is made to time out, for the chain's retry (hakios.wifi.pci.c)
+WIFI_MHI_IDLE	arg	wifi_mhi_idle	Wi-Fi	k	lx_mhi.c	
+WIFI_MHI_M3	arg	wifi_mhi_m3	Wi-Fi	k	lx_mhi.c	
 WIFI_MISSION	arg	wifi_mission	Wi-Fi	k	hakios.wlfw.c	
 WIFI_MSI	arg	wifi_msi	Wi-Fi	k	hakios.wifi.pci.c,lx_pci.c	one message-signalled interrupt vector instead of the 32 that are enabled before MHI powers up (lx_pci.c)
 WIFI_NEW	arg	wifi_new	Wi-Fi	k	hakios.wifi.c	steps K and later have not been seen to work (default: the last one)
 WIFI_OFFLOAD	arg	wifi_offload	Wi-Fi	k	hakios.lx.c	
 WIFI_PAUSE	arg	wifi_pause	Wi-Fi	k	hakios.wifi.c	
+WIFI_PCIE_OFF	arg	wifi_pcie_off	Wi-Fi	k	lx_80211.c	
 WIFI_PSK	arg	wifi_psk	Wi-Fi	k	hakios.wifi.pci.c	its WPA2 passphrase, 8 to 63 bytes; it is said in no line of any log
 WIFI_QUIET	arg	wifi_quiet	Wi-Fi	k	lx_bus.c	
 WIFI_RADIO_READ	arg	wifi_radio_read	Wi-Fi	k	hakios.wifi.c	step 16 does read (2: whatever mode the firmware is in)
 WIFI_READY	arg	wifi_ready	Wi-Fi	k	hakios.wlfw.c	
 WIFI_RETURN	arg	wifi_return	Wi-Fi	k	hakios.wifi.c	when all is over, go back to the loader instead of starting the system
+WIFI_RX_ETH	arg	wifi_rx_eth	Wi-Fi	k	lx_80211.c	
 WIFI_SCAN	arg	wifi_scan	Wi-Fi	k	lx_bus.c	
 WIFI_SMMU	arg	wifi_smmu	Wi-Fi	k	hakios.wifi.c,hakios.wifi.pci.c	before any step: read what the boot chain has set up in the SMMU for the radio's stream (smmu_look() below; nothing is written)
 WIFI_SOC	arg	wifi_soc	Wi-Fi	k	hakios.wifi.pci.c,lx_80211.c,lx_base.c,lx_bus.c,lx_pci.c	the OnePlus 10 Pro's radio, on PCIe0: this file runs the Wi-Fi and redwood's WPSS steps are left out
@@ -377,5 +412,6 @@ WIFI_STEP	arg	wifi_step	Wi-Fi	k	hakios.wifi.c
 WIFI_WAIT	arg	wifi_wait	Wi-Fi	k	hakios.wifi.c	how long step 11 watches for the DSP to say that it is up (default 10)
 WIFI_WATCH	arg	wifi_watch	Wi-Fi	k	hakios.wifi.c	
 WIFI_WIDE	arg	wifi_wide	Wi-Fi	k	lx_80211.c	
+WIFI_WMI_DEBUG	arg	wifi_wmi_debug	Wi-Fi	k	lx_bus.c	
 WIFI_WMM	arg	wifi_wmm	Wi-Fi	k	hakios.lx.c	
 XPCPROXY_IDVERSION	arg	xpcproxy_idversion	CPU, memory and boot	k	(patch)	

@@ -41,7 +41,11 @@ struct hakios_camera_frame {
 	uint32_t        sensor;         /* which: 0 the macro, 1 the wide, 2 the front, 3 the ultra-wide camera */
 	uint32_t        focus;          /* the lens's position as last set, 0 (the furthest) to 1023: HAKIOS_CAMERA_NO_FOCUS where it
 	                                 * has no motor (or it does not answer) */
-	uint32_t        reserved[5];
+	/* Optional full-range NV12 after the RAW10 bytes, Y then UV with the same stride.
+	 * Zero dimensions mean there is no processed preview. The metadata applies to both. */
+	uint32_t        preview_width, preview_height, preview_stride;
+	uint32_t        exposure_lines_min; /* zero on older kernels */
+	uint32_t        reserved[1];
 };
 
 #define HAKIOS_CAMERA_NO_FOCUS 0xffffffffu

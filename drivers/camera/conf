@@ -10,3 +10,11 @@ driver CAMERA
 driver TORCH
 	file    bsd/dev/hakios.torch.c
 	help    the flashlight: the flash LED module of the PM8350C (torch=1); it stays off while the battery is too warm
+
+driver CAM_PROBE
+	file    bsd/dev/hakios.cam_probe.c
+	file    bsd/dev/hakios.iris_probe.c
+	file    bsd/dev/hakios.icp_probe.c
+	requires CPUFREQ
+	default n
+	help    OnePlus 10 Pro rear IMX789 camera (cam=5, and diagnostics cam_probe=1..4)

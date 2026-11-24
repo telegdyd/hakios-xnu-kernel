@@ -4450,6 +4450,74 @@ print_banner(void)
 	print("\n");
 }
 
+/*
+ * What a warm reset left of the camera: GCC's camera AHB, HF/SF AXI and XO branches (always readable), and, only while
+ * the camera AHB branch runs (CamCC hangs the bus without it), the Titan top GDSC and the ICP and ICP AHB branches. An
+ * ICP probe that reset the SoC left the next boot stopping after "usb: started" (CAMERA-PLAN step 5.2).
+ */
+static void
+oneshot_camera_note(void)
+{
+	volatile const uint32_t *gcc = (volatile const uint32_t *)0x136000ul;
+	uint32_t ahb = gcc[0x004 / 4], hf = gcc[0x010 / 4], sf = gcc[0x018 / 4], xo = gcc[0x020 / 4];
+	print("camera at start: GCC AHB %x HF AXI %x SF AXI %x XO %x; IMEM restart reason %x\n", (uint64_t)ahb,
+	    (uint64_t)hf, (uint64_t)sf, (uint64_t)xo, (uint64_t)*(volatile const uint32_t *)0x146aa65cul);
+	if ((ahb & 1) && !(ahb & 0x80000000u)) {
+		volatile const uint32_t *cc = (volatile const uint32_t *)0xade0000ul;
+		print("camera at start: Titan GDSC %x ICP %x ICP AHB %x BPS GDSC %x IPE GDSC %x\n",
+		    (uint64_t)cc[0x131dc / 4], (uint64_t)cc[0x13120 / 4], (uint64_t)cc[0x13128 / 4],
+		    (uint64_t)cc[0x10004 / 4], (uint64_t)cc[0x10078 / 4]);
+	}
+}
+
+/*
+ * The one-shot boot's USB, after a reset by the ICP probe: the boot stopped for good between 1.0 and 1.5 s into the
+ * poll window, inside Qualcomm's USB driver (owner's photo, 2026-11-23), with the camera's clocks off. Suspected: the
+ * controller as XNU's NCM driver left it. So the driver stops and starts the controller once (usb_restart's way), and
+ * the window only pumps the driver's events: this boot takes no host command, so no receive is queued. Each event is
+ * shown, so a stop names its call.
+ */
+static int
+oneshot_usb(void)
+{
+	if (!usb_start()) {
+		return 0;
+	}
+	efi_status s = USB->stop();
+	usb_connected = 0;
+	usb_rx_queued = 0;
+	print("one-shot 1: USB stopped (%x), starting again\n", (uint64_t)s);
+	if (!usb_start()) {
+		return 0;
+	}
+	uint64_t began = READ_SYSREG(CNTVCT_EL0), said = began, polls = 0;
+	unsigned shown = 0;
+	print("one-shot 2: USB events, no receive queued\n");
+	while (seconds_since(began) < 2) {
+		uint32_t msg = UsbDeviceEventNoEvent;
+		uint64_t size = 0;
+		usb_device_event_data data;
+		USB->handle_event(&msg, &size, &data);
+		polls++;
+		if (msg != UsbDeviceEventNoEvent && shown < 16) {
+			shown++;
+			print("one-shot 2: %d ms event %d state %d endpoint %d\n",
+			    (READ_SYSREG(CNTVCT_EL0) - began) * 1000 / READ_SYSREG(CNTFRQ_EL0), (uint64_t)msg,
+			    (uint64_t)(msg == UsbDeviceEventDeviceStateChange ? data.device_state : 0),
+			    (uint64_t)(msg == UsbDeviceEventTransferNotification ? data.transfer.endpoint_index : 0));
+		}
+		if (msg == UsbDeviceEventDeviceStateChange) {
+			usb_connected = (data.device_state == UsbDeviceStateConnected);
+		}
+		BS->stall(1000);
+		if ((READ_SYSREG(CNTVCT_EL0) - said) * 2 >= READ_SYSREG(CNTFRQ_EL0)) {
+			said = READ_SYSREG(CNTVCT_EL0);
+			print("one-shot 2: %d ms, %d polls\n", (said - began) * 1000 / READ_SYSREG(CNTFRQ_EL0), polls);
+		}
+	}
+	return 1;
+}
+
 efi_status EFIAPI
 efi_main(efi_handle image, efi_system_table *st)
 {
@@ -4516,15 +4584,24 @@ efi_main(efi_handle image, efi_system_table *st)
 		/* Qualcomm's USB firmware also prepares the PHY. A hostless boot has
 		 * not visited the USB command loop, but the kernel's NCM driver still
 		 * needs that preparation before taking ownership of the controller. */
-		if (PLAT == &platform_negroni && !pi.usb_mode && usb_start()) {
-			/* StartEx is asynchronous: let the DXE finish cable/controller
-			 * setup before XNU takes ownership. This bounded delay also works
-			 * with no cable, and never waits for a host command. */
-			uint64_t began = READ_SYSREG(CNTVCT_EL0);
-			while (seconds_since(began) < 2) {
-				usb_poll_command();
-				BS->stall(1000);
-			}
+		/*
+		 * Numbered steps on the screen: after a reset caused by the camera ICP probe this boot stopped for good
+		 * after "usb: started", with the USB device enumerated but no transfer ever served and the watchdog not
+		 * biting (2026-11-23). The last line shown says where.
+		 */
+		if (PLAT == &platform_negroni && !pi.usb_mode) {
+			oneshot_camera_note();
+			print("one-shot 1: USB start\n");
+		}
+		/* StartEx is asynchronous: let the DXE finish cable/controller setup before XNU takes ownership. This
+		 * bounded delay also works with no cable, and never waits for a host command (oneshot_usb). */
+		if (PLAT == &platform_negroni && !pi.usb_mode) {
+			(void)oneshot_usb();
+		}
+		if (PLAT == &platform_negroni && !pi.usb_mode) {
+			uint64_t ctl = 0, since = 0;
+			uint64_t st = PLAT->hypervisor_wdt ? smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since) : ~0ull;
+			print("one-shot 3: running the kernel (watchdog status %x ctl %x since_pet %x)\n", st, ctl, since);
 		}
 		run_kernel(0, 0);
 		/*

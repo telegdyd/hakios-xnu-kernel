@@ -45,7 +45,7 @@ TUNABLE = re.compile(r'\bTUNABLE\w*\(\s*[^,()]+,\s*[^,()]+,\s*"([A-Za-z0-9_.\-]+
 # literal at the call: option("modem_again") in hakios.mpss.c and hakios.adsp.c (a static function in each), and for
 # Wi-Fi hakios_wifi_option("wifi_keep") with lx_os_option("wifi_irq") of the Linux layer in wifi/lx/src, which calls it.
 # A scan for PE_parse_boot_argn("...") alone misses all of them (about forty names), so these are scanned too.
-WRAPPED = re.compile(r'\b(?:hakios_wifi_option|lx_os_option)\(\s*"([a-z][a-z0-9_]*)"')
+WRAPPED = re.compile(r'\b(?:hakios_wifi_option|lx_os_option|numeric_word)\(\s*"([a-z][a-z0-9_]*)"')
 OPTION_DEF = re.compile(r'^option\(const char \*name\)', re.M)
 OPTION_CALL = re.compile(r'\boption\(\s*"([a-z][a-z0-9_]*)"')
 # ... and user space has its own: boot_arg("var_store") in init.c (a static function that reads sysctl kern.bootargs)
@@ -65,7 +65,7 @@ GROUPS = [
     ("Wi-Fi", r"hakios\.(wifi|wlfw|lx|sta|apple80211)\.|^lx_[a-z0-9]+\.c$"),     # wifi/lx/src/lx_*.c: the Linux layer
     ("Cellular", r"hakios\.(mpss|ipa|cell|nas|qmi)\."),
     ("Audio and battery", r"hakios\.(adsp|audio|sound|speaker|mic|virtio_sound|battery|battery_bcl|battguard)\."),
-    ("Cameras", r"hakios\.camera\."),
+    ("Cameras", r"hakios\.(camera|cam_probe)\."),
     ("Touch and buttons", r"hakios\.(goodix|input|buttons|virtio_input)\."),
     ("Storage and APFS", r"hakios\.(ufs|ufshc|virtio_blk|sparse|apfs_check)\.|apfs_vfsops\."),
     ("Network", r"hakios\.(net|virtio_net)\."),
@@ -96,6 +96,7 @@ SET_BY = {
     "wifi_irq": "implied by wifi=1",
     "wifi_ba": "implied by wifi=1",
     "wifi_wide": "implied by wifi=1",
+    "wifi_pcie_off": "implied by wifi=1; full PCIe off/on with wifi_soc=8450 (0: station only)",
 }
 
 
