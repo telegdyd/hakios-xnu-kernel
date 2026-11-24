@@ -303,7 +303,7 @@ dcs_start(void)
 	uint32_t version, control;
 
 	gcc = ml_io_map(profile.gcc, 0x80000);
-	dispcc = ml_io_map(profile.dispcc, 0x4000);
+	dispcc = ml_io_map(profile.dispcc, 0x20000);
 	dsi = ml_io_map(profile.dsi, DSI_SIZE);
 	if (!dsi_reachable(mode >= 2)) {
 		say("backlight: dcs: the display block is off or its registers have no clock%s: nothing done\n",

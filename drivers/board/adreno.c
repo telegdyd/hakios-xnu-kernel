@@ -3964,7 +3964,7 @@ hakios_adreno_minute(void)
  * count although the register that enables them reads 0; the line counter goes from 0 to 2431,
  * 429 lines in 1.47 ms. (The first clock is found off again by the next kernel.)
  */
-static struct block dispcc = { "dispcc", 0, 0x4000 };                   /* soc: clocks { } dispcc */
+static struct block dispcc = { "dispcc", 0, 0x20000 };                  /* soc: clocks { } dispcc */
 static struct block disp_intf;                                          /* the interface the panel hangs on */
 #define GCC_DISP_AHB_CBCR       (hakios_board()->clocks.gcc_disp_ahb_cbcr)      /* gcc_disp_ahb_clk */
 /*
@@ -4304,7 +4304,7 @@ hakios_adreno_init(void)
 			uint32_t cfg = rd(gcc.base + board->clocks.gcc_disp_ahb_cbcr);
 			printf("display-clocks: gcc display ahb %#x\n", cfg);
 			if (cfg & 1) {
-				vm_offset_t cc = ml_io_map(board->clocks.dispcc, 0x5000);
+				vm_offset_t cc = ml_io_map(board->clocks.dispcc, 0x20000);
 				if (cc) {
 					uint32_t gdsc = rd(cc + board->clocks.dispcc_mdss_gdscr), ahb = rd(cc + board->clocks.dispcc_mdss_ahb_cbcr);
 					printf("display-clocks: gdsc %#x mdss ahb %#x\n", gdsc, ahb);
