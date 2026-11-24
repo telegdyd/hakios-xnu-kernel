@@ -17,7 +17,7 @@ static char started[1024];
 STARTS(hakios_bt_uart_init)
 STARTS(hakios_scmi_perf_init)
 STARTS(hakios_input_init) STARTS(hakios_cpufreq_init) STARTS(hakios_virtio_input_init) STARTS(hakios_fts_init)
-STARTS(hakios_ft5x06_init)
+STARTS(hakios_ft5x06_init) STARTS(hakios_s3908_init)
 STARTS(hakios_goodix_init) STARTS(hakios_prof_start) STARTS(hakios_buttons_init) STARTS(hakios_rtc_init) STARTS(hakios_battery_init)
 STARTS(hakios_ufs_init) STARTS(hakios_net_init) STARTS(hakios_adreno_init) STARTS(hakios_backlight_init)
 STARTS(hakios_thermal_init) STARTS(hakios_wifi_init) STARTS(hakios_adsp_init) STARTS(hakios_mpss_init) STARTS(hakios_audio_init)
@@ -75,6 +75,7 @@ all_once(const char *touch)
 	}
 	CHECK(times("hakios_fts_init ") == (strcmp(touch, "hakios_fts_init ") == 0), "the FT3658U's driver: %s", started);
 	CHECK(times("hakios_goodix_init ") == (strcmp(touch, "hakios_goodix_init ") == 0), "the Goodix driver: %s", started);
+	CHECK(times("hakios_s3908_init ") == (strcmp(touch, "hakios_s3908_init ") == 0), "the S3908 driver: %s", started);
 	CHECK(times("hakios_ft5x06_init ") == (strcmp(touch, "hakios_ft5x06_init ") == 0), "the FT5x06 family's driver: %s", started);
 	/* what the order is for */
 	before("hakios_input_init ", "hakios_virtio_input_init ");    /* the queue before whoever feeds it */
