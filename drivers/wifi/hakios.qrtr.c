@@ -17,6 +17,7 @@
  * going down) around them, so that they come from one thread at a time. Neither is held across
  * a call into the link (send), and receive is never entered from send.
  */
+#include <kern/clock.h>
 #include <kern/kalloc.h>
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
@@ -435,6 +436,35 @@ hakios_qrtr_poll(void)
 	qrtr_calling_leave();
 }
 
+/*
+ * ... and the wait between two such calls (STANDBY-PLAN.md): until a lookup is made that has not been told yet, or
+ * hakios_qrtr_wake(), or ms. So the thread need not look every millisecond for lookups that come a few times a boot.
+ */
+void
+hakios_qrtr_wait(uint32_t ms)
+{
+	uint64_t deadline;
+	bool fresh = false;
+
+	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+	lck_mtx_lock(&qrtr_lock);
+	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]) && !fresh; p++) {
+		for (unsigned l = 0; l < 4 && !fresh; l++) {
+			fresh = qrtr_ports[p].number != 0 && qrtr_ports[p].lookups[l].fresh;
+		}
+	}
+	if (!fresh) {
+		(void)lck_mtx_sleep_deadline(&qrtr_lock, LCK_SLEEP_DEFAULT, (event_t)&qrtr_ports, THREAD_UNINT, deadline);
+	}
+	lck_mtx_unlock(&qrtr_lock);
+}
+
+void
+hakios_qrtr_wake(void)
+{
+	thread_wakeup((event_t)&qrtr_ports);
+}
+
 /* What the steps of hakios.wifi.c write down about the exchange so far. */
 void
 hakios_qrtr_stats(uint32_t *peer, uint32_t *hellos, uint32_t *in, uint32_t *out, uint32_t *services)
@@ -497,6 +527,7 @@ qrtr_lookup(struct hakios_qrtr_port *port, uint32_t service, uint32_t version, u
 			port->lookups[l].asked = true;
 			port->lookups[l].fresh = true;
 			error = 0;
+			thread_wakeup((event_t)&qrtr_ports);    /* (hakios_qrtr_wait()) */
 		}
 	}
 	lck_mtx_unlock(&qrtr_lock);

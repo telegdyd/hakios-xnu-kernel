@@ -8,6 +8,12 @@ This supersedes the summary in `NOTICE`, which stays as the short, canonical lis
 
 ## Redistributed in this repository
 
+SAE group-19 derivation and SHA-256 in `wifi/lx/src/lx_sae*.c`, and the IEEE/H2E
+fixtures in `tools/sae-test/ieee.inc`, adapt hostap 2.11 (Jouni Malinen and
+contributors), BSD-3-Clause. Full notice: `wifi/lx/src/sae-crypto/HOSTAP-LICENSE`.
+The fixed-size field/Jacobian backend is local code; no external ECC library
+is fetched or linked. See `docs/wifi-sae.md` for source hashes and test origins.
+
 | Component | Path | Origin | License | Notes |
 |---|---|---|---|---|
 | XNU modifications | `xnu/hakios.patch`, `xnu/files/`, `drivers/` | derivative of Apple XNU | APSL 2.0 (`LICENSE.APSL`) | base tag `xnu-8796.121.2`, fetched by `xnu/apply.sh` |
@@ -17,6 +23,7 @@ This supersedes the summary in `NOTICE`, which stays as the short, canonical lis
 | Linux DRM shim | `tools/mesa/hakios-drm/`, `xf86drm.h` | Linux / X.Org | MIT | build-time shim for Mesa |
 | Mesa patches | `tools/mesa/*.patch` (`turnip-darwin.patch` among them) | changes to Mesa, HakiOS | MIT (Mesa's terms for the files they change) | patches only; Mesa itself is fetched |
 | AdrenoMetal patch | `tools/m2v/adrenometal-ios16.patch` | changes to UniXNU/AdrenoMetal, HakiOS | MIT, Copyright (c) 2026 NativeMetal contributors | patch only; the source is fetched. `tools/m2v/ios16-compat.h` is our own, MIT |
+| SM8450 camera probe and test pattern | `drivers/camera/hakios.cam_probe.c`, camera bandwidth settings in `drivers/power/hakios.cpufreq.c` | iOSPlus10 patches 0310–0313 and 0315 | MIT (`LICENSE`), Copyright (c) 2026 iOSPlus10 contributors | adapted to the NE2213 sensor module and HakiOS resource handling |
 | metal2vulkan patch | `tools/m2v/metal2vulkan-hakios.patch` | changes to steelbrain/metal2vulkan, HakiOS | GPL-2.0-or-later OR LGPL-3.0-or-later, as the code it changes; **not MIT** | patch only, and its context lines are their code. The file carries no notice of its own: **to verify** that this is enough |
 | The window server's Metal plug-in | `userland/src/HakiosMetalCA.m` | begun from vcvkk's `userland/src/HakiosMetal.m` (github.com/vcvkk/darwin-redwood, branch hakios-workspace, at eb9fdf5), with this tree's changes | **to verify**: that repository states no license (read 2026-11-04); this tree's changes are MIT | not in `prebuilt/` |
 | AIR / Metal-library tooling | `tools/mesa/air/` | HakiOS (Darwin on redwood contributors) | MIT | our own; LLVM bitcode layout is a published format |

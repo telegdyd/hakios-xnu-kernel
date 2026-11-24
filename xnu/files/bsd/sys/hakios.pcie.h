@@ -25,6 +25,9 @@ int hakios_pcie_up(unsigned rc, struct hakios_pcie_link *link);
  * Invalidates all borrowed BAR pointers. Does not own the SMMU context.
  */
 void hakios_pcie_down(unsigned rc);
+int hakios_pcie_down_status(void); /* 0 only after a complete shutdown; EBUSY while up */
+int hakios_pcie_pm_start(void);
+void hakios_pcie_pm_sample(void);
 /* size=1/2/4, naturally aligned off, off+size<=4096; narrow reads zero-extend.
  * No endpoint config/BAR access before link-up. Failure leaves *value alone.
  */
@@ -35,5 +38,22 @@ int hakios_pcie_cfg_write(unsigned rc, unsigned bdf, unsigned off, unsigned size
  */
 int hakios_pcie_try_read32(const volatile void *va, unsigned *value);
 int hakios_pcie_try_write32(volatile void *va, unsigned value);
+/* Link sleep with the radio powered. sleep: MHI already in M3; saves the endpoint's config, D3hot, PME_Turn_Off,
+ * PERST, controller off, PCIe's bus floor released. wake: back, config restored, link PM as requested. Caller
+ * serializes both with up/down. While asleep config access and the bar accessors fail (ENXIO), never touch it. */
+int hakios_pcie_sleep(_Bool fast_mhi);
+_Bool hakios_pcie_drv_cx_ready(void);
+int hakios_pcie_wake(void);
+int hakios_pcie_l1_hold(unsigned *saved);
+int hakios_pcie_l1_restore(unsigned saved);
+_Bool hakios_pcie_asleep(void);
+int hakios_pcie_bar_read32(const volatile void *va, unsigned *value);
+int hakios_pcie_bar_write32(volatile void *va, unsigned value);
+/* WAKE# (GPIO 96) through the PDC: cb in interrupt context, the line then masked; arm(1) unmasks it. */
+int hakios_pcie_wake_irq(void (*cb)(void));
+void hakios_pcie_wake_arm(_Bool on);
+_Bool hakios_pcie_wake_line(void);
+/* How the link sleeps: 1 DRV (trained, L1.2, the audio DSP holding it; PERST# high, the endpoint in D0), 2 off (PERST#). */
+unsigned hakios_pcie_sleep_mode(void);
 
 #endif

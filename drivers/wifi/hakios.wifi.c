@@ -170,6 +170,7 @@
 #include <sys/stat.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
+#include <sys/sysctl.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
@@ -234,7 +235,9 @@ say_line(const char *line, bool aloud)
 		return;
 	}
 	lck_mtx_lock(&say_lock);
-	if (quiet && !aloud) {
+	if (quiet) {
+		/* every line kept, the said ones too: kern.hakios.wifi_kept is then the whole story (run58: the join's
+		 * milestones, said aloud, were not in it, and the kept scan lines looked like the station had stopped) */
 		for (const char *c = line; *c != 0; c++) {
 			kept[kept_at] = *c;
 			if (++kept_at == sizeof(kept)) {
@@ -242,7 +245,8 @@ say_line(const char *line, bool aloud)
 				kept_wrapped = true;
 			}
 		}
-	} else {
+	}
+	if (!quiet || aloud) {
 		for (const char *c = line; *c != 0; c++) {
 			loader_log_putc(*c);
 		}
@@ -293,6 +297,28 @@ hakios_wifi_tell(const char *format, ...)
 	return 0;
 }
 #define tell hakios_wifi_tell
+
+/* kern.hakios.wifi_kept: all the lines kept (not said) since the radio came up, as far as the buffer goes back (run58: an
+ * 8 KB tail of scan lines no longer reached the moment the network was lost) */
+static int
+sysctl_wifi_kept SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	static char out[sizeof(kept) + 1];
+	uint32_t length, show, start;
+
+	lck_mtx_lock(&say_lock);
+	length = kept_wrapped ? sizeof(kept) : kept_at;
+	show = length;
+	start = kept_wrapped ? (kept_at + sizeof(kept) - show) % sizeof(kept) : kept_at - show;
+	for (uint32_t i = 0; i < show; i++) out[i] = kept[(start + i) % sizeof(kept)];
+	out[show] = 0;
+	lck_mtx_unlock(&say_lock);
+	return SYSCTL_OUT(req, out, show + 1);
+}
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, wifi_kept, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_wifi_kept, "A",
+    "the Wi-Fi lines kept since the radio came up (the buffer's worth)");
 
 /* The last of what was kept, into the log after all: the radio has not come up. */
 static void
@@ -372,7 +398,7 @@ hakios_wifi_option(const char *name)
 		const char *name;
 		uint32_t value;
 	} stands_for[] = { { "wifi_lx", 2 }, { "wifi_smmu", 2 }, { "wifi_station", 1 }, { "wifi_keep", 1 }, { "wifi_irq", 1 },
-			   { "wifi_ba", 1 }, { "wifi_wide", 1 } };
+			   { "wifi_ba", 1 }, { "wifi_wide", 1 }, { "wifi_pcie_off", 1 } };
 	uint32_t value = 0;
 
 	if (strcmp(name, "wifi_quiet") == 0) {

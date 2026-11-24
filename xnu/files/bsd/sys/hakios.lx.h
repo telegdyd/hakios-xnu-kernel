@@ -84,6 +84,11 @@ void	 lx_os_wakeup(const void *address);			/* everyone asleep on it */
 void	 lx_os_random(void *buffer, unsigned long size);	/* bytes nobody can guess */
 /* a number given to the kernel when it was started ("wifi_lx=2"); 0 if it was not */
 unsigned lx_os_option(const char *name);
+void lx_os_mhi_power(unsigned state, unsigned wake, unsigned pending, unsigned m0, unsigned m2, unsigned errors, unsigned blocked);
+void lx_os_thread_slots(unsigned used, unsigned high);
+void lx_thread_release(void);
+/* 1 while the display is off (the layer's clocks then tick less often: STANDBY-PLAN.md), else 0 */
+int	 lx_os_screen_off(void);
 /* a file the driver asks for by the name Linux has for it, in place: 0, or an errno (ENOENT) */
 int	 lx_os_firmware(const char *name, const void **data, unsigned long *size);
 /* the processor that runs the radio's firmware: started, and up when this returns; 0 or an errno */
@@ -146,6 +151,25 @@ void	 lx_os_station_lost(int error);				/* the network joined is gone by itself 
  * is not up).
  */
 int	 lx_start(void);
+int lx_os_pcie_down_status(void);
+void lx_os_runtime_state(int phase, int error);
+void lx_os_qrtr_diagnostic(void);
+int lx_os_pcie_pm_start(void);
+void lx_os_pcie_pm_sample(void);
+/* doze (lx_80211.c): C2's link sleep/wake, WAKE# (cb in interrupt context), the words, a counts line, en0's IPv4 */
+int lx_os_pcie_sleep(_Bool fast_mhi);
+int lx_os_pcie_wake(void);
+int lx_os_pcie_wake_irq(void (*cb)(void));
+void lx_os_pcie_wake_arm(int on);
+int lx_os_pcie_wake_line(void);
+unsigned lx_os_pcie_sleep_mode(void);
+void lx_os_doze_config(unsigned *on, unsigned *idle_ms, unsigned *ps);
+bool lx_os_rx_filter_asked(unsigned *mode);
+void lx_os_doze_stats(const char *text);
+unsigned lx_os_doze_patterns(void);
+void lx_os_doze_event(const void *event);
+unsigned lx_os_doze_kick_mode(void);
+int lx_os_wifi_ipv4(unsigned *be_addr);
 void	 lx_stop(void);
 int	 lx_transmit(const unsigned char *frame, unsigned long length, unsigned flags);
 /* before lx_start(), if the kernel wants it early: take the memory the radio will be shown. 0, or an errno. */

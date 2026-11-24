@@ -48,6 +48,30 @@
 #include <linux/pci.h>
 #endif
 
+/* The normal ath11k WoW command sends these tuples alongside its IPv4 ARP offload. */
+void lx_bus_wow_ns(struct ieee80211_vif *vif, const u8 addresses[][16], unsigned count);
+void
+lx_bus_wow_ns(struct ieee80211_vif *vif, const u8 addresses[][16], unsigned count)
+{
+	struct ath11k_vif *arvif = ath11k_vif_to_arvif(vif);
+	struct ath11k_arp_ns_offload *offload = &arvif->arp_ns_offload;
+
+	count = min_t(unsigned, count, ARRAY_SIZE(offload->ipv6_addr));
+	memset(offload->ipv6_addr, 0, sizeof(offload->ipv6_addr));
+	memset(offload->self_ipv6_addr, 0, sizeof(offload->self_ipv6_addr));
+	memset(offload->ipv6_type, ATH11K_IPV6_UC_TYPE, sizeof(offload->ipv6_type));
+	memcpy(offload->mac_addr, vif->addr, ETH_ALEN);
+	for (unsigned i = 0; i < count; i++) {
+		memcpy(offload->ipv6_addr[i], addresses[i], 16);
+		offload->self_ipv6_addr[i][0] = 0xff;
+		offload->self_ipv6_addr[i][1] = 0x02;
+		offload->self_ipv6_addr[i][11] = 0x01;
+		offload->self_ipv6_addr[i][12] = 0xff;
+		memcpy(offload->self_ipv6_addr[i] + 13, addresses[i] + 13, 3);
+	}
+	offload->ipv6_count = count;
+}
+
 static struct {
 	unsigned how;				/* wifi_lx */
 	bool mission;				/* the firmware has been asked for mission mode, and for no other since */
@@ -139,11 +163,151 @@ ath11k_err(struct ath11k_base *ab, const char *format, ...)
 	va_end(list);
 }
 
+/* doze (lx_80211.c): the firmware's reason for each WoW wake */
+void lx_doze_reason(int reason, const char *name);
+void lx_doze_note(const char *format);
+extern volatile bool lx_doze_in_call;	/* lx_80211.c: inside the doze's suspend, resume or undo */
+
+/*
+ * After the driver's probe, before QMI starts the firmware: no firmware log over WMI (hw_params.fw_wmi_diag_event,
+ * QMI WLAN_INI enablefwlog). Its WMI_DIAG events, which the driver only traces, came a few a second and each is a
+ * message to the host: in M3 an interrupt that ended every doze (run50, run51). wifi_fwlog=1 keeps it.
+ */
+#ifdef CONFIG_ATH11K_PCI
+void *lx_pci_base(void);
+void lx_bus_probed(void);
+void
+lx_bus_probed(void)
+{
+	struct ath11k_base *ab = lx_pci_base();
+
+	if (ab != NULL && !lx_os_option("wifi_fwlog")) ab->hw_params.fw_wmi_diag_event = false;
+}
+
+/*
+ * The flags of WMI_WOW_ENABLE (ath11k_wmi_wow_enable sends 0; tools/ath11k-clock-source.py has it ask here). How the
+ * radio asks for the host during WoW is the firmware's choice by the link's state (amss20.bin's own lines: "PERST GPIO
+ * line is HIGH. Not asserting WAKE#, CHECK D3 State", "D3 Hot State, PERST HIGH. Issue PME#", "Endpoint assert WAKE#
+ * since PERST is LOW"): in DRV sleep PERST# stays high and the endpoint in D0, so without being told it asserts nothing
+ * (run53..60: no WAKE#, no MSI, every wake the host's). Qualcomm's fw-api wmi_unified.h: WMI_WOW_FLAG_ENABLE_DRV_PCIE_
+ * L1SS_SLEEP = 0x10, "Enable L1SS sleep for PCIE DRV case" -- the radio's L1ss sleep mode, whose wake is an MSI
+ * through the DSP-held link ("Pagedone MSI for L1SS Sleep sent to HOST"). With the link off (PERST# low) it asserts
+ * WAKE#, as it is: 0 then.
+ */
+#define LX_WMI_WOW_FLAG_ENABLE_DRV_PCIE_L1SS_SLEEP 0x10u
+/* the vector of the radio's wake MSI given in the host capabilities; ~0u: none */
+unsigned lx_wake_msi_vector = ~0u;
+unsigned lx_wow_flags_sent;
+u32 lx_wow_enable_flags(void);
+u32
+lx_wow_enable_flags(void)
+{
+	lx_wow_flags_sent = lx_os_pcie_sleep_mode() == 1 && lx_wake_msi_vector != ~0u ? LX_WMI_WOW_FLAG_ENABLE_DRV_PCIE_L1SS_SLEEP : 0;
+	return lx_wow_flags_sent;
+}
+
+/*
+ * The receive frames ath11k dropped, by its own counts (soc_stats, as debugfs.c's soc_dp_stats says them): the error ring,
+ * buffers of no known pool, each RXDMA and REO error code (dp_rx.c drops all but TKIP MIC and a missing REO queue). Said
+ * as "; rx dropped by the driver: ..." into text; codes with a count only. (run69: the LAN's broadcasts never reached
+ * the host while its multicasts, same group key, did.)
+ */
+int lx_bus_rx_errors(char *text, size_t size);
+int
+lx_bus_rx_errors(char *text, size_t size)
+{
+	struct ath11k_base *ab = lx_pci_base();
+	struct ath11k_soc_dp_stats *s;
+	int at;
+
+	if (ab == NULL || size == 0) return 0;
+	s = &ab->soc_stats;
+	at = snprintf(text, size, "; rx dropped by the driver: error ring %u, invalid rbm %u, reo errors", s->err_ring_pkts,
+	    s->invalid_rbm);
+	for (unsigned i = 0; i < HAL_REO_DEST_RING_ERROR_CODE_MAX && at < (int)size - 16; i++)
+		if (s->reo_error[i]) at += snprintf(text + at, size - (size_t)at, " %u:%u", i, s->reo_error[i]);
+	at += snprintf(text + at, size - (size_t)at, ", rxdma errors");
+	for (unsigned i = 0; i < HAL_REO_ENTR_RING_RXDMA_ECODE_MAX && at < (int)size - 16; i++)
+		if (s->rxdma_error[i]) at += snprintf(text + at, size - (size_t)at, " %u:%u", i, s->rxdma_error[i]);
+	at += snprintf(text + at, size - (size_t)at, ", hal reo %u %u %u %u", s->hal_reo_error[0], s->hal_reo_error[1],
+	    s->hal_reo_error[2], s->hal_reo_error[3]);
+	return at < (int)size ? at : (int)size - 1;
+}
+
+/* The firmware's receive data filter on each interface (wifi_rx_filter): mode 0 off, else WMI_HW_DATA_FILTER_* bits. */
+int lx_bus_rx_filter(unsigned mode);
+int
+lx_bus_rx_filter(unsigned mode)
+{
+	struct ath11k_base *ab = lx_pci_base();
+	struct ath11k *ar;
+	struct ath11k_vif *arvif;
+	int ret = -ENODEV, r;
+
+	if (ab == NULL || (ar = ath11k_ab_to_ar(ab, 0)) == NULL) return -ENODEV;
+	mutex_lock(&ar->conf_mutex);
+	list_for_each_entry(arvif, &ar->arvifs, list) {
+		r = ath11k_wmi_hw_data_filter_cmd(ar, arvif->vdev_id, mode, mode != 0);
+		if (ret == -ENODEV || (r != 0 && ret == 0)) ret = r;
+	}
+	mutex_unlock(&ar->conf_mutex);
+	return ret;
+}
+
+/*
+ * After ath11k_wow_op_suspend() has failed: what it leaves set undone, step for step (its own unwinding covers the WoW
+ * enable and wakeup events only; mac80211 would rebuild the hardware). The hw data filter, the ARP/NS offload and the
+ * keepalive: off as ath11k_wow_op_resume() turns them off (sent whatever step failed: each is idempotent). The data
+ * path's and copy engines' interrupts: on again only when hif_suspend failed (mhi_was_asked), the one failure that comes
+ * after ath11k_hif_irq_disable() and ath11k_hif_ce_irq_disable(). 0, or the first error.
+ */
+int lx_bus_wow_undo(bool mhi_was_asked);
+int
+lx_bus_wow_undo(bool mhi_was_asked)
+{
+	struct ath11k_base *ab = lx_pci_base();
+	struct ath11k *ar;
+	struct ath11k_vif *arvif;
+	int ret = 0, r;
+
+	if (ab == NULL || (ar = ath11k_ab_to_ar(ab, 0)) == NULL) {
+		return -ENODEV;
+	}
+	if (mhi_was_asked) {
+		ath11k_hif_ce_irq_enable(ab);
+		ath11k_hif_irq_enable(ab);
+	}
+	mutex_lock(&ar->conf_mutex);
+	list_for_each_entry(arvif, &ar->arvifs, list) {
+		if ((r = ath11k_wmi_hw_data_filter_cmd(ar, arvif->vdev_id, 0, false)) != 0 && ret == 0) ret = r;
+		if (arvif->vdev_type != WMI_VDEV_TYPE_STA) continue;
+		if ((r = ath11k_wmi_arp_ns_offload(ar, arvif, false)) != 0 && ret == 0) ret = r;
+		if ((r = ath11k_mac_vif_set_keepalive(arvif, WMI_STA_KEEPALIVE_METHOD_NULL_FRAME,
+		    WMI_STA_KEEPALIVE_INTERVAL_DISABLE)) != 0 && ret == 0) ret = r;
+	}
+	mutex_unlock(&ar->conf_mutex);
+	return ret;
+}
+#endif
 void
 __ath11k_dbg(struct ath11k_base *ab, enum ath11k_debug_mask mask, const char *format, ...)
 {
 	va_list list;
 
+	if (strcmp(format, "event diag") == 0) {
+		return;		/* (the firmware log's events: not said) */
+	}
+	if (strncmp(format, "wow wakeup host reason", 22) == 0) {
+		va_start(list, format);
+		int reason = va_arg(list, int);
+		const char *name = va_arg(list, const char *);
+		va_end(list);
+		lx_doze_reason(reason, name);
+	}
+	if (mask == ATH11K_DBG_WMI && lx_doze_in_call && !lx_os_option("wifi_wmi_debug")) {
+		lx_doze_note(format);	/* (counted for the wake's line instead: lx_80211.c doze_seen_say) */
+		return;		/* (a doze's WoW setup and teardown, some fifty commands each time, would bury the driver's warnings) */
+	}
 	va_start(list, format);
 	driver_says(" (debug)", format, list);
 	va_end(list);
@@ -389,6 +553,25 @@ lx_qmi_send_request(struct qmi_handle *qmi, struct sockaddr_qrtr *sq, struct qmi
 		    req.nm_modem_valid ? req.nm_modem : 0);
 		req.nm_modem_valid = 0;
 		req.nm_modem = 0;
+		/*
+		 * The vector the radio is to ask for the host with (cnss2: cnss_pci_get_wake_msi, "WAKE MSI base data is %d"):
+		 * ath11k's MSI layout has a WAKE user (pcic.c, vector 13 of 32) but never says it to the firmware, nor listens
+		 * on it. In DRV sleep (PERST# high, D0) the firmware asserts neither WAKE# nor PME#: this MSI is its way, and
+		 * without it, with WMI_WOW_FLAG_ENABLE_DRV_PCIE_L1SS_SLEEP, it crashed in WoW (run61: MHI SYS_ERR in a doze).
+		 * lx_pci.c's poll takes the vector as the doze's wake.
+		 */
+		{
+			struct ath11k_base *ab = lx_pci_base();
+			int vectors = 0;
+			u32 data = 0, base = 0;
+
+			if (ab != NULL && ath11k_pcic_get_user_msi_assignment(ab, "WAKE", &vectors, &data, &base) == 0 && vectors > 0) {
+				req.wake_msi_valid = 1;
+				req.wake_msi = data;
+				lx_wake_msi_vector = base;
+				lx_tell("lx: host capabilities: the radio's wake MSI is vector %u (data %u)\n", base, data);
+			}
+		}
 		return (qmi_send_request(qmi, sq, txn, msg_id, largest, ei, &req));
 	}
 #endif
@@ -819,6 +1002,73 @@ say_radio(struct ath11k_base *ab)
 /* ---- the entries ---------------------------------------------------------------------------------- */
 
 static struct ath11k_base *volatile driver;	/* the driver, while it is up: between lx_start() and lx_stop() */
+static unsigned transmitters;
+
+/* Close admission before freeing the radio; a queued Darwin transmit may be in it. */
+static void driver_close(void)
+{
+	lx_os_lock();
+	driver = NULL;
+	while (transmitters) lx_os_sleep(&transmitters, 1000000ull);
+	lx_os_unlock();
+}
+
+/* Full off/on for Settings' POWER request. Keep the static station boundary:
+ * withdrawing it here would wait for this very callback to finish. State
+ * readers are excluded by hakios.sta.c, and driver_close drains transmitters.
+ * The boot chain retains its SMMU/pool ownership until normal teardown. */
+int lx_pci_runtime_power(bool on)
+{
+#ifdef CONFIG_ATH11K_PCI
+	struct ath11k_base *ab;
+	unsigned long long began;
+	int ret;
+	if (!on) {
+		lx_os_runtime_state(1, 0);
+		if (driver) {
+			driver_close();
+			lx_station_leave();
+			lx_pci_driver_exit();
+		}
+		ret = lx_os_pcie_down_status();
+		lx_os_runtime_state(ret ? 5 : 0, ret);
+		lx_tell("lx: runtime PCIe off: status %d\n", ret);
+		return ret;
+	}
+	if (driver) return 0;
+	lx_os_runtime_state(2, 0);
+	if ((ret = lx_os_pcie_down_status()) != 0) return ret;
+	if ((ret = lx_prepare()) != 0) return ret;
+	ret = lx_pci_driver_init();
+	if (ret) return -ret;
+	lx_tell("lx: runtime PCIe probe returned; waiting for registered firmware\n");
+	ab = lx_pci_base();
+	if (!ab) { lx_pci_driver_exit(); return EIO; }
+	began = lx_os_nanoseconds();
+	unsigned diagnostic = 0;
+	while (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) &&
+	    !test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags) &&
+	    lx_os_nanoseconds() - began < 60000000000ull) {
+		if (lx_os_nanoseconds() - began > (diagnostic + 1ull) * 10000000000ull) {
+			diagnostic++;
+			lx_tell("lx: runtime firmware wait %u s flags %#lx\n", diagnostic * 10, ab->dev_flags);
+			lx_os_qrtr_diagnostic(); lx_mhi_diagnostic();
+		}
+		lx_pause_ms(10);
+	}
+	if (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags) ||
+	    test_bit(ATH11K_FLAG_QMI_FAIL, &ab->dev_flags)) {
+		lx_pci_driver_exit(); return EIO;
+	}
+	lx_os_lock(); driver = ab; lx_os_unlock();
+	(void)lx_os_pcie_pm_start();
+	lx_os_runtime_state(3, 0);
+	lx_tell("lx: runtime PCIe reprobe ready in %llu ms\n", (lx_os_nanoseconds() - began) / 1000000ull);
+	return 0;
+#else
+	return EOPNOTSUPP;
+#endif
+}
 
 int
 lx_start(void)
@@ -850,6 +1100,7 @@ lx_start(void)
    lx_pci_driver_exit(); return EIO;
   }
   driver = ab;
+  (void)lx_os_pcie_pm_start();
   say_radio(ab);
   if (lx_os_option("wifi_station")) ret = lx_station_offer();
   else if (lx_os_option("wifi_join")) ret = lx_station_join();
@@ -977,13 +1228,14 @@ lx_prepare(void)
 void
 lx_stop(void)
 {
-	struct ath11k_base *ab = driver;
+	struct ath11k_base *ab;
+	lx_station_withdraw(); /* also withdraw the retained runtime-off boundary */
+	ab = driver;
 
 	if (ab == NULL) {
 		return;
 	}
-	driver = NULL;
-	lx_station_withdraw();
+	driver_close();
 	lx_station_leave();
 	#ifdef CONFIG_ATH11K_PCI
  if (lx_os_option("wifi_soc") == 8450) lx_pci_driver_exit();
@@ -996,5 +1248,15 @@ lx_stop(void)
 int
 lx_transmit(const unsigned char *frame, unsigned long length, unsigned flags)
 {
-	return (driver != NULL ? lx_station_send(frame, length, flags) : ENETDOWN);
+	int ret;
+	lx_os_lock();
+	if (!driver) { lx_os_unlock(); return ENETDOWN; }
+	transmitters++;
+	lx_os_unlock();
+	ret = lx_station_send(frame, length, flags);
+	lx_os_lock();
+	transmitters--;
+	lx_os_wakeup(&transmitters);
+	lx_os_unlock();
+	return ret;
 }

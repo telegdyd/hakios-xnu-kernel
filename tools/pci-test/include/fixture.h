@@ -2,6 +2,7 @@
 #define FIXTURE_H
 #include <assert.h>
 #include <stdbool.h>
+void lx_os_pcie_pm_sample(void);
 #include <stddef.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -54,6 +55,7 @@ int lx_os_pcie_cfg_write(unsigned,unsigned,unsigned,unsigned,unsigned);
 int lx_os_pcie_try_read32(const volatile void *,unsigned *);
 int lx_os_pcie_try_write32(volatile void *,unsigned);
 unsigned lx_os_option(const char *);
+bool lx_mhi_bar_access(unsigned, bool);
 void lx_os_lock(void);
 void lx_os_unlock(void);
 void lx_os_wakeup(const void *);

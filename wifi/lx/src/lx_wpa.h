@@ -20,6 +20,19 @@ struct lx_wpa {
 	const unsigned char *rsn;		/* the station's RSN element as its association request had it ... */
 	unsigned rsn_length;			/* ... which goes into message 2 */
 	unsigned group_cipher;			/* negotiated RSN suite type: 2 TKIP or 4 CCMP (0: legacy CCMP caller) */
+	unsigned pmf;				/* negotiated MFPC, BIP-CMAC-128 only */
+	unsigned owe, owe_ready;         /* OWE: SHA256 PTK, HMAC-SHA256 MIC, descriptor 0; PMK publication gate */
+	unsigned sae;                    /* AKM 00:0f:ac:8: SHA256 PTK, AKM-defined (0) AES-CMAC MIC */
+	const unsigned char *ap_rsn;		/* AP's advertised RSN: message 3 must authenticate the same negotiation */
+	unsigned ap_rsn_length;
+	const unsigned char *ap_rsnxe;   /* SAE H2E indication must be authenticated in message 3 */
+	unsigned ap_rsnxe_length;
+	struct {
+		unsigned valid;
+		unsigned char key[16], ipn[6]; /* little-endian integrity packet number; slots 4 and 5 */
+	} igtk[2];
+	unsigned char management_pn[6];		/* unicast management RX CCMP PN, separate from data */
+	unsigned group_updated;			/* this accepted key message carried a GTK */
 	/* from here on: lx_wpa.c's */
 	unsigned char peer_nonce[32];
 	unsigned char kck[16], kek[16];		/* the keys the handshake's own messages are signed and ciphered with */
@@ -46,5 +59,13 @@ enum {
 };
 int lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length, unsigned char *reply,
     unsigned *reply_length, const char **why);
+
+/* Is a plaintext management frame robust? Protected unicast is classified after its IV is removed. */
+int lx_wpa_robust(const unsigned char *frame, unsigned length);
+/* Verify a group MMIE in software or a firmware-decrypted unicast frame and its PN.
+ * On success remove the crypto header/trailer in place. Never trust stripped PNs unless the driver validated them.
+ * Caller checks transmitter, BSSID and destination first; serializes this with key messages. */
+int lx_wpa_pmf_rx(struct lx_wpa *wpa, unsigned char *frame, unsigned *length,
+    int decrypted, int iv_stripped, int mic_stripped, int pn_validated);
 
 #endif

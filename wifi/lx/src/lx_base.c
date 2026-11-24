@@ -127,7 +127,8 @@ int linuxkpi_warn_dump_stack;
 
 /*
  * FreeBSD's code finds "the current thread" and LinuxKPI's hangs its "current task" on it. A
- * thread of the kernel's gets one of these the first time it is seen here, and keeps it.
+ * thread of the kernel's gets one of these the first time it is seen here. The
+ * C4 thread trampoline releases it after the driver function returns.
  */
 static struct lx_thread {
 	void *volatile self;			/* lx_os_thread_self() of the thread that has it; NULL: free */
@@ -136,6 +137,32 @@ static struct lx_thread {
 	const void *waiting_on;			/* linux_wait_event_common(): what for, and ... */
 	unsigned long long deadline;		/* ... until when (0: for good) */
 } lx_threads[24];
+static unsigned thread_slots, thread_slots_high;
+
+static void thread_slots_report(void)
+{
+	unsigned used = __atomic_load_n(&thread_slots, __ATOMIC_RELAXED);
+	unsigned high = __atomic_load_n(&thread_slots_high, __ATOMIC_RELAXED);
+	while (used > high && !__atomic_compare_exchange_n(&thread_slots_high, &high, used, false,
+	    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+	lx_os_thread_slots(used, __atomic_load_n(&thread_slots_high, __ATOMIC_RELAXED));
+}
+
+void lx_thread_release(void)
+{
+	void *self = lx_os_thread_self();
+	for (unsigned i = 0; i < nitems(lx_threads); i++) {
+		struct lx_thread *t = &lx_threads[i];
+		if (__atomic_load_n(&t->self, __ATOMIC_ACQUIRE) != self) continue;
+		/* No driver code can use this thread's LinuxKPI state after return.
+		 * Clear it before publishing the slot for another worker. */
+		bzero(&t->td, sizeof(*t) - offsetof(struct lx_thread, td));
+		__atomic_store_n(&t->self, NULL, __ATOMIC_RELEASE);
+		__sync_sub_and_fetch(&thread_slots, 1);
+		thread_slots_report();
+		return;
+	}
+}
 
 static struct lx_thread *
 lx_thread(void)
@@ -143,13 +170,15 @@ lx_thread(void)
 	void *self = lx_os_thread_self();
 
 	for (unsigned i = 0; i < nitems(lx_threads); i++) {
-		if (lx_threads[i].self == self) {
+		if (__atomic_load_n(&lx_threads[i].self, __ATOMIC_ACQUIRE) == self) {
 			return (&lx_threads[i]);
 		}
 	}
 	for (unsigned i = 0; i < nitems(lx_threads); i++) {
-		if (lx_threads[i].self == NULL && __sync_bool_compare_and_swap(&lx_threads[i].self, NULL, self)) {
+		if (__atomic_load_n(&lx_threads[i].self, __ATOMIC_ACQUIRE) == NULL && __sync_bool_compare_and_swap(&lx_threads[i].self, NULL, self)) {
 			lx_threads[i].td.td_tid = 100 + i;
+			__sync_add_and_fetch(&thread_slots, 1);
+			thread_slots_report();
 			return (&lx_threads[i]);
 		}
 	}
@@ -229,9 +258,13 @@ linux_synchronize_rcu(unsigned type)
 	}
 }
 
-/* A thousand ticks a second, counted by a thread that also runs the timers that have come due. */
+/* A thousand jiffies a second, read from the clock: no periodic tick is needed. */
 int hz = 1000;
-unsigned long jiffies;
+unsigned long
+lx_jiffies(void)
+{
+	return (unsigned long)(lx_os_nanoseconds() / 1000000ull);
+}
 uint64_t lkpi_msec2hz_rem = 1, lkpi_msec2hz_div = 1, lkpi_msec2hz_max = 0x7fffffff;
 
 static unsigned long long
@@ -241,6 +274,15 @@ ticks_to_ns(unsigned long ticks)
 }
 
 static struct timer_list *armed[16];
+static char timer_event;
+/* Monitor statistics have no deadline that should wake an idle CPU. The PCI
+ * worker services this timer on its existing interrupts/recovery sweeps. */
+static struct timer_list *deferred_timer;
+static struct timer_list *running_timer[2]; /* ticker and PCI monitor worker */
+static void *timer_owner[2];
+static struct delayed_work *dispatching_work;
+static void *dispatch_owner;
+static unsigned timer_waiters;
 static struct {
 	struct delayed_work *work;		/* to be queued on ... */
 	struct workqueue_struct *queue;		/* ... when the ticks have reached ... */
@@ -250,29 +292,57 @@ static struct {
 static void
 ticker(void *argument)
 {
-	unsigned long long began = lx_os_nanoseconds();
-
+	lx_tell("lx: timers: clock-based jiffies, deadline waits\n");
 	for (;;) {
 		struct timer_list *due = NULL;
 		struct delayed_work *work = NULL;
 		struct workqueue_struct *queue = NULL;
+		unsigned long long now_ns;
+		unsigned long now;
+		long nearest = 0;
+		bool pending = false;
 
 		lx_os_lock();
-		lx_os_sleep(&jiffies, 2 * 1000000ull);
-		jiffies = (unsigned long)((lx_os_nanoseconds() - began) / 1000000ull);
-		for (unsigned i = 0; i < nitems(armed) && due == NULL; i++) {
-			if (armed[i] != NULL && (long)(jiffies - armed[i]->expires) >= 0) {
-				due = armed[i];
-				armed[i] = NULL;
+		now_ns = lx_os_nanoseconds();
+		now = (unsigned long)(now_ns / 1000000ull);
+		for (unsigned i = 0; i < nitems(armed); i++) {
+			if (armed[i] != NULL && armed[i] != deferred_timer) {
+				long delta = (long)(armed[i]->expires - now);
+				if (!pending || delta < nearest) {
+					nearest = delta;
+				}
+				pending = true;
+				if (delta <= 0 && due == NULL) {
+					due = armed[i];
+					armed[i] = NULL;
+				}
 			}
 		}
-		for (unsigned i = 0; i < nitems(later) && work == NULL; i++) {
-			if (later[i].work != NULL && (long)(jiffies - later[i].when) >= 0) {
-				work = later[i].work;
-				queue = later[i].queue;
-				later[i].work = NULL;
+		for (unsigned i = 0; i < nitems(later); i++) {
+			if (later[i].work != NULL) {
+				long delta = (long)(later[i].when - now);
+				if (!pending || delta < nearest) {
+					nearest = delta;
+				}
+				pending = true;
+				if (delta <= 0 && work == NULL && due == NULL) {
+					work = later[i].work;
+					queue = later[i].queue;
+					later[i].work = NULL;
+				}
 			}
 		}
+		if (due == NULL && work == NULL) {
+			/* Same lock as insertion and notification: no lost wake before registering the wait.
+			 * Subtract the partial jiffy so an expiry is not delayed by another millisecond. */
+			lx_os_sleep(&timer_event, pending ? ticks_to_ns((unsigned long)nearest) - now_ns % 1000000ull : 0);
+			lx_os_unlock();
+			continue;
+		}
+		running_timer[0] = due;
+		timer_owner[0] = due ? lx_os_thread_self() : NULL;
+		dispatching_work = work;
+		dispatch_owner = work ? lx_os_thread_self() : NULL;
 		lx_os_unlock();
 		/* (a timer that a part of the driver not built yet would have given its function has none) */
 		if (due != NULL && due->function_415 != NULL) {
@@ -281,7 +351,52 @@ ticker(void *argument)
 		if (work != NULL) {
 			linux_queue_work_on(0, queue, &work->work);
 		}
+		lx_os_lock();
+		running_timer[0] = NULL; timer_owner[0] = NULL;
+		dispatching_work = NULL; dispatch_owner = NULL;
+		if (timer_waiters) lx_os_wakeup(&timer_event);
+		lx_os_unlock();
 	}
+}
+
+void
+lx_timer_defer(struct timer_list *timer)
+{
+	/* This service path belongs to negroni's PCI worker, not the AHB radio. */
+	if (lx_os_option("wifi_soc") != 8450) {
+		return;
+	}
+	lx_os_lock();
+	deferred_timer = timer;
+	lx_os_wakeup(&timer_event);
+	lx_os_unlock();
+	lx_tell("lx: monitor statistics timer: serviced by PCI worker\n");
+}
+
+/* Run only a due monitor timer; actual protocol timeouts stay on the ticker. */
+void
+lx_timer_poll(void)
+{
+	struct timer_list *due = NULL;
+	lx_os_lock();
+	for (unsigned i = 0; i < nitems(armed); i++) {
+		if (armed[i] != NULL && armed[i] == deferred_timer &&
+		    (long)(jiffies - armed[i]->expires) >= 0) {
+			due = armed[i];
+			armed[i] = NULL;
+			break;
+		}
+	}
+	running_timer[1] = due;
+	timer_owner[1] = due ? lx_os_thread_self() : NULL;
+	lx_os_unlock();
+	if (due != NULL && due->function_415 != NULL) {
+		due->function_415(due);
+	}
+	lx_os_lock();
+	running_timer[1] = NULL; timer_owner[1] = NULL;
+	if (timer_waiters) lx_os_wakeup(&timer_event);
+	lx_os_unlock();
 }
 
 /* Work that is to be queued when some time has passed: the thread above does that. */
@@ -314,6 +429,7 @@ linux_queue_delayed_work_on(int cpu, struct workqueue_struct *wq, struct delayed
 		later[slot].work = dwork;
 		later[slot].queue = wq;
 		later[slot].when = jiffies + delay;
+		lx_os_wakeup(&timer_event);
 	}
 	lx_os_unlock();
 	if (slot < 0) {
@@ -329,28 +445,48 @@ linux_cancel_delayed_work(struct delayed_work *dwork)
 	bool waited = false;
 
 	lx_os_lock();
+	while (dispatching_work == dwork && dispatch_owner != lx_os_thread_self()) {
+		timer_waiters++;
+		lx_os_sleep(&timer_event, 0);
+		timer_waiters--;
+	}
 	for (unsigned i = 0; i < nitems(later); i++) {
 		if (later[i].work == dwork) {
 			later[i].work = NULL;
 			waited = true;
 		}
 	}
+	if (waited) {
+		lx_os_wakeup(&timer_event);
+	}
 	lx_os_unlock();
 	return (waited);
 }
 
-/* (A timer's function that is running on the ticker's thread at this moment is not waited for.) */
+/* Wait for callbacks on either service thread, including any rearm before exit. */
 int
 timer_delete_sync(struct timer_list *timer)
 {
 	int was = 0;
 
 	lx_os_lock();
+	for (;;) {
 	for (unsigned i = 0; i < nitems(armed); i++) {
 		if (armed[i] == timer) {
 			armed[i] = NULL;
 			was = 1;
 		}
+	}
+	bool running = false;
+	for (unsigned i = 0; i < nitems(running_timer); i++)
+		if (running_timer[i] == timer && timer_owner[i] != lx_os_thread_self()) running = true;
+	if (!running) break;
+	timer_waiters++;
+	lx_os_sleep(&timer_event, 0);
+	timer_waiters--;
+	}
+	if (was) {
+		lx_os_wakeup(&timer_event);
 	}
 	lx_os_unlock();
 	return (was);
@@ -364,6 +500,17 @@ lx_pause_ms(unsigned ms)
 	lx_os_lock();
 	lx_os_sleep(&nothing, ms * 1000000ull);
 	lx_os_unlock();
+}
+
+/* FreeBSD's pause(9), which linuxkpi's msleep() becomes (wow.c's retry wait): a sleep of that long. sbt: 32.32 seconds. */
+int
+pause_sbt(const char *wmesg, sbintime_t sbt, sbintime_t pr, int flags)
+{
+	unsigned long long ms = ((unsigned long long)sbt * 1000ull) >> 32;
+
+	(void)wmesg; (void)pr; (void)flags;
+	lx_pause_ms(ms == 0 ? 1 : ms > 60000 ? 60000 : (unsigned)ms);
+	return (0);
 }
 
 void
@@ -389,6 +536,9 @@ mod_timer(struct timer_list *timer, unsigned long expires)
 	timer->expires = expires;
 	if (slot >= 0) {
 		armed[slot] = timer;
+		if (timer != deferred_timer) {
+			lx_os_wakeup(&timer_event);
+		}
 	}
 	lx_os_unlock();
 	if (slot < 0) {
@@ -590,6 +740,7 @@ struct lx_workqueue {
 	struct work_struct *running;
 	void *thread;
 	char name[24];
+	bool stopping, exited;
 };
 
 static void
@@ -603,8 +754,15 @@ worker(void *argument)
 		lx_os_lock();
 		queue->running = NULL;
 		lx_os_wakeup(&queue->running);
-		while (queue->count == 0) {
-			lx_os_sleep(queue, SLICE_NS);
+		while (queue->count == 0 && !queue->stopping) {
+			/* (no limit: linux_queue_work_on() wakes it, under the same lock; STANDBY-PLAN.md) */
+			lx_os_sleep(queue, 0);
+		}
+		if (queue->count == 0 && queue->stopping) {
+			queue->exited = true;
+			lx_os_wakeup(&queue->exited);
+			lx_os_unlock();
+			return;
 		}
 		work = queue->waiting[queue->first];
 		queue->first = (queue->first + 1) % nitems(queue->waiting);
@@ -635,7 +793,18 @@ linux_create_workqueue_common(const char *name, int cpus)
 void
 linux_destroy_workqueue(struct workqueue_struct *wq)
 {
-	/* (its thread stays, asleep: queues are made once here and never given up while the kernel runs) */
+	struct lx_workqueue *queue = __containerof(wq, struct lx_workqueue, shown);
+	lx_os_lock();
+	if (queue->thread == lx_os_thread_self()) {
+		lx_os_unlock();
+		lx_os_panic("lx: workqueue cannot destroy itself");
+		return;
+	}
+	queue->stopping = true;
+	lx_os_wakeup(queue);
+	while (!queue->exited) lx_os_sleep(&queue->exited, 0);
+	lx_os_unlock();
+	lx_os_free(queue, sizeof(*queue));
 }
 
 bool
@@ -645,7 +814,7 @@ linux_queue_work_on(int cpu, struct workqueue_struct *wq, struct work_struct *wo
 	bool queued = false;
 
 	lx_os_lock();
-	if (atomic_read(&work->state) == WORK_IDLE && queue->count < nitems(queue->waiting)) {
+	if (!queue->stopping && atomic_read(&work->state) == WORK_IDLE && queue->count < nitems(queue->waiting)) {
 		atomic_set(&work->state, WORK_QUEUED);
 		work->work_queue = wq;
 		queue->waiting[(queue->first + queue->count++) % nitems(queue->waiting)] = work;

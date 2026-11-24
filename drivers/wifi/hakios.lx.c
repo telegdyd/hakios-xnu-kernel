@@ -30,8 +30,11 @@
 #include <sys/hakios.net.h>
 #include <sys/hakios.smmu.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
+#include <net/kpi_interface.h>
+#include <netinet/in.h>
 
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern uint64_t kvtophys(vm_offset_t va);       /* pmap_paddr_t */
@@ -45,6 +48,9 @@ extern unsigned hakios_wifi_pci_seen(unsigned n);
 extern int hakios_wifi_pci_firmware(const char *name, const uint8_t **data, uint64_t *size);
 /* hakios.qrtr.c: the router's own calls that have no header */
 extern void hakios_qrtr_poll(void);
+extern void hakios_qrtr_wait(uint32_t ms);
+extern void hakios_qrtr_wake(void);
+extern bool hakios_screen_off(void);
 extern void hakios_qrtr_stats(uint32_t *peer, uint32_t *hellos, uint32_t *in, uint32_t *out, uint32_t *services);
 extern const struct hakios_qrtr_ops hakios_qrtr_router_ops;
 
@@ -52,6 +58,42 @@ extern const struct hakios_qrtr_ops hakios_qrtr_router_ops;
 
 static LCK_GRP_DECLARE(lx_lock_group, "hakios-lx");
 static LCK_MTX_DECLARE(lx_lock, &lx_lock_group);
+static int pcie_runtime_phase, pcie_runtime_error;
+SYSCTL_DECL(_kern_hakios);
+static int lx_thread_slots_used, lx_thread_slots_high;
+void lx_os_thread_slots(unsigned used, unsigned high)
+{
+	lx_thread_slots_used = used; lx_thread_slots_high = high;
+}
+SYSCTL_INT(_kern_hakios, OID_AUTO, lx_thread_slots_used, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &lx_thread_slots_used, 0, "Cached allocated LinuxKPI thread slots");
+SYSCTL_INT(_kern_hakios, OID_AUTO, lx_thread_slots_high, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &lx_thread_slots_high, 0, "Maximum allocated LinuxKPI thread slots");
+static unsigned mhi_state, mhi_wake, mhi_pending, mhi_m0, mhi_m2, mhi_errors, mhi_blocked;
+void lx_os_mhi_power(unsigned state, unsigned wake, unsigned pending, unsigned m0, unsigned m2, unsigned errors, unsigned blocked)
+{
+	mhi_state = state; mhi_wake = wake; mhi_pending = pending;
+	mhi_m0 = m0; mhi_m2 = m2; mhi_errors = errors; mhi_blocked = blocked;
+}
+static int sysctl_mhi_power SYSCTL_HANDLER_ARGS
+{
+	char s[192];
+	snprintf(s, sizeof(s), "state %#x wake %u pending %u m0 %u m2 %u errors %u blocked %u",
+	    mhi_state, mhi_wake, mhi_pending, mhi_m0, mhi_m2, mhi_errors, mhi_blocked);
+	return SYSCTL_OUT(req, s, strlen(s) + 1);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, mhi_power, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, sysctl_mhi_power, "A", "Cached MHI idle state and counters");
+SYSCTL_INT(_kern_hakios, OID_AUTO, pcie_runtime_phase, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &pcie_runtime_phase, 0, "PCIe runtime: 0 off, 1 stopping, 2 probing, 3 firmware ready, 4 station ready, 5 failed");
+SYSCTL_INT(_kern_hakios, OID_AUTO, pcie_runtime_error, CTLFLAG_RD | CTLFLAG_LOCKED,
+    &pcie_runtime_error, 0, "Last runtime PCIe error");
+void lx_os_runtime_state(int phase, int error)
+{
+	pcie_runtime_error = error;
+	pcie_runtime_phase = phase;
+	hakios_wifi_tell("lx: runtime PCIe phase %d error %d\n", phase, error);
+}
 
 /* ---- memory ------------------------------------------------------------------------------------------ */
 
@@ -172,6 +214,7 @@ lx_thread_runs(void *parameter, __unused wait_result_t result)
 
 	kfree_type(struct lx_thread, parameter);
 	start.function(start.argument);
+	lx_thread_release();
 	thread_terminate(current_thread());
 }
 
@@ -205,6 +248,12 @@ void
 lx_os_unlock(void)
 {
 	lck_mtx_unlock(&lx_lock);
+}
+
+int
+lx_os_screen_off(void)
+{
+	return hakios_screen_off() ? 1 : 0;
 }
 
 int
@@ -672,6 +721,159 @@ lx_os_pcie_down(unsigned rc)
 	hakios_lx_pcie_forget();
 }
 
+int lx_os_pcie_down_status(void) { return hakios_pcie_down_status(); }
+
+/* ---- doze (lx_80211.c): the link's sleep, WAKE#, and its words ---- */
+int lx_os_pcie_sleep(bool fast_mhi) { return hakios_pcie_sleep(fast_mhi); }
+int lx_os_pcie_wake(void) { return hakios_pcie_wake(); }
+int lx_os_pcie_l1_hold(unsigned *saved) { return hakios_pcie_l1_hold(saved); }
+int lx_os_pcie_l1_restore(unsigned saved) { return hakios_pcie_l1_restore(saved); }
+int lx_os_pcie_wake_irq(void (*cb)(void)) { return hakios_pcie_wake_irq(cb); }
+void lx_os_pcie_wake_arm(int on) { hakios_pcie_wake_arm(on != 0); }
+int lx_os_pcie_wake_line(void) { return hakios_pcie_wake_line() ? 1 : 0; }
+unsigned lx_os_pcie_sleep_mode(void) { return hakios_pcie_sleep_mode(); }
+
+/* kern.hakios.wifi_doze: 1 the radio dozes (WoW, M3, link off) with the screen off after wifi_doze_idle_ms without a
+ * frame; kern.hakios.wifi_ps: 1 station power save. Both 0 by default until measured (WIFI-PLAN.md P4c/P4d). */
+static unsigned wifi_doze, wifi_doze_idle_ms = 3000, wifi_ps, wifi_doze_patterns = 0xf;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, wifi_doze_patterns, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_doze_patterns, 0,
+    "doze wake events: 1 unicast to us, 2 IPv6 solicited-node multicast, 4 disconnect, 8 GTK rekey failure");
+unsigned lx_os_doze_patterns(void) { return wifi_doze_patterns; }
+static unsigned wifi_doze_kick = 1;	/* (run51: in M3 no interrupt ever came with new events; any one is the request) */
+SYSCTL_UINT(_kern_hakios, OID_AUTO, wifi_doze_kick, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_doze_kick, 0,
+    "the radio's MHI interrupt in M3 ends a doze: 0 never, 1 always, 2 only with new events (Linux)");
+unsigned lx_os_doze_kick_mode(void) { return wifi_doze_kick; }
+static char wifi_doze_text[2048] = "not started (no network joined yet)";
+static const void *doze_event;
+void lx_os_doze_event(const void *event) { doze_event = event; }
+static int
+sysctl_wifi_doze SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	unsigned value = wifi_doze;
+	int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || req->newptr == USER_ADDR_NULL) return error;
+	wifi_doze = value;
+	if (doze_event) thread_wakeup((event_t)doze_event);
+	return 0;
+}
+/*
+ * The firmware's receive data filter (WMI_HW_DATA_FILTER: bit 0 drop broadcasts but ARP, bit 1 drop multicasts but
+ * ICMPv6), set by a write: 0 off, else those bits on. ath11k sets it only for WoW and clears it at resume. run69/70: no
+ * broadcast ever reached the host, multicast did -- is it on from the start?
+ */
+static unsigned wifi_rx_filter, wifi_rx_filter_asked;
+static int
+sysctl_wifi_rx_filter SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	unsigned value = wifi_rx_filter;
+	int error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || req->newptr == USER_ADDR_NULL) return error;
+	wifi_rx_filter = value & 3;
+	wifi_rx_filter_asked = 1;
+	if (doze_event) thread_wakeup((event_t)doze_event);
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, wifi_rx_filter, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_wifi_rx_filter,
+    "I", "a write sends the firmware's receive data filter: 0 off, 1 drop broadcasts but ARP, 2 drop multicasts but ICMPv6");
+bool
+lx_os_rx_filter_asked(unsigned *mode)
+{
+	if (!wifi_rx_filter_asked) return false;
+	wifi_rx_filter_asked = 0;
+	*mode = wifi_rx_filter;
+	return true;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, wifi_doze, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_wifi_doze, "I",
+    "1: Wi-Fi dozes (WoW, MHI M3, the PCIe link to the DSP) with the screen off and no traffic");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, wifi_doze_idle_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_doze_idle_ms, 0,
+    "milliseconds without a frame before Wi-Fi dozes (200-600000)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, wifi_ps, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_ps, 0,
+    "1: Wi-Fi station power save (the firmware sleeps between beacons)");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, wifi_doze_stats, CTLFLAG_RD | CTLFLAG_LOCKED, wifi_doze_text, sizeof(wifi_doze_text),
+    "Wi-Fi doze counts");
+void
+lx_os_doze_config(unsigned *on, unsigned *idle_ms, unsigned *ps)
+{
+	unsigned idle = wifi_doze_idle_ms;
+	*on = wifi_doze != 0 && hakios_wifi_pci_selected();
+	*idle_ms = idle < 200 ? 200 : idle > 600000 ? 600000 : idle;
+	*ps = wifi_ps != 0;
+}
+void
+lx_os_doze_stats(const char *text)
+{
+	strlcpy(wifi_doze_text, text, sizeof(wifi_doze_text));
+}
+/* en0's first IPv4 address, network order (for the firmware's ARP offload). 0, or an errno. */
+int
+lx_os_wifi_ipv4(unsigned *be_addr)
+{
+	ifnet_t ifp = NULL;
+	ifaddr_t *list = NULL;
+	int error = ENOENT;
+
+	if (ifnet_find_by_name("en0", &ifp) != 0 || ifp == NULL) {
+		return ENXIO;
+	}
+	if (ifnet_get_address_list_family(ifp, &list, AF_INET) == 0 && list != NULL) {
+		for (unsigned i = 0; list[i] != NULL; i++) {
+			struct sockaddr_in sin;
+			if (ifaddr_address(list[i], (struct sockaddr *)&sin, sizeof(sin)) == 0 && sin.sin_family == AF_INET &&
+			    sin.sin_addr.s_addr != 0) {
+				*be_addr = sin.sin_addr.s_addr;
+				error = 0;
+				break;
+			}
+		}
+		ifnet_free_address_list(list);
+	}
+	ifnet_release(ifp);
+	return error;
+}
+/* Return the assigned unicast IPv6 addresses in wire format. */
+int
+lx_os_wifi_ipv6_addresses(uint8_t addresses[][16], unsigned capacity)
+{
+	ifnet_t ifp = NULL;
+	ifaddr_t *list = NULL;
+	int count = 0;
+
+	if (ifnet_find_by_name("en0", &ifp) != 0 || ifp == NULL) return -ENXIO;
+	if (ifnet_get_address_list_family(ifp, &list, AF_INET6) != 0) {
+		ifnet_release(ifp);
+		return -EIO;
+	}
+	for (unsigned i = 0; list != NULL && list[i] != NULL; i++) {
+		struct sockaddr_in6 address;
+		unsigned index;
+
+		if (ifaddr_address(list[i], (struct sockaddr *)&address, sizeof(address)) != 0 ||
+		    address.sin6_family != AF_INET6 || IN6_IS_ADDR_UNSPECIFIED(&address.sin6_addr) ||
+		    IN6_IS_ADDR_MULTICAST(&address.sin6_addr)) continue;
+		if (IN6_IS_ADDR_LINKLOCAL(&address.sin6_addr)) {
+			/* XNU can store the interface scope in the address itself. */
+			address.sin6_addr.s6_addr[2] = 0;
+			address.sin6_addr.s6_addr[3] = 0;
+		}
+		for (index = 0; index < (unsigned)count; index++)
+			if (memcmp(addresses[index], address.sin6_addr.s6_addr, 16) == 0) break;
+		if (index < (unsigned)count) continue;
+		if ((unsigned)count == capacity) {
+			count = -ENOSPC;
+			break;
+		}
+		memcpy(addresses[count++], address.sin6_addr.s6_addr, 16);
+	}
+	if (list != NULL) ifnet_free_address_list(list);
+	ifnet_release(ifp);
+	return count;
+}
+
+int lx_os_pcie_pm_start(void) { return hakios_pcie_pm_start(); }
+void lx_os_pcie_pm_sample(void) { hakios_pcie_pm_sample(); }
+
 int
 lx_os_pcie_cfg_read(unsigned rc, unsigned bdf, unsigned off, unsigned size, unsigned *value)
 {
@@ -687,13 +889,13 @@ lx_os_pcie_cfg_write(unsigned rc, unsigned bdf, unsigned off, unsigned size, uns
 int
 lx_os_pcie_try_read32(const volatile void *va, unsigned *value)
 {
-	return hakios_pcie_try_read32(va, value);
+	return hakios_pcie_bar_read32(va, value);
 }
 
 int
 lx_os_pcie_try_write32(volatile void *va, unsigned value)
 {
-	return hakios_pcie_try_write32(va, value);
+	return hakios_pcie_bar_write32(va, value);
 }
 
 /*
@@ -861,8 +1063,8 @@ hakios_lx_dma_release(void)
 
 /*
  * The router's link, the IPCR channels of MHI (wifi/lx/src/lx_mhi.c). The router (hakios.qrtr.c) wants hakios_qrtr_poll() now and
- * then, or a lookup on a link that has nothing to say is answered only at the next packet: the watcher below calls it every
- * millisecond while the link is up. It also looks for the Wi-Fi firmware's service itself, with a port of its own, and says
+ * then, or a lookup on a link that has nothing to say is answered only at the next packet: the watcher below calls it after each
+ * lookup (hakios_qrtr_wait(): 100 ms at most, 1 s with the screen off) while the link is up. It also looks for the Wi-Fi firmware's service itself, with a port of its own, and says
  * stage 7 when the HELLO has come and the service is there (never before stage 6; after 20 s it says it is not). No lock of
  * ours is held across a call into the router, and the link is the caller's until link_down() has returned.
  */
@@ -874,6 +1076,13 @@ static struct {
 	volatile uint32_t wlfw_node, wlfw_port;
 } lx_qrtr;
 static LCK_MTX_DECLARE(lx_qrtr_lock, &lx_lock_group);
+void lx_os_qrtr_diagnostic(void)
+{
+	uint32_t peer, hellos, in, out, services;
+	hakios_qrtr_stats(&peer, &hellos, &in, &out, &services);
+	hakios_wifi_tell("lx: runtime QRTR link %u running %u stop %u wlfw %u peer %u hellos %u in %u out %u services %u\n",
+	    lx_qrtr.link != NULL, lx_qrtr.running, lx_qrtr.stop, lx_qrtr.wlfw_there, peer, hellos, in, out, services);
+}
 
 static void
 lx_qrtr_server(__unused void *context, bool arrived, __unused uint32_t service, __unused uint32_t version, __unused uint32_t instance,
@@ -922,11 +1131,12 @@ lx_qrtr_watch(__unused void *parameter, __unused wait_result_t result)
 			    in, out);
 			said = true;
 		}
-		delay_for_interval(1, NSEC_PER_MSEC);
+		hakios_qrtr_wait(hakios_screen_off() ? 1000 : 100);
 	}
 	if (port != NULL) {
 		hakios_qrtr_router_ops.close(port);
 	}
+	lx_thread_release();
 	lck_mtx_lock(&lx_qrtr_lock);
 	lx_qrtr.running = false;
 	lck_mtx_unlock(&lx_qrtr_lock);
@@ -947,6 +1157,7 @@ lx_os_qrtr_link(const struct hakios_qrtr_link *link)
 			return 0;
 		}
 		lx_qrtr.stop = true;
+		hakios_qrtr_wake();
 		lck_mtx_lock(&lx_qrtr_lock);
 		while (lx_qrtr.running) {
 			lck_mtx_sleep(&lx_qrtr_lock, LCK_SLEEP_DEFAULT, (event_t)&lx_qrtr.running, THREAD_UNINT);
@@ -1004,6 +1215,11 @@ lx_os_station_lost(int error)
 /* ---- the driver ---------------------------------------------------------------------------------------- */
 
 /* The object has its own; this is the one of a kernel built without it. */
+__attribute__((weak, noinline)) void
+lx_thread_release(void)
+{
+}
+
 __attribute__((weak)) int
 lx_start(void)
 {
@@ -1110,6 +1326,13 @@ lx_os_pci_msi_wait(unsigned milliseconds)
 {
 	uint32_t fired;
 
+	/*
+	 * The quiet sweep (every handler once, after milliseconds without an MSI: 10) is a net for lost MSIs and for work queued
+	 * from other threads; with the screen off it comes every 200 ms (STANDBY-PLAN.md). An MSI still ends the wait at once.
+	 */
+	if (hakios_screen_off() && milliseconds < 200) {
+		milliseconds = 200;
+	}
 	assert_wait_timeout((event_t)&lx_msi_fired, THREAD_UNINT, milliseconds, NSEC_PER_MSEC);
 	if ((fired = os_atomic_xchg(&lx_msi_fired, 0, acquire)) != 0) {
 		clear_wait(current_thread(), THREAD_AWAKENED);

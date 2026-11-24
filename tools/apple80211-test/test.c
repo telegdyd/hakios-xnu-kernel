@@ -29,13 +29,38 @@ static struct hakios_sta_state now;
 static struct hakios_sta_bss heard[3];
 static unsigned heard_count;
 
-int kev_post_msg(struct kev_msg *message) { (void)message; return 0; }
+/* the events posted, in order: their codes, the name they carry, and their data */
+static struct {
+	uint32_t code;
+	uint32_t length;
+	uint8_t data[256];
+	bool named;
+} posted[16];
+static unsigned posted_count;
+
+int
+kev_post_msg(struct kev_msg *message)
+{
+	if (posted_count < sizeof(posted) / sizeof(posted[0])) {
+		posted[posted_count].code = message->event_code;
+		posted[posted_count].named = message->dv[0].data_length == 16 && strcmp(message->dv[0].data_ptr, "en0") == 0 &&
+		    message->vendor_code == KEV_VENDOR_APPLE && message->kev_class == KEV_IEEE80211_CLASS && message->kev_subclass == 1;
+		posted[posted_count].length = message->dv[1].data_length;
+		if (message->dv[1].data_length != 0 && message->dv[1].data_length <= sizeof(posted[0].data)) {
+			memcpy(posted[posted_count].data, message->dv[1].data_ptr, message->dv[1].data_length);
+		}
+	}
+	posted_count++;
+	return 0;
+}
 void proc_selfname(char *name, int size) { snprintf(name, (size_t)size, "wifid"); }
 bool hakios_sta_present(void) { return true; }
 bool hakios_sta_powered(void) { return true; }
 int hakios_sta_ask_power(bool on) { (void)on; return 0; }
 int hakios_sta_ask_scan(const struct hakios_sta_scan *what) { (void)what; return 0; }
-int hakios_sta_ask_join(const struct hakios_sta_join *what) { (void)what; return 0; }
+static struct hakios_sta_join asked_join;
+static unsigned join_calls;
+int hakios_sta_ask_join(const struct hakios_sta_join *what) { asked_join=*what;join_calls++;return 0; }
 int hakios_sta_ask_leave(void) { return 0; }
 int hakios_sta_ask_country(const char *code) { (void)code; return 0; }
 bool hakios_sta_country(char *code) { memcpy(code, "DE", 2); return true; }
@@ -177,6 +202,163 @@ expect_link(const char *what, uint32_t mode, int32_t rate, int32_t mcs, int32_t 
 		CHECK(error == 0 && value == mcs, "%s: MCS %d (error %d), want %d", what, value, error, mcs);
 	}
 	CHECK(get_value(353, &value) == 0 && value == streams, "%s: NSS %d, want %d", what, value, streams);
+}
+
+/* ---- events (P3b) ---- */
+
+static int32_t
+word(const uint8_t *data, unsigned at)
+{
+	int32_t value;
+
+	memcpy(&value, data + at, sizeof(value));
+	return value;
+}
+
+static int16_t
+half(const uint8_t *data, unsigned at)
+{
+	int16_t value;
+
+	memcpy(&value, data + at, sizeof(value));
+	return value;
+}
+
+/* the codes posted since the last call, as a string of numbers ("2 3 4 39") */
+static const char *
+codes(void)
+{
+	static char line[128];
+
+	line[0] = 0;
+	for (unsigned i = 0; i < posted_count && i < sizeof(posted) / sizeof(posted[0]); i++) {
+		CHECK(posted[i].named, "event %u does not carry en0's name", posted[i].code);
+		snprintf(line + strlen(line), sizeof(line) - strlen(line), "%s%u", i ? " " : "", posted[i].code);
+	}
+	return line;
+}
+
+static unsigned
+find(uint32_t code)
+{
+	for (unsigned i = 0; i < posted_count; i++) {
+		if (posted[i].code == code) {
+			return i;
+		}
+	}
+	return ~0u;
+}
+
+static void
+signal_says(int dbm, bool sent, const char *what)
+{
+	unsigned at;
+
+	posted_count = 0;
+	hakios_apple80211_event(HAKIOS_STA_SIGNAL, dbm);
+	at = find(39);
+	CHECK(sent ? posted_count == 1 && at == 0 && word(posted[0].data, 4) == dbm : posted_count == 0,
+	    "%s: %d dBm: posted \"%s\", want %s", what, dbm, codes(), sent ? "39" : "nothing");
+}
+
+static void
+events(void)
+{
+	unsigned at;
+
+	/* joined: the name, the access point, the link up with its signal, then the first RSSI_CHANGED at once */
+	network(5180);
+	posted_count = 0;
+	hakios_apple80211_event(HAKIOS_STA_LINK, 1);
+	CHECK(strcmp(codes(), "2 3 4 39") == 0, "joined: posted \"%s\"", codes());
+	at = find(4);
+	CHECK(at != ~0u && posted[at].length == 32 && posted[at].data[0] == 0 && word(posted[at].data, 4) == -60 &&
+	    half(posted[at].data, 8) == 35 && half(posted[at].data, 10) == -95 && posted[at].data[0x10] == 0 &&
+	    word(posted[at].data, 0x14) == 0, "joined: LINK_CHANGED");
+	at = find(39);
+	CHECK(at != ~0u && posted[at].length == 180 && posted[at].data[0] == 1 && word(posted[at].data, 4) == -60 &&
+	    posted[at].data[8] == 0 && posted[at].data[0xb] == 1 && half(posted[at].data, 0xc) == 35 &&
+	    posted[at].data[0xe] == 1 && half(posted[at].data, 0x10) == -95 && posted[at].data[0x12] == 0 &&
+	    posted[at].data[0x30] == 0 && posted[at].data[0x31] == 0 && word(posted[at].data, 0x1c) == 0,
+	    "joined: RSSI_CHANGED");
+
+	/* the signal: by 3 dB, across the threshold, and every 5 s at least */
+	signal_says(-61, false, "1 dB");
+	signal_says(-62, false, "2 dB");
+	signal_says(-63, true, "3 dB");
+	signal_says(-63, false, "quiet 1");
+	signal_says(-63, false, "quiet 2");
+	signal_says(-62, false, "quiet 3");
+	signal_says(-64, false, "quiet 4");
+	signal_says(-64, true, "quiet 5");
+	signal_says(-79, true, "-15 dB");
+	signal_says(-80, false, "at the threshold (1 dB)");
+	signal_says(-81, true, "below the threshold (2 dB)");
+	signal_says(-79, true, "back above the threshold (2 dB)");
+
+	/* the country */
+	posted_count = 0;
+	hakios_apple80211_event(HAKIOS_STA_COUNTRY, 0);
+	CHECK(strcmp(codes(), "11") == 0 && posted[0].length == 0, "country: posted \"%s\"", codes());
+
+	/* lost: the access point deauthenticates us with reason 7 */
+	now.phase = HAKIOS_STA_IDLE;
+	now.last_error = ECONNRESET;
+	now.loss = HAKIOS_STA_LOSS_DEAUTH;
+	now.reason = 7;
+	posted_count = 0;
+	hakios_apple80211_event(HAKIOS_STA_LINK, ECONNRESET);
+	CHECK(strcmp(codes(), "34 2 3 4") == 0, "deauthenticated: posted \"%s\"", codes());
+	CHECK(posted[0].length == 8 && word(posted[0].data, 0) == 0 && word(posted[0].data, 4) == 7, "DEAUTH_RECEIVED");
+	at = find(4);
+	CHECK(at != ~0u && posted[at].data[0] == 1 && posted[at].data[0x10] == 1 && word(posted[at].data, 0x14) == 7 &&
+	    word(posted[at].data, 4) == 0, "deauthenticated: LINK_CHANGED down, involuntary, reason %d", word(posted[at].data, 0x14));
+	{
+		struct {
+			uint32_t version, reason;
+			uint8_t address[6], unused[2];
+		} deauth;
+
+		CHECK(ask(false, 29, NULL, &deauth, sizeof(deauth)) == 0 && deauth.reason == 7, "DEAUTH after one: reason %u",
+		    deauth.reason);
+	}
+	signal_says(-60, false, "after the loss");
+
+	/* ... disassociates us with reason 8 */
+	now.loss = HAKIOS_STA_LOSS_DISASSOC;
+	now.reason = 8;
+	posted_count = 0;
+	hakios_apple80211_event(HAKIOS_STA_LINK, ECONNRESET);
+	CHECK(strcmp(codes(), "72 2 3 4") == 0 && word(posted[0].data, 4) == 8 && word(posted[3].data, 0x14) == 8,
+	    "disassociated: posted \"%s\"", codes());
+
+	/* ... its beacons stop: inactivity, no frame to tell of */
+	now.loss = HAKIOS_STA_LOSS_BEACONS;
+	now.reason = 0;
+	now.last_error = ETIMEDOUT;
+	posted_count = 0;
+	hakios_apple80211_event(HAKIOS_STA_LINK, ETIMEDOUT);
+	CHECK(strcmp(codes(), "2 3 4") == 0 && posted[2].data[0x10] == 1 && word(posted[2].data, 0x14) == 4,
+	    "beacons lost: posted \"%s\", reason %d", codes(), word(posted[2].data, 0x14));
+
+	/* left when asked: down, not involuntary, no reason; no signal after */
+	network(5180);
+	hakios_apple80211_event(HAKIOS_STA_LINK, 1);
+	now.phase = HAKIOS_STA_IDLE;
+	now.loss = HAKIOS_STA_LOSS_NONE;
+	posted_count = 0;
+	hakios_apple80211_event(HAKIOS_STA_LINK, 0);
+	CHECK(strcmp(codes(), "2 3 4") == 0 && posted[2].data[0] == 1 && posted[2].data[0x10] == 0 &&
+	    word(posted[2].data, 0x14) == 0, "left: posted \"%s\"", codes());
+	signal_says(-60, false, "after leaving");
+
+	/* scans, joins, power: no data */
+	posted_count = 0;
+	hakios_apple80211_event(HAKIOS_STA_SCAN_DONE, 0);
+	hakios_apple80211_event(HAKIOS_STA_JOIN_DONE, 0);
+	hakios_apple80211_event(HAKIOS_STA_POWER, 1);
+	CHECK(strcmp(codes(), "10 9 1") == 0 && posted[0].length == 0 && posted[1].length == 0 && posted[2].length == 0,
+	    "scan, join, power: posted \"%s\"", codes());
 }
 
 int
@@ -380,6 +562,34 @@ main(void)
 			CHECK(ask(true, sets[i], NULL, room, sizeof(room)) == EOPNOTSUPP, "set %d not refused", sets[i]);
 		}
 	}
+
+	/* WPA3-only requests preserve their policy; SAE needs the password itself.
+	 * Transition requests remain automatic and select SAE from the AP RSN. */
+	{
+		uint8_t assoc[592]={0};uint32_t n=4,cipher=10;uint16_t auth=0x1000;
+		memcpy(assoc+8,&auth,2);memcpy(assoc+12,&n,4);memcpy(assoc+16,"test",4);
+		n=3;memcpy(assoc+60,&n,4);memcpy(assoc+64,&cipher,4);memcpy(assoc+72,"sae",3);
+		CHECK(ask(true,20,NULL,assoc,sizeof(assoc))==0 && asked_join.security==HAKIOS_STA_WPA3_SAE && asked_join.passphrase_length==3,
+		    "WPA3-only password and policy cross the station boundary");
+		auth=0x1008;memcpy(assoc+8,&auth,2);
+		CHECK(ask(true,20,NULL,assoc,sizeof(assoc))==0 && asked_join.security==HAKIOS_STA_WPA2_PSK,"transition request remains automatic");
+		n=32;cipher=6;memcpy(assoc+60,&n,4);memcpy(assoc+64,&cipher,4);unsigned before=join_calls;
+		CHECK(ask(true,20,NULL,assoc,sizeof(assoc))==EINVAL && join_calls==before,"WPA3 refuses WPA2-derived PMK");
+		now.phase=HAKIOS_STA_JOINED;now.security=HAKIOS_STA_WPA3_SAE;uint32_t answer[4]={0};
+		CHECK(ask(false,2,NULL,answer,sizeof(answer))==0 && answer[2]==0x1000,"GET AUTH_TYPE reports negotiated SAE");
+		now.security=HAKIOS_STA_WPA2_PSK;
+		CHECK(ask(false,2,NULL,answer,sizeof(answer))==0 && answer[2]==8,"GET AUTH_TYPE retains WPA2");
+	}
+
+    { /* OWE uses the existing passwordless request and reports Enhanced Open as open. */
+        uint8_t assoc[592]={0};uint32_t n=4;
+        memcpy(assoc+12,&n,4);memcpy(assoc+16,"test",4);
+        CHECK(ask(true,20,NULL,assoc,sizeof(assoc))==0 && asked_join.security==HAKIOS_STA_OPEN &&
+            !asked_join.passphrase_length,"passwordless OWE request crosses the station boundary");
+        now.phase=HAKIOS_STA_JOINED;now.security=HAKIOS_STA_OWE;uint32_t answer[4]={0};
+        CHECK(ask(false,2,NULL,answer,sizeof(answer))==0 && answer[2]==0,"OWE reports passwordless upper authentication");
+    }
+	events();
 
 	printf("apple80211-test: %u checks, %u failed\n", checks, failures);
 	return failures != 0;

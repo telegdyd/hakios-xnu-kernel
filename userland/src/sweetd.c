@@ -2,7 +2,7 @@
  * sweetd: a tiny remote command runner for the phone's iOS userland. From ios-jasmine (ios/sweetd.c, MIT,
  * the same author's Mi A2 port), by way of ios-vayu: launchd starts it as root (com.hakios.sweetd.plist),
  * it listens on TCP port 5143 of the USB Ethernet link (en2, boot-arg usb_net=1: CDC-NCM, the phone is
- * 192.168.7.2) and runs one command per connection:
+ * 192.168.7.2) and of Wi-Fi (en0, the address the network gave it) and runs one command per connection:
  *
  *   request:  "RUN <token> <timeout-seconds> <argc>
 " then argc lines, one
@@ -657,9 +657,8 @@ main(void)
 		if (cs < 0) {
 			continue;
 		}
-		/* the USB Ethernet link only (192.168.7.0/24) */
-		uint32_t pa = ntohl(peer.sin_addr.s_addr);
-		if (peer.sin_family == AF_INET && (pa >> 8) == 0xc0a807) {
+		/* any IPv4 peer: the USB Ethernet link (192.168.7.0/24) or Wi-Fi (en0); the token is what guards it */
+		if (peer.sin_family == AF_INET) {
 			serve(cs);
 		}
 		close(cs);

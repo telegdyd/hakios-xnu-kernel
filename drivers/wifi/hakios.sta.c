@@ -16,6 +16,11 @@
  * again whenever the radio is turned back on (Settings' switch), until somebody asks for
  * another network -- as Darwin itself rejoins the networks it knows. If that other network cannot
  * be joined (a wrong passphrase), the standing one is joined again.
+ *
+ * While a network is joined and nothing is asked for, the thread measures its signal once a
+ * second (the station side's signal(), else its last beacon) and says so (HAKIOS_STA_SIGNAL):
+ * Darwin hears how the link goes without asking (WIFI-PLAN.md P3b). A country request that
+ * leaves another country in force is said too (HAKIOS_STA_COUNTRY).
  */
 #include <kern/clock.h>
 #include <kern/kalloc.h>
@@ -33,6 +38,7 @@ extern void thread_set_thread_name(thread_t thread, const char *name);
 
 #define HEARD_MOST      128
 #define CHANNELS_MOST   96
+#define SIGNAL_EVERY_MS 1000            /* how often the signal of the network joined is measured */
 
 static LCK_GRP_DECLARE(sta_lock_group, "hakios-sta");
 static LCK_MTX_DECLARE(sta_lock, &sta_lock_group);
@@ -41,7 +47,9 @@ static const struct hakios_sta_ops *sta_ops;   /* the station side, while there 
 static bool sta_thread_made;
 static bool sta_calls;                          /* the thread is in a call of the station side's */
 static unsigned sta_reads;                      /* ... and so many others are in its state() */
+static bool sta_power_change;                  /* power may free/recreate the driver's radio */
 static bool sta_on;                             /* the radio's power, as last asked for */
+static bool sta_joined;                         /* a network is joined (as the events have said) */
 
 /* what has been asked for and not begun */
 static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave, asked_country;
@@ -80,16 +88,32 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 	for (;;) {
 		const struct hakios_sta_ops *ops;
 		bool power = false, power_on = false, leave = false, do_join = false, do_scan = false, country = false;
+		bool sample = false;
 		char code[2] = { 0 };
 		int error = 0;
 
 		lck_mtx_lock(&sta_lock);
 		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan || asked_country)) {
-			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
+			uint64_t deadline;
+
+			if (sta_ops == NULL || !sta_joined) {
+				lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
+				continue;
+			}
+			/* (joined: a second with nothing asked for is the time to measure the signal) */
+			clock_interval_to_deadline(SIGNAL_EVERY_MS, NSEC_PER_MSEC, &deadline);
+			if (lck_mtx_sleep_deadline(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT, deadline) ==
+			    THREAD_TIMED_OUT && sta_ops != NULL && sta_joined && !(asked_power || asked_leave || asked_join ||
+			    asked_scan || asked_country)) {
+				sample = true;
+				break;
+			}
 		}
 		ops = sta_ops;
 		/* one thing at a time, in the order that makes sense when several wait */
-		if (asked_power) {
+		if (sample) {
+			/* (below) */
+		} else if (asked_power) {
 			power = true;
 			power_on = asked_power_on;
 			asked_power = false;
@@ -111,6 +135,11 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			asked_scan = false;
 		}
 		sta_calls = true;
+		if (power) {
+			sta_power_change = true;
+			while (sta_reads != 0)
+				lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_calls, THREAD_UNINT);
+		}
 		lck_mtx_unlock(&sta_lock);
 
 		if (power) {
@@ -121,6 +150,11 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 				ops->state(state);
 				was_joined = state->phase == HAKIOS_STA_JOINED;
 				kfree_data(state, sizeof(*state));
+			}
+			if (!power_on) {
+				lck_mtx_lock(&sta_lock);
+				sta_joined = false;
+				lck_mtx_unlock(&sta_lock);
 			}
 			error = ops->power(power_on);
 			if (!power_on && was_joined) {
@@ -137,12 +171,14 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			struct hakios_sta_channel *now = kalloc_data(CHANNELS_MOST * sizeof(*now), Z_WAITOK);
 			char in_force[2] = { 0 };
 			unsigned count = 0;
+			bool changed;
 
 			error = ops->country(code, in_force);
 			if (now != NULL) {
 				count = ops->channels(now, CHANNELS_MOST);
 			}
 			lck_mtx_lock(&sta_lock);
+			changed = in_force[0] != 0 && memcmp(country_now, in_force, sizeof(country_now)) != 0;
 			memcpy(country_now, in_force, sizeof(country_now));
 			if (now != NULL) {
 				memcpy(channels, now, count * sizeof(*now));
@@ -157,14 +193,26 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			}
 			hakios_wifi_tell("wifi: the country %c%c: %s (in force: %c%c, %u channels)\n", code[0], code[1], error == 0 ? "done" :
 			    "NOT DONE", in_force[0] ? in_force[0] : '-', in_force[1] ? in_force[1] : '-', count);
+			if (changed) {
+				hakios_apple80211_event(HAKIOS_STA_COUNTRY, 0);
+			}
 		} else if (leave) {
+			lck_mtx_lock(&sta_lock);
+			sta_joined = false;
+			lck_mtx_unlock(&sta_lock);
 			ops->leave();
 			hakios_apple80211_event(HAKIOS_STA_LINK, 0);
 		} else if (do_join) {
+			lck_mtx_lock(&sta_lock);
+			sta_joined = false;
+			lck_mtx_unlock(&sta_lock);
 			error = ops->join(&join);
 			bzero(&join, sizeof(join));
 			hakios_apple80211_event(HAKIOS_STA_JOIN_DONE, error);
 			if (error == 0) {
+				lck_mtx_lock(&sta_lock);
+				sta_joined = true;
+				lck_mtx_unlock(&sta_lock);
 				hakios_apple80211_event(HAKIOS_STA_LINK, 1);
 			}
 			/* a join that did not come through (a wrong passphrase) leaves things as they were: the standing network again */
@@ -185,10 +233,30 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			scan_generation++;
 			lck_mtx_unlock(&sta_lock);
 			hakios_apple80211_event(HAKIOS_STA_SCAN_DONE, error);
+		} else if (sample) {
+			struct hakios_sta_state *state;
+			bool still, known;
+			int dbm = 0;
+
+			/* the radio's own measurement, else the last beacon's (a network lost meanwhile is not measured) */
+			known = ops->signal != NULL && ops->signal(&dbm) == 0;
+			if (!known && (state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO)) != NULL) {
+				ops->state(state);
+				known = state->phase == HAKIOS_STA_JOINED;
+				dbm = state->bss.rssi;
+				kfree_data(state, sizeof(*state));
+			}
+			lck_mtx_lock(&sta_lock);
+			still = sta_joined;
+			lck_mtx_unlock(&sta_lock);
+			if (still && known) {
+				hakios_apple80211_event(HAKIOS_STA_SIGNAL, dbm);
+			}
 		}
 
 		lck_mtx_lock(&sta_lock);
 		sta_calls = false;
+		sta_power_change = false;
 		lck_mtx_unlock(&sta_lock);
 		thread_wakeup((event_t)&sta_calls);
 	}
@@ -209,6 +277,7 @@ hakios_sta_attach(const struct hakios_sta_ops *ops)
 			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_calls, THREAD_UNINT);
 		}
 		heard_count = channel_count = 0;
+		sta_joined = false;
 		bzero(country_now, sizeof(country_now));
 		country_error = ENXIO;
 		country_done++;                 /* (whoever waits for a country hears that there is no radio) */
@@ -245,6 +314,9 @@ hakios_sta_attach(const struct hakios_sta_ops *ops)
 void
 hakios_sta_lost(int error)
 {
+	lck_mtx_lock(&sta_lock);
+	sta_joined = false;
+	lck_mtx_unlock(&sta_lock);
 	hakios_apple80211_event(HAKIOS_STA_LINK, error != 0 ? error : ECONNRESET);
 }
 
@@ -433,7 +505,8 @@ hakios_sta_state(struct hakios_sta_state *state)
 
 	bzero(state, sizeof(*state));
 	lck_mtx_lock(&sta_lock);
-	if ((ops = sta_ops) != NULL) {
+	ops = sta_power_change ? NULL : sta_ops;
+	if (ops != NULL) {
 		sta_reads++;
 	}
 	lck_mtx_unlock(&sta_lock);

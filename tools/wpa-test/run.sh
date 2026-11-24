@@ -11,6 +11,7 @@ rm -rf "$B"
 mkdir -p "$B"
 "$HERE/reference.py" "${1:-1}" > "$B/cases.inc"
 ${CC:-cc} -std=gnu11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=all \
-	-I"$B" -I"$ROOT/wifi/lx/src" -o "$B/test" "$HERE/test_wpa.c"
+	-I"$B" -I"$ROOT/wifi/lx/src" -o "$B/test" "$HERE/test_wpa.c" "$ROOT/wifi/lx/src/lx_sae_crypto.c"
 "$B/test"
 python3 "$HERE/station.py"
+python3 "$HERE/pmf_station.py"

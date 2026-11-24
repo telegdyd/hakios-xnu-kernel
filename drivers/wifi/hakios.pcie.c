@@ -36,12 +36,15 @@
 #include <libkern/libkern.h>
 #include <machine/machine_routines.h>
 #include <mach/vm_param.h>
+#include <os/atomic_private.h>
 #include <vm/memory_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/hakios.pcie.h>
 #include <sys/hakios.wifi.h>
+#include <sys/hakios.input.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 
 /* From the kernel's own map, as redwood's Wi-Fi does: the io_submap of plain I/O mappings holds 8 MB in all and is
  * full by the time the chain runs; a mapping that does not fit there panics (KMA_NOFAIL), which reset the phone in
@@ -106,6 +109,19 @@ G(unsigned off)
 }
 static unsigned generation = 2, ncpt, rail_count;
 static bool started, linked, endpoint, tcs_owned, tcs_poisoned;
+static unsigned down_errors, up_count, down_count, rail_mask;
+/* Link sleep (hakios_pcie_sleep/wake): the journal entries from ctl_mark on are the controller's (clocks, GDSC,
+ * PHY, DBI); those before are the rails' and pins'. Asleep: the controller is off, the radio powered, in M3. */
+static unsigned ctl_mark;
+static bool drv_mode;
+static int drv_wake(void);
+static volatile bool asleep;
+static unsigned sleeps, wakes, sleep_errors, wake_errors, l23_missed, refused_bar;
+static unsigned long long asleep_since, asleep_ns;
+static char pm_description[768] = "no completed enumeration";
+static struct pm_port {
+	unsigned bdf, pc, ss, lc, ctl, sta, dc2, dctl2, sc, s1, s2, dc;
+} pm_ports[2];
 /* mask 0: restore the whole old word. mask != 0: a shared vote word (GCC VOTE0/VOTE2,
  * also set by touch and the GPU); down clears only these bits, with a fresh read. */
 static struct { vm_offset_t address; unsigned old, mask; } undo[512];
@@ -504,6 +520,8 @@ vote_slot(unsigned index, bool on)
 	CHECK(tcs_sync(TCS(0x10), 0));
 	CHECK(wr(rsc + TCS_BASE + 8, TCS_BIT));
 	tcs_poisoned = false;
+	if (on) rail_mask |= 1u << index;
+	else rail_mask &= ~(1u << index);
 	return 0;
 }
 static int
@@ -688,7 +706,7 @@ config_address(unsigned rc, unsigned bdf, unsigned off, unsigned size, vm_offset
 {
 	if (rc) return ENODEV;
 	if ((size != 1 && size != 2 && size != 4) || (off & (size - 1)) || off > 4096 - size) return EINVAL;
-	if (!started || !dbi) return ENXIO;
+	if (!started || !dbi || asleep) return ENXIO;
 	if (bdf == 0) *a = dbi + (off & ~3u);
 	else if (bdf == HAKIOS_PCIE_WIFI_BDF && linked) *a = cfg + (off & ~3u);
 	else return ENODEV;
@@ -747,6 +765,64 @@ hakios_pcie_cfg_write(unsigned rc, unsigned bdf, unsigned off, unsigned size, un
 	} else v = value;
 	return wr(a, v);
 }
+#include "hakios.pcie-pm.h"
+
+/* Read-only capability snapshot at enumeration, while this caller owns the link.
+ * The sysctl serves this cache; it never touches a powered-down config window. */
+static int pm_describe(unsigned bdf, char *text, size_t size)
+{
+	unsigned ptr, header, pc = 0, ss = 0, ltr = 0, seen[32] = {0};
+	CHECK(hakios_pcie_cfg_read(0, bdf, 0x34, 1, &ptr));
+	for (unsigned n = 0; ptr && n < 48; n++) {
+		if (ptr < 0x40 || ptr > 0xfc || (ptr & 3)) return EIO;
+		unsigned bit = ptr / 4;
+		if (seen[bit / 32] & (1u << (bit % 32))) return EIO;
+		seen[bit / 32] |= 1u << (bit % 32);
+		CHECK(hakios_pcie_cfg_read(0, bdf, ptr, 4, &header));
+		if (header == ~0u) return EIO;
+		if ((header & 255) == 0x10) pc = ptr;
+		ptr = (header >> 8) & 255;
+	}
+	if (ptr || !pc) return EIO;
+	bzero(seen, sizeof(seen)); ptr = 0x100;
+	for (unsigned n = 0; ptr && n < 256; n++) {
+		if (ptr < 0x100 || ptr > 0xffc || (ptr & 3)) return EIO;
+		unsigned bit = ptr / 4;
+		if (seen[bit / 32] & (1u << (bit % 32))) return EIO;
+		seen[bit / 32] |= 1u << (bit % 32);
+		CHECK(hakios_pcie_cfg_read(0, bdf, ptr, 4, &header));
+		if (!header || header == ~0u) { ptr = 0; break; }
+		if ((header & 0xffff) == 0x1e) ss = ptr;
+		if ((header & 0xffff) == 0x18) ltr = ptr;
+		ptr = (header >> 20) & 0xfff;
+	}
+	if (ptr || pc > 0xd4 || (ss && ss > 0xff0)) return EIO;
+	unsigned lc, ctl, sta, dc, dc2, dctl2, sc = 0, s1 = 0, s2 = 0;
+	CHECK(hakios_pcie_cfg_read(0, bdf, pc + 4, 4, &dc));
+	CHECK(hakios_pcie_cfg_read(0, bdf, pc + 0xc, 4, &lc));
+	CHECK(hakios_pcie_cfg_read(0, bdf, pc + 0x10, 2, &ctl));
+	CHECK(hakios_pcie_cfg_read(0, bdf, pc + 0x12, 2, &sta));
+	CHECK(hakios_pcie_cfg_read(0, bdf, pc + 0x24, 4, &dc2));
+	CHECK(hakios_pcie_cfg_read(0, bdf, pc + 0x28, 2, &dctl2));
+	if (ss) {
+		CHECK(hakios_pcie_cfg_read(0, bdf, ss + 4, 4, &sc));
+		CHECK(hakios_pcie_cfg_read(0, bdf, ss + 8, 4, &s1));
+		CHECK(hakios_pcie_cfg_read(0, bdf, ss + 12, 4, &s2));
+	}
+	snprintf(text, size, "%s pcie %#x lnkcap %#x lnkctl %#x lnksta %#x devcap %#x devcap2 %#x devctl2 %#x l1ss %#x cap %#x ctl1 %#x ctl2 %#x ltr %#x",
+	    bdf ? "endpoint" : "root", pc, lc, ctl, sta, dc, dc2, dctl2, ss, sc, s1, s2, ltr);
+	pm_ports[bdf ? 1 : 0] = (struct pm_port){bdf, pc, ss, lc, ctl, sta, dc2, dctl2, sc, s1, s2, dc};
+	return 0;
+}
+static void pm_snapshot(void)
+{
+	char root[320] = {0}, ep[320] = {0};
+	bzero(pm_ports, sizeof(pm_ports));
+	int a = pm_describe(0, root, sizeof(root));
+	int b = pm_describe(HAKIOS_PCIE_WIFI_BDF, ep, sizeof(ep));
+	pm_valid = !a && !b;
+	snprintf(pm_description, sizeof(pm_description), "last enumeration (cached), errors %d/%d\n%s\n%s", a, b, root, ep);
+}
 static int
 enumerate(struct hakios_pcie_link *link)
 {
@@ -777,6 +853,13 @@ enumerate(struct hakios_pcie_link *link)
 	endpoint = true;
 	link->vendor = id & 0xffff; link->device = id >> 16;
 	link->bar0_pa = BAR_PA; link->bar0_va = (void *)bar; link->bar0_size = BAR_SIZE;
+	pm_snapshot();
+	pm_error = pm_prepare(pm_requested);
+	if (pm_error) {
+		int restore = pm_restore();
+		say("pcie: link PM prepare failed %d; restoration %d, ASPM left off\n", pm_error, restore);
+		if (restore) return restore;
+	}
 	return 0;
 }
 /* Parse exact strings: PE_parse_boot_argn would accept numeric prefixes or
@@ -812,6 +895,15 @@ hakios_pcie_down(unsigned rc)
 	/* No mutex, mapping, allocation or thread waits; safe when panic owns a lock.
 	 * GPIOs first: even if the endpoint no longer answers, stop its bus traffic. */
 	int errors = 0;
+	if (asleep && drv_mode) {
+		(void)drv_wake();       /* (the DSP gives the link back first; then the ordinary shutdown) */
+	}
+	if (asleep) {
+		/* the controller is already off (its journal undone), the endpoint in reset: only pins and rails remain */
+		pm_owned = false;
+		asleep = false;
+	}
+	errors += !!pm_restore();
 	if (tlmm) { errors += !!gpio(94, false); errors += !!gpio(80, false); errors += !!gpio(204, false); }
 	linked = endpoint = false;
 	while (undo_count) {
@@ -823,7 +915,664 @@ hakios_pcie_down(unsigned rc)
 	if (!tcs_poisoned) tcs_owned = false;
 	/* A timed-out TCS stays quarantined for the boot. Never clear or retrigger it. */
 	started = false;
+	down_errors += errors;
+	down_count++;
+	if (!errors) (void)hakios_pcie_bandwidth(false); /* uncertain shutdown: keep its bus floor */
 	if (errors) say("pcie: shutdown incomplete: %d refused/timed-out operations; reset pins attempted\n", errors);
+}
+int hakios_pcie_down_status(void)
+{
+	return started ? EBUSY : down_errors || tcs_poisoned || rail_mask ? EIO : 0;
+}
+
+/*
+ * ---- link sleep with the radio powered (the vendor's non-DRV suspend: pci-msm.c msm_pcie_pm_suspend/resume, cnss2's
+ * cnss_pci_suspend_bus: MHI in M3 first, then the endpoint's config saved, D3hot, PME_Turn_Off, L23_Ready, PERST, and the
+ * controller off; the radio keeps its rails, WLAN_EN and its association, and asks for the host with WAKE#, GPIO 96).
+ * Off, nothing of APSS's holds CX for PCIe: no GDSC, no clock, no SN0 floor.
+ */
+#define EP_BDF HAKIOS_PCIE_WIFI_BDF
+static unsigned ep_cfg[64], ep_msi, ep_pmc, ep_pcie;
+static bool ep_saved;
+static int
+ep_cap(unsigned id, unsigned *at)
+{
+	unsigned ptr, header;
+	*at = 0;
+	CHECK(hakios_pcie_cfg_read(0, EP_BDF, 0x34, 1, &ptr));
+	for (unsigned n = 0; ptr && n < 48; n++) {
+		if (ptr < 0x40 || ptr > 0xfc || (ptr & 3)) return EIO;
+		CHECK(hakios_pcie_cfg_read(0, EP_BDF, ptr, 4, &header));
+		if (header == ~0u) return EIO;
+		if ((header & 255) == id) { *at = ptr; return 0; }
+		ptr = (header >> 8) & 255;
+	}
+	return 0;
+}
+static int
+ep_save(void)
+{
+	for (unsigned i = 0; i < 64; i++) CHECK(hakios_pcie_cfg_read(0, EP_BDF, 4 * i, 4, &ep_cfg[i]));
+	if (ep_cfg[0] == ~0u || ep_cfg[0] == 0) return EIO;
+	CHECK(ep_cap(0x05, &ep_msi));
+	CHECK(ep_cap(0x01, &ep_pmc));
+	CHECK(ep_cap(0x10, &ep_pcie));
+	ep_saved = true;
+	return 0;
+}
+/* Linux pci_restore_state's order: D0 first, PCIe control registers, the header (the command word last), MSI
+ * (its control word last). Status words are not written back (W1C). */
+static int
+ep_restore(void)
+{
+	unsigned id;
+	if (!ep_saved) return EINVAL;
+	CHECK(hakios_pcie_cfg_read(0, EP_BDF, 0, 4, &id));
+	if (id != ep_cfg[0]) return ENODEV;
+	if (ep_pmc) {
+		CHECK(hakios_pcie_cfg_write(0, EP_BDF, ep_pmc + 4, 2, ep_cfg[(ep_pmc + 4) / 4] & ~3u & 0xffff));
+		delay(10000); /* D3hot -> D0: 10 ms (PCI PM 1.2) */
+	}
+	if (ep_pcie) {
+		CHECK(hakios_pcie_cfg_write(0, EP_BDF, ep_pcie + 0x08, 2, ep_cfg[(ep_pcie + 0x08) / 4] & 0xffff));       /* DEVCTL */
+		CHECK(hakios_pcie_cfg_write(0, EP_BDF, ep_pcie + 0x10, 2, ep_cfg[(ep_pcie + 0x10) / 4] & 0xffff & ~3u)); /* LNKCTL, ASPM off */
+		CHECK(hakios_pcie_cfg_write(0, EP_BDF, ep_pcie + 0x28, 2, ep_cfg[(ep_pcie + 0x28) / 4] & 0xffff));       /* DEVCTL2 */
+	}
+	for (int i = 15; i >= 2; i--) CHECK(hakios_pcie_cfg_write(0, EP_BDF, 4 * (unsigned)i, 4, ep_cfg[i]));
+	if (ep_msi) {
+		unsigned control = ep_cfg[ep_msi / 4] >> 16, wide = control & (1u << 7);
+		CHECK(hakios_pcie_cfg_write(0, EP_BDF, ep_msi + 4, 4, ep_cfg[(ep_msi + 4) / 4]));
+		if (wide) {
+			CHECK(hakios_pcie_cfg_write(0, EP_BDF, ep_msi + 8, 4, ep_cfg[(ep_msi + 8) / 4]));
+			CHECK(hakios_pcie_cfg_write(0, EP_BDF, ep_msi + 12, 2, ep_cfg[(ep_msi + 12) / 4] & 0xffff));
+		} else {
+			CHECK(hakios_pcie_cfg_write(0, EP_BDF, ep_msi + 8, 2, ep_cfg[(ep_msi + 8) / 4] & 0xffff));
+		}
+		if (control & (1u << 8)) { /* per-vector masking */
+			unsigned mask_at = ep_msi + (wide ? 16 : 12);
+			CHECK(hakios_pcie_cfg_write(0, EP_BDF, mask_at, 4, ep_cfg[mask_at / 4]));
+		}
+		CHECK(hakios_pcie_cfg_write(0, EP_BDF, ep_msi + 2, 2, control));
+	}
+	CHECK(hakios_pcie_cfg_write(0, EP_BDF, 4, 2, ep_cfg[1] & 0xffff));
+	return 0;
+}
+
+static unsigned long long
+now_ns(void)
+{
+	uint64_t ns;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
+
+/*
+ * DRV sleep (pci-msm.c msm_pcie_drv_suspend/resume): the link stays trained and in L1.2; the audio DSP takes RC0 over
+ * (ENABLE), APSS lets go of its clocks, its GDSC vote and its bus floor, and the DSP may power the controller down
+ * whenever the link has been in L1ss for 5 ms (ENABLE_L1SS_SLEEP; qcom,drv-l1ss-timeout-us = 5000). The radio still
+ * reaches the host's memory through it (its paging: run47's link-off WoW woke for WOW_REASON_PAGE_FAULT at once).
+ */
+extern int hakios_adsp_pcie_drv(uint32_t command, uint32_t argument) __attribute__((weak));
+#define DRV_ENABLE 0xc0000000u
+#define DRV_DISABLE 0xc0000001u
+#define DRV_ENABLE_L1SS_SLEEP 0xc0000005u
+#define DRV_DISABLE_L1SS_SLEEP 0xc0000006u
+static unsigned sleep_mode = 1;         /* 1 DRV, 2 the link off (PERST), 3 kept by APSS in L1ss (no hand-off) */
+/* 0: DRV sleep without ENABLE_L1SS_SLEEP (the DSP holds the link and never powers the controller down) */
+static unsigned drv_l1ss_sleep = 1;
+static bool drv_mode, drv_l1ss_requested;
+static bool drv_cx_ready;
+
+bool
+hakios_pcie_drv_cx_ready(void)
+{
+	return os_atomic_load(&drv_cx_ready, acquire);
+}
+static unsigned drv_errors, drv_last_error, drv_pm_mode;
+static unsigned drv_gdsc_off;
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, pcie_drv_gdsc, CTLFLAG_RW | CTLFLAG_LOCKED, &drv_gdsc_off, 0,
+    "1: DRV sleep also collapses the PCIe0 GDSC (SW_COLLAPSE); 0 (Linux: PWRSTS_RET_ON) leaves it on");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, pcie_sleep_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &sleep_mode, 0,
+    "PCIe0 link sleep: 1 handed to the audio DSP (DRV, link in L1.2), 2 link off (PERST; the radio cannot page), "
+    "3 kept by APSS with its clocks and link PM (L1ss): nothing handed over");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, pcie_drv_l1ss_sleep, CTLFLAG_RW | CTLFLAG_LOCKED, &drv_l1ss_sleep, 0,
+    "1: DRV sleep lets the DSP power the controller down after 5 ms in L1ss (ENABLE_L1SS_SLEEP); 0: it never does");
+/*
+ * The radio in D3hot while the link sleeps (PME enabled), D0 and its config back on wake: what upstream's PCI core does
+ * at system suspend and cnss2's cnss_pci_suspend does (pci_set_power_state(D3hot), "Failed to set D3Hot"). The firmware
+ * picks how it asks for the host by it (amss20.bin: "D3 Hot State, PERST HIGH. Issue PME#"; in D0 with PERST# high it
+ * asserts nothing). run63: in D0 no WoW wake in any link mode, the link fully APSS's included. At wake the endpoint's
+ * PME_Status and the root port's (RTSTA, cap 0x70 + 0x20) say whether the radio signalled.
+ */
+static unsigned ep_d3 = 1;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, pcie_ep_d3, CTLFLAG_RW | CTLFLAG_LOCKED, &ep_d3, 0,
+    "1: the radio in D3hot (PME on) while the APSS-kept link sleeps (mode 3); 2: in DRV sleep too; 0: it stays in D0");
+static void pme_settle(void);
+static int pme_setup(void);
+/* ms between the caller's MHI M3 and D3hot (run68: 95 of 109 wakes were the radio's PME the instant it entered D3hot,
+ * PAGE_FAULT or no reason: is the firmware still finishing its WoW entry, reaching host memory, when it is cut off?) */
+static unsigned d3_delay_ms;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, pcie_d3_delay_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &d3_delay_ms, 0,
+    "ms the radio is left in D0 after MHI M3 before D3hot (0: at once)");
+static bool ep_in_d3;
+static unsigned pme_ep, pme_rc, d3_entered, d3_errors, pmcsr_at_wake, rtsta_at_wake;
+static int
+ep_d3_enter(void)
+{
+	int error;
+	if (!ep_d3 || !ep_pmc) return 0;
+	if ((error = pme_setup())) { d3_errors++; return error; }
+	if (d3_delay_ms) delay((int)(d3_delay_ms > 5000 ? 5000 : d3_delay_ms) * 1000);
+	if ((error = ep_save())) { d3_errors++; return error; }	/* (as it is now: link PM on, for the way back) */
+	(void)wr(dbi + 0x90, 1u << 16);				/* the root port's PME status cleared (W1C) */
+	unsigned pmcsr = (ep_cfg[(ep_pmc + 4) / 4] & 0xffff & ~3u) | 3u | (1u << 8) | (1u << 15); /* D3hot, PME_En, PME_Status W1C */
+	if ((error = hakios_pcie_cfg_write(0, EP_BDF, ep_pmc + 4, 2, pmcsr))) { d3_errors++; return error; }
+	delay(10000); /* D0 -> D3hot: 10 ms */
+	ep_in_d3 = true;
+	d3_entered++;
+	return 0;
+}
+static int
+ep_d3_leave(void)
+{
+	unsigned pmcsr = 0, rtsta = 0;
+	int error;
+	if (!ep_in_d3) return 0;
+	ep_in_d3 = false;
+	(void)hakios_pcie_cfg_read(0, EP_BDF, ep_pmc + 4, 2, &pmcsr);
+	(void)rd(dbi + 0x90, &rtsta);
+	pmcsr_at_wake = pmcsr;
+	rtsta_at_wake = rtsta;
+	if (pmcsr & (1u << 15)) pme_ep++;
+	if (rtsta & (1u << 16)) pme_rc++;
+	if ((error = ep_restore())) { d3_errors++; return error; }	/* (D0, then the header and MSI) */
+	if (ep_pcie) {	/* LNKCTL as saved, its ASPM enables included (ep_restore leaves them off) */
+		error = hakios_pcie_cfg_write(0, EP_BDF, ep_pcie + 0x10, 2, ep_cfg[(ep_pcie + 0x10) / 4] & 0xffff);
+		if (error) { d3_errors++; return error; }
+	}
+	/*
+	 * The PME cleared from its source down: the radio's PME_Status (in D0 now, PME_En off: ep_restore's saved word), the
+	 * root port's RTSTA status (a pending PME behind it moves up, and is cleared too), then the PARF event. run66: the
+	 * PARF cleared first latched again from the root port's still-set status, and every second doze ended at ~80 ms.
+	 */
+	(void)hakios_pcie_cfg_write(0, EP_BDF, ep_pmc + 4, 2, (ep_cfg[(ep_pmc + 4) / 4] & 0xffff & ~3u & ~(1u << 8)) | (1u << 15));
+	for (unsigned n = 0; n < 4; n++) {
+		if (rd(dbi + 0x90, &rtsta) || !(rtsta & (1u << 16))) break;
+		(void)wr(dbi + 0x90, 1u << 16);
+	}
+	pme_settle();
+	return 0;
+}
+static int
+drv_votes(bool on)
+{
+	/* APSS's own clock votes of the controller's journal (the shared vote words): off and on again */
+	int errors = 0;
+	for (unsigned n = ctl_mark; n < undo_count; n++) {
+		if (!undo[n].mask) continue;
+		unsigned v;
+		if (rd(undo[n].address, &v)) { errors++; continue; }
+		errors += !!wr(undo[n].address, on ? v | undo[n].mask : v & ~undo[n].mask);
+	}
+	return errors;
+}
+static int
+drv_sleep(bool fast_mhi)
+{
+	int error;
+	unsigned v;
+	if (!hakios_adsp_pcie_drv) return ENOTSUP;
+	if (pm_active != 3) {
+		if (!pm_owned && (error = pm_prepare(3))) return error;
+		if ((error = pm_activate(3))) return error;
+	}
+	drv_pm_mode = pm_active;
+	/* (D3hot only with pcie_ep_d3=2: cnss_pci_suspend_bus leaves the radio in D0 with DRV, and lx_mhi.c's fast M3 has it
+	 * ask for the host by MSI; run64..75 in D3hot: a PME ~80 ms after every entry) */
+	if (ep_d3 == 2 && (error = ep_d3_enter())) return error;
+	if ((error = hakios_adsp_pcie_drv(DRV_ENABLE, 0))) {
+		drv_errors++; drv_last_error = error;
+		(void)ep_d3_leave();
+		return error;
+	}
+	asleep = true;          /* (no config or BAR access of APSS's from here) */
+	drv_mode = true;
+	int errors = drv_votes(false);
+	/* the GDSC stays on: Linux's pcie_0_gdsc is PWRSTS_RET_ON (never collapsed by software; retention is the hardware's
+	 * when the domain under it goes down). SW_COLLAPSE here powered the controller off under the radio (run53: no MSI
+	 * in M3, the data path gone after); pcie_drv_gdsc=1 keeps the old way */
+	if (drv_gdsc_off) {
+		CHECK(rd(G(GDSCR), &v));
+		errors += !!wr(G(GDSCR), v | 1);
+	}
+	(void)hakios_pcie_bandwidth(false);
+	drv_l1ss_requested = drv_l1ss_sleep != 0;
+	error = drv_l1ss_requested ? hakios_adsp_pcie_drv(DRV_ENABLE_L1SS_SLEEP, 5) : 0;
+	if (error) { drv_errors++; drv_last_error = error; }
+	sleeps++;
+	asleep_since = now_ns();
+	/* Only the verified D0/fast-MHI path may retain the domain across CX collapse. */
+	os_atomic_store(&drv_cx_ready,
+	    fast_mhi && !ep_in_d3 && !drv_gdsc_off && errors == 0 && drv_l1ss_requested && error == 0,
+	    release);
+	if (sleeps <= 3 || !(sleeps & (sleeps - 1)))
+		say("pcie: DRV sleep %u: handed to the DSP; %d vote writes refused; L1ss requested %u, error %d\n",
+		    sleeps, errors, drv_l1ss_requested, error);
+	return 0;
+}
+static int
+drv_wake(void)
+{
+	unsigned v, status = 0;
+	int error = 0, e;
+	unsigned long long began = now_ns();
+	os_atomic_store(&drv_cx_ready, false, release);
+	asleep_ns += began - asleep_since;
+	if (drv_l1ss_requested) {
+		e = hakios_adsp_pcie_drv(DRV_DISABLE_L1SS_SLEEP, 0);
+		if (e) { drv_errors++; drv_last_error = e; }
+	}
+	if (!hakios_pcie_bandwidth(true)) error = EIO;
+	CHECK(rd(G(GDSCR), &v));
+	CHECK(wr(G(GDSCR), v & ~1u));
+	if ((e = wait_bits(G(GDSCR), 1u << 31, 1u << 31, 10000))) error = e;
+	/* APSS's clock votes back before any controller register is read (PARF/DBI unclocked: the bus hangs); then a
+	 * CLKREQ override the DSP left: the pipe mux through XO and back (as the vendor's resume), the override off */
+	if (drv_votes(true)) error = EIO;
+	delay(10);
+	if (!rd(parf + 0x2b0, &v) && (v & 2)) { (void)wr(G(PIPE_MUX), 2); delay(10); (void)wr(G(PIPE_MUX), 0); }
+	if (!rd(parf + 0x2b0, &v) && (v & 0xa)) (void)wr(parf + 0x2b0, v & ~0xau);
+	if ((e = hakios_adsp_pcie_drv(DRV_DISABLE, 0))) { drv_errors++; drv_last_error = e; error = error ? error : e; }
+	asleep = false;
+	drv_mode = false;
+	/* the link still up, the endpoint there */
+	if (rd(dbi + 0x80, &status) || !(status & (1u << 29))) error = error ? error : ENOLINK;
+	if (!error && (e = hakios_pcie_cfg_read(0, EP_BDF, 0, 4, &v)) == 0 && v != ep_cfg[0] && ep_saved) error = ENODEV;
+	if (!error && (e = ep_d3_leave())) error = e;
+	wakes++;
+	if (error) { wake_errors++; say("pcie: DRV wake: error %d (link status %#x)\n", error, status); }
+	else if (wakes <= 3 || !(wakes & (wakes - 1)))
+		say("pcie: DRV wake %u in %llu us\n", wakes, (now_ns() - began) / 1000);
+	return error;
+}
+
+/* Caller: MHI already in M3 (no DMA, no doorbells), BAR users stopped, serialized with up/down/wake. */
+int
+hakios_pcie_sleep(bool fast_mhi)
+{
+	unsigned v;
+	int error;
+	if (!started || !linked || !endpoint || asleep) return EINVAL;
+	if (sleep_mode == 3) {
+		/* (the radio in WoW and MHI in M3 over a link that stays as it is awake: APSS's clocks and votes, L1ss by
+		 * itself; the test of whether the radio works in WoW when nothing about the link changes) */
+		if (pm_active != 3) {
+			if (!pm_owned && (error = pm_prepare(3))) { sleep_errors++; return error; }
+			if ((error = pm_activate(3))) { sleep_errors++; return error; }
+		}
+		if ((error = ep_d3_enter())) { sleep_errors++; return error; }
+		asleep = true;	/* (no BAR access in D3hot) */
+		sleeps++;
+		asleep_since = now_ns();
+		return 0;
+	}
+	if (sleep_mode == 1) {
+		if (!ep_saved) (void)ep_save();
+		if ((error = drv_sleep(fast_mhi))) { sleep_errors++; return error; }
+		return 0;
+	}
+	if ((error = ep_save())) { sleep_errors++; return error; }
+	if (pm_owned) {
+		/* link PM off before D3 (pm_disable: both ends' L1/L1SS enables); pm_activate() puts it back after wake */
+		if ((error = pm_disable())) { sleep_errors++; return error; }
+		pm_active = 0;
+	}
+	if (ep_pmc && (error = hakios_pcie_cfg_write(0, EP_BDF, ep_pmc + 4, 2, (ep_cfg[(ep_pmc + 4) / 4] & 0xfffcu) | 3u))) {
+		sleep_errors++; return error;
+	}
+	delay(10000); /* D0 -> D3hot: 10 ms */
+	/* PME_Turn_Off (ELBI SYS_CTRL bit 4), then L23_Ready (PARF PM_STTS bit 5), at most 100 ms as the vendor's */
+	(void)wr(dbi + 0xf24, 1u << 4);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	bool l23 = false;
+	for (unsigned us = 0; us < 100000; us += 1000) {
+		if (!rd(parf + 0x24, &v) && v != ~0u && (v & (1u << 5))) { l23 = true; break; }
+		delay(1000);
+	}
+	if (!l23) l23_missed++;
+	/* from here the link is gone: no endpoint access, the controller off */
+	asleep = true;
+	linked = false;
+	(void)gpio(94, false);
+	delay(1000);
+	int errors = 0;
+	while (undo_count > ctl_mark) {
+		unsigned n = --undo_count;
+		errors += !!(undo[n].mask ? vote_clear(undo[n].address, undo[n].mask) : wr(undo[n].address, undo[n].old));
+	}
+	pm_owned = false;
+	sleeps++;
+	asleep_since = now_ns();
+	if (errors) {
+		sleep_errors++;
+		say("pcie: link sleep: %d controller writes refused; its floor kept\n", errors);
+		return EIO; /* asleep, but the bandwidth floor stays (as an uncertain down) */
+	}
+	(void)hakios_pcie_bandwidth(false);
+	if (sleeps <= 3 || !(sleeps & (sleeps - 1)))
+		say("pcie: link sleep %u: L23_Ready %s; controller off\n", sleeps, l23 ? "seen" : "NOT seen");
+	return 0;
+}
+
+/* Back: floor, controller (clocks_phy, train, SID table), the endpoint's config, link PM as it was. */
+int
+hakios_pcie_wake(void)
+{
+	struct hakios_pcie_link link;
+	int error;
+	if (!started) return EINVAL;
+	if (!asleep) return 0;
+	if (drv_mode) return drv_wake();
+	if (linked && sleep_mode == 3) {
+		asleep_ns += now_ns() - asleep_since;
+		asleep = false;
+		wakes++;
+		if ((error = ep_d3_leave())) { wake_errors++; say("pcie: D3hot leave failed %d\n", error); return error; }
+		return 0;
+	}
+	if (!hakios_pcie_bandwidth(true)) { wake_errors++; return EIO; }
+	asleep = false; /* (the controller's own accesses below; the endpoint stays refused until linked) */
+	unsigned long long began = now_ns();
+	asleep_ns += began - asleep_since;
+	bzero(&link, sizeof(link));
+	if ((error = clocks_phy()) || (error = train(&link)) || (error = bdf_to_sid()) || (error = ep_restore())) {
+		wake_errors++;
+		say("pcie: link wake failed %d\n", error);
+		failure_dump();
+		return error;
+	}
+	if (pm_requested && pm_valid) {
+		if ((error = pm_prepare(pm_requested)) || (error = pm_activate(pm_requested))) {
+			say("pcie: link PM after wake failed %d; restored %d\n", error, pm_restore());
+			error = 0;
+		}
+	}
+	wakes++;
+	unsigned long long took = now_ns() - began;
+	if (wakes <= 3 || !(wakes & (wakes - 1)))
+		say("pcie: link wake %u: gen %u x%u in %llu us\n", wakes, link.gen, link.width, took / 1000);
+	return 0;
+}
+bool hakios_pcie_asleep(void) { return asleep; }
+
+/* pci-msm prevent_l1/allow_l1 around the fast MHI resume, with APSS already owning RC0. */
+int
+hakios_pcie_l1_restore(unsigned saved)
+{
+	unsigned link, pm;
+	uint16_t linkctl;
+
+	CHECK(rd(parf + 0x20, &pm));
+	CHECK(wr(parf + 0x20, (pm & ~(1u << 5)) | (saved & (1u << 5))));
+	CHECK(rd(dbi + 0x80, &link));
+	linkctl = (link & ~2u) | (saved & 2u);
+	return wr(dbi + 0x80, linkctl); /* upper half is Link Status, including W1C bits */
+}
+
+int
+hakios_pcie_l1_hold(unsigned *saved)
+{
+	unsigned link, pm, ltssm;
+	int error;
+
+	if (!started || !linked || asleep) return EINVAL;
+	CHECK(rd(dbi + 0x80, &link));
+	CHECK(rd(parf + 0x20, &pm));
+	*saved = (link & 2u) | (pm & (1u << 5));
+	error = wr(dbi + 0x80, link & 0xfffdu);
+	if (!error) error = wr(parf + 0x20, pm | (1u << 5));
+	if (!error) {
+		for (unsigned us = 0; us < 100000; us += 100) {
+			error = rd(parf + 0x1b0, &ltssm);
+			if (error) break;
+			if ((ltssm & 63u) == 0x11 || (ltssm & 63u) == 0x12) return 0;
+			delay(100);
+		}
+	}
+	int restore = hakios_pcie_l1_restore(*saved);
+	if (restore) return restore;
+	return error ? error : ETIMEDOUT;
+}
+
+/* The borrowed BAR pointers' accessors (lx.c): refused, not attempted, while the controller is off. */
+int
+hakios_pcie_bar_read32(const volatile void *va, unsigned *value)
+{
+	if (asleep) { refused_bar++; return ENXIO; }
+	return hakios_pcie_try_read32(va, value);
+}
+int
+hakios_pcie_bar_write32(volatile void *va, unsigned value)
+{
+	if (asleep) { refused_bar++; return ENXIO; }
+	return hakios_pcie_try_write32(va, value);
+}
+
+/* ---- WAKE# (GPIO 96, active low): PDC pin 104 (Linux pinctrl-sm8450.c { 96, 104 }), pdc-ranges <94 609 31>: SPI 619,
+ * INTID 651; level low at the PDC, so it wakes a collapsed CX as the touch line does. The handler masks it; arm unmasks. */
+#define WAKE_PIN 96u
+#define WAKE_PDC_PA 0x0b220000UL
+#define WAKE_PDC_PIN 104u
+#define WAKE_INTID 651u
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
+static vm_offset_t wake_pdc;
+static void (*wake_cb)(void);
+static bool wake_ready;
+static unsigned wake_irqs, wake_low_at_irq;
+static unsigned long long wake_armed_at, wake_after_us[8];
+static void
+wake_arrived(__unused void *context, uint32_t intid)
+{
+	unsigned io = 1;
+	gic_v3_spi_mask(intid);
+	if (tlmm) (void)rd(tlmm + PIN(WAKE_PIN) + 4, &io);
+	if (!(io & 1)) wake_low_at_irq++;
+	wake_after_us[wake_irqs % 8] = wake_armed_at ? (now_ns() - wake_armed_at) / 1000 : 0;
+	wake_irqs++;
+	if (wake_cb) wake_cb();
+}
+int
+hakios_pcie_wake_irq(void (*cb)(void))
+{
+	unsigned cfg, version;
+	if (wake_ready) { wake_cb = cb; return 0; }
+	if (!tlmm) return ENXIO;
+	if (!wake_pdc) wake_pdc = MAP_IO(WAKE_PDC_PA, 0x2000);
+	if (!wake_pdc) return ENOMEM;
+	/* GPIO 96: function 0, input, pull-up (the radio drives it low); its TLMM summary interrupt off */
+	CHECK(rd(tlmm + PIN(WAKE_PIN), &cfg));
+	CHECK(wr(tlmm + PIN(WAKE_PIN), (cfg & ~0x3ffu) | 3u | (1u << 6)));
+	CHECK(rd(tlmm + PIN(WAKE_PIN) + 8, &cfg));
+	CHECK(wr(tlmm + PIN(WAKE_PIN) + 8, cfg & ~1u));
+	CHECK(wr(tlmm + PIN(WAKE_PIN) + 0xc, 0));
+	version = *(volatile unsigned *)(wake_pdc + 0x1000);
+	*(volatile unsigned *)(wake_pdc + 0x110 + 4 * WAKE_PDC_PIN) = version >= 0x30200u ? 8u : 0u; /* level low (+ enable) */
+	if (version < 0x30200u) {
+		volatile unsigned *bank = (volatile unsigned *)(wake_pdc + 0x10 + 4 * (WAKE_PDC_PIN / 32));
+		*bank |= 1u << (WAKE_PDC_PIN % 32);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	wake_cb = cb;
+	if (gic_v3_spi_attach(WAKE_INTID, false, wake_arrived, NULL) != KERN_SUCCESS) return EIO;
+	gic_v3_spi_mask(WAKE_INTID);
+	wake_ready = true;
+	say("pcie: WAKE# GPIO %u -> PDC pin %u (version %#x) -> GIC %u\n", WAKE_PIN, WAKE_PDC_PIN, version, WAKE_INTID);
+	return 0;
+}
+/*
+ * The root port's PME (run64: with the radio in D3hot every WoW wake is a PM_PME message -- the radio's PME_Status and
+ * the root port's RTSTA PME set at wake -- and nothing took it). The controller's global interrupt (DT pcie0
+ * interrupt-map entry 0: GIC SPI 0x8c, INTID 172, level) carries it: PARF_INT_ALL_STATUS/CLEAR/MASK 0x224/0x228/0x22c
+ * (pcie-qcom.c), the events numbered as pci-msm.c's MSM_PCIE_INT_EVT_* (LINK_UP bit 13 and MSI_0..7 bits 23..30 there
+ * are upstream's too): PME_LEGACY bit 16, PLS_PME bit 17. The root port raises it with Root Control's PME Interrupt
+ * Enable (cap 0x70 + 0x1c, bit 3). The handler only masks and calls the wake (no PARF access: in DRV sleep APSS's
+ * clocks of the controller are off); the wake reads and clears it once they are back (pme_settle).
+ */
+#define PME_INTID 172u
+#define PARF_INT_ALL_STATUS 0x224u
+#define PARF_INT_ALL_CLEAR 0x228u
+#define PARF_INT_ALL_MASK 0x22cu
+#define PARF_INT_PME ((1u << 16) | (1u << 17))
+static bool pme_ready;
+static unsigned pme_irqs, parf_at_wake, parf_pme_seen;
+static void
+pme_arrived(__unused void *context, uint32_t intid)
+{
+	gic_v3_spi_mask(intid);
+	pme_irqs++;
+	if (wake_cb) wake_cb();
+}
+static int
+pme_setup(void)
+{
+	unsigned v;
+	if (pme_ready) return 0;
+	if (!parf || !dbi || asleep) return ENXIO;
+	CHECK(rd(parf + PARF_INT_ALL_MASK, &v));
+	CHECK(wr(parf + PARF_INT_ALL_MASK, v | PARF_INT_PME));
+	CHECK(wr(parf + PARF_INT_ALL_CLEAR, PARF_INT_PME));
+	CHECK(wr(dbi + 0x90, 1u << 16));	/* RTSTA PME status (W1C) */
+	CHECK(rd(dbi + 0x8c, &v));
+	CHECK(wr(dbi + 0x8c, (v & 0xffffu) | (1u << 3)));	/* Root Control: PME Interrupt Enable */
+	if (gic_v3_spi_attach(PME_INTID, false, pme_arrived, NULL) != KERN_SUCCESS) return EIO;
+	gic_v3_spi_mask(PME_INTID);
+	pme_ready = true;
+	say("pcie: the root port's PME -> PARF event bits 16/17 -> GIC %u\n", PME_INTID);
+	return 0;
+}
+/* at wake, the controller clocked again: what the PARF said, cleared */
+static void
+pme_settle(void)
+{
+	unsigned v = 0;
+	if (!pme_ready || !parf || rd(parf + PARF_INT_ALL_STATUS, &v)) return;
+	parf_at_wake = v;
+	if (v & PARF_INT_PME) parf_pme_seen++;
+	(void)wr(parf + PARF_INT_ALL_CLEAR, v & PARF_INT_PME);
+}
+void
+hakios_pcie_wake_arm(bool on)
+{
+	if (wake_ready) { if (on) { wake_armed_at = now_ns(); gic_v3_spi_unmask(WAKE_INTID); } else gic_v3_spi_mask(WAKE_INTID); }
+	if (pme_ready) {
+		if (on && ep_in_d3) gic_v3_spi_unmask(PME_INTID);
+		else gic_v3_spi_mask(PME_INTID);
+	}
+}
+unsigned hakios_pcie_sleep_mode(void) { return sleep_mode; }
+bool
+hakios_pcie_wake_line(void)
+{
+	unsigned io;
+	return tlmm && !rd(tlmm + PIN(WAKE_PIN) + 4, &io) && !(io & 1); /* true: WAKE# asserted (low) */
+}
+
+SYSCTL_DECL(_kern_hakios);
+static int sysctl_pcie_sleep SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	char text[640];
+	unsigned long long ns = asleep_ns + (asleep ? now_ns() - asleep_since : 0);
+	int at = snprintf(text, sizeof(text), "mode %u (drv %u, errors %u last %u, pm %u) asleep %u sleeps %u wakes %u sleep_errors %u wake_errors %u l23_missed %u refused_bar %u "
+	    "wake_irqs %u (line low at it %u) wake_line %u asleep_ms %llu; irq after arm us", sleep_mode, drv_mode, drv_errors,
+	    drv_last_error, drv_pm_mode, asleep, sleeps, wakes, sleep_errors,
+	    wake_errors, l23_missed, refused_bar, wake_irqs, wake_low_at_irq, hakios_pcie_wake_line(), ns / 1000000);
+	at += snprintf(text + at, sizeof(text) - (size_t)at, "; D3hot %u (errors %u), PME at wake: radio %u root port %u, "
+	    "last PMCSR %#x RTSTA %#x; PME irqs %u (ready %u), PARF PME at wake %u, last PARF status %#x;", d3_entered,
+	    d3_errors, pme_ep, pme_rc, pmcsr_at_wake, rtsta_at_wake, pme_irqs, pme_ready, parf_pme_seen, parf_at_wake);
+	for (unsigned k = wake_irqs > 8 ? wake_irqs - 8 : 0; k < wake_irqs && at < (int)sizeof(text) - 16; k++)
+		at += snprintf(text + at, sizeof(text) - (size_t)at, " %llu", wake_after_us[k % 8]);
+	return sysctl_handle_string(oidp, text, 0, req);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, pcie_sleep, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, sysctl_pcie_sleep, "A", "PCIe0 link sleep with the radio powered: counts and time asleep");
+static int sysctl_pcie_power SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	char text[320];
+	snprintf(text, sizeof(text), "started %u linked %u endpoint %u rails %#x tcs_owned %u tcs_poisoned %u down_errors %u ups %u downs %u down_status %d",
+	    started, linked, endpoint, rail_mask, tcs_owned, tcs_poisoned, down_errors, up_count, down_count, hakios_pcie_down_status());
+	return sysctl_handle_string(oidp, text, 0, req);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, pcie_power, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, sysctl_pcie_power, "A", "Cached PCIe lifecycle and acknowledged rail enables");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, pcie_pm, CTLFLAG_RD | CTLFLAG_LOCKED,
+    pm_description, sizeof(pm_description), "PCIe power capabilities at last enumeration");
+static int pm_audit_request;
+static char pm_audit[512] = "not requested";
+SYSCTL_INT(_kern_hakios, OID_AUTO, pcie_pm_audit_request, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &pm_audit_request, 0, "Request one configuration audit on the existing PCI worker");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, pcie_pm_audit, CTLFLAG_RD | CTLFLAG_LOCKED,
+    pm_audit, sizeof(pm_audit), "Cached configuration audit; requesting it briefly wakes the link");
+static int sysctl_pcie_aspm SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int value = pm_requested, e = sysctl_handle_int(oidp, &value, 0, req);
+	if (e || req->newptr == USER_ADDR_NULL) return e;
+	if (value < 0 || value > 3) return EINVAL;
+	pm_requested = value;
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, pcie_aspm, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    NULL, 0, sysctl_pcie_aspm, "I", "Link PM on next Wi-Fi start: 0 inherited, 1 L1, 2 L1.1, 3 L1.2");
+static int sysctl_pcie_pm_stats SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	char text[320];
+	snprintf(text, sizeof(text), "requested %d active %d owned %u error %d samples %llu l1 %llu l1ss %llu last_ltssm %#x last_pm_status %#x",
+	    pm_requested, pm_active, pm_owned, pm_error, pm_samples, pm_l1_samples, pm_ss_samples, pm_last_ltssm, pm_last_status);
+	return sysctl_handle_string(oidp, text, 0, req);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, pcie_pm_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, sysctl_pcie_pm_stats, "A", "Link-state observations on existing PCI worker wakes; not residency");
+int hakios_pcie_pm_start(void)
+{
+	if (!pm_prepared || !pm_owned) return pm_error;
+	pm_error = pm_activate(pm_prepared);
+	if (pm_error) {
+		int restore = pm_restore();
+		say("pcie: link PM activation failed %d; restoration %d\n", pm_error, restore);
+		if (restore) { down_errors++; return restore; }
+	} else say("pcie: link PM profile %d enabled after firmware ready\n", pm_active);
+	return pm_error;
+}
+void hakios_pcie_pm_sample(void)
+{
+	unsigned ltssm, status;
+	/* Only the PCI worker calls this, before servicing BARs. Removal joins
+	 * that worker before C2 restores registers or powers down the controller. */
+	if (!pm_active || !started || !linked || asleep) return; /* (asleep: its clocks are not ours; a read would hang the bus) */
+	if (pm_audit_request) {
+		unsigned ctl[2] = {0}, ss[2] = {0}, dc[2] = {0}, sys = 0, clkreq = 0, ack = 0;
+		int e = 0;
+		pm_audit_request = 0;
+		for (unsigned i = 0; i < 2; i++) {
+			e |= hakios_pcie_cfg_read(0, pm_ports[i].bdf, pm_ports[i].pc + 0x10, 2, &ctl[i]);
+			e |= hakios_pcie_cfg_read(0, pm_ports[i].bdf, pm_ports[i].ss + 8, 4, &ss[i]);
+			e |= hakios_pcie_cfg_read(0, pm_ports[i].bdf, pm_ports[i].pc + 0x28, 2, &dc[i]);
+		}
+		e |= rd(parf, &sys); e |= rd(parf + 0x2b0, &clkreq); e |= rd(dbi + 0x70c, &ack);
+		snprintf(pm_audit, sizeof(pm_audit), "error %d root ctl %#x ss %#x devctl2 %#x endpoint ctl %#x ss %#x devctl2 %#x parf_sys %#x clkreq %#x ack %#x",
+		    e, ctl[0], ss[0], dc[0], ctl[1], ss[1], dc[1], sys, clkreq, ack);
+	}
+	if (rd(parf + 0x1b0, &ltssm) || rd(parf + 0x24, &status)) return;
+	pm_samples++;
+	pm_last_ltssm = ltssm & 63; pm_last_status = status;
+	if ((ltssm & 63) == 0x14) pm_l1_samples++;
+	if (status & (1u << 8)) pm_ss_samples++; /* vendor's L1ss indicator */
 }
 int
 hakios_pcie_up(unsigned rc, struct hakios_pcie_link *link)
@@ -834,6 +1583,13 @@ hakios_pcie_up(unsigned rc, struct hakios_pcie_link *link)
 	bzero(link, sizeof(*link));
 	if (rc) return ENODEV;
 	if (started) return EBUSY;
+	if (down_errors || rail_mask) return EIO; /* uncertain shutdown: do not reuse */
+	static bool pm_args_read;
+	if (!pm_args_read) {
+		unsigned mode = 0;
+		if ((error = numeric_word("pcie_aspm", &mode, 0, 3))) goto failed;
+		pm_requested = mode; pm_args_read = true;
+	}
 	generation = 2;
 	if ((error = numeric_word("pcie_gen", &generation, 1, 2))) goto failed;
 	if (generation != 1 && generation != 2) { error = EINVAL; goto failed; }
@@ -845,7 +1601,10 @@ hakios_pcie_up(unsigned rc, struct hakios_pcie_link *link)
 	step("0 C2 up: rc 0, pcie_gen %u", generation);
 	if ((error = map_blocks())) goto failed;
 	started = true;
+	if (!hakios_pcie_bandwidth(true)) { error = EIO; goto failed; }
 	if ((error = power())) goto failed;
+	ctl_mark = undo_count;
+	asleep = false;
 	hakios_wifi_stage(1, "rails", true, "pcie: rails (6 incl ant switch), BT_EN low, wlan_en high");
 	stage = 2;
 	if ((error = clocks_phy()) || (error = train(link))) goto failed;
@@ -853,6 +1612,7 @@ hakios_pcie_up(unsigned rc, struct hakios_pcie_link *link)
 	stage = 3;
 	if ((error = bdf_to_sid())) goto failed;
 	if ((error = enumerate(link))) goto failed;
+	up_count++;
 	hakios_wifi_stage(3, "endpoint", true, "pcie: 17cb:1103 BAR0 %#llx + %#lx decode + master", link->bar0_pa, link->bar0_size);
 	return 0;
 failed:

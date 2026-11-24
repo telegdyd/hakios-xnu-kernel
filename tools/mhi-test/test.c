@@ -67,6 +67,8 @@ iova2va(u64 iova)
 
 static u64 now_ns;
 static unsigned option_dump;
+static unsigned option_idle;
+void lx_os_mhi_power(unsigned state, unsigned wake, unsigned pending, unsigned m0, unsigned m2, unsigned errors, unsigned blocked) {}
 static char (*lines)[256];
 static unsigned nlines;
 #define MAXLINES 8192
@@ -86,6 +88,31 @@ lx_tell(const char *fmt, ...)
 	}
 }
 /* C1 stage lines said by the production file (WP6: stages 5 and 6): the order, the verdict and the first detail words */
+static unsigned doze_kicks, pcie_sleep_mode;
+static bool l1_held, l1_fail;
+static unsigned l1_restores;
+void lx_doze_kick(void) { doze_kicks++; }
+bool lx_pci_net_pass(void) { return false; }
+void lx_doze_say_live(void) {}
+unsigned lx_os_doze_kick_mode(void) { return 2; }
+unsigned lx_os_pcie_sleep_mode(void) { return pcie_sleep_mode; }
+int
+lx_os_pcie_l1_hold(unsigned *saved)
+{
+	if (l1_fail) return ETIMEDOUT;
+	*saved = 2;
+	l1_held = true;
+	return 0;
+}
+
+int
+lx_os_pcie_l1_restore(unsigned saved)
+{
+	if (!l1_held || saved != 2) return EINVAL;
+	l1_held = false;
+	l1_restores++;
+	return 0;
+}
 static struct {
 	unsigned n[32], count;
 	int ok[32];
@@ -161,7 +188,7 @@ lx_os_random(void *buf, unsigned long n)
 unsigned
 lx_os_option(const char *name)
 {
-	return !strcmp(name, "wifi_mhi_dump") ? option_dump : 0;
+	return !strcmp(name, "wifi_mhi_dump") ? option_dump : !strcmp(name, "wifi_mhi_idle") ? option_idle : 0;
 }
 static const u8 *fw_file;
 static size_t fw_file_len;
@@ -296,6 +323,8 @@ static struct {
 	/* knobs */
 	enum stall stall;
 	bool bhi_error, bhie_error, syserr_at_m0, fail_start_chan, reads_dead;
+	bool m3, m3_stall, m3_no_event;	/* in M3; the next M3 not entered; entered with no state change event */
+	unsigned m3_asks, m0_asks_from_m3;
 	/* what the host programmed */
 	bool pending_bhi, pending_bhie, pending_cmd;
 	u32 pending_ul;
@@ -383,9 +412,27 @@ dev_write(u32 off, u32 val)
 		dv.nwl++;
 	}
 	*breg(off) = val;
+	if (off == R_MHICTRL && !(val & MHICTRL_RESET_MASK) && ((val & MHICTRL_MHISTATE_MASK) >> 8) == MHI_STATE_M3) {
+		dv.m3_asks++;
+		if (!dv.m3_stall) {
+			dv.m3 = true;
+			*breg(R_MHISTATUS) = (MHI_STATE_M3 << 8) | 1;
+			if (!dv.m3_no_event) ev_push(0, 0, MHI_STATE_M3 << 24, PKT_STATE_CHANGE << 16);
+		}
+		return;
+	}
+	if (off == R_MHICTRL && !(val & MHICTRL_RESET_MASK) && ((val & MHICTRL_MHISTATE_MASK) >> 8) == MHI_STATE_M0 && dv.m3) {
+		dv.m3 = false;
+		dv.m0_asks_from_m3++;
+		*breg(R_MHISTATUS) = (MHI_STATE_M0 << 8) | 1;
+		ev_push(0, 0, MHI_STATE_M0 << 24, PKT_STATE_CHANGE << 16);
+		return;
+	}
 	if (off == R_MHICTRL) {
 		if (val & MHICTRL_RESET_MASK) {
 			dev_reset();
+		} else if (((val & MHICTRL_MHISTATE_MASK) >> 8) == MHI_STATE_M2) {
+			*breg(R_MHISTATUS) = (MHI_STATE_M2 << 8) | 1;
 		} else if (((val & MHICTRL_MHISTATE_MASK) >> 8) == MHI_STATE_M0 && dv.stage == S_READY &&
 		    dv.stall != STALL_M0) {
 			dv.stage = S_M0;
@@ -420,6 +467,10 @@ dev_write(u32 off, u32 val)
 		} else {
 			dv.wake_last = val;
 			dv.wake_writes++;
+			if (val && active_ctrl && (PRIV(active_ctrl)->pm & PM_M2)) {
+				*breg(R_MHISTATUS) = MHI_STATE_M0 << 8;
+				ev_push(0, 0, MHI_STATE_M0 << 24, PKT_STATE_CHANGE << 16);
+			}
 		}
 	} else if (off >= ERDB && off < ERDB + 8 * 8 && (off & 7) == 0) {
 		dv.er_db_writes[(off - ERDB) / 8]++;
@@ -1232,11 +1283,11 @@ test_refusals(void)
 	struct mhi_priv *p = PRIV(c);
 	unsigned n0 = nlines;
 
-	CHECK(mhi_pm_suspend(c) == -EOPNOTSUPP);
-	CHECK(mhi_pm_resume_force(c) == -EOPNOTSUPP);
+	CHECK(mhi_pm_suspend(c) == -EIO);	/* not powered */
+	CHECK(mhi_pm_resume_force(c) == -EIO);
 	CHECK(mhi_download_rddm_image(c, false) == -EOPNOTSUPP);
 	CHECK(mhi_download_rddm_image(c, true) == -EOPNOTSUPP);
-	CHECK(lines_with("suspend is not supported", n0) == 1 && lines_with("resume is not supported", n0) == 1);
+	CHECK(lines_with("suspend refused", n0) == 1 && lines_with("resume refused", n0) == 1);
 	CHECK(lines_with("RDDM download is not supported", n0) == 2);
 	CHECK(c->rddm_image == NULL);
 	/* not powered: nothing acts as if it were */
@@ -1249,7 +1300,29 @@ test_refusals(void)
 	/* powered: suspend still says no, and the link stays */
 	MUST(mhi_prepare_for_power_up(c) == 0);
 	MUST(mhi_sync_power_up(c) == 0);
-	CHECK(mhi_pm_suspend(c) == -EOPNOTSUPP && p->pm == PM_M0 && qlink != NULL);
+	/* M3 and back (Linux pm.c): the permanent wake let go and taken again, the doorbells rung again */
+	CHECK(p->pm == PM_M0 && p->wake_hold && p->dev_wake == 1);
+	CHECK(mhi_pm_resume_force(c) == 0 && dv.m0_asks_from_m3 == 0);	/* not suspended: nothing to do */
+	CHECK(mhi_pm_suspend(c) == 0 && p->pm == PM_M3 && dv.m3 && !p->wake_hold && p->dev_wake == 0 && p->m3_entries == 1);
+	CHECK(!lx_mhi_in_fast_m3());
+	CHECK(mhi_pm_suspend(c) == -EIO && dv.m3_asks == 1);	/* already: refused, nothing asked */
+	CHECK(mhi_pm_resume_force(c) == 0 && p->pm == PM_M0 && !dv.m3 && p->wake_hold && p->dev_wake == 1);
+	CHECK(dv.m0_asks_from_m3 == 1 && qlink != NULL);
+	/* entered with no event: MHISTATUS says so */
+	dv.m3_no_event = true;
+	CHECK(mhi_pm_suspend(c) == 0 && p->pm == PM_M3 && p->m3_entries == 2);
+	dv.m3_no_event = false;
+	CHECK(mhi_pm_resume_force(c) == 0 && p->pm == PM_M0 && p->wake_hold);
+	/* a client reference: busy, and the wake still held */
+	MUST(mhi_device_get_sync(c->mhi_dev) == 0);
+	CHECK(mhi_pm_suspend(c) == -EBUSY && p->pm == PM_M0 && p->wake_hold && dv.m3_asks == 2);
+	mhi_device_put(c->mhi_dev);
+	/* M3 not reached: M0 asked again, the wake taken again */
+	dv.m3_stall = true;
+	CHECK(mhi_pm_suspend(c) == -EIO && p->pm == PM_M0 && p->wake_hold && p->m3_failures == 1);
+	dv.m3_stall = false;
+	CHECK(lines_with("M3 not reached", n0) == 1);
+	CHECK(p->pm == PM_M0 && qlink != NULL);
 	mhi_power_down_keep_dev(c, true);	/* the devices go with it, and it says so */
 	CHECK(p->pm == PM_DISABLE && qlink == NULL && lines_with("suspend is not supported, so the devices go too", 0) == 1);
 	mhi_unprepare_after_power_down(c);
@@ -1259,6 +1332,65 @@ test_refusals(void)
 	mhi_unprepare_after_power_down(c);
 	CHECK(p->pm == PM_DISABLE && c->fbc_image == NULL && qlink == NULL && irqs_active() == 0);
 	CHECK(lines_with("unprepare while powered", 0) == 1);
+	done(c);
+}
+
+static void
+test_fast_suspend(void)
+{
+	struct mhi_controller *c = fresh();
+	struct mhi_priv *p = PRIV(c);
+	struct mhi_event *ctrl = &p->ev[0];
+	unsigned kicks, rp;
+	unsigned restores = l1_restores;
+
+	MUST(mhi_prepare_for_power_up(c) == 0);
+	MUST(mhi_sync_power_up(c) == 0);
+	pcie_sleep_mode = 1;
+
+	MUST(mhi_device_get_sync(c->mhi_dev) == 0);
+	CHECK(mhi_pm_suspend(c) == -EBUSY && p->pm == PM_M0 && p->wake_hold);
+	mhi_device_put(c->mhi_dev);
+
+	CHECK(mhi_pm_suspend(c) == 0 && p->pm == PM_M3 && p->fast && p->fast_saved_pm == PM_M0);
+	CHECK(lx_mhi_in_fast_m3());
+	CHECK((*breg(R_MHISTATUS) >> 8) == MHI_STATE_M0 && dv.m3_asks == 0);
+	kicks = doze_kicks;
+	rp = ctrl->ring.rp;
+	(void)ev_handler(0, ctrl);
+	CHECK(doze_kicks == kicks);
+	ev_push(0, 0, MHI_STATE_M0 << 24, PKT_STATE_CHANGE << 16);
+	(void)ev_handler(0, ctrl);
+	CHECK(doze_kicks == kicks + 1 && ctrl->ring.rp == rp);
+	l1_fail = true;
+	CHECK(mhi_pm_resume_force(c) == -ETIMEDOUT && p->fast && p->pm == PM_M3 && l1_restores == restores);
+	l1_fail = false;
+	CHECK(mhi_pm_resume_force(c) == 0 && p->pm == PM_M0 && p->wake_hold && p->dev_wake == 1);
+	CHECK(ctrl->ring.rp == (rp + 1) % ctrl->ring.n && !p->fast);
+	CHECK(!lx_mhi_in_fast_m3());
+
+	ev_push(0, 0, MHI_STATE_M1 << 24, PKT_STATE_CHANGE << 16);
+	CHECK(mhi_pm_suspend(c) == 0 && p->pm == PM_M3 && p->fast_saved_pm == PM_M2);
+	CHECK((*breg(R_MHISTATUS) >> 8) == MHI_STATE_M2 && !dv.wake_last && p->fast_m2_reached == 1);
+	CHECK(mhi_pm_resume_force(c) == 0 && p->pm == PM_M0 && p->wake_hold && dv.wake_last == 1);
+	CHECK(!l1_held && l1_restores == restores + 2);
+
+	option_idle = 1;
+	lx_mhi_idle_start();
+	ev_push(0, 0, MHI_STATE_M1 << 24, PKT_STATE_CHANGE << 16);
+	(void)ev_handler(0, ctrl);
+	MUST(p->pm == PM_M2);
+	kicks = doze_kicks;
+	rp = ctrl->ring.rp;
+	ev_push(0, 0, MHI_STATE_M2 << 24, PKT_STATE_CHANGE << 16);
+	CHECK(mhi_pm_suspend(c) == 0 && p->fast && doze_kicks == kicks + 1 && ctrl->ring.rp == rp);
+	CHECK(mhi_pm_resume_force(c) == 0 && p->pm == PM_M0 && ctrl->ring.rp != rp);
+	CHECK(dv.m3_asks == 0 && dv.m0_asks_from_m3 == 0);
+
+	option_idle = 0;
+	pcie_sleep_mode = 0;
+	mhi_power_down(c, true);
+	mhi_unprepare_after_power_down(c);
 	done(c);
 }
 
@@ -1514,6 +1646,60 @@ test_async_and_poll_only(void)
 	done(c);
 }
 
+static void test_idle(void)
+{
+	struct mhi_controller *c = fresh();
+	struct mhi_priv *p = PRIV(c);
+	MUST(mhi_prepare_for_power_up(c) == 0);
+	MUST(mhi_sync_power_up(c) == 0);
+	option_idle = 1;
+	p->m2_no_db = true;
+	lx_mhi_idle_start();
+	CHECK(!p->idle_enabled && p->wake_hold);
+	p->m2_no_db = false;
+	lx_mhi_idle_start();
+	CHECK(p->idle_enabled && !p->wake_hold && !p->dev_wake && !p->wake_set);
+	for (unsigned i = 0; i < 20; i++) {
+		ev_push(0, 0, MHI_STATE_M1 << 24, PKT_STATE_CHANGE << 16);
+		lx_mhi_poll(c);
+		CHECK(p->pm == PM_M2 && p->m2_entries == i + 1);
+		CHECK(lx_mhi_bar_access(0x100, false));
+		CHECK(!lx_mhi_bar_access(0x10000, false));
+		CHECK(!lx_mhi_bar_access(0x10000, true));
+		CHECK(lx_mhi_bar_access(p->chdboff + 127 * 8, true));
+		CHECK(mhi_device_get_sync(c->mhi_dev) == 0);
+		CHECK(p->pm == PM_M0 && p->wake_set && p->dev_wake == 1);
+		CHECK(lx_mhi_bar_access(0x10000, false));
+		mhi_device_put(c->mhi_dev);
+		CHECK(!p->wake_set && !p->dev_wake);
+	}
+	ev_push(0, 0, MHI_STATE_M1 << 24, PKT_STATE_CHANGE << 16);
+	lx_mhi_poll(c);
+	CHECK(p->pm == PM_M2);
+	{
+		u8 packet[128];
+		unsigned len = qpacket(packet, 40, 0x39);
+		CHECK(qlink->send(qlink->ctx, packet, len) == 0);
+		CHECK(p->pending_pkts == 1 && p->wake_set);
+		for (unsigned i = 0; i < 5; i++) { lx_mhi_poll(c); lx_pause_ms(1); }
+		CHECK(p->pm == PM_M0 && !p->pending_pkts && !p->wake_set);
+		CHECK(mhi_device_get_sync(c->mhi_dev) == 0);
+		ev_push(0, 0, MHI_STATE_M1 << 24, PKT_STATE_CHANGE << 16);
+		for (unsigned i = 0; i < 5; i++) { lx_mhi_poll(c); lx_pause_ms(1); }
+		CHECK(p->pm == PM_M0 && p->dev_wake == 1 && p->wake_set);
+		mhi_device_put(c->mhi_dev);
+		mhi_device_put(c->mhi_dev);
+		CHECK(!p->dev_wake && !p->wake_set);
+	}
+	ev_push(0, 0, MHI_STATE_M1 << 24, PKT_STATE_CHANGE << 16);
+	lx_mhi_poll(c);
+	mhi_power_down(c, true);
+	CHECK(p->pm == PM_DISABLE);
+	mhi_unprepare_after_power_down(c);
+	done(c);
+	option_idle = 0;
+}
+
 int
 main(void)
 {
@@ -1552,8 +1738,10 @@ main(void)
 	test_window();
 	printf("pool window: ok\n");
 	test_refusals();
+	test_fast_suspend();
 	printf("refusals (suspend, resume, RDDM): ok\n");
 	test_ipcr();
+	test_idle();
 	printf("IPCR one packet each way and beyond, driver bind and unbind: ok\n");
 	test_link_refused();
 	test_syserr_in_operation();

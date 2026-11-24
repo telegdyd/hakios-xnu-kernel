@@ -23,7 +23,10 @@
  *   Device wake  Held from the first M0 until power-down, like iOSPlus10's stage 1 and unlike Linux's
  *                idle M2: the device is never allowed into M1/M2 (ath11k comments that register
  *                reads in M2 hang the system).
- *   Suspend      mhi_pm_suspend/resume_force and RDDM are not supported and say so.
+ *   Suspend      mhi_pm_suspend (M3) and mhi_pm_resume_force (M3 -> M0), as Linux's pm.c: the permanent
+ *                device wake is let go for M3 and taken again with M0. Between them the caller may take the
+ *                PCIe link down (C2's hakios_pcie_sleep); nothing here touches the BAR in PM_M3. RDDM is
+ *                not supported and says so.
  *
  * One controller at a time (one radio): the IPCR client keeps one set of state.
  */
@@ -50,6 +53,14 @@
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "MHI structures are little-endian; host is too");
 
 #define MHI_LOG(fmt, ...) lx_tell("mhi: " fmt "\n", ##__VA_ARGS__)
+void lx_doze_kick(void);	/* lx_80211.c */
+unsigned lx_os_doze_kick_mode(void);	/* 0 none, 1 any interrupt in M3, 2 only an event ring with new events (Linux) */
+static unsigned m3_irq_ev, m3_irq_ev_pending, m3_irq_bhi, m3_net;
+bool lx_pci_net_pass(void);	/* lx_pci.c (a weak false for the host tests) */
+void lx_doze_say_live(void);	/* lx_80211.c */
+bool lx_mhi_in_m3(void);
+bool lx_mhi_in_fast_m3(void);
+
 
 /* ---- registers (Linux drivers/bus/mhi/common.h) ---- */
 #define R_MHICFG 0x10
@@ -143,13 +154,18 @@ enum { CH_DISABLED = 0, CH_ENABLED = 1 };
 #define PM_DISABLE 0x1u
 #define PM_POR 0x2u
 #define PM_M0 0x4u
+#define PM_M2 0x8u
+#define PM_M3_ENTER 0x10u
+#define PM_M3 0x20u
+#define PM_M3_EXIT 0x40u
 #define PM_FW_DL_ERR 0x80u
 #define PM_SYS_ERR_FAIL 0x400u
 #define PM_SHUTDOWN 0x800u
 #define PM_LD_ERR_FATAL 0x1000u
 #define PM_ERRORS (PM_FW_DL_ERR | PM_SYS_ERR_FAIL | PM_SHUTDOWN | PM_LD_ERR_FATAL)
-#define PM_REG_OK (PM_POR | PM_M0 | PM_FW_DL_ERR | PM_SYS_ERR_FAIL | PM_SHUTDOWN)
-#define PM_EVENTS_OK (PM_POR | PM_M0)
+#define PM_REG_OK (PM_POR | PM_M0 | PM_M3_ENTER | PM_M3_EXIT | PM_FW_DL_ERR | PM_SYS_ERR_FAIL | PM_SHUTDOWN)
+#define PM_EVENTS_OK (PM_POR | PM_M0 | PM_M2 | PM_M3_ENTER | PM_M3_EXIT)
+#define PM_DB_OK (PM_POR | PM_M0 | PM_M2)
 
 /* transitions the executor runs, in the order the device produces them */
 #define T_PBL 0x1u
@@ -242,6 +258,12 @@ struct mhi_priv {
 	int builtin_err;
 	u32 dev_wake, pending_pkts, watch_n, ready_timeout_ms;
 	bool wake_set, wake_hold;
+	bool idle_enabled, m2_no_db;
+	u32 m0_entries, m2_entries, idle_errors, blocked_accesses;
+	u32 m3_entries, m3_failures, m3_kicks;
+	/* fast M3 (DRV): the host's own M3 only, the device left in M0/M2 (fast_m2_ok: its M1 taken while entering) */
+	bool fast, fast_m2_ok;
+	u32 fast_saved_pm, fast_entries, fast_m2_reached;
 	u8 *wake_db;
 	struct mhi_dev_slot dev_slot[MAX_DEV];
 	u32 serial;
@@ -253,6 +275,36 @@ struct mhi_priv {
 static struct mhi_controller *active_ctrl;
 static const struct mhi_driver *drivers[MAX_DRV];
 static struct mhi_driver ipcr_driver;	/* the IPCR client, defined below */
+static inline u64 ctx_get64(const volatile u32 *w);
+
+static void idle_report(struct mhi_priv *p)
+{
+	lx_os_mhi_power(p->pm, p->dev_wake, p->pending_pkts, p->m0_entries, p->m2_entries, p->idle_errors, p->blocked_accesses);
+}
+bool lx_mhi_bar_access(unsigned off, bool write)
+{
+	struct mhi_priv *p = active_ctrl ? PRIV(active_ctrl) : NULL;
+	if (!p || !p->idle_enabled || off < 0xfe0 || (p->pm & (PM_POR | PM_M0 | PM_DISABLE))) return true;
+	/* QCA6390/WCN6855 permits doorbell writes in M2 (m2_no_db=false).
+	 * Other BAR windows must be woken through mhi_device_get_sync first. */
+	if (write && p->wake_db && off >= p->chdboff && off < p->chdboff + 128 * 8) return true;
+	if (write && (p->pm & PM_M2) && !p->m2_no_db && off >= p->erdboff && off < p->erdboff + p->n_ev * 8) return true;
+	p->blocked_accesses++;
+	idle_report(p);
+	return false;
+}
+
+void lx_mhi_diagnostic(void)
+{
+	struct mhi_priv *p = active_ctrl ? PRIV(active_ctrl) : NULL;
+	if (!p) { MHI_LOG("runtime diagnostic: no controller"); return; }
+	MHI_LOG("runtime diagnostic: pm %#x pending %#x mission %u irqs %u busy %u watch %u", p->pm, p->pending,
+	    p->mission_done, p->irqs_on, p->tr_busy, p->watch_n);
+	if (p->er_ctx) for (unsigned i = 0; i < p->n_ev; i++)
+		MHI_LOG("runtime event %u busy %u ring rp %u wp %u device rp %#llx host wp %#llx", i, p->ev[i].busy,
+		    p->ev[i].ring.rp, p->ev[i].ring.wp, (unsigned long long)ctx_get64(p->er_ctx[i].rp),
+		    (unsigned long long)ctx_get64(p->er_ctx[i].wp));
+}
 
 /* ---- the two small locks: data (never held across a client call or a sleep), and the claim flags ---- */
 static void
@@ -581,16 +633,21 @@ state_set(struct mhi_priv *p, u32 pm)
 	U(p);
 }
 
-/* device wake: the count of who needs the device awake; the doorbell is rung on 0 -> 1 and back.
- * Linux rings it only in M0/M2; here M0 is the only state. Called under L. */
+/* Client references and pending UL transfers keep device wake asserted.
+ * Only the always-on wake doorbell is used to leave M2. Called under L. */
+static void wake_update_locked(struct mhi_priv *p)
+{
+	bool wanted = p->dev_wake || p->pending_pkts;
+	if (!(p->pm & (PM_M0 | PM_M2)) || !p->wake_db || wanted == p->wake_set) return;
+	write_db(p->c, p->wake_db, wanted ? 1 : 0);
+	p->wake_set = wanted;
+	if (p->idle_enabled) idle_report(p);
+}
 static void
 wake_get_locked(struct mhi_priv *p)
 {
 	p->dev_wake++;
-	if ((p->pm & PM_M0) && !p->wake_set && p->wake_db) {
-		write_db(p->c, p->wake_db, 1);
-		p->wake_set = true;
-	}
+	wake_update_locked(p);
 }
 static void
 wake_put_locked(struct mhi_priv *p)
@@ -598,10 +655,21 @@ wake_put_locked(struct mhi_priv *p)
 	if (p->dev_wake) {
 		p->dev_wake--;
 	}
-	if (p->dev_wake == 0 && p->wake_set && p->wake_db && (p->pm & PM_REG_OK)) {
-		write_db(p->c, p->wake_db, 0);
-		p->wake_set = false;
+	wake_update_locked(p);
+}
+
+void lx_mhi_idle_start(void)
+{
+	struct mhi_priv *p = active_ctrl ? PRIV(active_ctrl) : NULL;
+	if (!p || !lx_os_option("wifi_mhi_idle") || p->m2_no_db) return;
+	L(p);
+	if (!p->idle_enabled && p->mission_done && (p->pm & PM_M0)) {
+		p->idle_enabled = true;
+		if (p->wake_hold) { p->wake_hold = false; wake_put_locked(p); }
+		idle_report(p);
+		MHI_LOG("runtime idle enabled: permanent device wake released");
 	}
+	U(p);
 }
 
 /* ---- doorbells ---- */
@@ -1255,12 +1323,15 @@ m0_transition(struct mhi_priv *p, const char *how)
 {
 	u32 i;
 
-	if (!(p->pm & (PM_POR | PM_M0))) {
+	if (!(p->pm & (PM_POR | PM_M0 | PM_M2 | PM_M3_EXIT))) {
 		return;
 	}
 	p->dev_state = MHI_STATE_M0;
 	p->pm = PM_M0;
-	if (!p->wake_hold) {
+	p->m0_entries++;
+	if (p->idle_enabled) {
+		wake_get_locked(p);
+	} else if (!p->wake_hold) {
 		p->wake_hold = true;
 		wake_get_locked(p);
 	}
@@ -1279,10 +1350,13 @@ m0_transition(struct mhi_priv *p, const char *how)
 			chan_db(p, ch);
 		}
 	}
+	if (p->idle_enabled) wake_put_locked(p);
+	idle_report(p);
 	lx_os_lock();
 	lx_os_wakeup((const void *)&p->pm);
 	lx_os_unlock();
-	MHI_LOG("M0 (%s), device wake asserted", how);
+	if (!p->idle_enabled || p->m0_entries < 4 || !(p->m0_entries & (p->m0_entries - 1)))
+		MHI_LOG("M0 (%s), device wake %u, entries %u", how, p->wake_set, p->m0_entries);
 }
 
 /* ---- client devices and drivers: the bus, in a table ---- */
@@ -1539,6 +1613,7 @@ xfer_event(struct mhi_priv *p, struct mhi_chan *ch, const struct mhi_el *ev, str
 	ch->tre.rp = (ch->tre.rp + 1) % ch->tre.n;
 	if (ch->dir == DMA_TO_DEVICE && p->pending_pkts) {
 		p->pending_pkts--;
+		wake_update_locked(p);
 	}
 	if (a->xfer) {
 		ch->cb_busy++;
@@ -1573,7 +1648,37 @@ ctrl_event(struct mhi_priv *p, const struct mhi_el *ev, struct action *a)	/* und
 		} else if (code == MHI_STATE_SYS_ERR) {
 			syserr(p, "state change event", a);
 		} else if (code == MHI_STATE_M1) {
-			MHI_LOG("M1 requested by the device; device wake is held, staying in M0");
+			if (!p->idle_enabled && !p->fast_m2_ok) {
+				MHI_LOG("M1 requested by the device; device wake is held, staying in M0");
+			} else if (p->pm & PM_M0) {
+				int r = wr_field(p->c, p->c->regs, R_MHICTRL, MHICTRL_MHISTATE_MASK, MHI_STATE_M2);
+				if (r) {
+					p->idle_errors++; p->pm = PM_SYS_ERR_FAIL; p->fail_err = r;
+					a->kind = A_STATUS; a->cb = MHI_CB_SYS_ERROR;
+				} else {
+					p->pm = PM_M2; p->dev_state = MHI_STATE_M2; p->m2_entries++;
+					/* A request racing M1 must force a wake edge even if
+					 * the previous M0 wake bit was already asserted. */
+					if (p->dev_wake || p->pending_pkts) {
+						write_db(p->c, p->wake_db, 1); p->wake_set = true;
+					} else { a->kind = A_STATUS; a->cb = MHI_CB_IDLE; }
+					if (p->m2_entries < 4 || !(p->m2_entries & (p->m2_entries - 1)))
+						MHI_LOG("M2 idle, entries %u", p->m2_entries);
+				}
+				idle_report(p);
+			}
+		} else if (code == MHI_STATE_M3) {
+			if (p->pm & PM_M3_ENTER) {
+				p->dev_state = MHI_STATE_M3;
+				p->pm = PM_M3;
+				lx_os_lock();
+				lx_os_wakeup((const void *)&p->pm);
+				lx_os_unlock();
+			} else {
+				MHI_LOG("M3 not asked for (pm %#x) ignored", p->pm);
+			}
+		} else if (code == MHI_STATE_M2 && p->idle_enabled) {
+			/* M1 was acknowledged by the host; no second transition needed. */
 		} else {
 			MHI_LOG("unexpected state %s ignored", state_name(code));
 		}
@@ -1708,7 +1813,7 @@ ev_process(struct mhi_priv *p, struct mhi_event *e)
 		count++;
 	}
 	L(p);
-	if (count > 0 && (p->pm & PM_REG_OK)) {
+	if (count > 0 && (p->pm & PM_DB_OK)) {
 		er_db(p, e);
 	}
 	e->busy = false;
@@ -1912,6 +2017,20 @@ lx_mhi_poll(struct mhi_controller *c)
 	return service(p);
 }
 
+/* Called under L; the device producer pointer lives in host memory. */
+static bool
+ev_pending(struct mhi_event *e, struct mhi_el *first)
+{
+	struct mhi_priv *p = e->p;
+	u32 idx;
+
+	if (e->ring.el == NULL || !ring_index(&e->ring, ctx_get64(p->er_ctx[e->index].rp), &idx) ||
+	    idx == e->ring.rp) return false;
+	fence();
+	*first = e->ring.el[e->ring.rp];
+	return true;
+}
+
 static irqreturn_t
 ev_handler(int irq, void *arg)
 {
@@ -1921,6 +2040,31 @@ ev_handler(int irq, void *arg)
 	if (!p->irqs_on) {
 		return IRQ_NONE;
 	}
+	L(p);
+	if (p->pm == PM_M3) {
+		/* the device wants the host while in M3 (Linux main.c: mhi_trigger_resume) when its event ring has new events:
+		 * the read pointer the device writes is in host memory (the context), so nothing of the link's is read */
+		unsigned mode = lx_os_doze_kick_mode();
+		struct mhi_el first;
+		bool pending = ev_pending(e, &first);
+		U(p);
+
+		if (lx_pci_net_pass()) {
+			m3_net++;	/* (the quiet sweep, not the radio) */
+			return IRQ_HANDLED;
+		}
+		m3_irq_ev++;
+		if (pending && ++m3_irq_ev_pending <= 8)
+			MHI_LOG("standby ring %u interrupt: event %#x code %#x", e->index,
+			    (first.dw1 >> 16) & 0xff, first.dw0 >> 24);
+		lx_doze_say_live();
+		if (mode == 1 || (mode == 2 && pending)) {
+			p->m3_kicks++;
+			lx_doze_kick();
+		}
+		return IRQ_HANDLED;
+	}
+	U(p);
 	(void)ev_process(p, e);
 	run_transitions(p);
 	return IRQ_HANDLED;
@@ -1934,6 +2078,19 @@ bhi_handler(int irq, void *arg)
 
 	if (!p->irqs_on) {
 		return IRQ_NONE;
+	}
+	if (p->pm == PM_M3) {
+		if (lx_pci_net_pass()) {
+			m3_net++;
+			return IRQ_HANDLED;
+		}
+		m3_irq_bhi++;
+		lx_doze_say_live();
+		if (lx_os_doze_kick_mode() == 1) {
+			p->m3_kicks++;
+			lx_doze_kick();
+		}
+		return IRQ_HANDLED;
 	}
 	watch(p);
 	run_transitions(p);
@@ -2177,6 +2334,10 @@ power_down_inner(struct mhi_priv *p, bool graceful)
 	u32 i;
 	u32 wait_ms = c->timeout_ms < 1000 ? c->timeout_ms : 1000;
 
+	if (p->idle_enabled && (p->pm & PM_M2) && c->mhi_dev && mhi_device_get_sync(c->mhi_dev)) {
+		p->idle_errors++;
+		idle_report(p);
+	}
 	L(p);
 	if (p->pm & PM_DISABLE) {
 		U(p);
@@ -2325,7 +2486,9 @@ mhi_device_get_sync(struct mhi_device *d)
 		U(p);
 		return -EIO;
 	}
+	L(p);
 	d->dev_wake++;
+	U(p);
 	return 0;
 }
 
@@ -2338,11 +2501,11 @@ mhi_device_put(struct mhi_device *d)
 	if (!p || !p->registered) {
 		return;
 	}
+	L(p);
 	if (d->dev_wake) {
 		d->dev_wake--;
+		wake_put_locked(p);
 	}
-	L(p);
-	wake_put_locked(p);
 	U(p);
 }
 
@@ -2440,6 +2603,7 @@ chan_reset(struct mhi_priv *p, struct mhi_chan *ch, bool command)
 		ch->tre.rp = (ch->tre.rp + 1) % ch->tre.n;
 		if (ch->dir == DMA_TO_DEVICE && p->pending_pkts) {
 			p->pending_pkts--;
+			wake_update_locked(p);
 		}
 		cb = ch->xfer_cb;
 		dev = ch->dev;
@@ -2619,6 +2783,7 @@ queue_xfer(struct mhi_device *d, enum dma_data_direction dir, void *cb, void *bu
 	ch->tre.wp = (ch->tre.wp + 1) % ch->tre.n;
 	if (dir == DMA_TO_DEVICE) {
 		p->pending_pkts++;
+		wake_update_locked(p);
 	}
 	if (p->pm & PM_M0) {
 		chan_db(p, ch);
@@ -2796,6 +2961,7 @@ static int
 ipcr_probe(struct mhi_device *d, const struct mhi_device_id *id)
 {
 	int r, n, i;
+	bool router_up = false;
 
 	if (ipcr.dev) {
 		return -EBUSY;
@@ -2824,11 +2990,6 @@ ipcr_probe(struct mhi_device *d, const struct mhi_device_id *id)
 			goto err_unprepare;
 		}
 		ipcr.rx_count = (u32)(i + 1);
-		r = mhi_queue_buf(d, DMA_FROM_DEVICE, ipcr.rx[i], ipcr.rx_len, MHI_EOT);
-		if (r) {
-			MHI_LOG("IPCR: could not queue a receive buffer (%d)", r);
-			goto err_unprepare;
-		}
 	}
 	ipcr.dev = d;
 	ipcr.link.send = ipcr_send;
@@ -2843,10 +3004,24 @@ ipcr_probe(struct mhi_device *d, const struct mhi_device_id *id)
 		r = -r;
 		goto err_unprepare;
 	}
+	router_up = true;
+	/* Publish the router before the first RX doorbell. A fast HELLO can be
+	 * completed on the PCI worker immediately after queue_buf; dropping that
+	 * packet before link registration leaves a live MHI bus with no services. */
+	for (i = 0; i < n; i++) {
+		r = mhi_queue_buf(d, DMA_FROM_DEVICE, ipcr.rx[i], ipcr.rx_len, MHI_EOT);
+		if (r) {
+			MHI_LOG("IPCR: could not queue a receive buffer (%d)", r);
+			goto err_unprepare;
+		}
+	}
 	MHI_LOG("IPCR: link up with %d receive buffers of %zu bytes", n, ipcr.rx_len);
 	return 0;
 err_unprepare:
+	ipcr.up = false;
+	if (router_up) lx_os_qrtr_link(NULL);
 	mhi_unprepare_from_transfer(d);
+	ipcr.dev = NULL;
 	ipcr_free_rx();
 	return r;
 }
@@ -3035,6 +3210,7 @@ mhi_register_controller(struct mhi_controller *c, const struct mhi_controller_co
 	c->timeout_ms = cfg->timeout_ms ? cfg->timeout_ms : MHI_TIMEOUT_DEFAULT_MS;
 	p->ready_timeout_ms = cfg->ready_timeout_ms;
 	c->buffer_len = cfg->buf_len ? cfg->buf_len : MHI_MAX_MTU;
+	p->m2_no_db = cfg->m2_no_db;
 	/* use_bounce_buf is ignored: buffers are copied in any case (the radio reaches only the pool) */
 	/* Linux requests the interrupts here and holds them off until power-up; the handlers run on the
 	 * polling thread of the PCI layer */
@@ -3134,19 +3310,346 @@ mhi_free_controller(struct mhi_controller *c)
 	kfree(c);
 }
 
+unsigned lx_os_pcie_sleep_mode(void);
+int lx_os_pcie_l1_hold(unsigned *saved);
+int lx_os_pcie_l1_restore(unsigned saved);
 /* ---- what is not here, said when asked ---- */
+/* MHISTATUS says the device is in `st` (a register read: only while the link is up) */
+static bool
+device_in(struct mhi_priv *p, enum mhi_state st)
+{
+	u32 s;
+
+	return rd_field(p->c, p->c->regs, R_MHISTATUS, MHISTATUS_MHISTATE_MASK, &s) == 0 && s == (u32)st;
+}
+
+/*
+ * Linux pm.c mhi_pm_suspend: busy with a client reference or a pending UL transfer; out of M2 first; then
+ * M3 asked in MHICTRL and waited for (its state change event, or MHISTATUS). The permanent device wake of
+ * this layer is let go first (M3 is entered with none), and m0_transition() takes it again.
+ */
+static unsigned suspend_calls;		/* (lx_mhi_suspend_calls: whether a failed WoW suspend got as far as here) */
+static int mhi_pm_suspend_locked(struct mhi_priv *p);
 int
 mhi_pm_suspend(struct mhi_controller *c)
 {
-	MHI_LOG("suspend is not supported");
-	return -EOPNOTSUPP;
+	struct mhi_priv *p = c ? PRIV(c) : NULL;
+
+	if (p == NULL) {
+		return -EINVAL;
+	}
+	suspend_calls++;
+	return mhi_pm_suspend_locked(p);
+}
+unsigned lx_mhi_suspend_calls(void);
+unsigned lx_mhi_suspend_calls(void) { return suspend_calls; }
+/*
+ * DRV sleep (the audio DSP holds the link): what Qualcomm's cnss2 does there instead of M3 -- cnss_pci_set_mhi_state
+ * (CNSS_MHI_SUSPEND) with drv_connected_last calls mhi_pm_fast_suspend (drivers/bus/mhi/core/misc.c): the device is let
+ * go to M2 (waited for up to the M2 timeout, not required), the states are saved, and only the host's state becomes M3
+ * (dev_state MHI_STATE_M3_FAST). The device stays in M0/M2 and in D0 (cnss_pci_suspend_bus skips pci_clear_master,
+ * the config save, pci_disable_device and D3hot with DRV), so it asks for the host the way it does awake: an MSI --
+ * the WAKE vector of the host capabilities, or an event ring's -- over the DSP-held link, which ev_handler takes as the
+ * request (lx_doze_kick). run63..75: in real M3 the radio had only PME (D3hot) or WAKE# (PERST# low) to ask with; in D0
+ * none ("PERST GPIO line is HIGH. Not asserting WAKE#, CHECK D3 State"), and in D3hot it raised PME ~80 ms after
+ * every entry, nothing to deliver. wifi_mhi_m3=1: real M3 as before.
+ */
+#define FAST_M2_TIMEOUT_MS 100u /* Run76 saw M1 after the 25 ms window. Allow it to reach M2 before handoff. */
+static bool
+fast_wanted(void)
+{
+	return lx_os_pcie_sleep_mode() == 1 && !lx_os_option("wifi_mhi_m3");
+}
+static int
+fast_suspend(struct mhi_priv *p)	/* not under L */
+{
+	bool pending = false;
+	struct mhi_el first;
+	u32 ring = 0;
+	int rc;
+
+	L(p);
+	if (aborted(p) || !(p->pm & (PM_M0 | PM_M2)) || !p->mission_done) {
+		u32 pm = p->pm;
+		U(p);
+		MHI_LOG("fast suspend refused: pm %#x", pm);
+		return -EIO;
+	}
+	if (p->dev_wake > (p->wake_hold ? 1u : 0u) || p->pending_pkts) {
+		U(p);
+		return -EBUSY;
+	}
+	/* the device may now attempt M2: the permanent device wake let go, its M1 request taken */
+	if (p->wake_hold) {
+		p->wake_hold = false;
+		wake_put_locked(p);
+	}
+	p->fast_m2_ok = true;
+	U(p);
+	MHI_WAIT(p, (p->pm & PM_M2) != 0 || p->dev_wake || p->pending_pkts, FAST_M2_TIMEOUT_MS, rc);
+	(void)rc;
+	L(p);
+	p->fast_m2_ok = false;
+	if (aborted(p) || !(p->pm & (PM_M0 | PM_M2)) || p->dev_wake || p->pending_pkts) {
+		bool busy = !aborted(p) && (p->pm & (PM_M0 | PM_M2));
+		if (busy && !p->idle_enabled && !p->wake_hold) {
+			p->wake_hold = true;
+			wake_get_locked(p);
+		}
+		U(p);
+		return busy ? -EBUSY : -EIO;
+	}
+	if (p->pm & PM_M2) p->fast_m2_reached++;
+	p->fast_saved_pm = p->pm;
+	p->pm = PM_M3;
+	p->fast = true;
+	p->fast_entries++;
+	p->m3_entries++;
+	/* An event may have arrived as host processing stopped, with its MSI already dispatched. */
+	for (; ring < p->n_ev; ring++) {
+		pending = ev_pending(&p->ev[ring], &first);
+		if (pending) break;
+	}
+	idle_report(p);
+	U(p);
+	if (pending && lx_os_doze_kick_mode() != 0) {
+		if (p->fast_entries <= 8)
+			MHI_LOG("standby ring %u at entry: event %#x code %#x", ring,
+			    (first.dw1 >> 16) & 0xff, first.dw0 >> 24);
+		p->m3_kicks++;
+		lx_doze_kick();
+	}
+	if (p->fast_entries < 4 || !(p->fast_entries & (p->fast_entries - 1)))
+		MHI_LOG("fast M3 (the device in %s), entries %u, M2 reached %u", p->fast_saved_pm & PM_M2 ? "M2" : "M0",
+		    p->fast_entries, p->fast_m2_reached);
+	return 0;
+}
+/* mhi_pm_fast_resume: the saved states back; from M2 the device wake brings M0; the events that waited processed */
+static int
+fast_resume(struct mhi_priv *p)	/* under L, p->fast; returns unlocked */
+{
+	int rc = 0;
+
+	p->fast = false;
+	p->pm = p->fast_saved_pm;
+	if (p->pm & PM_M2) {
+		p->dev_state = MHI_STATE_M2;
+		wake_get_locked(p);
+		U(p);
+		MHI_WAIT(p, (p->pm & PM_M0) != 0 || device_in(p, MHI_STATE_M0), p->c->timeout_ms, rc);
+		L(p);
+		if (rc == 0 && !(p->pm & PM_M0)) m0_transition(p, "MHISTATUS after fast M3");
+		wake_put_locked(p);
+	} else {
+		m0_transition(p, "fast M3 left");
+	}
+	if (!(p->pm & PM_M0)) {
+		u32 pm = p->pm;
+		p->m3_failures++;
+		U(p);
+		MHI_LOG("fast resume: M0 not reached: %d, pm %#x", rc, pm);
+		return -EIO;
+	}
+	U(p);
+	for (u32 i = 0; i < p->n_ev; i++) (void)ev_process(p, &p->ev[i]);
+	run_transitions(p);
+	return 0;
 }
 
+static int
+mhi_pm_suspend_locked(struct mhi_priv *p)
+{
+	int rc;
+
+	if (fast_wanted()) return fast_suspend(p);
+	L(p);
+	if (aborted(p) || !(p->pm & (PM_M0 | PM_M2)) || !p->mission_done) {
+		u32 pm = p->pm;
+		U(p);
+		MHI_LOG("suspend refused: pm %#x", pm);
+		return -EIO;
+	}
+	if (p->dev_wake > (p->wake_hold ? 1u : 0u) || p->pending_pkts) {
+		U(p);
+		return -EBUSY;	/* (the caller retries later) */
+	}
+	if (p->pm & PM_M2) {
+		wake_get_locked(p);
+		U(p);
+		MHI_WAIT(p, (p->pm & PM_M0) != 0, 1000, rc);
+		L(p);
+		wake_put_locked(p);
+		if (rc) {
+			U(p);
+			MHI_LOG("suspend: M2 not left: %d", rc);
+			return -EIO;
+		}
+	}
+	if (p->wake_hold) {
+		p->wake_hold = false;
+		wake_put_locked(p);
+	}
+	if (p->dev_wake || p->pending_pkts) {
+		if (!p->idle_enabled && !p->wake_hold) {
+			p->wake_hold = true;
+			wake_get_locked(p);
+		}
+		U(p);
+		return -EBUSY;
+	}
+	p->pm = PM_M3_ENTER;
+	set_mhi_state(p, MHI_STATE_M3);
+	U(p);
+	/* the device's M3 state change event (an old one was consumed by the last M3 already); MHISTATUS only if none came */
+	MHI_WAIT(p, p->pm == PM_M3, 1000, rc);
+	L(p);
+	if (rc == -ETIMEDOUT && p->pm == PM_M3_ENTER && device_in(p, MHI_STATE_M3)) {
+		p->dev_state = MHI_STATE_M3;
+		p->pm = PM_M3;
+		rc = 0;
+		MHI_LOG("suspend: M3 by MHISTATUS, no state change event");
+	}
+	if (rc) {
+		p->m3_failures++;
+		/* back to M0 as resume would: the device may be on its way */
+		p->pm = PM_M3_EXIT;
+		set_mhi_state(p, MHI_STATE_M0);
+		U(p);
+		MHI_LOG("suspend: M3 not reached: %d; M0 asked again", rc);
+		MHI_WAIT(p, (p->pm & PM_M0) != 0 || device_in(p, MHI_STATE_M0), 1000, rc);
+		L(p);
+		if (!(p->pm & PM_M0)) m0_transition(p, "MHISTATUS after a failed M3");
+		U(p);
+		return -EIO;
+	}
+	p->m3_entries++;
+	idle_report(p);
+	U(p);
+	if (p->m3_entries < 4 || !(p->m3_entries & (p->m3_entries - 1)))
+		MHI_LOG("M3, entries %u", p->m3_entries);
+	return 0;
+}
+
+/*
+ * Linux pm.c __mhi_pm_resume(force): M0 asked in MHICTRL and waited for; m0_transition() rings the event,
+ * command and channel doorbells again and takes the permanent device wake. The link must be up again.
+ */
 int
 mhi_pm_resume_force(struct mhi_controller *c)
 {
-	MHI_LOG("resume is not supported (nothing was suspended)");
-	return -EOPNOTSUPP;
+	struct mhi_priv *p = c ? PRIV(c) : NULL;
+	int rc;
+
+	if (p == NULL) {
+		return -EINVAL;
+	}
+	L(p);
+	if (p->pm & (PM_M0 | PM_M2)) {
+		U(p);
+		return 0;
+	}
+	if (p->pm == PM_M3 && p->fast) {
+		unsigned saved;
+		int restore;
+
+		U(p);
+		rc = lx_os_pcie_l1_hold(&saved);
+		if (rc) {
+			MHI_LOG("fast resume: cannot bring PCIe to L0: %d", rc);
+			return -rc;
+		}
+		L(p);
+		rc = fast_resume(p);
+		restore = lx_os_pcie_l1_restore(saved);
+		if (restore) MHI_LOG("fast resume: cannot restore PCIe ASPM: %d", restore);
+		return rc ? rc : -restore;
+	}
+	if (p->pm != PM_M3) {
+		u32 pm = p->pm;
+		U(p);
+		MHI_LOG("resume refused: pm %#x", pm);
+		return -EIO;
+	}
+	p->pm = PM_M3_EXIT;
+	set_mhi_state(p, MHI_STATE_M0);
+	U(p);
+	/* (as long as Linux waits: the controller's timeout_ms, ath11k's 20 s; run65: a radio back from D3hot reached M0
+	 * after 2 s, and the driver going on without it crashed the firmware) */
+	MHI_WAIT(p, (p->pm & PM_M0) != 0 || device_in(p, MHI_STATE_M0), c->timeout_ms, rc);
+	L(p);
+	if (rc == 0 && !(p->pm & PM_M0)) {
+		m0_transition(p, "MHISTATUS after M3");
+	}
+	if (!(p->pm & PM_M0)) {
+		u32 pm = p->pm;
+		p->m3_failures++;
+		U(p);
+		MHI_LOG("resume: M0 not reached: %d, pm %#x", rc, pm);
+		return -EIO;
+	}
+	U(p);
+	return 0;
+}
+
+/*
+ * Whether mhi_pm_suspend() would go ahead now (its refusals and -EBUSY, without its M2 wait): the doze asks before it
+ * starts the driver's suspend, whose late failure (hif_suspend, its last step) leaves the WoW setup half undone.
+ */
+bool lx_mhi_suspend_ready(void);
+bool
+lx_mhi_suspend_ready(void)
+{
+	struct mhi_priv *p = active_ctrl ? PRIV(active_ctrl) : NULL;
+	bool ready;
+
+	if (p == NULL) {
+		return false;
+	}
+	L(p);
+	ready = !aborted(p) && (p->pm & (PM_M0 | PM_M2)) && p->mission_done &&
+	    p->dev_wake <= (p->wake_hold ? 1u : 0u) && !p->pending_pkts;
+	U(p);
+	return ready;
+}
+
+void lx_mhi_m3_counts(unsigned *entries, unsigned *failures);
+void
+lx_mhi_m3_counts(unsigned *entries, unsigned *failures)
+{
+	struct mhi_priv *p = active_ctrl ? PRIV(active_ctrl) : NULL;
+
+	*entries = p ? p->m3_entries : 0;
+	*failures = p ? p->m3_failures : 0;
+}
+bool
+lx_mhi_in_m3(void)
+{
+	struct mhi_priv *p = active_ctrl ? PRIV(active_ctrl) : NULL;
+
+	return p != NULL && p->pm == PM_M3;
+}
+
+bool
+lx_mhi_in_fast_m3(void)
+{
+	struct mhi_priv *p = active_ctrl ? PRIV(active_ctrl) : NULL;
+	bool fast = false;
+
+	if (p != NULL) {
+		L(p);
+		fast = p->pm == PM_M3 && p->fast;
+		U(p);
+	}
+	return fast;
+}
+
+void lx_mhi_m3_irqs(unsigned *ev, unsigned *ev_pending, unsigned *bhi, unsigned *kicks, unsigned *net);
+void
+lx_mhi_m3_irqs(unsigned *ev, unsigned *ev_pending, unsigned *bhi, unsigned *kicks, unsigned *net)
+{
+	struct mhi_priv *p = active_ctrl ? PRIV(active_ctrl) : NULL;
+
+	*ev = m3_irq_ev; *ev_pending = m3_irq_ev_pending; *bhi = m3_irq_bhi; *kicks = p ? p->m3_kicks : 0; *net = m3_net;
 }
 
 int

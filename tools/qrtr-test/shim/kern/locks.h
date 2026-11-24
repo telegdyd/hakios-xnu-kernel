@@ -7,7 +7,9 @@
 #define QRTR_TEST_SHIM_LOCKS_H
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
+#include <time.h>
 
 typedef struct {
 	pthread_mutex_t m;
@@ -50,6 +52,18 @@ lck_mtx_sleep(lck_mtx_t *l, lck_sleep_action_t action, event_t event, wait_inter
 	if (pthread_cond_wait(&shim_event, &l->m) != 0) {
 		abort();
 	}
+	return 0;
+}
+
+static inline wait_result_t
+lck_mtx_sleep_deadline(lck_mtx_t *l, lck_sleep_action_t action, event_t event, wait_interrupt_t interruptible, uint64_t deadline)
+{
+	struct timespec until = { .tv_sec = (time_t)(deadline / 1000000000ull), .tv_nsec = (long)(deadline % 1000000000ull) };
+
+	(void)action;
+	(void)event;
+	(void)interruptible;
+	(void)pthread_cond_timedwait(&shim_event, &l->m, &until);
 	return 0;
 }
 

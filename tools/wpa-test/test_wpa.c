@@ -54,9 +54,12 @@ struct handshake {
 	const unsigned char *g1; size_t g1_length;
 	const unsigned char *g2; size_t g2_length;
 	const unsigned char *m3_wrong; size_t m3_wrong_length;
-	unsigned group_index;
+	const unsigned char *igtk; size_t igtk_length;
+	const unsigned char *igtk2; size_t igtk2_length;
+	unsigned group_index, pmf, sae, owe;
 };
 
+struct bip_case { const unsigned char *key, *frame; unsigned length; };
 #include "cases.inc"
 
 static void
@@ -189,7 +192,8 @@ whole(void)
 		struct lx_wpa wpa;
 
 		memset(&wpa, 0, sizeof(wpa));
-		lx_wpa_pmk(h->passphrase, (unsigned)h->passphrase_length, h->name, (unsigned)h->name_length, wpa.pmk);
+		if (h->sae || h->owe) memcpy(wpa.pmk,h->pmk,32);
+		else lx_wpa_pmk(h->passphrase, (unsigned)h->passphrase_length, h->name, (unsigned)h->name_length, wpa.pmk);
 		check(memcmp(wpa.pmk, h->pmk, 32) == 0, "the PMK against Python's pbkdf2_hmac", (int)n);
 		memcpy(wpa.own, h->station, 6);
 		memcpy(wpa.peer, h->ap, 6);
@@ -197,7 +201,22 @@ whole(void)
 		wpa.rsn = h->rsn;
 		wpa.rsn_length = (unsigned)h->rsn_length;
 		wpa.group_cipher = h->rsn[7];
+		wpa.pmf = h->pmf;
+		wpa.sae = h->sae;
+		wpa.owe = h->owe; wpa.owe_ready = 1;
+		wpa.ap_rsn = h->rsn;
+		wpa.ap_rsn_length = h->rsn[1]+2;
+        if(h->rsn_length>wpa.ap_rsn_length) {
+            wpa.ap_rsnxe=h->rsn+wpa.ap_rsn_length;
+            wpa.ap_rsnxe_length=(unsigned)h->rsn_length-wpa.ap_rsn_length;
+        }
 
+        if(h->owe) {
+            wpa.owe_ready=0;
+            check(lx_wpa_message(&wpa,h->m1,(unsigned)h->m1_length,reply,&length,&why)==LX_WPA_NOTHING &&
+                !length && !wpa.have_keys,"OWE early M1 waits for the PMK",(int)n);
+            wpa.owe_ready=1;
+        }
 		/* a signed message before any message 1 */
 		check(lx_wpa_message(&wpa, h->m3, (unsigned)h->m3_length, reply, &length, &why) == LX_WPA_BAD, "message 3 first is refused",
 		    (int)n);
@@ -219,6 +238,8 @@ whole(void)
 		    "the group key and its number are the reference's", (int)n);
 		check(memcmp(wpa.group_counter, h->m3 + AT_RSC, 8) == 0, "the group key's packet number is message 3's", (int)n);
 
+		check(!h->pmf || (wpa.igtk[0].valid && memcmp(wpa.igtk[0].key, h->igtk, 16) == 0), "PMF message 3 installs IGTK 4", (int)n);
+
 		/* message 3 once more: played again */
 		check(lx_wpa_message(&wpa, h->m3, (unsigned)h->m3_length, reply, &length, &why) == LX_WPA_BAD,
 		    "message 3 played again is refused", (int)n);
@@ -229,6 +250,8 @@ whole(void)
 		    (int)n);
 		check(wpa.group_length == h->group2_length && memcmp(wpa.group, h->group2, h->group2_length) == 0 && wpa.group_index == h->group_index % 3 + 1,
 		    "the new group key and its number are the reference's", (int)n);
+
+		check(!h->pmf || (wpa.igtk[1].valid && memcmp(wpa.igtk[1].key, h->igtk2, 16) == 0 && wpa.igtk[0].valid), "PMF group rekey installs IGTK 5 and retains 4", (int)n);
 
 		/* a network that wants another kind of key management says so in the descriptor's version */
 		memcpy(spoiled, h->m1, h->m1_length);
@@ -243,12 +266,117 @@ whole(void)
 	}
 }
 
+static void
+pmf_tests(void)
+{
+    /* RFC 4493 section 4, all four lengths (empty, full and partial final blocks). */
+    const uint8_t key[16] = {0x2b,0x7e,0x15,0x16,0x28,0xae,0xd2,0xa6,0xab,0xf7,0x15,0x88,0x09,0xcf,0x4f,0x3c};
+    const uint8_t msg[64] = {
+        0x6b,0xc1,0xbe,0xe2,0x2e,0x40,0x9f,0x96,0xe9,0x3d,0x7e,0x11,0x73,0x93,0x17,0x2a,
+        0xae,0x2d,0x8a,0x57,0x1e,0x03,0xac,0x9c,0x9e,0xb7,0x6f,0xac,0x45,0xaf,0x8e,0x51,
+        0x30,0xc8,0x1c,0x46,0xa3,0x5c,0xe4,0x11,0xe5,0xfb,0xc1,0x19,0x1a,0x0a,0x52,0xef,
+        0xf6,0x9f,0x24,0x45,0xdf,0x4f,0x9b,0x17,0xad,0x2b,0x41,0x7b,0xe6,0x6c,0x37,0x10};
+    const unsigned sizes[] = {0,16,40,64};
+    const char *tags[] = {"bb1d6929e95937287fa37d129b756746", "070a16b46b4d4144f79bdd9dd04a287c",
+        "dfa66747de9ae63030ca32611497c827", "51f0bebf7e3b9d92fc49741779363cfe"};
+    for (unsigned i=0;i<4;i++) {
+        uint8_t out[16];
+        const uint8_t *parts[] = {msg};
+        cmac(key,parts,&sizes[i],1,out);
+        check(hex_is(out,16,tags[i]),"RFC 4493 CMAC vector",(int)i);
+    }
+    for (unsigned i=0;i<sizeof(bip_cases)/sizeof(bip_cases[0]);i++) {
+        const struct bip_case *c=&bip_cases[i];
+        struct lx_wpa w={0}, before;
+        unsigned slot=i%2;
+        w.pmf=1;
+        w.igtk[slot].valid=1;
+        memcpy(w.igtk[slot].key,c->key,16);
+        before=w;
+        for (unsigned bit=0;bit<c->length*8;bit++) {
+            uint8_t f[128]; unsigned n=c->length;
+            w=before;
+            memcpy(f,c->frame,n); f[bit/8]^=1u<<(bit%8);
+            /* Duration, sequence number, and three FC flags are outside BIP's authentication. */
+            if (bit/8==2 || bit/8==3 || bit/8==22 || bit/8==23 || (bit/8==1 && (bit%8>=3 && bit%8<=5))) continue;
+            /* Destination bit 0 can turn this into unicast: not firmware-decrypted, still refused. */
+            check(lx_wpa_pmf_rx(&w,f,&n,0,0,0,0)==-1 && memcmp(&w,&before,sizeof(w))==0,
+                "BIP rejects tampering without advancing IPN",(int)bit);
+        }
+        for (unsigned n=0;n<c->length;n++) {
+            uint8_t f[128]; unsigned len=n;
+            w=before; memcpy(f,c->frame,c->length);
+            check(lx_wpa_pmf_rx(&w,f,&len,0,0,0,0)==-1,"truncated BIP refused",(int)n);
+        }
+        uint8_t f[128]; unsigned n=c->length;
+        w=before; memcpy(f,c->frame,n);
+        check(lx_wpa_pmf_rx(&w,f,&n,0,0,0,0)==0 && n==26,"reference BIP accepted and MMIE removed",(int)i);
+        memcpy(f,c->frame,c->length); n=c->length;
+        check(lx_wpa_pmf_rx(&w,f,&n,0,0,0,0)==-1,"BIP replay refused",(int)i);
+    }
+    /* Transactional KDE parsing, required IGTK, both slots and reinstall IPN preservation. */
+    {
+        struct lx_wpa w={0}, saved;
+        uint8_t kde[54]={0xdd,22,0,15,172,1,1,0}, counter[8]={0};
+        for(unsigned i=0;i<16;i++) kde[8+i]=i;
+        memcpy(kde+24,"\xdd\x1c\x00\x0f\xac\x09\x04\x00",8);
+        kde[32]=1;
+        memset(kde+38,0x5a,16);
+        w.pmf=1; w.group_cipher=4; saved=w;
+        check(key_data(&w,kde,24,counter,1)==-1 && memcmp(&w,&saved,sizeof(w))==0,"initial PMF requires IGTK",0);
+        for(unsigned n=25;n<54;n++) {
+            check(key_data(&w,kde,n,counter,1)==-1 && memcmp(&w,&saved,sizeof(w))==0,"truncated IGTK is atomic",(int)n);
+        }
+        check(key_data(&w,kde,54,counter,1)==0 && w.group_updated && w.igtk[0].valid,"GTK and IGTK committed together",0);
+        w.igtk[0].ipn[0]=50;
+        check(key_data(&w,kde+24,30,counter,0)==0 && !w.group_updated && w.igtk[0].ipn[0]==50,"IGTK-only rekey cannot roll IPN back",0);
+        saved=w; kde[30]=3;
+        check(key_data(&w,kde,54,counter,1)==-1 && memcmp(&w,&saved,sizeof(w))==0,"invalid IGTK index cannot change GTK",0);
+        kde[30]=4; kde[25]=27;
+        check(key_data(&w,kde,54,counter,1)==-1,"wrong IGTK size refused",0);
+        kde[25]=28;
+        uint8_t dup[84]; memcpy(dup,kde,54); memcpy(dup+54,kde+24,30);
+        check(key_data(&w,dup,84,counter,1)==-1,"duplicate IGTK refused",0);
+        kde[30]=5;
+        check(key_data(&w,kde+24,30,counter,0)==0 && w.igtk[1].ipn[0]==50,"same key in other slot keeps IPN",0);
+    }
+    /* Message 3 authenticates the AP's advertised RSN, including its PMF capabilities. */
+    {
+        uint8_t rsn[22]={48,20,1,0,0,15,172,4,1,0,0,15,172,4,1,0,0,15,172,2,0x80,0};
+        uint8_t data[46]; memcpy(data,rsn,22);
+        memcpy(data+22,"\xdd\x16\x00\x0f\xac\x01\x01\x00",8); memset(data+30,0x5a,16);
+        struct lx_wpa w={0}, saved; uint8_t counter[8]={0};
+        w.ap_rsn=rsn; w.ap_rsn_length=22; saved=w;
+        data[20]=0;
+        check(key_data(&w,data,46,counter,1)==-1 && memcmp(&w,&saved,sizeof(w))==0,"RSN downgrade in message 3 rejected atomically",0);
+        check(key_data(&w,data+22,24,counter,1)==-1,"message 3 must authenticate the AP RSN",0);
+        data[20]=0x80;
+        check(key_data(&w,data,46,counter,1)==0,"matching AP RSN accepted",0);
+    }
+    /* Firmware-decrypted unicast: CCMP header/MIC removal and independent management PN. */
+    for (unsigned stripped=0;stripped<2;stripped++) {
+        struct lx_wpa w={0};
+        uint8_t original[42]={0xc0,0x40};
+        original[4]=2; original[24]=1; original[27]=0x20; original[32]=3;
+        uint8_t f[42]; unsigned n=sizeof(f)-(stripped?8:0);
+        memcpy(f,original,sizeof(f));
+        check(lx_wpa_pmf_rx(&w,f,&n,0,0,stripped,0)==-1,"unverified unicast rejected",0);
+        check(lx_wpa_pmf_rx(&w,f,&n,1,0,stripped,0)==0 && n==26 && f[24]==3,"decrypted CCMP normalized",0);
+        memcpy(f,original,sizeof(f)); n=sizeof(f)-(stripped?8:0);
+        check(lx_wpa_pmf_rx(&w,f,&n,1,0,stripped,0)==-1,"unicast management replay refused",0);
+        n=26;
+        check(lx_wpa_pmf_rx(&w,f,&n,1,1,1,0)==-1,"stripped PN requires validation",0);
+        check(lx_wpa_pmf_rx(&w,f,&n,1,1,1,1)==0,"driver-validated stripped PN accepted",0);
+    }
+}
+
 int
 main(void)
 {
 	pieces();
 	group_keys();
 	whole();
+	pmf_tests();
 	printf("%u checks, %u failed\n", checks, failed);
 	return failed != 0;
 }

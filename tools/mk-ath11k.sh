@@ -115,7 +115,7 @@ if [ ! -d gen ]; then
 fi
 
 # --- compile: the driver's files that are built so far, and ours
-DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p"
+DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p wow"
 # Which bus the object has, per device. The OnePlus 10 Pro's radio is a PCIe chip (ath11k's pci, pcic, mhi and our lx_pci.c,
 # lx_mhi.c: WIFI-PLAN.md), redwood's an AHB one; both are the same ath11k core and station. By default the device the tree is
 # configured for decides (CONFIG_DEVICE of .config, which `tools/hakios-config.py defconfig <device>` writes): negroni builds the
@@ -139,8 +139,8 @@ CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fn
 	-include $S/compat/linuxkpi/common/include/linux/kconfig.h -DLINUXKPI_VERSION=70000"
 # CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS: ath11k_reg_notifier() hands the firmware the country iOS asks for (lx_80211.c,
 # boundary_country); without it the notifier only says "Country Setting is not allowed".
-DFLAGS="-Isrc/ath11k -Isrc -include $W/include/lx_prelude.h -DCONFIG_ATH11K_AHB -DCONFIG_ATH11K_DEBUG
-	-DCONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS -DKBUILD_MODNAME=\"ath11k\""
+DFLAGS="-Igen/ath11k -Isrc -include $W/include/lx_prelude.h -DCONFIG_ATH11K_AHB -DCONFIG_ATH11K_DEBUG
+	-DCONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS -DCONFIG_PM -DKBUILD_MODNAME=\"ath11k\""
 # two headers are the kernel's: what it offers this object (wifi/lx/include/lx_os.h), and its QMI
 # helpers (wifi/lx/include/linux/soc/qcom/qmi.h)
 source "$ROOT/xnu-env.sh"
@@ -152,6 +152,9 @@ DFLAGS="$DFLAGS -DLX_HAKIOS_LX_H=\"$XNU_SRC/bsd/sys/hakios.lx.h\" -DLX_HAKIOS_QM
 # the pool's window (C3) from the kernel's own header, where there is one, in place of lx_mhi.c's checked copy
 [ "$ATH11K_PCI" = 0 ] || [ ! -f "$XNU_SRC/bsd/sys/hakios.smmu.h" ] || DFLAGS="$DFLAGS -DLX_HAKIOS_SMMU_H=\"$XNU_SRC/bsd/sys/hakios.smmu.h\""
 mkdir -p obj out
+# A field named jiffies conflicts with the clock accessor macro. Compile copies
+# with that member renamed, leaving the pinned upstream files unchanged.
+python3 "$ROOT/tools/ath11k-clock-source.py" src/ath11k gen/ath11k
 if [ "$(cat obj/.pci 2>/dev/null)" != "$ATH11K_PCI" ]; then
  rm -f obj/*.o obj/*.o.d
  echo "$ATH11K_PCI" > obj/.pci
@@ -173,7 +176,7 @@ int lx_pci_driver_init(void) { return ath11k_pci_init(); }
 void lx_pci_driver_exit(void) { ath11k_pci_exit(); }
 EOF
 for f in $DRIVER; do
- source=src/ath11k/$f.c
+ source=gen/ath11k/$f.c
  [ "$f" != pci ] || source=gen/ath11k_pci_entry.c
  compile "$source" obj/ath11k_$f.o $DFLAGS &
 done
@@ -211,8 +214,8 @@ for s in $(cat out/undefined.txt); do
 done
 [ -z "$missing" ] || exit 1
 $CC -c out/stubs.s -o out/stubs.o
-# four names are shown: where the kernel enters (lx_prepare(), lx_start(), lx_stop() and lx_transmit() of hakios.lx.h)
-printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n' > out/exported.txt
+# These names are the kernel's entry points, including cleanup at thread exit.
+printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n_lx_thread_release\n' > out/exported.txt
 $LD -r -arch arm64 -exported_symbols_list out/exported.txt out/all.o out/stubs.o -o out/ath11k.o 2> out/ld.err ||
 	{ cat out/ld.err; exit 1; }
 rm -f out/all.o

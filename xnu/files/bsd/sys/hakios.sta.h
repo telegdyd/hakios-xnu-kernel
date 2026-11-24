@@ -42,7 +42,11 @@ struct hakios_sta_scan {
 	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
 };
 
-enum { HAKIOS_STA_OPEN, HAKIOS_STA_WPA2_PSK };
+/* WPA2_PSK is Personal/automatic: prefer SAE in a transition BSS when a
+ * password is supplied. WPA3_SAE additionally prohibits a PSK-only BSS.
+ * OPEN selects OWE when its RSN is advertised; OWE explicitly requires it.
+ * Neither passwordless request can downgrade a selected OWE BSS to plaintext. */
+enum { HAKIOS_STA_OPEN, HAKIOS_STA_WPA2_PSK, HAKIOS_STA_WPA3_SAE, HAKIOS_STA_OWE };
 
 struct hakios_sta_join {
 	uint8_t ssid[32], ssid_length;
@@ -54,10 +58,21 @@ struct hakios_sta_join {
 
 enum hakios_sta_phase { HAKIOS_STA_OFF, HAKIOS_STA_IDLE, HAKIOS_STA_SCANNING, HAKIOS_STA_JOINING, HAKIOS_STA_JOINED };
 
+/* How the network joined last was lost by itself. */
+enum hakios_sta_loss {
+	HAKIOS_STA_LOSS_NONE,                  /* it was not (or it was left when asked) */
+	HAKIOS_STA_LOSS_DEAUTH,                /* the access point deauthenticated us, with `reason` */
+	HAKIOS_STA_LOSS_DISASSOC,              /* ... disassociated us, with `reason` */
+	HAKIOS_STA_LOSS_BEACONS,               /* its beacons stopped and it did not answer the radio's probes */
+};
+
 struct hakios_sta_state {
 	enum hakios_sta_phase phase;
 	struct hakios_sta_bss bss;             /* the network joined or being joined */
 	int last_error;                         /* why the last join failed or the network was lost (an errno); 0: it was not */
+	enum hakios_sta_loss loss;             /* ... and if it was lost, how */
+	uint16_t reason;                        /* the 802.11 reason code the access point gave (DEAUTH, DISASSOC); else 0 */
+	int security;                          /* negotiated HAKIOS_STA_* AKM while joining/joined */
 };
 
 #define HAKIOS_STA_CHANNEL_PASSIVE     1u      /* the radio may only listen there */
@@ -84,6 +99,9 @@ struct hakios_sta_ops {
 	/* asked (two letters, or NULL only to read): the radio into that country, returning once its domain is in
 	 * force; now (or NULL): the country of the domain in force, two letters (zero: none yet) */
 	int (*country)(const char *asked, char *now);
+	/* the network joined: how strongly it is heard now, in dBm, as the radio measures it (may be NULL; may sleep, on
+	 * the one thread like the rest). 0, or an errno: then whoever asks goes by state()'s, the last beacon's */
+	int (*signal)(int *dbm);
 	uint8_t address[6];
 };
 
@@ -93,7 +111,9 @@ enum hakios_sta_event {
 	HAKIOS_STA_SCAN_DONE,                  /* status: 0, or the scan's errno */
 	HAKIOS_STA_JOIN_DONE,                  /* status: 0, or the join's errno */
 	HAKIOS_STA_LINK,                       /* status: 1 a network is joined, 0 it has been left when asked,
-	                                         * an errno: it was lost (the access point showed us the door) */
+	                                         * an errno: it was lost (state() says how: loss, reason) */
+	HAKIOS_STA_SIGNAL,                     /* status: dBm of the network joined, once a second while joined */
+	HAKIOS_STA_COUNTRY,                    /* status: 0; the country in force is another one now */
 };
 
 #ifdef KERNEL

@@ -138,6 +138,7 @@ u32 lx_pci_read32(const volatile void *va)
 {
  unsigned v=~0u;
  if (in_bar(va)) {
+  if (!lx_mhi_bar_access((unsigned)((uintptr_t)va-(uintptr_t)endpoint.link.bar0_va),false)) return v;
   bool traced=bar_trace("read ",va,0);
   if (lx_os_pcie_try_read32(va,&v)) lx_tell("pci: BAR read refused at %p\n",va);
   if (traced) lx_tell("pci: BAR read gave %#x\n",v);
@@ -150,6 +151,7 @@ u32 lx_pci_read32(const volatile void *va)
 void lx_pci_write32(u32 v,volatile void *va)
 {
  if (in_bar(va)) {
+  if (!lx_mhi_bar_access((unsigned)((uintptr_t)va-(uintptr_t)endpoint.link.bar0_va),true)) return;
   bar_trace("write",va,v);
   if (lx_os_pcie_try_write32(va,v)) lx_tell("pci: BAR write refused at %p\n",va);
  } else if (lx_os_option("wifi_soc")!=8450) { (writel)(v,va); }
@@ -175,12 +177,21 @@ static void msi_counts(const char *when)
  * an edge interrupt); while a tasklet or NAPI is queued it does not sleep; and every 10 ms without an interrupt it calls
  * all of them, as a net under a lost message. Without the ITS: all of them every millisecond (the RAM mailbox).
  */
+/* this pass of the handlers is the quiet sweep (the net), not vectors that fired (doze: lx_mhi.c tells them apart) */
+static volatile bool net_pass;
+bool lx_pci_net_pass(void);
+bool lx_pci_net_pass(void) { return net_pass; }
+bool lx_mhi_in_m3(void);
+extern unsigned lx_wake_msi_vector;
+void lx_doze_kick(void);
 static void poll(void *arg)
 {
  unsigned want=~0u, owed=0;
  unsigned long long started=lx_os_nanoseconds(); bool counted=false;
  endpoint.poll_owner=lx_os_thread_self();
  while (!endpoint.stop) {
+  net_pass = want==~0u;
+  lx_os_pcie_pm_sample();
   for (unsigned i=0;i<HANDLERS;i++) {
    irq_handler_t handler,thread; void *data; unsigned irq, bit;
    lx_os_lock();
@@ -198,6 +209,7 @@ static void poll(void *arg)
    lx_os_lock(); endpoint.handlers[i].active--; lx_os_unlock();
   }
   deferred_poll();
+  lx_timer_poll();
   if (!endpoint.its) { lx_pause_ms(1); continue; }
   if (!counted && lx_os_nanoseconds()-started>20000000000ull) { counted=true; msi_counts("in the first 20 s"); }
   unsigned masked=0; bool queued;
@@ -207,7 +219,10 @@ static void poll(void *arg)
   lx_os_unlock();
   unsigned ready=owed & ~masked;
   if (queued || ready) { owed&=~ready; want=ready; continue; }
-  unsigned fired=lx_os_pci_msi_wait(10);
+  /* in M3 (doze) nothing is there to sweep: the net only after a minute; an MSI still ends the wait at once */
+  unsigned fired=lx_os_pci_msi_wait(lx_mhi_in_m3() ? 60000 : 10);
+  /* the radio's wake MSI (lx_bus.c, the host capabilities): no handler of ath11k's; the doze's wake */
+  if (lx_wake_msi_vector<32 && (fired & (1u<<lx_wake_msi_vector))) lx_doze_kick();
   want=fired ? fired : ~0u;
  }
  endpoint.poll_owner=NULL;
@@ -390,6 +405,7 @@ int lx_pci_register_driver(struct pci_driver *driver)
  if (!id->vendor) { ret=-ENODEV; goto fail; }
  endpoint.driver=driver;
  ret=driver->probe(&endpoint.dev,id);
+ { extern void lx_bus_probed(void); if (ret==0) lx_bus_probed(); }
  if (ret) { endpoint.driver=NULL; goto fail; }
  return 0;
 fail:

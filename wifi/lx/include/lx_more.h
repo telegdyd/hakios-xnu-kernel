@@ -12,6 +12,10 @@
 #include <linux/ieee80211.h>
 #include <net/cfg80211.h>
 
+/* Statistics-only timer, serviced by the PCI worker instead of waking a CPU. */
+struct timer_list;
+void lx_timer_defer(struct timer_list *timer);
+
 /* --- interrupts: how the line is triggered is the kernel's knowledge, not the driver's */
 #define IRQF_TRIGGER_RISING	0x0001
 #define IRQ_NOAUTOEN		(1 << 12)	/* request_irq() leaves the interrupt disabled */
@@ -41,5 +45,8 @@ void dma_free_noncoherent(struct device *dev, size_t size, void *vaddr, dma_addr
 #define WLAN_RM_ACTION_LINK_MEASUREMENT_REPORT		3
 /* the driver wants to hear of every change of regulatory domain it brought about itself */
 #define WIPHY_FLAG_NOTIFY_REGDOM_BY_DRIVER		BIT(24)
+
+/* --- WoW (wow.c, CONFIG_PM): whether the device may wake the system is the doze thread's own business (lx_80211.c) */
+#define device_set_wakeup_capable(dev, capable)	((void)(dev), (void)(capable))
 
 #endif

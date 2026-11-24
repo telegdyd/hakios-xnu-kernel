@@ -9,6 +9,8 @@ static bool fail_dma, fail_thread, fail_readback, raw_fault, fail_enable_write;
 static unsigned stuck_mask_offset=~0u;
 static unsigned long long ticks;
 void lx_pci_pool_reset(void) {}
+void lx_timer_poll(void) {}
+void lx_os_pcie_pm_sample(void) {}
 void lx_os_lock(void) {}
 void lx_os_unlock(void) {}
 void lx_os_wakeup(const void *p) {}
@@ -18,6 +20,7 @@ void lx_os_tell(const char *s) {}
 void lx_tell(const char *fmt,...) {}
 _Noreturn void lx_os_panic(const char *s) { fprintf(stderr,"%s\n",s); abort(); }
 unsigned lx_os_option(const char *name) { return !strcmp(name,"wifi_msi")?option_msi:!strcmp(name,"wifi_soc")?8450:0; }
+bool lx_mhi_bar_access(unsigned off, bool write) { return true; }
 void lx_pause_ms(unsigned ms) { endpoint.stop=true; }
 int lx_os_thread(const char *name,void (*fn)(void *),void *arg) { return fail_thread?EAGAIN:0; }
 int lx_os_pcie_up(unsigned rc,struct hakios_pcie_link *link)
