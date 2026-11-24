@@ -30,6 +30,8 @@
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
+#include <sys/sysctl.h>
+#include <sys/kauth.h>
 
 extern "C" {
 #include <console/video_console.h>
@@ -2683,6 +2685,49 @@ MiniIOMobileFramebufferPanel(uint32_t * width, uint32_t * height)
 	*width = usable ? (uint32_t) vinfo.v_width : 0;
 	*height = usable ? (uint32_t) vinfo.v_height : 0;
 }
+
+/*
+ * kern.hakios.screen: what the panel shows, for root alone (userland/src/screencap.c makes a PNG of it). A header of
+ * 24 bytes -- "HKSCREEN", then width, height, bytes a row and 0 for BGRA, little-endian words -- and the rows packed,
+ * 4 bytes a pixel, read from the boot framebuffer the panel scans out (what MiniIOMobileFramebufferShow() and the
+ * swaps copy into). Not one instant: rows a frame is copied over while they are read may be of the next frame.
+ */
+struct screen_header {
+	char magic[8];
+	uint32_t width, height, rowBytes, format;
+};
+
+static int
+screenSysctl(struct sysctl_oid * oidp __unused, void * arg1 __unused, int arg2 __unused, struct sysctl_req * req)
+{
+	struct screen_header h = { { 'H', 'K', 'S', 'C', 'R', 'E', 'E', 'N' }, 0, 0, 0, 0 };
+
+	if (req->newptr != USER_ADDR_NULL) {
+		return EPERM;
+	}
+	if (suser(kauth_cred_get(), NULL) != 0) {
+		return EPERM;
+	}
+	if (vinfo.v_baseaddr == 0 || vinfo.v_depth != 32 || vinfo.v_width == 0 || vinfo.v_height == 0) {
+		return ENODEV;
+	}
+	h.width = (uint32_t) vinfo.v_width;
+	h.height = (uint32_t) vinfo.v_height;
+	h.rowBytes = h.width * 4;
+	if (req->oldptr == USER_ADDR_NULL) {
+		req->oldidx = sizeof(h) + (size_t) h.rowBytes * h.height;
+		return 0;
+	}
+	int error = SYSCTL_OUT(req, &h, sizeof(h));
+	for (uint32_t y = 0; error == 0 && y < h.height; y++) {
+		error = SYSCTL_OUT(req, (const void *) (vinfo.v_baseaddr + (size_t) y * vinfo.v_rowbytes), h.rowBytes);
+	}
+	return error;
+}
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, screen, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, screenSysctl, "S",
+    "what the panel shows: a 24-byte header (HKSCREEN, width, height, bytes a row, 0 = BGRA) and its rows (root only)");
 
 void
 MiniIOMobileFramebufferStart(IOService * provider)

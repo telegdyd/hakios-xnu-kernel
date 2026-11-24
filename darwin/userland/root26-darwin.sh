@@ -51,6 +51,9 @@ pac_strip "$OBJ/net_test"
 # touches, buttons and notifications for job lists (RC_JOBS=...; usage in its source): a swipe up unlocks, as a finger does
 $DYN -o "$OBJ/rwtouch" "$US/src/rwtouch.c"
 pac_strip "$OBJ/rwtouch"
+# what the panel shows, as a PNG (kern.hakios.screen; sweet-sh.py /hakios/bin/screencap > screen.png)
+$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o "$OBJ/screencap" "$US/src/screencap.c"
+pac_strip "$OBJ/screencap"
 # the command runner on the USB Ethernet link (usb_net=1: TCP 5143 of en2; the job list starts it; the client is the
 # OnePlus 10 Pro package's tools/sweet-sh.py). SWEETD=0: not in the image
 if [ "${SWEETD-1}" != 0 ]; then
@@ -81,6 +84,7 @@ for f in ${EXTRA_BIN:-}; do
 	chmod 755 "$T/bin/$(basename "$f")"
 done
 cp "$OBJ/rwtouch" "$T/bin/rwtouch"
+cp "$OBJ/screencap" "$T/bin/screencap"
 # sweetd and its token: SWEETD_TOKEN=FILE, else $OBJ/sweetd.token, made here once (never in git; the client reads the
 # same file). Not with SHARE=1: an image for somebody else gets no token of ours, and sweetd then runs nothing
 if [ -f "$OBJ/sweetd" ] && [ "${SWEETD-1}" != 0 ]; then
