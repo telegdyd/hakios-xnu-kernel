@@ -162,7 +162,10 @@ BOARD_SCHEMA = {
                 'resin_volume_up': (bool, False)},
     'rtc': {'peripheral': (int, True), 'name': (str, False)},
     'adsp': {'firmware': (str, True), 'memory': (int, True), 'memory_size': (int, True),
-             'charge_counter_divisor': (int, False)},
+             'charge_counter_divisor': (int, False),
+             # (SM8450 and after) the audio services' protocol, the doorbells' interrupt, the battery manager's numbering
+             'services': (('apr', 'gpr'), False), 'interrupt': (int, False), 'battery_linux_numbers': (bool, False),
+             'current_positive_discharging': (bool, False), 'pack_uah': (int, False), 'oplus_charger': (bool, False)},
     'gpu': {'model': (str, True), 'chip_id': (int, True), 'firmware': (str, True), 'gmem_kb': (int, True),
             'primitive_fifo': (int, True), 'hang_cycles': (int, True), 'uche_cmdq_config': (int, False),
             'speed_fuse': (int, True), 'gaming_fuse': (int, True), 'highest_bank_bit': (int, True),
@@ -856,6 +859,8 @@ def load(problems=None):
                 problems.add(f'{rel} [adsp]', 'memory: the address of the DSP\'s reserved memory, on a page, and not 0')
             if adsp.get('charge_counter_divisor', 1) == 0:
                 problems.add(f'{rel} [adsp]', 'charge_counter_divisor must not be 0')
+            if 'interrupt' in adsp and not 32 <= adsp['interrupt'] <= 1019:
+                problems.add(f'{rel} [adsp]', "interrupt: the doorbells' line as the GIC numbers it (an SPI: 32 to 1019)")
             if not re.fullmatch(r'[A-Za-z0-9._-]+', adsp['firmware']):
                 problems.add(f'{rel} [adsp]', 'firmware: the name of a directory of the root, without slashes')
         gpu = data.get('gpu')
@@ -1203,7 +1208,13 @@ def table_text(socs, boards):
         if adsp:
             out.append(f'\t\t.adsp = {{ .firmware = {c_string(adsp["firmware"])}, .memory = {adsp["memory"]:#010x}, '
                        f'.memory_size = {adsp["memory_size"]:#010x}, '
-                       f'.charge_counter_divisor = {adsp.get("charge_counter_divisor", 1)} }},')
+                       f'.charge_counter_divisor = {adsp.get("charge_counter_divisor", 1)}'
+                       + (', .gpr = true' if adsp.get('services') == 'gpr' else '')
+                       + (f', .interrupt = {adsp["interrupt"]}' if 'interrupt' in adsp else '')
+                       + (', .battery_linux_numbers = true' if adsp.get('battery_linux_numbers') else '')
+                       + (', .current_positive_discharging = true' if adsp.get('current_positive_discharging') else '')
+                       + (f', .pack_uah = {adsp["pack_uah"]}' if 'pack_uah' in adsp else '')
+                       + (', .oplus_charger = true' if adsp.get('oplus_charger') else '') + ' },')
         radio = board.get('wifi')
         if radio:
             supplies = ", ".join(c_string(name) for name in radio.get("supplies", ["", "", ""]))

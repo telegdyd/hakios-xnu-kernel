@@ -240,6 +240,16 @@
 		//                              // reserved-memory node the DSP's memory-region points at
 		// charge-counter-divisor = <100>; // 100 when the battery manager counts charge in 1/100 uAh (a gauge that is
 		//                              // not a BQ: Linux's qti_battery_charger.c); left out: in uAh
+		// From the SM8450 on (the OnePlus 10 Pro's are these):
+		// services = "gpr";            // the audio services are AudioReach's (a qcom,gpr node under the DSP's qcom,glink):
+		//                              // GPR on adsp_apps; left out: "apr" (qcom,apr, apr_audio_svc)
+		// interrupt = <261>;           // the doorbells' line, the GIC's number: 32 + the SPI of qcom,ipcc's interrupts;
+		//                              // left out: the link looks every millisecond
+		// battery-linux-numbers;       // the battery manager numbers its properties as Linux's qcom_battmgr.c
+		//                              // (12 TEMP ... 17 CHG_FULL); left out: one more before TEMP (13 ... 18)
+		// current-positive-discharging; // its current is above 0 while the battery gives charge
+		// pack-uah = <5000000>;        // its charges are not in uAh: the charge from the percentage of the pack's
+		// oplus-charger;               // OPLUS's charger firmware: the port set to sink only, the input limit raised
 	// };
 
 	// The GPU, for the feature "gpu-a660" (Documentation/drivers.md). From the SoC's -gpu.dtsi in the Android device

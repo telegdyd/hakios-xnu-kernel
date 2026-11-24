@@ -52,6 +52,8 @@
  *              down for adsp_listen seconds (default 3)
  *  11  talks   APR, on the channel apr_audio_svc that the DSP opens and we answer as well: whether
  *              the audio services are up, and which there are (see step_apr())
+ *              -- or, with adsp { } services = "gpr" (AudioReach, the SM8450 on), GPR on the channel
+ *              adsp_apps that we open: whether SPF is ready (step_gpr()); the battery then needs only step 10
  *
  * Once everything is up with adsp=1, the sound's path takes over (board/sound.c, boot-arg sound=N):
  * hakios_adsp_apr() is how it speaks to the audio services (any service, port and token; what
@@ -451,14 +453,18 @@ static struct block aoss = { "mailbox", 0, 0x400 };              /* where: the S
 static struct block ipcc = { "ipcc", 0, 0x1000 };                /* where: the SoC file's ipc { }, at the start */
 
 static struct {
-	uint32_t glink, smp2p, said;
+	uint32_t glink, smp2p, aop, said;
 	uint64_t since;
 } doorbell;
+static bool clear_aop_rings;            /* nobody else listens on this block (no wifi-wcn6750): the AOP's rings are ours to clear */
 
 /*
  * The audio DSP's rings, counted and cleared. Another's ring (the Wi-Fi DSP's, the always-on
  * processor's) is left for whoever listens for it: IPCC names the same one until it is cleared,
- * so the look ends there.
+ * so the look ends there. With nobody else on the block (no Wi-Fi DSP: the 10 Pro's radio is on
+ * PCIe) the always-on processor's rings are cleared here: it rings after each mailbox message,
+ * which nobody waits for, and the ring would hold the doorbells' interrupt high for good (Linux's
+ * IPCC handler clears every ring).
  */
 static void
 doorbells(void)
@@ -466,6 +472,11 @@ doorbells(void)
 	for (unsigned i = 0; i < 8; i++) {
 		uint32_t who = rd(ipcc.base + IPCC_RECEIVED);
 
+		if (who != IPCC_NOBODY && who >> 16 == IPCC_AOP && clear_aop_rings) {
+			wr(ipcc.base + IPCC_CLEAR, who);
+			doorbell.aop++;
+			continue;
+		}
 		if (who == IPCC_NOBODY || who >> 16 != IPCC_LPASS) {
 			return;
 		}
@@ -933,7 +944,7 @@ step_firmware(void)
 	struct elf_segment segment;
 	const uint8_t *header;
 	uint64_t size = 0, files = 0;
-	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
+	uint32_t count, hashes = 0, lowest = ~0u, highest = 0, base;
 
 	announce("find the audio DSP's image in the small image or on the root, and check it against its own header");
 	image_forget();
@@ -949,6 +960,7 @@ step_firmware(void)
 		printf("adsp: %u: adsp.mdt is not such a header (%llu bytes)\n", step, size);
 		goto fail;
 	}
+	base = mdt_image_base(header, count, ADSP_MEMORY);       /* (a relocatable image: wherever its memory is) */
 	for (uint32_t i = 0; i < count; i++) {
 		char name[16];
 
@@ -956,19 +968,19 @@ step_firmware(void)
 		if (!mdt_loaded(&segment)) {
 			continue;
 		}
-		if (!mdt_within(&segment, ADSP_MEMORY, ADSP_MEMORY_SIZE)) {
+		if (!mdt_within(&segment, base, ADSP_MEMORY_SIZE)) {
 			printf("adsp: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
 			    segment.memory_size);
 			goto fail;
 		}
 		for (uint32_t j = 0; j < image.segments; j++) {
-			if (!mdt_apart(segment.paddr - ADSP_MEMORY, segment.memory_size, image.segment[j].at, image.segment[j].memory_size)) {
+			if (!mdt_apart(segment.paddr - base, segment.memory_size, image.segment[j].at, image.segment[j].memory_size)) {
 				printf("adsp: %u: segment %u (%#x, %#x bytes) is loaded over one before it\n", step, i, segment.paddr,
 				    segment.memory_size);
 				goto fail;
 			}
 		}
-		image.segment[image.segments].at = segment.paddr - ADSP_MEMORY;
+		image.segment[image.segments].at = segment.paddr - base;
 		image.segment[image.segments].file_size = segment.file_size;
 		image.segment[image.segments].memory_size = segment.memory_size;
 		image.segment[image.segments].file = NULL;
@@ -994,17 +1006,18 @@ step_firmware(void)
 		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
 		image.segments++;
 	}
-	if (image.segments == 0 || lowest != ADSP_MEMORY || !mdt_header_whole(header, count, size, &hashes)) {
+	if (image.segments == 0 || lowest != base || !mdt_header_whole(header, count, size, &hashes)) {
 		printf("adsp: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
 		goto fail;
 	}
 	image.header = header;
 	image.header_size = size;
-	image.size = ((highest + 0xfff) & ~0xfffu) - ADSP_MEMORY;
+	image.size = ((highest + 0xfff) & ~0xfffu) - base;
 	printf("adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
-	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
-	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
+	    "bytes of the DSP's %#x from %#x%s\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
+	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY,
+	    base != ADSP_MEMORY ? " (relocatable: moved there)" : "");
 	return true;
 fail:
 	image_forget();
@@ -1160,13 +1173,25 @@ dsp_shutdown(const char *why)
 		link_stop();
 	}
 	stopped_by_its_word = dsp_ask_to_stop(leaving ? 2000 : 5000);
+	/*
+	 * The rails at 384 again for TrustZone's shutdown, as Android's PIL does (subsys-pil-tz.c pil_shutdown_trusted: the
+	 * proxy votes around the call): a DSP that has been up for minutes has let LCX and LMX down to retention, and on the
+	 * 10 Pro the shutdown then failed and the phone reset on its way back to the loader (negroni-dev, 2026-11-10). Not
+	 * on a panic's way out (no lock may be taken there).
+	 */
+	bool voted = !leaving && !rails_asked && rails(384);
+
 	result = scm("to shut the audio DSP down", SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_ADSP, 0, 0, &answer);
+	if (voted) {
+		rails(0);
+	}
 	if (result != 0 || answer != 0) {
-		printf("adsp: %u: TRUSTZONE DOES NOT SHUT THE AUDIO DSP DOWN: the call returns %d, its answer is %#llx\n", step, result,
-		    answer);
+		tell("adsp: %u: TRUSTZONE DOES NOT SHUT THE AUDIO DSP DOWN: the call returns %d, its answer is %#llx (rails %s)\n", step,
+		    result, answer, voted ? "asked for it" : rails_asked ? "still asked" : "NOT asked");
 		return false;
 	}
-	printf("adsp: %u: THE AUDIO DSP IS SHUT DOWN\n", step);
+	tell("adsp: %u: THE AUDIO DSP IS SHUT DOWN (rails %s)\n", step, voted ? "asked for it" : rails_asked ? "still asked" :
+	    "not asked");
 	need(&ipcc);
 	wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_SMP2P);
 	wr(ipcc.base + IPCC_DISABLE, IPCC_LPASS << 16 | IPCC_GLINK);   /* (both of the two step 7 listened for) */
@@ -1266,8 +1291,16 @@ step_image(void)
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
 
-		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
-			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
+		/*
+		 * (a segment's end need not be a multiple of eight -- the 10 Pro's are not, e.g. 0x3135a4 bytes -- and its last
+		 * word is then written with zeroes past the end: those bytes are in the DSP's memory, before the next segment,
+		 * which begins on a page)
+		 */
+		uint64_t end = (uint64_t)image.segment[s].at + ((image.segment[s].memory_size + 7) & ~7ull);
+
+		if ((image.segment[s].at & 7) != 0 || end > ADSP_MEMORY_SIZE) {
+			printf("adsp: %u: segment %u (at %#x, %#x bytes) does not begin at a multiple of eight bytes or does not fit: "
+			    "not written\n", step, s, image.segment[s].at, image.segment[s].memory_size);
 			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
 			return false;
 		}
@@ -1605,7 +1638,7 @@ struct glink_channel {
 	struct {
 		uint32_t id, size;
 		bool there, in_use;
-	} their_intents[64];                    /* what we may send into */
+	} their_intents[128];                   /* what we may send into (the DSP gives adsp_apps 77 of 128 bytes) */
 	struct {
 		uint32_t size, fill;
 		uint8_t *data;
@@ -2449,6 +2482,133 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 	return hakios_adsp_apr(service, 0, 0, opcode, payload, length, ms, NULL);
 }
 
+/* ---- GPR: AudioReach's packets, on the channel adsp_apps (adsp { } services = "gpr") --------------------- */
+
+/*
+ * From the SM8450 on, the audio services are AudioReach's (the "Signal Processing Framework", SPF), and what
+ * the operating system says to them goes in GPR packets (Linux: drivers/soc/qcom/apr.c, the gpr half;
+ * include/linux/soc/qcom/apr.h; sound/soc/qcom/qdsp6/audioreach.h): a header of six words -- version 0, the
+ * header's length in words (6) and the packet's in bytes in the first; the domains (the DSP 2, we 3) in the
+ * second; the source and destination ports (a module's instance ID on the DSP's side: APM 1, PRM 2; one of ours
+ * on our side, which the answer is sent back to); a token the answer carries back; the opcode -- and what the
+ * opcode takes. Only step 11's question is asked here so far: whether SPF is ready (APM_CMD_GET_SPF_STATE, the
+ * first thing Linux's q6apm asks). The sound's path over GPR is the audio port's (COMMON-PORT.md).
+ */
+#define GPR_DOMAIN_ADSP                 2
+#define GPR_DOMAIN_APPS                 3
+#define GPR_HEADER_WORDS                6
+#define GPR_PORT_APM                    1
+#define GPR_PORT_OURS                   3       /* (Android's spf_core node: reg 3) */
+#define APM_CMD_GET_SPF_STATE           0x01001021u
+#define APM_CMD_RSP_GET_SPF_STATE       0x02001007u
+#define GPR_MAX_PAYLOAD                 256
+
+struct gpr_header {
+	uint32_t sizes;                 /* [3:0] version, [7:4] header words, [31:8] packet bytes */
+	uint32_t domains;               /* [7:0] destination, [15:8] source */
+	uint32_t from_port, to_port;
+	uint32_t token, opcode;
+};
+
+static bool gpr;                        /* the board's adsp { } services = "gpr" */
+static uint32_t gpr_in, gpr_out;
+
+/* A packet from the DSP's audio services, over GPR. From the link's thread. */
+static void
+gpr_input(const uint8_t *data, uint32_t length)
+{
+	struct gpr_header header;
+	uint32_t header_length, size, payload;
+
+	if (length < sizeof(header)) {
+		printf("adsp: gpr: %u bytes, no GPR packet\n", length);
+		return;
+	}
+	memcpy(&header, data, sizeof(header));
+	header_length = (header.sizes >> 4 & 0xf) * 4;
+	size = header.sizes >> 8;
+	/* (both lengths are the DSP's words: a header shorter than ours, or longer than the packet, and it is dropped) */
+	if (header_length < sizeof(header) || header_length > length || size < header_length) {
+		printf("adsp: gpr: a header of %u bytes in a packet of %u (%u by its own word): dropped\n", header_length, length, size);
+		return;
+	}
+	payload = (size < length ? size : length) - header_length;
+	gpr_in++;
+	if (gpr_in <= 40) {
+		uint32_t w[4] = { 0, 0, 0, 0 };
+
+		memcpy(w, data + header_length, payload < sizeof(w) ? payload : sizeof(w));
+		printf("adsp: gpr: < from port %#x of domain %u to port %#x: opcode %#x, token %#x, %u bytes: %#x %#x %#x %#x\n",
+		    header.from_port, header.domains >> 8 & 0xff, header.to_port, header.opcode, header.token, payload, w[0], w[1], w[2],
+		    w[3]);
+	}
+	/* (kept only as the answer to the question waited for, the first one standing: as apr_input()) */
+	if (header.token == 0 || header.token != __atomic_load_n(&apr_waited_for, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&apr_answer.there, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	bzero(apr_answer.words, sizeof(apr_answer.words));
+	memcpy(apr_answer.words, data + header_length, payload < sizeof(apr_answer.words) ? payload : sizeof(apr_answer.words));
+	apr_answer.length = payload;
+	apr_answer.opcode = header.opcode;
+	apr_answer.token = header.token;
+	__atomic_store_n(&apr_answer.there, true, __ATOMIC_RELEASE);
+}
+
+/* A GPR command to a module of the DSP (to_port: its instance ID), its answer waited for ms: true when it came. */
+static bool
+gpr_ask(uint32_t to_port, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms, struct hakios_apr_answer *answer)
+{
+	uint8_t packet[sizeof(struct gpr_header) + GPR_MAX_PAYLOAD];
+	struct gpr_header *header = (struct gpr_header *)packet;
+	uint32_t size = (uint32_t)sizeof(*header) + length, token;
+	bool answered = false;
+	int error;
+
+	if (!gpr || length > GPR_MAX_PAYLOAD || !glink.channel[CHANNEL_APR].open) {
+		return false;
+	}
+	bzero(packet, sizeof(packet));
+	header->sizes = (uint32_t)GPR_HEADER_WORDS << 4 | size << 8;
+	header->domains = GPR_DOMAIN_ADSP | GPR_DOMAIN_APPS << 8;
+	header->from_port = GPR_PORT_OURS;
+	header->to_port = to_port;
+	header->opcode = opcode;
+	if (length != 0) {
+		memcpy(packet + sizeof(*header), payload, length);
+	}
+	lck_mtx_lock(&apr_lock);
+	token = apr_next_token++;
+	if (apr_next_token >= 0x01000000u) {
+		apr_next_token = 1;
+	}
+	header->token = token;
+	apr_answer.there = false;
+	__atomic_store_n(&apr_waited_for, token, __ATOMIC_RELEASE);
+	error = glink_send(&glink.channel[CHANNEL_APR], packet, size);
+	if (error != 0) {
+		printf("adsp: gpr: > opcode %#x to port %#x: NOT SENT (%d)\n", opcode, to_port, error);
+	} else {
+		gpr_out++;
+		for (uint32_t waited = 0; waited < ms; waited++) {
+			if (__atomic_load_n(&apr_answer.there, __ATOMIC_ACQUIRE) && apr_answer.token == token) {
+				answered = true;
+				if (answer != NULL) {
+					answer->opcode = apr_answer.opcode;
+					answer->token = apr_answer.token;
+					answer->length = apr_answer.length;
+					memcpy(answer->words, apr_answer.words, sizeof(answer->words));
+				}
+				break;
+			}
+			sleep_ms(1);
+		}
+	}
+	__atomic_store_n(&apr_waited_for, 0, __ATOMIC_RELEASE);
+	lck_mtx_unlock(&apr_lock);
+	return answered;
+}
+
 /* ---- the battery manager, on the channel PMIC_RTR_ADSP_APPS ------------------------------------------ */
 
 /*
@@ -2459,7 +2619,7 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
  * answer, or 2, a notice; an opcode) and its words; a property is asked for with opcode 0x30 (the
  * battery's) or 0x32 (the USB port's), the battery's number (0), the property's number and a word
  * that a get does not use, and is answered with the property's number, its value and a result (0:
- * good). Only gets are sent from here: nothing is set, no limit, no current, no notice asked for.
+ * good). Only gets are sent from here, but with adsp { } oplus-charger (below); no notice is asked for.
  * With adsp=1 (battmgr=0: not) it is asked every BATTMGR_SECONDS while the DSP runs, and what it says
  * goes to bsd/dev/board/battery.c (hakios_battery_report()), and from there to the power source
  * that Darwin reads (iokit/Kernel/BoardBattery.cpp). battmgr=2: every property once, for the log.
@@ -2473,29 +2633,56 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
  * Android shows at the same moment (dumpsys battery, /sys/class/power_supply/battery): up to 9 they
  * are those of Linux's qcom_battmgr.c (sm8350), from there on one more property comes before the
  * temperature, so the temperature is 13, not 12, and the charge counter, the cycles, the designed and
- * the learnt full charge are 15 to 18.
+ * the learnt full charge are 15 to 18. A board whose firmware has Linux's own numbers (the 10 Pro's: 12 TEMP,
+ * 13 TECHNOLOGY, 14 CHG_COUNTER .. 17 CHG_FULL, read with battmgr=2) says so in adsp { } (battery-linux-numbers).
+ *
+ * adsp { } oplus-charger: OPLUS's charger firmware (the OnePlus 10 Pro's), which waits for the operating system:
+ *   - its charger_pd starts the Type-C port as dual-role and, with no Android to say otherwise, makes the phone the
+ *     source a few seconds after the DSP is up (the computer then sees no device): the port is set to sink only and
+ *     OTG off, as Android's oplus charger code does (battmgr_sink=0: not), and set again if it reads a source
+ *   - it keeps the input limit at about 1 A until the operating system raises it, and a phone running iOS takes about
+ *     that much itself: the battery stays where it is. Android's oplus_battery_sm8450.c raises USB_INPUT_CURR_LIMIT
+ *     step by step to 2000 mA and steps back when VBUS falls under 4.5 V (4.55 V above 4.1 V a cell), sets
+ *     BATT_CHG_EN and the charge current (1100 mA). So is it here, once per plug and type, with at most 5 tries
+ *     (battmgr_charge=0: not); nothing above 2000 mA is written.
  */
 #define BATTMGR_OWNER           32778
 #define BATTMGR_REQUEST         1
 #define BATTMGR_NOTICE          2
 #define BATTMGR_BATTERY_GET     0x30
+#define BATTMGR_BATTERY_SET     0x31
 #define BATTMGR_USB_GET         0x32
+#define BATTMGR_USB_SET         0x33
 #define BATT_STATUS             0               /* Linux's POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
 #define BATT_HEALTH             1
 #define BATT_PRESENT            2
 #define BATT_CAPACITY           4
 #define BATT_VOLT_NOW           7
 #define BATT_CURR_NOW           9
-#define BATT_TEMP               13              /* hundredths of a degree: 3900 when Android says 39.0 */
-#define BATT_CHG_COUNTER        15              /* the charge in the battery now, uAh */
-#define BATT_CYCLE_COUNT        16
-#define BATT_CHG_FULL_DESIGN    17              /* 5000000 uAh */
-#define BATT_CHG_FULL           18              /* the full charge as the fuel gauge has learnt it, uAh */
+static uint32_t batt_shift = 1;         /* 0 with adsp { } battery-linux-numbers */
+#define BATT_TEMP               (12 + batt_shift)       /* hundredths of a degree: 3900 when Android says 39.0 */
+#define BATT_CHG_COUNTER        (14 + batt_shift)       /* the charge in the battery now, uAh */
+#define BATT_CYCLE_COUNT        (15 + batt_shift)
+#define BATT_CHG_FULL_DESIGN    (16 + batt_shift)       /* 5000000 uAh */
+#define BATT_CHG_FULL           (17 + batt_shift)       /* the full charge as the fuel gauge has learnt it, uAh */
+#define BATT_CHG_CTRL_LIM       10              /* uA: the battery's charge current limit (FCC) */
+#define BATT_CHG_EN             24              /* OPLUS: 1 charging allowed */
 #define USB_VOLT_NOW            1               /* uV */
 #define USB_CURR_NOW            3               /* uA, what the port gives */
 #define USB_TYPE                6               /* Linux's POWER_SUPPLY_USB_TYPE_*: 1 here, a computer's port */
 #define USB_ONLINE              0
+#define USB_INPUT_CURR_LIMIT    5               /* uA: the charger's input limit */
+#define USB_ADAP_TYPE           7
+#define USB_OTG_SWITCH          15              /* OPLUS: 0 OTG off */
+#define USB_TYPEC_MODE          19              /* OPLUS: set 0 dual-role, 1 sink only; read 0 sink */
+#define USB_SUSPEND_PMIC        26              /* OPLUS: 1 input suspended */
 #define BATTMGR_SECONDS         10
+static bool oplus_charger;              /* adsp { } oplus-charger */
+static bool current_positive_discharging;       /* adsp { } current-positive-discharging */
+static uint32_t pack_uah;               /* adsp { } pack-uah */
+static const uint32_t battmgr_icl_steps[] = { 500, 900, 1200, 1350, 1500, 1750, 2000 };
+#define BATTMGR_ICL_MAX_MA      2000
+#define BATTMGR_FCC_MA          1100
 #include "plug_watch_core.h"         /* when a plug between two rounds calls for one at once */
 
 struct battmgr_message {
@@ -2537,11 +2724,15 @@ battmgr_input(const uint8_t *data, uint32_t length)
 	os_atomic_inc(&battmgr.answers, release);
 }
 
-/* One property asked for and its answer waited for (a second at most); one thread asks at a time (battmgr_thread). */
+/*
+ * One property asked for (or set, with a _SET opcode and *value the value) and its answer waited for (a second at
+ * most); one thread asks at a time (battmgr_thread).
+ */
 static bool
 battmgr_get(uint32_t opcode, uint32_t property, uint32_t *value)
 {
-	struct battmgr_message q = { BATTMGR_OWNER, BATTMGR_REQUEST, opcode, { 0, property, 0 } };
+	bool set = opcode == BATTMGR_USB_SET || opcode == BATTMGR_BATTERY_SET;
+	struct battmgr_message q = { BATTMGR_OWNER, BATTMGR_REQUEST, opcode, { 0, property, set ? *value : 0 } };
 	uint32_t before = os_atomic_load(&battmgr.answers, acquire);
 
 	if (glink_send(&glink.channel[CHANNEL_PMIC], &q, sizeof(q)) != 0) {
@@ -2573,6 +2764,133 @@ battmgr_charge_uah(uint32_t raw)
 	return (uint32_t)((raw + charge_counter_divisor / 2ull) / charge_counter_divisor);
 }
 
+/*
+ * One round's look at the charging, with adsp { } oplus-charger (the block comment above): usb the USB_ONLINE value,
+ * usb_type Linux's POWER_SUPPLY_USB_TYPE_* (0 unknown, 1 SDP, 2 DCP, 3 CDP; the rest counts as a charger, as Android has
+ * it), pack_uv the battery's voltage (both cells).
+ */
+static void
+battmgr_charge(uint32_t usb, uint32_t usb_type, uint32_t pack_uv)
+{
+	static uint32_t wanted = ~0u, last_type = ~0u, done_ma, tries;
+	uint32_t icl = 0, vbus = 0, ibus = 0, en = ~0u, susp = ~0u, fcc = 0, adap = 0, v;
+	uint32_t aicl_uv = pack_uv / 2 > 4100000 ? 4550000 : 4500000;
+	unsigned i, step = 0;
+
+	if (wanted == ~0u) {
+		wanted = 1;
+		PE_parse_boot_argn("battmgr_charge", &wanted, sizeof(wanted));
+	}
+	if (wanted == 0 || !oplus_charger) {
+		return;
+	}
+	if (!usb) {
+		if (last_type != ~0u) {
+			tell("adsp: battmgr: charge: unplugged\n");
+		}
+		last_type = ~0u;
+		done_ma = tries = 0;
+		return;
+	}
+	if (usb_type != last_type) {
+		last_type = usb_type;
+		done_ma = tries = 0;
+		(void)battmgr_get(BATTMGR_USB_GET, USB_INPUT_CURR_LIMIT, &icl);
+		(void)battmgr_get(BATTMGR_USB_GET, USB_ADAP_TYPE, &adap);
+		(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_CTRL_LIM, &fcc);
+		(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_EN, &en);
+		(void)battmgr_get(BATTMGR_USB_GET, USB_SUSPEND_PMIC, &susp);
+		tell("adsp: battmgr: charge: plugged, type %u (adapter %u): input limit %u uA, charge limit %u uA, charging "
+		    "enabled %d, input suspended %d\n", usb_type, adap, icl, fcc, (int)en, (int)susp);
+		if (susp != 0 && susp != ~0u) {
+			v = 0;
+			tell("adsp: battmgr: charge: input un-suspended: %s\n",
+			    battmgr_get(BATTMGR_USB_SET, USB_SUSPEND_PMIC, &v) ? "done" : "NO ANSWER");
+		}
+		if (en != 1) {
+			v = 1;
+			tell("adsp: battmgr: charge: charging enabled: %s\n",
+			    battmgr_get(BATTMGR_BATTERY_SET, BATT_CHG_EN, &v) ? "done" : "NO ANSWER");
+		}
+	}
+	if (usb_type == 0) {
+		return;         /* unknown (the PD may still be finding out) */
+	}
+	/*
+	 * Every known type, a computer's port too: Android does the same on this phone (2026-11-11, a PC's USB 3 port:
+	 * 100 mA, then 500 .. 2000, AICL at 4.5 V, 1.85 A in). Until it is written the hardware stays at the port's
+	 * default (900 mA): ~4.4 W in.
+	 */
+	if (done_ma != 0) {
+		/* (set before: put back only if the PD has lowered it since) */
+		if (!battmgr_get(BATTMGR_USB_GET, USB_INPUT_CURR_LIMIT, &icl) || icl + 50000 >= done_ma * 1000) {
+			return;
+		}
+		tell("adsp: battmgr: charge: the input limit reads %u uA, not %u mA: set again\n", icl, done_ma);
+	}
+	if (tries >= 5) {
+		return;
+	}
+	tries++;
+	/* the battery's charge current as Android sets it in the normal band (dt temp_normal_fastchg_current_ma) */
+	if (battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_CTRL_LIM, &fcc) && fcc > BATTMGR_FCC_MA * 1000) {
+		v = BATTMGR_FCC_MA * 1000;
+		tell("adsp: battmgr: charge: charge limit %u uA to %u mA: %s\n", fcc, BATTMGR_FCC_MA,
+		    battmgr_get(BATTMGR_BATTERY_SET, BATT_CHG_CTRL_LIM, &v) ? "done" : "NO ANSWER");
+	}
+	/* (100 mA first, as Android: the PD then programs the hardware on every step) */
+	v = 100000;
+	(void)battmgr_get(BATTMGR_USB_SET, USB_INPUT_CURR_LIMIT, &v);
+	sleep_ms(25);
+	for (i = 0; i < sizeof(battmgr_icl_steps) / sizeof(battmgr_icl_steps[0]) && battmgr_icl_steps[i] <= BATTMGR_ICL_MAX_MA; i++) {
+		v = battmgr_icl_steps[i] * 1000;
+		if (!battmgr_get(BATTMGR_USB_SET, USB_INPUT_CURR_LIMIT, &v)) {
+			tell("adsp: battmgr: charge: input limit %u mA: NO ANSWER\n", battmgr_icl_steps[i]);
+			return;         /* (tried again next round) */
+		}
+		sleep_ms(i < 2 ? 50 : 90);
+		if (battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &vbus) && vbus < aicl_uv) {
+			/* the adapter gives no more: the step before (the first one if it was the first) */
+			tell("adsp: battmgr: charge: VBUS %u uV at %u mA, under %u: back a step\n", vbus, battmgr_icl_steps[i], aicl_uv);
+			if (step == 0) {
+				step = battmgr_icl_steps[0];
+			}
+			v = step * 1000;
+			(void)battmgr_get(BATTMGR_USB_SET, USB_INPUT_CURR_LIMIT, &v);
+			break;
+		}
+		step = battmgr_icl_steps[i];
+	}
+	if (step == 0) {
+		return;
+	}
+	done_ma = step;
+	sleep_ms(200);
+	(void)battmgr_get(BATTMGR_USB_GET, USB_INPUT_CURR_LIMIT, &icl);
+	(void)battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &vbus);
+	(void)battmgr_get(BATTMGR_USB_GET, USB_CURR_NOW, &ibus);
+	tell("adsp: battmgr: charge: input limit set to %u mA (try %u): reads %u uA; VBUS %u uV, %u uA in\n", step, tries, icl,
+	    vbus, ibus);
+}
+
+/* adsp { } oplus-charger: the port as a sink only, and OTG off (battmgr_sink=0: left as the firmware has it). */
+static void
+battmgr_sink(void)
+{
+	uint32_t sink = 1, mode = 1, otg = 0, role = ~0u;
+
+	PE_parse_boot_argn("battmgr_sink", &sink, sizeof(sink));
+	if (!oplus_charger || sink == 0) {
+		return;
+	}
+	bool set_mode = battmgr_get(BATTMGR_USB_SET, USB_TYPEC_MODE, &mode);
+	bool set_otg = battmgr_get(BATTMGR_USB_SET, USB_OTG_SWITCH, &otg);
+	bool got = battmgr_get(BATTMGR_USB_GET, USB_TYPEC_MODE, &role);
+
+	tell("adsp: battmgr: the USB port set to sink only: %s, OTG off: %s; it reads %d (0: sink)\n",
+	    set_mode ? "done" : "NO ANSWER", set_otg ? "done" : "NO ANSWER", got ? (int)role : -1);
+}
+
 static void
 battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -2592,6 +2910,7 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 		battmgr.runs = false;
 		thread_terminate(current_thread());
 	}
+	battmgr_sink();
 	{
 		/* boot-arg battmgr=2: every property once, for the log (which number is which on this phone's firmware) */
 		uint32_t mode = 1;
@@ -2623,6 +2942,16 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 		    battmgr_get(BATTMGR_BATTERY_GET, BATT_TEMP, &temp) &&
 		    battmgr_get(BATTMGR_USB_GET, USB_ONLINE, &usb);
 
+		if (good && oplus_charger) {
+			static unsigned again;
+			uint32_t role = 0, mode = 1;
+
+			if (battmgr_get(BATTMGR_USB_GET, USB_TYPEC_MODE, &role) && role != 0 && again < 6) {
+				again++;
+				tell("adsp: battmgr: the USB port reads %u (a source): set to sink only again (%u): %s\n", role, again,
+				    battmgr_get(BATTMGR_USB_SET, USB_TYPEC_MODE, &mode) ? "done" : "NO ANSWER");
+			}
+		}
 		if (good) {
 			/* (what may be missing without harm, and the capacities and the cycles only now and then: they hardly change) */
 			(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_COUNTER, &charge);
@@ -2632,6 +2961,7 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 				(void)battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &usb_volt);
 				(void)battmgr_get(BATTMGR_USB_GET, USB_CURR_NOW, &usb_curr);
 			}
+			battmgr_charge(usb, usb_type, volt);
 			if (round % 30 == 0 || full == 0) {
 				(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_FULL, &full);
 				(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_FULL_DESIGN, &design);
@@ -2647,6 +2977,19 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 			b.charge_uah = (int32_t)charge;
 			b.full_uah = (int32_t)full;
 			b.design_uah = (int32_t)design;
+			if (current_positive_discharging) {
+				/* (the 10 Pro's gauge: +110 mA while its charge counter fell 18 mAh in 10 minutes) */
+				b.current_ua = -(int32_t)curr;
+			}
+			if (pack_uah != 0) {
+				/*
+				 * A gauge whose charges are not in the pack's units (the 10 Pro's learnt 1859000 against a design of
+				 * 4000000, for a pack of 5000 mAh): the charge is the percentage of the pack, the full charge not given.
+				 */
+				b.charge_uah = (int32_t)((int64_t)pack_uah * (int32_t)capacity / 10000);
+				b.full_uah = 0;
+				b.design_uah = (int32_t)pack_uah;
+			}
 			b.cycles = (int32_t)cycles;
 			b.usb_type = (int32_t)usb_type;
 			b.usb_voltage_uv = (int32_t)usb_volt;
@@ -2724,9 +3067,153 @@ battmgr_stop(void)
 	}
 }
 
-/* ---- the link's thread ----------------------------------------------------------------------------- */
+/* ---- the doorbells' interrupt (adsp { } interrupt) --------------------------------------------------- */
+
+/*
+ * The IPCC block of the DSP's doorbells interrupts the processors (the 10 Pro's qcom,ipcc@ed18000: interrupts <0 0xe5 4>,
+ * SPI 229, level) for as long as a signal it listens for (IPCC_ENABLE: the DSP's GLINK and SMP2P) is uncleared. With
+ * adsp { } interrupt the handler masks the line and wakes the link's thread; the thread clears what rang (doorbells())
+ * and unmasks it. So the thread sleeps until the DSP says something instead of looking every millisecond. A wait also
+ * ends by itself after LINK_NET_MS, as a net: work that such a wait finds is counted, a ring the line did not bring. A
+ * ring of another processor's that stays uncleared (nobody here clears it, so the line would not go low) keeps the
+ * line masked and the thread looking every millisecond while it is there. More than LINK_IRQ_STORM interrupts in a
+ * second give the line up for this boot. adsp_irq=0: never taken (the millisecond look).
+ */
+#define LINK_NET_MS             100
+#define LINK_IRQ_STORM          5000
+
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
+extern void gic_v3_spi_mask(uint32_t intid);
+extern void gic_v3_spi_unmask(uint32_t intid);
+extern void gic_v3_spi_detach(uint32_t intid);
 
 static volatile bool link_wanted, link_runs;
+
+static struct {
+	uint32_t intid;                 /* the board's; 0: none */
+	bool attached, given_up, foreign_now;
+	volatile uint32_t on, rang;
+	uint32_t count, period_count, by_line, by_net, net_found, foreign;
+	uint64_t period, second;
+} link_irq;
+
+/* In interrupt context. */
+static void
+link_irq_arrived(__unused void *context, uint32_t intid)
+{
+	uint64_t now = mach_absolute_time();
+
+	gic_v3_spi_mask(intid);
+	link_irq.count++;
+	if (now - link_irq.period >= link_irq.second) {
+		link_irq.period = now;
+		link_irq.period_count = 0;
+	}
+	if (++link_irq.period_count > LINK_IRQ_STORM) {
+		os_atomic_store(&link_irq.on, 0, release);      /* (left masked; the thread says so) */
+	}
+	os_atomic_store(&link_irq.rang, 1, release);
+	thread_wakeup((event_t)&link_irq.rang);
+}
+
+static void
+link_irq_start(void)
+{
+	uint32_t wanted = 1;
+
+	if (link_irq.intid == 0 || link_irq.attached || link_irq.given_up) {
+		return;
+	}
+	PE_parse_boot_argn("adsp_irq", &wanted, sizeof(wanted));
+	if (wanted == 0) {
+		tell("adsp: link: the doorbells' interrupt is not used (adsp_irq=0): the link's thread looks every millisecond\n");
+		return;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &link_irq.second);
+	link_irq.foreign_now = false;
+	os_atomic_store(&link_irq.rang, 0, relaxed);
+	os_atomic_store(&link_irq.on, 1, release);
+	/* (attaching enables the line: a ring already there comes at once, and only wakes the thread) */
+	if (gic_v3_spi_attach(link_irq.intid, false, link_irq_arrived, NULL) != KERN_SUCCESS) {
+		os_atomic_store(&link_irq.on, 0, release);
+		tell("adsp: link: THE DOORBELLS' INTERRUPT (GIC %u) CANNOT BE TAKEN: the link's thread looks every millisecond\n",
+		    link_irq.intid);
+		return;
+	}
+	link_irq.attached = true;
+	tell("adsp: link: the doorbells' interrupt (GIC %u, level) wakes the link's thread; a net every %u ms\n", link_irq.intid,
+	    LINK_NET_MS);
+}
+
+static void
+link_irq_stop(void)
+{
+	if (link_irq.attached) {
+		gic_v3_spi_detach(link_irq.intid);
+		link_irq.attached = false;
+		tell("adsp: link: the doorbells' interrupt: %u taken; waits ended by it %u, by the net %u (of those %u found work); "
+		    "another's ring left uncleared %u times; the always-on processor's rings cleared %u\n", link_irq.count,
+		    link_irq.by_line, link_irq.by_net, link_irq.net_found, link_irq.foreign, doorbell.aop);
+	}
+	os_atomic_store(&link_irq.on, 0, release);
+}
+
+/* Until the DSP may have said something. True if a ring (or the millisecond look) ended it, false if the net did. */
+static bool
+link_wait(void)
+{
+	if (!link_irq.attached || !os_atomic_load(&link_irq.on, acquire) || link_irq.foreign_now) {
+		sleep_us(1000);
+		return true;
+	}
+	assert_wait_timeout((event_t)&link_irq.rang, THREAD_UNINT, LINK_NET_MS, NSEC_PER_MSEC);
+	if (os_atomic_xchg(&link_irq.rang, 0, acquire) != 0 || !link_wanted) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+		link_irq.by_line++;
+		return true;
+	}
+	(void)thread_block(THREAD_CONTINUE_NULL);
+	if (os_atomic_xchg(&link_irq.rang, 0, acquire) != 0) {
+		link_irq.by_line++;
+		return true;
+	}
+	link_irq.by_net++;
+	return false;
+}
+
+/* After doorbells(): the line on again, unless a ring that is not the audio DSP's is left (it would hold the line high). */
+static void
+link_irq_rearm(void)
+{
+	uint32_t who;
+
+	if (!link_irq.attached) {
+		return;
+	}
+	if (!os_atomic_load(&link_irq.on, acquire)) {
+		if (!link_irq.given_up) {
+			link_irq.given_up = true;
+			tell("adsp: link: MORE THAN %u DOORBELL INTERRUPTS IN A SECOND: the line is given up for this boot; the link's "
+			    "thread looks every millisecond\n", LINK_IRQ_STORM);
+		}
+		return;
+	}
+	who = rd(ipcc.base + IPCC_RECEIVED);
+	/* (a ring of the DSP's, or the always-on processor's we clear, since doorbells(): the line brings it again at once) */
+	if (who != IPCC_NOBODY && who >> 16 != IPCC_LPASS && !(who >> 16 == IPCC_AOP && clear_aop_rings)) {
+		if (!link_irq.foreign_now && link_irq.foreign < 4) {
+			tell("adsp: link: a ring of another processor's is left uncleared (%#x): the line stays masked and the link's "
+			    "thread looks every millisecond while it is there\n", who);
+		}
+		link_irq.foreign++;
+		link_irq.foreign_now = true;
+		return;
+	}
+	link_irq.foreign_now = false;
+	gic_v3_spi_unmask(link_irq.intid);
+}
+
+/* ---- the link's thread ----------------------------------------------------------------------------- */
 
 static void
 link_thread(__unused void *parameter, __unused wait_result_t result)
@@ -2738,10 +3225,13 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 	bzero(&last, sizeof(last));
 	dsp_words(&last);
 	while (link_wanted) {
-		sleep_us(1000);
+		bool rung = link_wait(), found = false;
+
 		doorbells();
+		link_irq_rearm();
 		if (dsp_words(&words) && memcmp(&words, &last, sizeof(words)) != 0) {
 			last = words;
+			found = true;
 			dsp_listen(&words);
 			if ((dsp_state(&words) & DSP_FATAL) && !gave_up) {
 				gave_up = true;
@@ -2757,7 +3247,7 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 				show_crash_reason();
 			}
 		}
-		for (;;) {
+		for (;; found = true) {
 			unsigned from = CHANNELS;
 
 			lck_mtx_lock(&glink_lock);
@@ -2780,10 +3270,15 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 				qrtr_input(packet->data, packet->length);
 			} else if (from == CHANNEL_PMIC) {
 				battmgr_input(packet->data, packet->length);
+			} else if (gpr) {
+				gpr_input(packet->data, packet->length);
 			} else {
 				apr_input(packet->data, packet->length);
 			}
 			kfree_data(packet, sizeof(*packet) + packet->length);
+		}
+		if (!rung && found) {
+			link_irq.net_found++;
 		}
 	}
 	link_runs = false;
@@ -2797,8 +3292,12 @@ link_stop(void)
 
 	if (link_runs) {
 		link_wanted = false;
+		thread_wakeup((event_t)&link_irq.rang);
 		for (unsigned ms = 0; ms < 2000 && link_runs; ms++) {
 			sleep_ms(1);
+		}
+		if (!link_runs) {
+			link_irq_stop();
 		}
 		printf("adsp: link: %s; GLINK said %u and heard %u messages, QRTR sent %u and received %u datagrams, APR %u and %u "
 		    "packets; its doorbells heard: GLINK %u, SMP2P %u\n", link_runs ? "THE THREAD DOES NOT END" : "down", glink.said,
@@ -2899,8 +3398,10 @@ step_link(void)
 	glink_say(GLINK_VERSION, GLINK_VERSION_1, glink.features, NULL, 0);
 	lck_mtx_unlock(&glink_lock);
 	link_wanted = link_runs = true;
+	link_irq_start();
 	if (kernel_thread_start(link_thread, NULL, &thread) != KERN_SUCCESS) {
 		link_wanted = link_runs = false;
+		link_irq_stop();
 		printf("adsp: %u: no thread\n", step);
 		return false;
 	}
@@ -2908,10 +3409,30 @@ step_link(void)
 	for (unsigned ms = 0; ms < 5000 && !glink.channel[CHANNEL_QRTR].open && !glink.broken; ms++) {
 		sleep_ms(1);
 	}
+	if (gpr && glink.agreed) {
+		/*
+		 * GPR's channel is opened from our side (Linux: the qcom,gpr node under qcom,glink makes the rpmsg device, which
+		 * opens "adsp_apps"); the DSP answers with its own open once its audio services run, and the channel is open
+		 * both ways from then on (glink_pump()).
+		 */
+		struct glink_channel *channel = &glink.channel[CHANNEL_APR];
+		uint32_t size = (uint32_t)strlen(channel->name) + 1;
+		char name[33];
+
+		lck_mtx_lock(&glink_lock);
+		if (!channel->asked) {
+			bzero(name, sizeof(name));
+			strlcpy(name, channel->name, sizeof(name));
+			glink_say(GLINK_OPEN, channel->ours, size, name, (size + 7) & ~7u);
+			channel->asked = true;
+		}
+		lck_mtx_unlock(&glink_lock);
+		printf("adsp: %u: \"%s\" opened from our side as channel %u (GPR's)\n", step, channel->name, channel->ours);
+	}
 	sleep_ms(50);
-	printf("adsp: %u: %llu ms after our version: versions %s (features %#x); the channel \"IPCRTR\" is %s, \"apr_audio_svc\" %s; "
+	printf("adsp: %u: %llu ms after our version: versions %s (features %#x); the channel \"IPCRTR\" is %s, \"%s\" %s; "
 	    "the DSP also opened \"%s\" \"%s\" \"%s\" \"%s\"\n", step, (now_us() - began) / 1000, glink.agreed ? "agreed" :
-	    "NOT AGREED", glink.features, glink.channel[CHANNEL_QRTR].open ? "OPEN" : "NOT OPEN",
+	    "NOT AGREED", glink.features, glink.channel[CHANNEL_QRTR].open ? "OPEN" : "NOT OPEN", glink.channel[CHANNEL_APR].name,
 	    glink.channel[CHANNEL_APR].open ? "OPEN" : "NOT OPEN", glink.others[0], glink.others[1], glink.others[2], glink.others[3]);
 	return glink.channel[CHANNEL_QRTR].open;
 }
@@ -2943,11 +3464,58 @@ step_qrtr(void)
 
 /* ---- step 11: APR ---------------------------------------------------------------------------------- */
 
+/*
+ * With GPR: its channel open both ways (the DSP opens its side once its audio services run), then APM asked whether
+ * the framework is ready (APM_CMD_GET_SPF_STATE; the answer's word is 1 when it is), again and again until it is or
+ * adsp_apr_wait seconds pass.
+ */
+static bool
+step_gpr(void)
+{
+	uint32_t wait_seconds = 10, asked = 0, state = 0;
+	uint64_t began = now_us(), opened;
+	struct hakios_apr_answer answer;
+
+	PE_parse_boot_argn("adsp_apr_wait", &wait_seconds, sizeof(wait_seconds));
+	announce("wait for the audio DSP to open GPR's channel (adsp_apps) from its side, then ask APM whether the audio "
+	    "framework (SPF) is ready, again and again");
+	while (!glink.channel[CHANNEL_APR].open && now_us() - began < wait_seconds * 1000000ull) {
+		sleep_ms(1);
+	}
+	opened = now_us();
+	if (!glink.channel[CHANNEL_APR].open) {
+		tell("adsp: %u: GPR: THE CHANNEL \"adsp_apps\" IS NOT OPEN after %u s (we asked: %s, the DSP acknowledged: %s, the DSP "
+		    "opened its side: %s)\n", step, wait_seconds, glink.channel[CHANNEL_APR].asked ? "yes" : "no",
+		    glink.channel[CHANNEL_APR].acknowledged ? "yes" : "no", glink.channel[CHANNEL_APR].theirs ? "yes" : "no");
+		return false;
+	}
+	bzero(&answer, sizeof(answer));
+	while (now_us() - began < wait_seconds * 1000000ull) {
+		asked++;
+		if (gpr_ask(GPR_PORT_APM, APM_CMD_GET_SPF_STATE, NULL, 0, 500, &answer) && answer.opcode == APM_CMD_RSP_GET_SPF_STATE) {
+			state = answer.words[0];
+			if (state == 1) {
+				break;
+			}
+		}
+		sleep_ms(200);
+	}
+	audio_up = state == 1;
+	tell("adsp: %u: GPR: the channel open %llu ms after we asked; %s after %u questions (the last answer: opcode %#x, %u bytes, "
+	    "%#x %#x)\n", step, (opened - began) / 1000, state == 1 ? "SPF IS READY" : "SPF DOES NOT SAY IT IS READY", asked,
+	    answer.opcode, answer.length, answer.words[0], answer.words[1]);
+	return state == 1;
+}
+
 static bool
 step_apr(void)
 {
 	uint32_t wait_seconds = 10, asked = 0, state = 0;
 	uint64_t began = now_us();
+
+	if (gpr) {
+		return step_gpr();
+	}
 
 	/* boot-arg adsp_apr_wait=N: for how many seconds (default 10) the core service is asked whether the audio services are up */
 	PE_parse_boot_argn("adsp_apr_wait", &wait_seconds, sizeof(wait_seconds));
@@ -3003,7 +3571,8 @@ static void
 steps_over(uint32_t done)
 {
 	lck_mtx_lock(&dsp_lock);
-	if (dsp_started && done == last_step && keep) {
+	/* (with GPR the battery needs only the link and QRTR, step 10: the DSP stays for it if GPR's step fails) */
+	if (dsp_started && keep && (done == last_step || (gpr && done >= 10))) {
 		printf("adsp: THE AUDIO DSP STAYS ON while the system runs%s\n", link_runs ? ", and the link with it" : "");
 	} else if (dsp_started) {
 		dsp_shutdown("the steps are over");
@@ -3082,11 +3651,14 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
 		services += qrtr_servers[i].there;
 	}
-	if (step == STEPS && dsp_started) {
-		tell("adsp: THE AUDIO DSP IS UP AND LINKED, its audio services up (APR), %llu ms after the kernel began on it (the "
-		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
-		hakios_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, board/sound.c) */
-		hakios_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, board/mic.c) */
+	if ((step == STEPS || (gpr && step >= 10)) && dsp_started) {
+		tell("adsp: THE AUDIO DSP IS UP AND LINKED%s, %llu ms after the kernel began on it (the root's waited for included): "
+		    "node %u, %u services; it stays on\n", step != STEPS ? ", ITS AUDIO SERVICES NOT UP" : gpr ?
+		    ", its audio framework ready (GPR)" : ", its audio services up (APR)", (now_us() - began) / 1000, qrtr_peer, services);
+		if (step == STEPS && !gpr) {
+			hakios_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, board/sound.c; APR's) */
+			hakios_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, board/mic.c; APR's) */
+		}
 		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
@@ -3129,6 +3701,16 @@ hakios_adsp_init(void)
 	if (board->adsp.charge_counter_divisor != 0) {
 		charge_counter_divisor = board->adsp.charge_counter_divisor;
 	}
+	gpr = board->adsp.gpr;
+	if (gpr) {
+		glink.channel[CHANNEL_APR].name = "adsp_apps";  /* (dt: qcom,gpr under qcom,glink, intents 20 x 512) */
+	}
+	link_irq.intid = board->adsp.interrupt;
+	batt_shift = board->adsp.battery_linux_numbers ? 0 : 1;
+	current_positive_discharging = board->adsp.current_positive_discharging;
+	pack_uah = board->adsp.pack_uah;
+	oplus_charger = board->adsp.oplus_charger;
+	clear_aop_rings = !hakios_board_has(HAKIOS_HAS_WIFI_WCN6750);
 	if (last_step == 0) {
 		/* all of it, on a thread of its own, and left up */
 		last_step = STEPS;

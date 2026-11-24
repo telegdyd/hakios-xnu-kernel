@@ -352,6 +352,12 @@ struct hakios_board {
 		uint32_t memory;                /* where its reserved memory is */
 		uint32_t memory_size;           /* how much of it the image may take */
 		uint32_t charge_counter_divisor;        /* the battery manager's charge counter, in this many parts of a uAh */
+		bool gpr;                       /* the audio services speak AudioReach's GPR (on adsp_apps), not APR */
+		uint32_t interrupt;             /* the doorbells' IPCC line (GIC number, level); 0: the link looks every ms */
+		bool battery_linux_numbers;     /* the battery properties numbered as Linux's qcom_battmgr (12 TEMP ...) */
+		bool current_positive_discharging;      /* the gauge's current is positive while the battery gives charge */
+		uint32_t pack_uah;              /* the gauge's charges are not in uAh: the charge from the percentage of this */
+		bool oplus_charger;             /* OPLUS's charger firmware: the port set to sink only, the input limit raised */
 	} adsp;
 
 	/* the microphones' codec (board: mic { }) */

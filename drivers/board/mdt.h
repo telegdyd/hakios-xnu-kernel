@@ -99,4 +99,29 @@ mdt_header_whole(const uint8_t *header, uint32_t count, uint64_t size, uint32_t 
 	       MDT_ELF_HEADER + (uint64_t)MDT_SEGMENT * count + found.file_size == size;
 }
 
+/*
+ * Where the image goes: a relocatable one (bit 27 of a loaded segment's flags, Linux's mdt_loader.c) is loaded wherever
+ * its memory is, each segment at its p_paddr less the lowest p_paddr, so its own addresses count from that lowest one;
+ * otherwise its addresses are the memory's own (`base'). The 10 Pro's audio DSP image is relocatable: its addresses
+ * begin at 0x86300000, its memory at 0x85700000.
+ */
+#define MDT_RELOCATABLE         (1u << 27)
+
+static inline uint32_t
+mdt_image_base(const uint8_t *header, uint32_t count, uint32_t base)
+{
+	struct elf_segment segment;
+	uint32_t lowest = ~0u;
+	bool relocatable = false;
+
+	for (uint32_t i = 0; i < count; i++) {
+		mdt_segment(header, i, &segment);
+		if (mdt_loaded(&segment)) {
+			relocatable |= (segment.flags & MDT_RELOCATABLE) != 0;
+			lowest = segment.paddr < lowest ? segment.paddr : lowest;
+		}
+	}
+	return relocatable && lowest != ~0u ? lowest : base;
+}
+
 #endif /* HAKIOS_MDT_H */

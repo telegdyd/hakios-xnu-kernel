@@ -187,12 +187,28 @@ apart(void)
 	CHECK(!mdt_apart(0x1000, 0xffffffffu, 0x2000, 0x10), "a size that would wrap a 32-bit sum below the other");
 }
 
+static void
+relocation(void)
+{
+	(void)header(4, 0x40);
+	hashes_at(1, TABLE_END(4), 0x40);
+	segment(2, MDT_LOAD, 0, 0x86300000u, 0x100, 0x1000);
+	segment(3, MDT_LOAD, 0, 0x86400000u, 0x100, 0x1000);
+	CHECK(mdt_image_base(file, 4, 0x85700000u) == 0x85700000u, "not relocatable: its addresses are the memory's own");
+	segment(3, MDT_LOAD, MDT_RELOCATABLE, 0x86400000u, 0x100, 0x1000);
+	CHECK(mdt_image_base(file, 4, 0x85700000u) == 0x86300000u, "relocatable: from its lowest loaded segment");
+	segment(2, MDT_LOAD, 0, 0x86300000u, 0, 0);
+	CHECK(mdt_image_base(file, 4, 0x85700000u) == 0x86400000u, "a segment of no memory is not loaded, so not the lowest");
+	segment(3, MDT_LOAD, MDT_RELOCATABLE, 0x86400000u, 0, 0);
+	CHECK(mdt_image_base(file, 4, 0x85700000u) == 0x85700000u, "nothing loaded: the memory's own");
+}
+
 int
 main(int argc, char **argv)
 {
 	static const struct { const char *name; void (*run)(void); } scenarios[] = {
 		{ "headers", headers }, { "segments", segments }, { "within", within }, { "whole", whole }, { "boundaries", boundaries },
-		{ "apart", apart },
+		{ "apart", apart }, { "relocation", relocation },
 	};
 
 	if (argc < 2) {
