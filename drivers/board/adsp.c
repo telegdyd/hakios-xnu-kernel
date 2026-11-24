@@ -3716,7 +3716,7 @@ hakios_adsp_init(void)
 		/* all of it, on a thread of its own, and left up */
 		last_step = STEPS;
 		keep = true;
-		quiet = true;
+		quiet = !option("adsp_loud");      /* (adsp_loud=1: every step's lines in the loader's log too) */
 		pause_ms = 0;
 		listen_seconds = 1;
 		new_from = STEPS + 1;
