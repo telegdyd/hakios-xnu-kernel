@@ -92,6 +92,7 @@ static uint64_t loader_l1[512] __attribute__((aligned(4096)));
 static uint64_t loader_l2[512] __attribute__((aligned(4096)));
 
 static uint64_t loader_log_total;        /* characters ever put in: the live log's positions (loader_log_copy) */
+static volatile int loader_request;      /* kern.hakios.loader_request: 1 back to the loader, 2 and a reset (Android) */
 static uint32_t loader_log_ring_at;      /* where the next character goes in the ring */
 static bool     loader_log_wrapped;
 static bool     loader_log_linear;       /* the pieces have been put in order: only appending from now on */
@@ -659,7 +660,7 @@ loader_return(void)
 			loader_log_putc(*c);
 		}
 	}
-	loader_jump(0, 0);
+	loader_jump(loader_request == 2 ? 3 : 0, 0);    /* (3: the loader resets the phone once it has the log) */
 }
 
 /* Bring-up aid: stop here if the loader asked for checkpoint n. */
@@ -805,13 +806,35 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, loader_return_timer_init);
  */
 static thread_call_t loader_stop_call;
 
+/*
+ * kern.hakios.loader_request (bsd/dev/board/board.c), written by sweetd for its "loader" and "reboot": 1 = back to
+ * the loader and stay there, 2 = back to the loader, which then resets the phone (Android). The poll below does
+ * the work, at once: a system call must not be the thread that stops the system.
+ */
+void loader_request_return(int mode);
+
+void
+loader_request_return(int mode)
+{
+	if (mode != 1 && mode != 2) {
+		return;
+	}
+	loader_request = mode;
+	if (loader_stop_call != NULL) {
+		thread_call_enter(loader_stop_call);    /* (now, rather than at the next look) */
+	}
+}
+
 static void
 loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 {
 	uint64_t deadline;
+	int request = loader_request;
 
-	if (loader_live.stop) {
-		static const char banner[] = "\n--- the host asked for the end of the run: back to the loader ---\n";
+	if (loader_live.stop || request != 0) {
+		const char *banner = request == 2 ? "\n--- the system asked for a reset: back to the loader, then Android ---\n" :
+		    request == 1 ? "\n--- the system asked for the loader ---\n" :
+		    "\n--- the host asked for the end of the run: back to the loader ---\n";
 		for (const char *c = banner; *c; c++) {
 			loader_log_putc(*c);
 		}

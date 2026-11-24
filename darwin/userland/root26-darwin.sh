@@ -51,6 +51,12 @@ pac_strip "$OBJ/net_test"
 # touches, buttons and notifications for job lists (RC_JOBS=...; usage in its source): a swipe up unlocks, as a finger does
 $DYN -o "$OBJ/rwtouch" "$US/src/rwtouch.c"
 pac_strip "$OBJ/rwtouch"
+# the command runner on the USB Ethernet link (usb_net=1: TCP 5143 of en2; the job list starts it; the client is the
+# OnePlus 10 Pro package's tools/sweet-sh.py). SWEETD=0: not in the image
+if [ "${SWEETD-1}" != 0 ]; then
+	$DYN -o "$OBJ/sweetd" "$US/src/sweetd.c"
+	pac_strip "$OBJ/sweetd"
+fi
 # the flashlight as an application reaches it, through AVFlashlight (rc.jobs.torch; darwin/userland/torch_test.c)
 $DYN -framework CoreFoundation -lobjc -o "$OBJ/torch_test" "$RN/userland/torch_test.c"
 pac_strip "$OBJ/torch_test"
@@ -75,6 +81,20 @@ for f in ${EXTRA_BIN:-}; do
 	chmod 755 "$T/bin/$(basename "$f")"
 done
 cp "$OBJ/rwtouch" "$T/bin/rwtouch"
+# sweetd and its token: SWEETD_TOKEN=FILE, else $OBJ/sweetd.token, made here once (never in git; the client reads the
+# same file). Not with SHARE=1: an image for somebody else gets no token of ours, and sweetd then runs nothing
+if [ -f "$OBJ/sweetd" ] && [ "${SWEETD-1}" != 0 ]; then
+	cp "$OBJ/sweetd" "$T/bin/sweetd"
+	TOKEN=${SWEETD_TOKEN:-$OBJ/sweetd.token}
+	if [ ! -s "$TOKEN" ] && [ -z "$SWEETD_TOKEN" ]; then
+		(umask 077; od -An -N24 -tx1 /dev/urandom | tr -d ' \n' > "$TOKEN")
+		echo "  sweetd: made $TOKEN (for sweetd and sweet-sh.py)"
+	fi
+	if [ -z "$SHARE" ] && [ -s "$TOKEN" ]; then
+		cp "$TOKEN" "$T/etc/sweetd.token"
+		chmod 600 "$T/etc/sweetd.token"
+	fi
+fi
 cp "$OBJ/torch_test" "$T/bin/torch_test"
 cp "$OBJ/record_test" "$T/bin/record_test"
 # the SSH server and its shell, when darwin/userland/ssh.sh has built them (rc.jobs.ssh starts the server); the keys of
@@ -480,6 +500,12 @@ EOF
 fi
 # (first: /private/var saved as the run ends, with boot-arg var_store=1; without it var_store ends at once)
 { echo "/hakios/bin/var_store watch &"; cat $T/etc/rc.jobs; } > $T/etc/rc.jobs.new && mv $T/etc/rc.jobs.new $T/etc/rc.jobs
+# (and sweetd, when it is in the image, before everything else: it waits for en2 by itself, and the job list's
+# job, com.hakios.demo, leaves its process group behind when it ends. From here rather than a job of its own: the
+# jobs are in the system image, and this list is in the small one)
+if [ -f "$T/bin/sweetd" ]; then
+	{ echo "/hakios/bin/sweetd &"; cat $T/etc/rc.jobs; } > $T/etc/rc.jobs.new && mv $T/etc/rc.jobs.new $T/etc/rc.jobs
+fi
 # The image is what somebody would be handed to run this on a second phone, and two of the things put in it
 # are secrets: the Wi-Fi network's name and passphrase, and this machine's ssh keys. One small file each in
 # an image of megabytes: said here, and the image is then readable by its owner alone.

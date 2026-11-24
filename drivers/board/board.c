@@ -14,12 +14,14 @@
 #include <machine/machine_routines.h>
 #include <pexpert/device_tree.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 
 #include "kernel.h"
 #include "board.h"
 #include "board_table.h"
+#include "log.h"
 
 static const struct hakios_board *found;
 static bool looked;
@@ -162,3 +164,31 @@ SYSCTL_PROC(_hw_board, OID_AUTO, name, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOC
 SYSCTL_PROC(_hw_board, OID_AUTO, soc, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 1, sysctl_board, "A", "");
 SYSCTL_PROC(_hw_board, OID_AUTO, description, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 2, sysctl_board, "A", "");
 SYSCTL_PROC(_hw_board, OID_AUTO, features, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 3, sysctl_board, "A", "");
+
+/*
+ * kern.hakios.loader_request: 1 = the run ends, back to the loader, which stays; 2 = back to the loader, which resets
+ * the phone (Android) once it has the log. Root only (no CTLFLAG_ANYBODY); written by sweetd for "loader" and
+ * "reboot". Reads as 0. The return itself is loader_return.c's, within a second.
+ */
+extern void loader_request_return(int mode);   /* osfmk/arm64/loader_return.c */
+
+static int
+sysctl_loader_request SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int mode = 0, error;
+
+	error = sysctl_handle_int(oidp, &mode, 0, req);
+	if (error || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (mode != 1 && mode != 2) {
+		return EINVAL;
+	}
+	hakios_say("board: loader_request %d: %s\n", mode, mode == 2 ? "back to the loader, then a reset" : "back to the loader");
+	loader_request_return(mode);
+	return 0;
+}
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, loader_request, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    sysctl_loader_request, "I", "1: back to the loader, 2: back to the loader and reset (Android)");
