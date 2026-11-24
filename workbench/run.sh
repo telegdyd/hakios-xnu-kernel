@@ -113,6 +113,7 @@ echo "== qmi (drivers/board/qmi.c under the sanitizers)"
 run backlight_test -I"$SRC" "$HERE/backlight_test.c"
 run thermal_test -I"$SRC" "$HERE/thermal_test.c"
 run synaptics_report_test -I"$SRC" "$HERE/synaptics_report_test.c"
+run s3908_report_test -I"$SRC" "$HERE/s3908_report_test.c"
 # the data volume's store (init/var_store.c), against libmini's header as on the phone, over a sparse file for the partition
 run var_store_test -I"$HERE/../lib/libmini" "$HERE/var_store_test.c"
 # process 1 (init/init.c), the same way, its files under a directory of the test's and its children only noted

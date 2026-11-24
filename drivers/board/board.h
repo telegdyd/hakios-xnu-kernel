@@ -65,6 +65,8 @@ enum {
 	                                         * board lists one of the two */
 	HAKIOS_HAS_TOUCH_FT5X06    = 1u << 21,  /* a FocalTech controller of the FT5x06 register family (FT5x06, FT5x46,
 	                                         * FT6x36 ...) on I2C, wired as touch-i2c { } says (board/ft5x06.c) */
+	HAKIOS_HAS_TOUCH_S3908     = 1u << 22,  /* a Synaptics S3908 (TouchComm v1) on I2C, wired as touch-i2c { } says
+	                                         * (board/s3908.c) */
 	HAKIOS_HAS_CPUFREQ_SCMI = 1u << 16,     /* CPU performance queries via SCMI */
 };
 
@@ -278,7 +280,7 @@ struct hakios_board {
 	/*
 	 * A touch controller on I2C (board: touch-i2c { }): two of the SoC's pins for its bus, driven by hand, its
 	 * address there, its interrupt and reset, its supplies and what its reports can say. For the feature
-	 * "touch-ft5x06" (board/ft5x06.c).
+	 * "touch-ft5x06" (board/ft5x06.c) and "touch-s3908" (board/s3908.c).
 	 */
 	struct {
 		uint8_t sda, scl;               /* its I2C bus's two lines */
