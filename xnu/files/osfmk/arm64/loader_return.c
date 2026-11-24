@@ -554,6 +554,9 @@ loader_request_return(int mode)
 {
 	if (mode == 1 || mode == 2) {
 		loader_request = mode;
+		if (loader_stop_call != NULL) {
+			thread_call_enter(loader_stop_call);    /* (now, rather than at the next look) */
+		}
 	}
 }
 
@@ -577,8 +580,11 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		hakios_mpss_stop();
 		loader_return_reason(request == 2 ? 3 : 0);
 	}
+	/* (a look a second, or up to 2 s later with another wake: on its own it was one of cpu0's wakes, run22) */
+	uint64_t leeway;
 	clock_interval_to_deadline(1, NSEC_PER_SEC, &deadline);
-	thread_call_enter_delayed(loader_stop_call, deadline);
+	nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &leeway);
+	thread_call_enter_delayed_with_leeway(loader_stop_call, NULL, deadline, leeway, THREAD_CALL_DELAY_LEEWAY);
 }
 
 __startup_func
@@ -695,6 +701,7 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hv_wdt_pet_init);
 
 #define HANG_TICK_MS            500
 #define HANG_LIMIT_MS           5000
+#define HANG_LEEWAY_MS          1500
 #define HANG_START_SECONDS      30
 #define HANG_FRAMES             4
 
@@ -711,7 +718,7 @@ static struct hang_cpu hang_cpus[MAX_CPUS];
 static struct timer_call hang_timers[MAX_CPUS];
 static thread_call_t hang_thread_call, hang_start_call;
 static _Atomic uint64_t hang_thread_at;
-static uint64_t hang_tick_abs, hang_limit_abs;
+static uint64_t hang_tick_abs, hang_limit_abs, hang_leeway_abs;
 static uint32_t hang_detect = 1;
 static _Atomic uint32_t hang_fired;
 static _Atomic uint32_t hang_off;       /* a bit per processor that is switched off, or on its way */
@@ -794,6 +801,19 @@ hang_check(uint64_t now, int self)
 	    hang_text);
 }
 
+/*
+ * A processor's next tick: HANG_TICK_MS from now, or up to HANG_LEEWAY_MS later, when that processor wakes for
+ * something else (XNU's timer coalescing). A tick of its own on each idle core woke the SoC out of CX collapse every
+ * 500 ms per core (run16: 2 a second on each of cores 1-3); at most HANG_TICK_MS + HANG_LEEWAY_MS apart, well inside
+ * HANG_LIMIT_MS.
+ */
+static void
+hang_timer_enter(timer_call_t call, uint64_t now)
+{
+	timer_call_enter_with_leeway(call, NULL, now + hang_tick_abs, hang_leeway_abs,
+	    TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL | TIMER_CALL_LEEWAY, FALSE);
+}
+
 static void
 hang_tick(timer_call_param_t p0, __unused timer_call_param_t p1)
 {
@@ -805,7 +825,7 @@ hang_tick(timer_call_param_t p0, __unused timer_call_param_t p1)
 	c->ticks++;
 	os_atomic_store(&c->at, now, release);
 	hang_check(now, cpu);
-	timer_call_enter(&hang_timers[(uintptr_t)p0], now + hang_tick_abs, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
+	hang_timer_enter(&hang_timers[(uintptr_t)p0], now);
 	if (os_atomic_load(&hang_off, seq_cst) & (1u << cpu)) {
 		/* it is leaving: no local timer may be left on it (timer_queue_shutdown()) */
 		timer_call_cancel(&hang_timers[(uintptr_t)p0]);
@@ -829,7 +849,7 @@ hang_cpu_event(__unused void *param, enum cpu_event event, unsigned int cpu)
 	} else if (event == CPU_BOOTED && (int)cpu == cpu_number()) {
 		os_atomic_store(&hang_cpus[cpu].at, mach_absolute_time(), release);
 		os_atomic_andnot(&hang_off, 1u << cpu, seq_cst);
-		timer_call_enter(&hang_timers[cpu], mach_absolute_time() + hang_tick_abs, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
+		hang_timer_enter(&hang_timers[cpu], mach_absolute_time());
 	}
 	return true;
 }
@@ -840,7 +860,7 @@ hang_arm(__unused void *arg)
 {
 	int cpu = cpu_number();
 
-	timer_call_enter(&hang_timers[cpu], mach_absolute_time() + hang_tick_abs, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
+	hang_timer_enter(&hang_timers[cpu], mach_absolute_time());
 }
 
 static void
@@ -849,7 +869,9 @@ hang_thread_beat(__unused thread_call_param_t p0, __unused thread_call_param_t p
 	uint64_t now = mach_absolute_time();
 
 	os_atomic_store(&hang_thread_at, now, release);
-	thread_call_enter_delayed(hang_thread_call, now + hang_tick_abs);
+	/* (with the per-processor ticks' leeway: 2 a second of cpu0's wakes otherwise, run22; still well inside the limit) */
+	thread_call_enter_delayed_with_leeway(hang_thread_call, NULL, now + hang_tick_abs, hang_leeway_abs,
+	    THREAD_CALL_DELAY_LEEWAY);
 }
 
 static void
@@ -873,6 +895,7 @@ hang_detect_init(void)
 		return;
 	}
 	nanoseconds_to_absolutetime((uint64_t)HANG_TICK_MS * NSEC_PER_MSEC, &hang_tick_abs);
+	nanoseconds_to_absolutetime((uint64_t)HANG_LEEWAY_MS * NSEC_PER_MSEC, &hang_leeway_abs);
 	nanoseconds_to_absolutetime((uint64_t)HANG_LIMIT_MS * NSEC_PER_MSEC, &hang_limit_abs);
 	for (uintptr_t i = 0; i < MAX_CPUS; i++) {
 		timer_call_setup(&hang_timers[i], hang_tick, (timer_call_param_t)i);

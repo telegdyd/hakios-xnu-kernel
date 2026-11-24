@@ -167,6 +167,7 @@ gic_send_sgi(uint32_t phys_id, uint32_t sgi)
 void
 gic_v3_irq_signal(uint32_t phys_id)
 {
+	psci_ipi_sent(phys_id);
 	gic_send_sgi(phys_id, GIC_SGI_SIGNAL);
 }
 
@@ -318,6 +319,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			break;
 		}
 		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
+		psci_idle_irq(intid, intid == GIC_INTID_VTIMER ? 1 : intid == GIC_SGI_SIGNAL ? 2 : 0);
 
 		if (intid == GIC_INTID_VTIMER) {
 			/* same sequence as the FIQ path in sleh_fiq() */

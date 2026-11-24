@@ -108,6 +108,7 @@ void hakios_guard_attenuation(uint32_t below);                 /* the amplifiers
                                                                  * what the limits are reckoned from */
 void hakios_guard_monitor(uint32_t below);                     /* a reduction asked for by hakios_speaker_monitor() */
 void hakios_guard_process(int16_t *frames, uint32_t count);    /* stereo frames, in place */
+void hakios_guard_silence(uint64_t frames);                    /* that much silence not processed (the stream stopped) */
 void hakios_guard_take_report(struct hakios_guard_report *report);   /* what happened since the last call */
 int hakios_guard_decibels(uint64_t ratio);                     /* 10 log10 of a Q30 ratio, in tenths of a dB */
 /* boot-arg rec_sound_fed=1: the recording (rec_sound=N) has what the guard let through instead of what Darwin wrote */

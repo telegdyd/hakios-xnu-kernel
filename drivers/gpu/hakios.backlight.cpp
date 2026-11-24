@@ -64,6 +64,7 @@
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern "C" void loader_log_line(const char * line);
+extern "C" void hakios_display_bandwidth(bool on);     /* hakios.cpufreq.c: the display's votes, while the panel scans out */
 
 static TUNABLE(uint32_t, gBacklightSoC, "backlight", 0);
 static TUNABLE(uint32_t, gBacklightMax, "backlight_max", 0x7ff);
@@ -214,6 +215,10 @@ intf_wr(uint32_t offset, uint32_t value)
 	__builtin_arm_dsb(0xf);
 }
 
+/* boot-arg display_power_down=0: the display's hardware stays on while the panel sleeps (hakios.display-power.h) */
+static TUNABLE(uint32_t, gDPOn, "display_power_down", 1);
+#include "hakios.display-power.h"
+
 static bool
 dsi_long_type(uint8_t type)
 {
@@ -260,7 +265,7 @@ dsi_packet(uint8_t type, const uint8_t * buf, uint32_t len, bool lowPower)
 	}
 
 	IOLockLock(gDSILock);
-	if (gDSIDead) {
+	if (gDSIDead || !dp_regs_on()) {     /* (not while the display is off: hakios.display-power.h) */
 		IOLockUnlock(gDSILock);
 		return -1;
 	}
@@ -386,6 +391,7 @@ class AppleARMBacklight : public IOService
 	/* the work loop's */
 	bool                    fAsleep;        /* the panel in sleep (DCS 0x28, 0x10) */
 	bool                    fCanSleep;      /* the long-packet buffer and INTF_1 are there: it can be woken again */
+	uint32_t                fDPTries;       /* power-downs refused since the panel went to sleep */
 	bool                    fKnown;         /* fLevel is what the panel has */
 	uint32_t                fLevel;
 	uint32_t                fWrites;
@@ -401,11 +407,13 @@ class AppleARMBacklight : public IOService
 	void publish(uint32_t level);
 	void sleepPanel(void);
 	void wakePanel(void);
+	static IOReturn cycleAction(OSObject * owner, void * arg0, void * arg1, void * arg2, void * arg3);
 
 public:
 	uint32_t                fMax;
 
 	bool startBacklight(bool canSleep);
+	IOReturn powerCycle(uint32_t ms);
 	void again(void);
 	void displayPower(bool on);
 	IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
@@ -457,8 +465,9 @@ AppleARMBacklight::startBacklight(bool canSleep)
 	setProperty("backlight-control", true);
 	publish(fTarget);
 	registerService();
-	bl_say("backlight: AppleARMBacklight up, DBV 0..%u, low-power DCS; display sleep %s\n", fMax,
-	    fCanSleep ? "on (DCS 0x28 0x10, woken by the boot loader's on-sequence)" : "off (DBV 0 only)");
+	bl_say("backlight: AppleARMBacklight up, DBV 0..%u, low-power DCS; display sleep %s; the display's hardware off while "
+	    "the panel sleeps: %s\n", fMax, fCanSleep ? "on (DCS 0x28 0x10, woken by the boot loader's on-sequence)" :
+	    "off (DBV 0 only)", fCanSleep && gDPOn ? "on" : "off");
 	return true;
 }
 
@@ -516,11 +525,22 @@ AppleARMBacklight::step(void)
 		apply(0, true);
 		if (fCanSleep && !fAsleep) {
 			sleepPanel();
+			fDPTries = 0;
+		}
+		if (fCanSleep && fAsleep && !dp_down() && dp_retry() && fDPTries++ < 3) {
+			fTimer->setTimeoutMS(2000);     /* (refused: a holder or the controller busy; again in 2 s) */
 		}
 		return;
 	}
 	if (fAsleep) {
-		wakePanel();
+		dp_up();
+		if (dp_regs_on()) {
+			wakePanel();
+		} else {
+			/* (the display's hardware did not come back: not woken, nothing of it read; the panel stays dark) */
+			fAsleep = false;
+			hakios_fb_panel_asleep(false);
+		}
 		now = mach_absolute_time();
 		t = now - fFadeStart;
 	}
@@ -549,23 +569,45 @@ AppleARMBacklight::step(void)
  * framebuffer is told first: a flip it starts now would never be taken (MiniIOMobileFramebuffer's fb_flip would give up
  * after 100 ms), so until the wake its frames go into the panel's own memory; 20 ms let a flip already started be taken.
  */
+static uint32_t gSleepAutorefresh;     /* the auto-refresh's config sleepPanel() stopped (bit 31 set), for the wake */
+
+/*
+ * Since run18 the frames stop before the commands (as Linux's encoder is disabled before the panel's off commands):
+ * the auto-refresh off and the frame in flight finished, so that 0x28 and 0x10 never go out in the middle of a frame
+ * (dsi_packet() sends one "anyway" after 20 ms of frames: run18's 0x28 went into a transfer that never ended, the panel
+ * left awake on a broken frame). The display's bandwidth votes go once the panel sleeps.
+ */
 void
 AppleARMBacklight::sleepPanel(void)
 {
 	uint64_t began = mach_absolute_time(), ns;
 	uint8_t off = 0x28, enter = 0x10;
+	uint32_t autorefresh = intf_rd(INTF_TEAR_AUTOREFRESH_CONFIG), i;
 	int rc;
 
 	hakios_fb_panel_asleep(true);
 	IOSleep(20);
+	if (autorefresh & (1u << 31)) {
+		gSleepAutorefresh = autorefresh;
+		intf_wr(INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh & ~(1u << 31));
+	}
+	for (i = 0; i < 50 && (dsi_rd(DSI_STATUS) & DSI_STATUS_MDP_BUSY); i++) {
+		IOSleep(1);
+	}
+	if (dsi_rd(DSI_STATUS) & DSI_STATUS_MDP_BUSY) {
+		bl_say("backlight: display off: a frame still in flight after 50 ms (DSI status %#x)\n", dsi_rd(DSI_STATUS));
+	}
 	rc = dsi_packet(0x05, &off, 1, true);
 	IOSleep(21);
 	rc = rc != 0 ? rc : dsi_packet(0x05, &enter, 1, true);
 	IOSleep(101);
 	fAsleep = true;
+	hakios_display_bandwidth(false);
 	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 	bl_say("backlight: display off: panel asleep in %llu ms (DCS 0x28 0x10 %s)\n", ns / NSEC_PER_MSEC, rc == 0 ? "ok" : "FAILED");
 }
+
+static uint32_t gWakeSent, gWakeFailed, gWakeFrames;     /* the last wake's packets and frames (the power cycle's check) */
 
 /* Each entry: TYPE LEN BYTES... (the DSI data type), or 0xff MS (a wait). Made from the XML by devices/negroni/tools/panel-on-table.py. */
 /* the boot loader's panel file (Mu-Silicium Binaries/negroni/RawFiles/Panel_samsung_amb670yf08_1440_3216_dsc_cmd.xml), <DSIInitSequence>: 101 packets, 7 waits */
@@ -707,7 +749,12 @@ AppleARMBacklight::wakePanel(void)
 	uint32_t autorefresh = intf_rd(INTF_TEAR_AUTOREFRESH_CONFIG), sent = 0, failed = 0, i = 0, j;
 	int first = 0;
 
-	if (autorefresh & (1u << 31)) {
+	/* the display's bandwidth before its first fetch; the auto-refresh sleepPanel() stopped, to be started again */
+	hakios_display_bandwidth(true);
+	if (!(autorefresh & (1u << 31)) && (gSleepAutorefresh & (1u << 31))) {
+		autorefresh = gSleepAutorefresh;
+	}
+	if (intf_rd(INTF_TEAR_AUTOREFRESH_CONFIG) & (1u << 31)) {
 		intf_wr(INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh & ~(1u << 31));
 	}
 	while (i + 2 <= sizeof(kPanelOn)) {
@@ -741,6 +788,11 @@ AppleARMBacklight::wakePanel(void)
 		intf_wr(INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh & ~(1u << 31));
 		IODelay(100);
 		intf_wr(INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh);
+		if (gDPStat.ups != 0 && gDPMdss != NULL) {
+			/* after a power-up CTL0 starts from reset: one start, as Linux's kickoff after it enables the
+			 * auto-refresh (dpu_hw_ctl_trigger_start, CTL_START 0x1c) */
+			dp_wr(gDPMdss, 0x1601c, 1);
+		}
 		frames0 = intf_rd(INTF_FRAME_COUNT);
 		IOSleep(50);
 		frames = intf_rd(INTF_FRAME_COUNT) - frames0;
@@ -750,11 +802,14 @@ AppleARMBacklight::wakePanel(void)
 	}
 	fAsleep = false;
 	fKnown = false;                                 /* the level again, whatever the panel has after it */
+	gWakeSent = sent;
+	gWakeFailed = failed;
+	gWakeFrames = frames;
 	hakios_fb_panel_asleep(false);
 	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
 	bl_say("backlight: display on: panel woken in %llu ms (%u of %u packets%s, error %d; auto-refresh %#x; in 50 ms "
-	    "%u frames%s)\n", ns / NSEC_PER_MSEC, sent, (uint32_t) PANEL_ON_PACKETS, failed ? " FAILED" : "", first,
-	    autorefresh, frames, j ? ", auto-refresh re-armed" : "");
+	    "%u frames%s; CTL0 flush now %#x)\n", ns / NSEC_PER_MSEC, sent, (uint32_t) PANEL_ON_PACKETS, failed ? " FAILED" : "",
+	    first, autorefresh, frames, j ? ", auto-refresh re-armed" : "", gDPMdss != NULL ? dp_rd(gDPMdss, 0x16018) : 0);
 }
 
 /* RequestPowerChange (MiniIOMobileFramebuffer): does not wait for the panel */
@@ -810,6 +865,77 @@ backlight_min_sysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __
 
 SYSCTL_PROC(_kern_hakios, OID_AUTO, backlight_min, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
     backlight_min_sysctl, "IU", "the lowest DBV the brightness slider gives (backlight_min)");
+
+/*
+ * kern.hakios.display_power_cycle (write milliseconds, 1..60000, with the panel asleep): on the work loop, the display
+ * off (if it is not), that long, on, the panel woken (its packets and frames counted), asleep and off again. The
+ * display's RequestPowerChange waits meanwhile. Read: the last result.
+ */
+IOReturn
+AppleARMBacklight::cycleAction(OSObject * owner, void * arg0, __unused void * arg1, __unused void * arg2, __unused void * arg3)
+{
+	AppleARMBacklight * me = (AppleARMBacklight *) owner;
+	uint32_t ms = (uint32_t) (uintptr_t) arg0;
+	bool again;
+
+	if (!me->fCanSleep || !me->fAsleep) {
+		snprintf(gDPStat.cycle, sizeof(gDPStat.cycle), "not tried: the panel is not asleep");
+		return kIOReturnNotReady;
+	}
+	if (!dp_down()) {
+		gDPStat.cycle_failed++;
+		snprintf(gDPStat.cycle, sizeof(gDPStat.cycle), "FAILED: not powered down (%s)", gDPStat.why);
+		return kIOReturnError;
+	}
+	IOSleep(ms);
+	dp_up();
+	if (!dp_regs_on()) {
+		gDPStat.cycles++;
+		gDPStat.cycle_failed++;
+		snprintf(gDPStat.cycle, sizeof(gDPStat.cycle), "FAILED: the display did not come back on (%s)", gDPStat.why);
+		bl_say("display power: cycle %s\n", gDPStat.cycle);
+		return kIOReturnError;
+	}
+	me->wakePanel();
+	me->sleepPanel();
+	again = dp_down();
+	gDPStat.cycles++;
+	gDPStat.cycle_frames += gWakeFrames;
+	/* (not off again is a failure too: run18's last cycle passed with the controller stuck and the panel garbled) */
+	bool good = gWakeFailed == 0 && gWakeFrames != 0 && !gDPBroken && again;
+	if (!good) {
+		gDPStat.cycle_failed++;
+	}
+	snprintf(gDPStat.cycle, sizeof(gDPStat.cycle), "%s: %u ms off, woken with %u of %u packets and %u frames in 50 ms; off "
+	    "again %s", good ? "ok" : "FAILED", ms, gWakeSent,
+	    (uint32_t) PANEL_ON_PACKETS, gWakeFrames, again ? "yes" : "NO");
+	bl_say("display power: cycle %s\n", gDPStat.cycle);
+	return kIOReturnSuccess;
+}
+
+IOReturn
+AppleARMBacklight::powerCycle(uint32_t ms)
+{
+	return fWorkLoop->runAction(&AppleARMBacklight::cycleAction, this, (void *) (uintptr_t) ms);
+}
+
+static int
+display_power_cycle_sysctl(struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	uint32_t ms = gDPStat.cycles;
+	int error = sysctl_handle_int(oidp, &ms, 0, req);
+
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (ms == 0 || ms > 60000 || gBacklight == NULL) {
+		return EINVAL;
+	}
+	return gBacklight->powerCycle(ms) == kIOReturnSuccess ? 0 : EIO;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, display_power_cycle, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    display_power_cycle_sysctl, "IU", "write ms with the panel asleep: the display off, that long, on, woken, asleep, off "
+    "(read: cycles done; the result in display_power_stats)");
 
 void
 AppleARMBacklight::timerFired(OSObject * owner, __unused IOTimerEventSource * sender)

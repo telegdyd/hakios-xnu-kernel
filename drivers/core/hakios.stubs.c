@@ -67,6 +67,7 @@ void hakios_battery_init(void) {}
 int hakios_battery_temperature(void) { return -273; }      /* "not known", as the driver says before its first reading */
 void hakios_battery_report(__unused const struct hakios_battery_state *state) {}
 bool hakios_battery_get(int *soc, int *present, int *charger) { *soc = -1; *present = 0; *charger = 0; return false; }
+bool hakios_battery_power(int *ma, int *mv, int *charger) { *ma = 0; *mv = -1; *charger = 0; return false; }
 #endif
 
 #ifndef HAKIOS_CPUFREQ
@@ -76,6 +77,7 @@ void hakios_cpufreq_cap(uint32_t mhz);
 void hakios_cpufreq_cap(__unused uint32_t mhz) {}
 const char *hakios_cpufreq_line(void);
 const char *hakios_cpufreq_line(void) { return "-"; }
+bool hakios_rpmh_bw(__unused unsigned client, __unused const char *bcm, __unused uint32_t ab, __unused uint32_t ib) { return false; }
 #endif
 
 #ifndef HAKIOS_ADRENO
@@ -97,6 +99,7 @@ void HakiosWLANStart(__unused const char *interface, __unused const uint8_t *add
 void hakios_adsp_init(void) {}
 void hakios_adsp_stop(void) {}
 void hakios_adsp_quiesce(void) {}
+bool hakios_aop_message(__unused const char *text) { return false; }
 #endif
 
 #ifndef HAKIOS_MODEM

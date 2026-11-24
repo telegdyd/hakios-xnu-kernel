@@ -276,7 +276,14 @@ gpuPowerTick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		uint64_t deadline;
 		gGPUPowerSlow = hakios_gpu_power_asleep();
 		clock_interval_to_deadline(gGPUPowerSlow ? 1000 : 50, NSEC_PER_MSEC, &deadline);
-		thread_call_enter_delayed(gGPUPowerCall, deadline);
+		if (gGPUPowerSlow) {
+			/* (in slumber it only looks: up to a second later, with another wake, so it is not a wake of its own) */
+			uint64_t leeway;
+			nanoseconds_to_absolutetime(NSEC_PER_SEC, &leeway);
+			thread_call_enter_delayed_with_leeway(gGPUPowerCall, NULL, deadline, leeway, THREAD_CALL_DELAY_LEEWAY);
+		} else {
+			thread_call_enter_delayed(gGPUPowerCall, deadline);
+		}
 	}
 	IOLockUnlock(gGPULock);
 }

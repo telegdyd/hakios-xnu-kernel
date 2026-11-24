@@ -42,6 +42,8 @@ static int battery_soc_percent = -1, battery_voltage_mv = -1, battery_current_ma
 static int battery_temperature_c = -273, battery_present, battery_charger_present;
 static int battery_charging, battery_soc_estimated, battery_charger_action = -1;
 static uint64_t battery_updates, battery_failures;
+/* the charger flag's changes from the DSP; a thread_wakeup on its address at each (the USB driver's park waits on it) */
+volatile uint32_t hakios_battery_charger_changes;
 
 /* for others in the kernel (the battery guard): no sysctl lookup in between */
 bool
@@ -49,6 +51,16 @@ hakios_battery_get(int *soc, int *present, int *charger)
 {
 	*soc = battery_soc_percent;
 	*present = battery_present;
+	*charger = battery_charger_present;
+	return battery_updates != 0;
+}
+
+/* for others in the kernel (hakios.cpufreq.c's power log): current (mA, as the firmware signs it) and voltage */
+bool
+hakios_battery_power(int *ma, int *mv, int *charger)
+{
+	*ma = battery_current_ma;
+	*mv = battery_voltage_mv;
 	*charger = battery_charger_present;
 	return battery_updates != 0;
 }
@@ -140,7 +152,11 @@ extern void HakiosBatteryReport(const void *state, unsigned size);     /* driver
 
 static uint64_t gauge_at;               /* when the fuel gauge (the DSP's battery manager) last reported */
 
-/* The gauge has reported in the last minute: an estimate (hakios.battery_bcl.c) gives way to it. */
+/*
+ * The gauge has reported in the last three minutes: an estimate (hakios.battery_bcl.c) gives way to it. (A minute was
+ * shorter than the battery manager's rounds with the screen off, kern.hakios.battmgr_off_seconds 60 and its leeway:
+ * run33's stage gave way to the estimate after 90 s, which said a charger was in, and the screen lit.)
+ */
 bool
 hakios_battery_gauge_live(void)
 {
@@ -150,7 +166,7 @@ hakios_battery_gauge_live(void)
 		return false;
 	}
 	absolutetime_to_nanoseconds(mach_absolute_time() - at, &ns);
-	return ns < 60ull * NSEC_PER_SEC;
+	return ns < 180ull * NSEC_PER_SEC;
 }
 
 void
@@ -166,7 +182,11 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	battery_temperature_c = (b->estimated & HAKIOS_BATTERY_NO_TEMPERATURE) ? -273 :
 	    (int)(((int64_t)b->temperature_hundredths + 50) / 100);
 	battery_present = b->present != 0;
-	battery_charger_present = b->external != 0;
+	if (battery_charger_present != (b->external != 0)) {
+		battery_charger_present = b->external != 0;
+		hakios_battery_charger_changes++;
+		thread_wakeup((event_t)&hakios_battery_charger_changes);
+	}
 	battery_charging = b->status == 1;      /* POWER_SUPPLY_STATUS_CHARGING */
 	battery_soc_estimated = (b->estimated & HAKIOS_BATTERY_ESTIMATED) != 0;
 	battery_charger_action = b->status;

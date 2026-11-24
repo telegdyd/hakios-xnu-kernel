@@ -34,7 +34,8 @@
  * what it was taken for must not become a volume key held down for the whole session).
  * When: on the X5 Pro 60 times a second. On the 10 Pro an edge of any key raises the arbiter's
  * interrupt, which wakes the thread; it looks every 16 ms only until the keys are steady again,
- * and once a second as a net (16 ms until the line has delivered once). buttons_irq=0: looks only.
+ * and once a second as a net (16 ms until the line has delivered once, if its setup did not read back as asked).
+ * buttons_irq=0: looks only.
  *
  * The mapping: the phone has what the iPhone X has, whose user space runs here -- a side button
  * and two volume keys, no home button. Power is the side button (HAKIOS_BUTTON_LOCK).
@@ -73,6 +74,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
 extern void hakios_screen_pause(uint32_t on_ms, uint32_t off_ms);
+extern wait_result_t hakios_assert_wait_net(event_t event, uint32_t ms);  /* psci_smp.c: a net, with leeway while the screen is off */
 extern bool hakios_screen_off(void);
 extern void hakios_spmi_lock(void);
 extern void hakios_spmi_unlock(void);
@@ -780,9 +782,10 @@ keys_irq_start(void)
 		/* (left attached: an edge still wakes the thread early) */
 		printf("buttons: an interrupt is not set as asked: looking every %u ms as well\n", POLL_MS);
 	}
-	keys_irq.delivered = false;
-	printf("buttons: interrupts on: %u taken while setting up; the net is %u ms until one brings an edge, then %u ms\n",
-	    keys_irq.count, POLL_MS, KEYS_NET_MS);
+	/* set as asked (read back): the slow net from the start; else the fast one until an edge has come */
+	keys_irq.delivered = ok;
+	printf("buttons: interrupts on: %u taken while setting up; the net is %u ms%s\n", keys_irq.count,
+	    ok ? KEYS_NET_MS : POLL_MS, ok ? "" : " until one brings an edge");
 }
 
 /*
@@ -871,8 +874,12 @@ keys_wait(void)
 	uint8_t pon_bits, pin_bits;
 	bool rang;
 
-	assert_wait_timeout((event_t)&keys_irq.rang, THREAD_UNINT,
-	    keys_irq.delivered ? KEYS_NET_MS : hakios_screen_off() ? 3 * POLL_MS : POLL_MS, NSEC_PER_MSEC);
+	if (keys_irq.delivered) {
+		(void)hakios_assert_wait_net((event_t)&keys_irq.rang, KEYS_NET_MS);
+	} else {
+		assert_wait_timeout((event_t)&keys_irq.rang, THREAD_UNINT, hakios_screen_off() ? 3 * POLL_MS : POLL_MS,
+		    NSEC_PER_MSEC);
+	}
 	if (os_atomic_load(&keys_irq.rang, acquire) != 0) {
 		clear_wait(current_thread(), THREAD_AWAKENED);
 	} else {

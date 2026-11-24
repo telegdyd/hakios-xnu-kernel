@@ -9,9 +9,11 @@
  *            by hand, open drain, with the pull-ups of the TLMM
  *   chip     reset is GPIO20 (low = in reset), the attention line is GPIO21 (low = a message is waiting)
  *   report   a bit stream described by the chip's own "touch report config" (command 0x25), read once at start
- * The attention line's interrupt (TLMM GPIO21, level low, on the TLMM's summary line: GIC 240) wakes the thread, which
- * reads until the line is high again; a net of 1 s (10 ms, 50 ms with the screen off, until the line has delivered once).
+ * The attention line's interrupt (GPIO21 -> PDC pin 132 -> GIC 754, level low at the PDC) wakes the thread, which
+ * reads until the line is high again; a net of 1 s (10 ms, 50 ms with the screen off, until the line has delivered once, if the TLMM config did not
+ * read back as written).
  * touch_irq=0: the thread looks every 10 ms instead.
+ * touch_pdc=0: use the old TLMM summary interrupt (GIC 240); it cannot wake a collapsed CX domain.
  * With boot-arg touch_bus=2 the bytes go through the serial engine and the QUP's GPI DMA instead of the wires by hand
  * (see "the serial engine itself" below); touch_bus=1 only looks at that hardware and logs it.
  *
@@ -35,6 +37,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_line(const char *line);
 extern void hakios_screen_pause(uint32_t on_ms, uint32_t off_ms);
+extern wait_result_t hakios_assert_wait_net(event_t event, uint32_t ms);  /* psci_smp.c: a net, with leeway while the screen is off */
 extern bool hakios_screen_off(void);
 extern void thread_set_thread_name(thread_t thread, const char *name);
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
@@ -126,6 +129,32 @@ attention(void)
 #define TOUCH_INTID             240
 #define TOUCH_NET_MS            1000
 #define TOUCH_STORM             2000            /* in a second: the chip reports at some hundreds while touched */
+#define TOUCH_PDC_PHYS          0x0b220000UL
+#define TOUCH_PDC_PIN           132u            /* Linux v6.12 pinctrl-sm8450.c: { 21, 132 } */
+#define TOUCH_PDC_INTID         754u            /* stock pdc-ranges: pin 126 -> SPI 716; +6 +32 */
+#define TOUCH_PDC_BANK          (0x10 + 4 * (TOUCH_PDC_PIN / 32))
+#define TOUCH_PDC_BIT           (1u << (TOUCH_PDC_PIN % 32))
+#define TOUCH_PDC_CFG           (0x110 + 4 * TOUCH_PDC_PIN)
+#define TOUCH_PDC_VERSION       0x1000
+#define TOUCH_PDC_V3_2          0x30200u
+
+static vm_offset_t touch_pdc;
+static uint32_t touch_intid = TOUCH_INTID, touch_pdc_on;
+static uint32_t touch_pdc_old_cfg, touch_pdc_old_bank, touch_tlmm_old_cfg;
+static bool touch_quiescing;
+static uint32_t touch_bw_wait_ms(uint32_t usual);
+
+static uint32_t pdc_rd(unsigned offset) { return *(volatile uint32_t *)(touch_pdc + offset); }
+static void pdc_wr(unsigned offset, uint32_t value) { *(volatile uint32_t *)(touch_pdc + offset) = value; }
+
+/* Restore only our enable bit; other PDC clients can change the same bank. */
+static void touch_pdc_restore(void)
+{
+	if (touch_pdc == 0) return;
+	pdc_wr(TOUCH_PDC_CFG, touch_pdc_old_cfg);
+	if (pdc_rd(TOUCH_PDC_VERSION) < TOUCH_PDC_V3_2)
+		pdc_wr(TOUCH_PDC_BANK, (pdc_rd(TOUCH_PDC_BANK) & ~TOUCH_PDC_BIT) | (touch_pdc_old_bank & TOUCH_PDC_BIT));
+}
 
 static struct {
 	bool            on, delivered;
@@ -135,6 +164,10 @@ static struct {
 } touch_irq;
 
 SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_pdc_on, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_pdc_on, 0,
+    "touch attention delivered directly through PDC pin 132");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_intid, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_intid, 0,
+    "GIC interrupt used by the touch attention line");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_irq_count, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_irq.count, 0,
     "the touch attention line's interrupts taken");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_irq_foreign, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_irq.foreign, 0,
@@ -165,11 +198,49 @@ static void
 touch_irq_start(void)
 {
 	uint32_t wanted = 1, old = rd(PIN_ATTN + INTR_CFG), cfg;
+	uint32_t use_pdc = 1;
 
 	PE_parse_boot_argn("touch_irq", &wanted, sizeof(wanted));
 	if (!wanted) {
 		printf("s3908: no interrupt (touch_irq=0)\n");
 		return;
+	}
+	touch_tlmm_old_cfg = old;
+	PE_parse_boot_argn("touch_pdc", &use_pdc, sizeof(use_pdc));
+	if (use_pdc) {
+		touch_pdc = ml_io_map(TOUCH_PDC_PHYS, 0x2000);
+		if (touch_pdc != 0) {
+			uint32_t version = pdc_rd(TOUCH_PDC_VERSION);
+			touch_pdc_old_cfg = pdc_rd(TOUCH_PDC_CFG);
+			touch_pdc_old_bank = pdc_rd(TOUCH_PDC_BANK);
+			/* PDC inverts level low to the GIC's level high. As Linux's skip_wake_irqs path,
+			 * disable the TLMM summary source: the PDC sees the GPIO independently. */
+			wr(PIN_ATTN + INTR_CFG, old & ~INTR_ENABLE);
+			wr(PIN_ATTN + INTR_STATUS, 0);
+			pdc_wr(TOUCH_PDC_CFG, version >= TOUCH_PDC_V3_2 ? 8u : 0u);
+			if (version < TOUCH_PDC_V3_2)
+				pdc_wr(TOUCH_PDC_BANK, touch_pdc_old_bank | TOUCH_PDC_BIT);
+			bool ready = (pdc_rd(TOUCH_PDC_CFG) & 0xfu) == (version >= TOUCH_PDC_V3_2 ? 8u : 0u) &&
+			    (version >= TOUCH_PDC_V3_2 || (pdc_rd(TOUCH_PDC_BANK) & TOUCH_PDC_BIT) != 0);
+			if (ready) {
+				nanoseconds_to_absolutetime(NSEC_PER_SEC, &touch_irq.second);
+				touch_intid = TOUCH_PDC_INTID;
+				touch_irq.on = true;
+				if (gic_v3_spi_attach(touch_intid, false, touch_irq_arrived, NULL) == KERN_SUCCESS) {
+					touch_pdc_on = 1;
+					touch_irq.delivered = true;
+					printf("s3908: PDC version %#x: GPIO21 -> pin %u -> GIC %u; config %#x -> %#x, bank 4 %#x -> %#x; TLMM %#x; net %u ms\n",
+					    version, TOUCH_PDC_PIN, touch_intid, touch_pdc_old_cfg, pdc_rd(TOUCH_PDC_CFG),
+					    touch_pdc_old_bank, pdc_rd(TOUCH_PDC_BANK), rd(PIN_ATTN + INTR_CFG), TOUCH_NET_MS);
+					return;
+				}
+				touch_irq.on = false;
+				touch_intid = TOUCH_INTID;
+			}
+			touch_pdc_restore();
+			wr(PIN_ATTN + INTR_CFG, old);
+		}
+		printf("s3908: PDC unavailable: using the TLMM summary line\n");
 	}
 	nanoseconds_to_absolutetime(NSEC_PER_SEC, &touch_irq.second);
 	cfg = (old & ~0xffu) | INTR_RAW_STATUS | INTR_TARGET_APPS;      /* level, low */
@@ -184,8 +255,11 @@ touch_irq_start(void)
 		printf("s3908: THE TLMM'S INTERRUPT (GIC %u) CANNOT BE TAKEN: looking every 10 ms\n", TOUCH_INTID);
 		return;
 	}
-	printf("s3908: interrupts: GPIO21 config %#x -> %#x, status %#x, attention %s; GIC %u\n", old, rd(PIN_ATTN + INTR_CFG),
-	    rd(PIN_ATTN + INTR_STATUS), attention() ? "high" : "low", TOUCH_INTID);
+	/* the config read back as written: the slow net from the start (else the fast one until the line has delivered) */
+	touch_irq.delivered = (rd(PIN_ATTN + INTR_CFG) & 0xffu) == ((cfg | INTR_ENABLE) & 0xffu);
+	printf("s3908: interrupts: GPIO21 config %#x -> %#x, status %#x, attention %s; GIC %u; net %u ms\n", old,
+	    rd(PIN_ATTN + INTR_CFG), rd(PIN_ATTN + INTR_STATUS), attention() ? "high" : "low", TOUCH_INTID,
+	    touch_irq.delivered ? TOUCH_NET_MS : 50);
 }
 
 /* Until the chip has something (or the net). */
@@ -193,6 +267,7 @@ static void
 touch_wait(void)
 {
 	uint32_t status;
+	uint32_t net_ms = touch_bw_wait_ms(touch_irq.delivered ? TOUCH_NET_MS : hakios_screen_off() ? 50 : 10);
 
 	static bool said;
 
@@ -207,9 +282,12 @@ touch_wait(void)
 	}
 	/* re-armed only now that what was waiting has been read: a line still low latches again and rings at once */
 	wr(PIN_ATTN + INTR_STATUS, 0);
-	gic_v3_spi_unmask(TOUCH_INTID);
-	assert_wait_timeout((event_t)&touch_irq.rang, THREAD_UNINT,
-	    touch_irq.delivered ? TOUCH_NET_MS : hakios_screen_off() ? 50 : 10, NSEC_PER_MSEC);
+	gic_v3_spi_unmask(touch_intid);
+	if (touch_irq.delivered) {
+		(void)hakios_assert_wait_net((event_t)&touch_irq.rang, net_ms);
+	} else {
+		assert_wait_timeout((event_t)&touch_irq.rang, THREAD_UNINT, net_ms, NSEC_PER_MSEC);
+	}
 	if (os_atomic_load(&touch_irq.rang, acquire) != 0) {
 		clear_wait(current_thread(), THREAD_AWAKENED);
 	} else {
@@ -220,12 +298,24 @@ touch_wait(void)
 		return;
 	}
 	status = rd(PIN_ATTN + INTR_STATUS);
-	if (status & 1) {
+	if (touch_pdc_on ? !attention() : (status & 1) != 0) {
 		touch_irq.by_line++;
 		touch_irq.delivered = true;
 	} else if (touch_irq.foreign++ < 8) {
 		printf("s3908: the TLMM's interrupt with GPIO21's status clear (another pin's)\n");
 	}
+}
+
+void
+hakios_s3908_quiesce(void)
+{
+	if (!touch_pdc_on) return;
+	touch_quiescing = true;
+	touch_irq.on = false;
+	gic_v3_spi_mask(touch_intid);
+	touch_pdc_restore();
+	wr(PIN_ATTN + INTR_CFG, touch_tlmm_old_cfg);
+	printf("s3908: PDC touch route restored for loader handover\n");
 }
 
 /* ---- I2C by hand: a line is let go (pulled high) or driven low, never driven high ----------------- */
@@ -650,99 +740,79 @@ bus_look(void)
  * The device tree's interconnects of qupv3_0_geni_se: qup-core, snoc-llcc, qup-ddr. In Linux's sm8450 interconnect
  * driver the QUP0 master (qhm_qup0) is on aggre2_noc, which reaches the system NoC through qnm_aggre2_noc (BCM SN3),
  * then the gem NoC through qns_gemnoc_sf (BCM SN0); its core clock is BCM QUP0. Memory itself (SH0, MC0) is on for
- * the processors already and is not touched. Through DRV 2's TCS 0, as hakios.adsp.c does on this phone.
+ * the processors already and is not touched. Voted through hakios_rpmh_bw() (hakios.cpufreq.c), before each transfer;
+ * released after touch_idle_ms (default 250) without a transfer, with the attention line high. No clock or GPI/SMMU
+ * state is changed. After a transfer error the votes stay held: DMA may not have stopped safely.
  */
-#define CMD_DB_PHYS             0x80860000UL
-#define CMD_DB_SIZE             0x20000UL
-#define RSC_PHYS_8450           0x17a20000UL    /* dt: rsc@17a00000, drv-id 2 */
-#define RSC_TCS_BASE            0xd00
-#define RSC_IRQ_STATUS          (RSC_TCS_BASE + 0x04)
-#define RSC_IRQ_CLEAR           (RSC_TCS_BASE + 0x08)
-#define RSC_TCS0                RSC_TCS_BASE
-#define TCS_WAIT_FOR_DONE       0x10
-#define TCS_CONTROL             0x14
-#define TCS_STATUS              0x18            /* not zero: idle */
-#define TCS_ENABLED             0x1c
-#define TCS_COMMAND0            0x30            /* message id, address, value, status */
-#define TCS_ACTIVE_MODE         (1u << 16)
-#define TCS_TRIGGER             (1u << 24)
-#define MSGID_WRITE_WAITED      (8u | 1u << 8 | 1u << 16)
-#define BCM_VOTE(y)             (1u << 30 | 1u << 29 | ((y) & 0x3fffu))   /* commit, valid, peak vote */
 
-extern lck_mtx_t hakios_rsc_lock;
-extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+static uint32_t touch_idle_ms = 250, touch_bw_on, touch_bw_gets, touch_bw_drops, touch_bw_errors;
+static uint32_t touch_idle_keep, touch_bw_keep_applied;
+static uint32_t touch_gpi_transfers, touch_gpi_errors;
+static bool touch_bw_fault;
+static uint64_t touch_bw_last;
 
-static uint32_t
-cmd_db_address(const char *name)
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_bw_on, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_bw_on, 0,
+    "touch QUP0/SN3/SN0 bandwidth votes held");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_idle_keep, CTLFLAG_RW | CTLFLAG_LOCKED, &touch_idle_keep, 0,
+    "diagnostic idle holds: bit 0 QUP0, bit 1 SN3, bit 2 SN0; default 0");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_bw_gets, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_bw_gets, 0,
+    "successful acquisitions of touch bandwidth votes");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_bw_drops, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_bw_drops, 0,
+    "successful releases of idle touch bandwidth votes");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_bw_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_bw_errors, 0,
+    "failed touch bandwidth vote updates");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_gpi_transfers, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_gpi_transfers, 0,
+    "touch GPI transfers attempted with bandwidth held");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, touch_gpi_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &touch_gpi_errors, 0,
+    "touch GPI transfer errors; idle release disabled after any error");
+
+/* All calls belong to the touch thread. The keeper serializes the actual TCS writes. */
+static bool
+touch_bw_set(bool on)
 {
-	static const uint8_t *db;
-	char id[8] = { 0 };
-
-	if (db == NULL) {
-		db = (const uint8_t *)ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);       /* memory, not registers */
+	uint32_t keep = touch_idle_keep & 7u;
+	uint32_t qup = on || (keep & 1u), sn3 = on || (keep & 2u), sn0 = on || (keep & 4u);
+	bool ok = hakios_rpmh_bw(HAKIOS_RPMH_TOUCH, "QUP0", 0, qup);
+	ok &= hakios_rpmh_bw(HAKIOS_RPMH_TOUCH, "SN3", sn3, sn3);
+	ok &= hakios_rpmh_bw(HAKIOS_RPMH_TOUCH, "SN0", sn0, sn0);
+	if (!ok) {
+		touch_bw_errors++;
+		touch_bw_fault = true;
 	}
-	if (db == NULL || !(db[4] == 0xdb && db[5] == 0x30 && db[6] == 0x03 && db[7] == 0x0c)) {
-		printf("s3908: gpi: no command database\n");
-		return 0;
-	}
-	strlcpy(id, name, sizeof(id));
-	for (unsigned s = 0; s < 8; s++) {
-		const uint8_t *slave = db + 8 + 16 * s;                 /* id, header offset, data offset, count, ... */
-		uint16_t slave_id = slave[0] | slave[1] << 8, header = slave[2] | slave[3] << 8, count = slave[6] | slave[7] << 8;
-		const uint8_t *data = db + 8 + 16 * 8 + 8;               /* after the slaves, the checksum and a word */
-
-		if (slave_id == 0 || count > 512) {
-			continue;
-		}
-		for (unsigned i = 0; i < count; i++) {
-			const uint8_t *entry = data + header + 24 * i;  /* id[8], priority[2], address, length, offset */
-
-			if (memcmp(entry, id, sizeof(id)) == 0) {
-				return entry[16] | entry[17] << 8 | entry[18] << 16 | (uint32_t)entry[19] << 24;
-			}
-		}
-	}
-	printf("s3908: gpi: the command database has no \"%s\"\n", name);
-	return 0;
+	if (ok && !on) touch_bw_keep_applied = keep;
+	return ok;
 }
 
 static bool
-bcm_vote(const char *name, uint32_t vote)
+touch_bw_get(void)
 {
-	static volatile uint8_t *rsc;
-	uint32_t address = cmd_db_address(name), done = 0;
+	if (!touch_bw_on) {
+		if (!touch_bw_set(true)) return false;
+		touch_bw_on = 1;
+		touch_bw_gets++;
+	}
+	touch_bw_last = mach_absolute_time();
+	return true;
+}
 
-	if (address == 0) {
-		return false;
+/* Use the existing thread wait for the one autosuspend deadline, not a new timer/poller. */
+static uint32_t
+touch_bw_wait_ms(uint32_t usual)
+{
+	uint64_t ns;
+	if (!gpi.on || !touch_idle_ms || touch_bw_fault || touch_quiescing || !attention()) return usual;
+	if (!touch_bw_on) {
+		if (touch_bw_keep_applied != (touch_idle_keep & 7u) && !touch_bw_set(false)) (void)touch_bw_get();
+		return usual;
 	}
-	if (rsc == NULL && (rsc = map(RSC_PHYS_8450, 0x10000)) == NULL) {
-		return false;
-	}
-	lck_mtx_lock(&hakios_rsc_lock);
-	if (r32(rsc, RSC_TCS0 + TCS_STATUS) == 0) {
-		lck_mtx_unlock(&hakios_rsc_lock);
-		printf("s3908: gpi: RPMh's TCS 0 is busy: %s not asked\n", name);
-		return false;
-	}
-	w32(rsc, RSC_IRQ_CLEAR, 1);
-	w32(rsc, RSC_TCS0 + TCS_COMMAND0, MSGID_WRITE_WAITED);
-	w32(rsc, RSC_TCS0 + TCS_COMMAND0 + 4, address);
-	w32(rsc, RSC_TCS0 + TCS_COMMAND0 + 8, BCM_VOTE(vote));
-	w32(rsc, RSC_TCS0 + TCS_WAIT_FOR_DONE, 1);
-	w32(rsc, RSC_TCS0 + TCS_ENABLED, 1);
-	barrier();
-	w32(rsc, RSC_TCS0 + TCS_CONTROL, r32(rsc, RSC_TCS0 + TCS_CONTROL) & ~TCS_TRIGGER);
-	w32(rsc, RSC_TCS0 + TCS_CONTROL, r32(rsc, RSC_TCS0 + TCS_CONTROL) | TCS_ACTIVE_MODE);
-	w32(rsc, RSC_TCS0 + TCS_CONTROL, r32(rsc, RSC_TCS0 + TCS_CONTROL) | TCS_TRIGGER);
-	for (unsigned i = 0; i < 2000 && !(done = r32(rsc, RSC_IRQ_STATUS) & 1); i++) {
-		delay_us(50);
-	}
-	w32(rsc, RSC_IRQ_CLEAR, 1);
-	w32(rsc, RSC_TCS0 + TCS_CONTROL, r32(rsc, RSC_TCS0 + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
-	w32(rsc, RSC_TCS0 + TCS_ENABLED, 0);
-	lck_mtx_unlock(&hakios_rsc_lock);
-	printf("s3908: gpi: RPMh: %s (%#x) = %#x: %s\n", name, address, BCM_VOTE(vote), done ? "done" : "NOT DONE");
-	return done != 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - touch_bw_last, &ns);
+	uint64_t limit = (uint64_t)touch_idle_ms * NSEC_PER_MSEC;
+	if (ns < limit) return MIN(usual, (uint32_t)((limit - ns + NSEC_PER_MSEC - 1) / NSEC_PER_MSEC));
+	/* Only reached between synchronous transfers, with nothing waiting at the chip. */
+	touch_bw_on = 0;
+	if (touch_bw_set(false)) touch_bw_drops++;
+	else (void)touch_bw_get();       /* restore a full vote after a partial failed drop; no more autosuspend */
+	return usual;
 }
 
 /* ---- touch_bus=2: the SMMU context for the GPI's stream ---- */
@@ -1101,6 +1171,8 @@ gpi_transfer(bool read, uint8_t *buffer, uint32_t length)
 	if (length == 0 || length > 0x2000) {
 		return -2;
 	}
+	if (!touch_bw_get()) return -22;       /* do not touch the DMA engine without all three votes */
+	touch_gpi_transfers++;
 	if (!read) {
 		for (uint32_t i = 0; i < length; i++) {
 			gpi.mem[M_BUF + i] = buffer[i];
@@ -1125,6 +1197,8 @@ gpi_transfer(bool read, uint8_t *buffer, uint32_t length)
 		}
 	}
 	if (rc != 0) {
+		touch_gpi_errors++;
+		touch_bw_fault = true;          /* uncertain DMA completion: keep bandwidth until reboot */
 		/* the engine's channels may now be in error: start them again (as Linux's terminate_all) */
 		if (gpi.restarts++ < 3 || gpi.restarts % 100 == 0) {
 			printf("s3908: gpi: %s of %u bytes: rc %d, last event %08x %08x %08x %08x, gpii error %#x, se m-irq %#x\n",
@@ -1139,6 +1213,7 @@ gpi_transfer(bool read, uint8_t *buffer, uint32_t length)
 			gpi_off("the GPII did not start again", again);
 		}
 	}
+	touch_bw_last = mach_absolute_time();  /* the quiet interval starts after completion/recovery */
 	return rc;
 }
 
@@ -1203,10 +1278,16 @@ gpi_on(void)
 	w32(gpi.se, SE_GENI_DMA_MODE_EN, 1);
 	w32(gpi.se, SE_GSI_EVENT_EN, r32(gpi.se, SE_GSI_EVENT_EN) | 0xfu);
 
-	/* the QUP's way to memory, as Android's interconnect votes (on in every run that worked; not tried without) */
-	bcm_vote("QUP0", 1);
-	bcm_vote("SN3", 0x3fff);
-	bcm_vote("SN0", 0x3fff);
+	/*
+	 * the QUP's way to memory, as Android's interconnect votes (on in every run that worked): geni-se asks a few kB/s
+	 * for its core, configuration and memory paths, which icc-bcm-voter rounds up to the least vote, 1 (it was 0x3fff
+	 * on SN0 and SN3, the most, never lowered). Through the vote keeper (hakios.cpufreq.c), summed with the others'.
+	 */
+	if (!touch_bw_get()) {
+		printf("s3908: gpi: cannot acquire bandwidth: using the wires by hand\n");
+		return false;
+	}
+	printf("s3908: gpi: RPMh: QUP0 0/1, SN3 1/1, SN0 1/1 through the vote keeper\n");
 	/*
 	 * GPII 0: the one the serial engine is bound to (dt: qcom,static-gpii-mask 0x1). Android's driver takes it for SE 4
 	 * ("gpi_of_dma_xlate: client req gpii:0 ... proto:3 SE:4", its ipc log, 2026-11-11); a GO from GPII 1 for SE 4
@@ -1589,6 +1670,9 @@ s3908_thread(__unused void *argument, __unused wait_result_t wait)
 		return;
 	}
 	PE_parse_boot_argn("touch_bus", &touch_bus, sizeof(touch_bus));
+	PE_parse_boot_argn("touch_idle_ms", &touch_idle_ms, sizeof(touch_idle_ms));
+	PE_parse_boot_argn("touch_idle_keep", &touch_idle_keep, sizeof(touch_idle_keep));
+	if (touch_idle_ms > 60000) touch_idle_ms = 60000;
 	if (touch_bus == 1) {
 		bus_look();
 	}
@@ -1626,6 +1710,11 @@ s3908_thread(__unused void *argument, __unused wait_result_t wait)
 	nanoseconds_to_absolutetime(5 * NSEC_PER_SEC, &five_s);
 	next_beat = mach_absolute_time() + five_s;
 	for (;;) {
+		if (touch_quiescing) {
+			assert_wait((event_t)&touch_quiescing, THREAD_UNINT);
+			(void)thread_block(THREAD_CONTINUE_NULL);
+			continue;
+		}
 		for (unsigned n = 0; n < 4 && !attention(); n++) {
 			uint64_t start = mach_absolute_time(), ns;
 			int rc = tcm_read_message();

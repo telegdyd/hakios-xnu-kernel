@@ -232,7 +232,7 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, cpus_up, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG
     cpusUpSysctl, "QU", "the processors that are up now, a bit per processor number");
 
 /* kern.hakios.wakes: interrupts per processor and context switches per kernel thread, as text (psci_smp.c) */
-#define WAKES_TEXT      32768
+#define WAKES_TEXT      196608  /* (with the wake diagnostics: under the 256 KB the readers ask with) */
 
 static int
 wakesSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)

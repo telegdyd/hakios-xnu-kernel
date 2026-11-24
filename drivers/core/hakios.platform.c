@@ -40,6 +40,7 @@ static LCK_GRP_DECLARE(hakios_platform_lock_group, "hakios-platform");
 extern void loader_request_return(int mode) __attribute__((weak));
 extern void hakios_adsp_stop(void) __attribute__((weak));
 extern void hakios_buttons_quiesce(void) __attribute__((weak));
+extern void hakios_s3908_quiesce(void) __attribute__((weak));
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
 /*
@@ -252,6 +253,9 @@ hakios_loader_request_sysctl(struct sysctl_oid *oidp, __unused void *arg1, __unu
 		if (error != 0) {
 			return error;
 		}
+	}
+	if ((mode == 1 || mode == 2 || mode == 3) && hakios_s3908_quiesce != NULL) {
+		hakios_s3908_quiesce();
 	}
 	if ((mode == 1 || mode == 2 || mode == 3) && hakios_buttons_quiesce != NULL) {
 		hakios_buttons_quiesce();       /* (the keys' PMIC interrupts as the firmware left them: off) */

@@ -3644,6 +3644,17 @@ gpu_block_suspend(bool runtime)
 		get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
 		cx_off = !cx_is_on();
 	}
+	/*
+	 * In slumber, the GPU's three GCC bus clocks and its vote for GPLL0's 300 MHz tap off too, as a6xx_gmu_suspend's
+	 * clk_bulk_disable: left on, gpu_memnoc_gfx ran with the GPU collapsed and kept CX up through the SoC's sleep
+	 * (POWER-COLLAPSE-PLAN.md 5e). step_clocks() turns them on again at the resume.
+	 */
+	if (runtime && cx_off) {
+		put(&gcc, "gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR, rd(gcc.base + GCC_GPU_MEMNOC_GFX_CBCR) & ~CBCR_ENABLE);
+		put(&gcc, "gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX_CBCR, rd(gcc.base + GCC_GPU_SNOC_DVM_GFX_CBCR) & ~CBCR_ENABLE);
+		put(&gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR, rd(gcc.base + GCC_DDRSS_GPU_AXI_CBCR) & ~CBCR_ENABLE);
+		put(&gcc, "pll votes", GCC_PLL_VOTE, rd(gcc.base + GCC_PLL_VOTE) & ~GCC_PLL_VOTE_GPU_DIV);
+	}
 	core_runs = false;
 	return ok && cx_off && !(rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON);
 }

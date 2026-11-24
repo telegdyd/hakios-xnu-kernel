@@ -752,7 +752,7 @@ mailbox_open(void)
 
 /* A message to the always-on processor (Linux's qmp_send()), under the lock the Wi-Fi's start takes too. */
 static bool
-mailbox_send(const char *text)
+mailbox_say(const char *text, bool quiet)
 {
 	uint32_t words[QMP_MESSAGE / 4] = { 0 };
 	bool sent = false;
@@ -764,8 +764,10 @@ mailbox_send(const char *text)
 		goto out;
 	}
 	strlcpy((char *)words, text, sizeof(words));
-	printf("adsp: %u: about to tell the always-on processor \"%s\"\n", step, text);
-	snprintf(last_write, sizeof(last_write), "step %u sent the always-on processor a message", step);
+	if (!quiet) {
+		printf("adsp: %u: about to tell the always-on processor \"%s\"\n", step, text);
+		snprintf(last_write, sizeof(last_write), "step %u sent the always-on processor a message", step);
+	}
 	if (rd(aoss.base + our_box) != 0) {
 		printf("adsp: %u: our mailbox still holds a message of %u bytes: not sent\n", step, rd(aoss.base + our_box));
 		goto out;
@@ -781,13 +783,31 @@ mailbox_send(const char *text)
 		wr(aoss.base + our_box, 0);
 		goto out;
 	}
-	printf("adsp: %u: the always-on processor has taken it\n", step);
+	if (!quiet) {
+		printf("adsp: %u: the always-on processor has taken it\n", step);
+	}
 	sent = true;
 out:
 	if (!leaving) {
 		lck_mtx_unlock(&hakios_aop_mailbox_lock);
 	}
 	return sent;
+}
+
+static bool
+mailbox_send(const char *text)
+{
+	return mailbox_say(text, false);
+}
+
+/*
+ * For others in the kernel (hakios.cpufreq.c's RPMh statistics: "{class: ddr, action: freqsync}" and the like): a
+ * message of at most 63 characters to the always-on processor, without log lines. 8450 only (the mailbox's address).
+ */
+bool
+hakios_aop_message(const char *text)
+{
+	return adsp_soc == 8450 && !leaving && mailbox_say(text, true);
 }
 
 /* ---- RPMh: the DSP's two rails, asked for while it boots ------------------------------------------------ */
@@ -900,7 +920,17 @@ rail_position(const char *name, uint32_t level, uint32_t *address)
 	return -1;
 }
 
-/* The two rails at that level (Linux's proxy request), or given back (level 0). True: RPMh has said done. */
+static LCK_MTX_DECLARE(dsp_lock, &adsp_lock_group);
+/* Includes requests whose completion is uncertain; cleared only by an acknowledged release. */
+static bool rails_asked;
+static struct {
+	uint32_t attempts, submitted, completed, failures, release_failures;
+	uint32_t requested, acknowledged, ack_valid, uncertain, error;
+	uint32_t address[2], value[2], status[2], irq, tcs;
+} rail_trace;
+
+/* The two rails at that level (Linux's proxy request), or given back (level 0).
+ * Called under dsp_lock, except the existing lock-free panic handover. */
 static bool
 rails(uint32_t level)
 {
@@ -908,6 +938,9 @@ rails(uint32_t level)
 	uint32_t addresses[2] = { 0, 0 }, values[2] = { 0, 0 }, done = 0;
 	uint64_t began;
 
+	rail_trace.attempts++;
+	rail_trace.requested = level;
+	rail_trace.error = 0;
 	for (unsigned r = 0; r < 2; r++) {
 		int position = level == 0 ? 0 : rail_position(names[r], level, &addresses[r]);
 
@@ -916,6 +949,9 @@ rails(uint32_t level)
 		}
 		if (position < 0 || addresses[r] == 0) {
 			printf("adsp: %u: no position for %s at level %u: the rails are not asked\n", step, names[r], level);
+			rail_trace.error = ENXIO;
+			rail_trace.failures++;
+			rail_trace.release_failures += level == 0;
 			return false;
 		}
 		values[r] = (uint32_t)position;
@@ -932,6 +968,9 @@ rails(uint32_t level)
 		if (!leaving) {
 			lck_mtx_unlock(&hakios_rsc_lock);
 		}
+		rail_trace.error = EBUSY;
+		rail_trace.failures++;
+		rail_trace.release_failures += level == 0;
 		return false;
 	}
 	printf("adsp: %u: about to ask RPMh, through TCS %u, for lcx.lvl (%#x) = %u and lmx.lvl (%#x) = %u (level %u%s)\n", step,
@@ -949,6 +988,15 @@ rails(uint32_t level)
 	settle();
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~TCS_TRIGGER);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
+	/* A timed-out acquisition can already have reached RPMh. Keep ownership
+	 * until a later release is positively acknowledged. */
+	rails_asked = true;
+	rail_trace.uncertain = 1;
+	rail_trace.submitted++;
+	for (unsigned r = 0; r < 2; r++) {
+		rail_trace.address[r] = addresses[r];
+		rail_trace.value[r] = values[r];
+	}
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_TRIGGER);
 	began = now_us();
 	while (now_us() - began < 100000) {
@@ -958,16 +1006,37 @@ rails(uint32_t level)
 		}
 		sleep_us(50);
 	}
-	printf("adsp: %u: RPMh %s after %llu us; the commands' status %#x %#x, the TCS's %#x\n", step, done ? "HAS DONE IT" :
-	    "HAS NOT SAID DONE", now_us() - began, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(0) + 12),
-	    rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(1) + 12), rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS));
+	rail_trace.irq = done;
+	rail_trace.tcs = rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS);
+	for (unsigned r = 0; r < 2; r++) {
+		rail_trace.status[r] = rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(r) + 12);
+	}
+	bool complete = done != 0;
+	for (unsigned r = 0; r < 2; r++) {
+		/* Same waited-response completion check as the PCIe RPMh sender. */
+		complete &= rail_trace.status[r] != ~0u && (rail_trace.status[r] & 0x10100u) == 0x10100u;
+	}
+	if (complete) {
+		rail_trace.completed++;
+		rail_trace.ack_valid = 1;
+		rail_trace.acknowledged = level;
+		rail_trace.uncertain = 0;
+		rails_asked = level != 0;
+	} else {
+		rail_trace.error = done ? EIO : ETIMEDOUT;
+		rail_trace.failures++;
+		rail_trace.release_failures += level == 0;
+	}
+	printf("adsp: %u: RPMh %s after %llu us; commands %#x %#x, TCS %#x; owned %u uncertain %u error %u\n", step,
+	    complete ? "ACKNOWLEDGED" : "NOT ACKNOWLEDGED", now_us() - began, rail_trace.status[0], rail_trace.status[1],
+	    rail_trace.tcs, rails_asked, rail_trace.uncertain, rail_trace.error);
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
 	if (!leaving) {
 		lck_mtx_unlock(&hakios_rsc_lock);
 	}
-	return done != 0;
+	return complete;
 }
 
 /* ---- step 1: the shared memory --------------------------------------------------------------------- */
@@ -1276,8 +1345,6 @@ step_mailbox(void)
 #define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)
 #define SCM_INTERRUPTED         1
 
-static LCK_MTX_DECLARE(dsp_lock, &adsp_lock_group);     /* the DSP being started or stopped */
-static bool rails_asked;                /* our request for its rails stands (until it asks for its own, or is shut down) */
 static bool dsp_started;
 static bool stopped_by_its_word;
 static uint32_t our_item;
@@ -1453,7 +1520,6 @@ dsp_shutdown(const char *why)
 	mailbox_send("{class: image, res: load_state, name: adsp, val: off}");
 	if (rails_asked) {
 		rails(0);
-		rails_asked = false;
 	}
 	return true;
 }
@@ -1749,10 +1815,8 @@ step_start(void)
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
-	rails_asked = true;
 	if (!mailbox_send("{class: image, res: load_state, name: adsp, val: on}")) {
 		rails(0);
-		rails_asked = false;
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
@@ -1765,7 +1829,6 @@ step_start(void)
 		    answer);
 		mailbox_send("{class: image, res: load_state, name: adsp, val: off}");
 		rails(0);
-		rails_asked = false;
 		lck_mtx_unlock(&dsp_lock);
 		return false;
 	}
@@ -1801,12 +1864,11 @@ step_start(void)
 			}
 			if ((state & DSP_HANDOVER) && !handed_over) {
 				handed_over = true;
-				printf("adsp: %u: the DSP says it has asked for its own power (bit 2), %llu.%03llu ms after the start: ours is "
-				    "given back\n", step, (now - started) / 1000, (now - started) % 1000);
+				printf("adsp: %u: the DSP says it has asked for its own power (bit 2), %llu.%03llu ms after the start: releasing "
+				    "our proxy request\n", step, (now - started) / 1000, (now - started) % 1000);
 				lck_mtx_lock(&dsp_lock);
 				if (rails_asked) {
 					rails(0);
-					rails_asked = false;
 				}
 				lck_mtx_unlock(&dsp_lock);
 			}
@@ -1891,7 +1953,7 @@ struct glink_packet {
  * carries APR, the audio services' own protocol (below; Android's apr_tal_rpmsg.c asks for no
  * particular intents: what the DSP sends there is a few hundred bytes, up to a few kilobytes).
  */
-enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNELS };
+enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNEL_PCIE, CHANNELS };
 
 struct glink_channel {
 	const char *name;
@@ -1931,8 +1993,109 @@ static struct {
 		[CHANNEL_APR] = { .name = "apr_audio_svc", .ours = 2, .intents = { { 0x200, 8 }, { 0x1000, 4 }, { 0x2000, 2 } } },
 		/* the battery manager's (battmgr below): answers of a few dozen bytes, a name of 128 */
 		[CHANNEL_PMIC] = { .name = "PMIC_RTR_ADSP_APPS", .ours = 3, .intents = { { 0x200, 6 }, { 0x1000, 2 }, { 0, 0 } } },
+		/* PCIe DRV (the vendor's pci-msm.c "pcie_drv" rpmsg): the DSP keeps RC0's link in L1ss for us while APSS sleeps;
+		 * its answers are 28-byte ACKs */
+		[CHANNEL_PCIE] = { .name = "pcie_drv", .ours = 4, .intents = { { 0x40, 4 }, { 0, 0 }, { 0, 0 } } },
 	},
 };
+
+/*
+ * PCIe DRV (pci-msm.c msm_pcie_drv_send_rpmsg): a 24-byte header (version 1.0, msg_id 0xc command, seq, payload 16,
+ * dev_id = RC index) and four words (command, dev_id, argument, 0); the DSP answers msg_id 0xa with our seq as its
+ * reply_seq and a status word, 0 for done. One command at a time, up to 1 s for its answer.
+ */
+struct __attribute__((packed)) pcie_drv_header {
+	uint16_t major, minor, msg_id, seq, reply_seq, payload_size;
+	uint32_t dev_id;
+	uint8_t reserved[8];
+};
+static struct {
+	volatile uint32_t acks;
+	volatile uint16_t reply_seq;
+	volatile uint32_t status;
+	uint16_t seq;
+	uint32_t sent, timeouts, refused, odd;
+} pcie_drv;
+static LCK_GRP_DECLARE(pcie_drv_group, "hakios-pcie-drv");
+static LCK_MTX_DECLARE(pcie_drv_lock, &pcie_drv_group);
+static void
+pcie_drv_input(const uint8_t *data, uint32_t length)
+{
+	struct pcie_drv_header h;
+	uint32_t status;
+
+	if (length < sizeof(h) + 4) { pcie_drv.odd++; return; }
+	memcpy(&h, data, sizeof(h));
+	if (h.msg_id != 0xa || h.payload_size != 4) { pcie_drv.odd++; return; }
+	memcpy(&status, data + sizeof(h), 4);
+	pcie_drv.status = status;
+	pcie_drv.reply_seq = h.reply_seq;
+	os_atomic_inc(&pcie_drv.acks, release);
+	thread_wakeup((event_t)&pcie_drv.acks);
+}
+static int glink_send(struct glink_channel *channel, const void *data, uint32_t length);
+int hakios_adsp_pcie_drv(uint32_t command, uint32_t argument);
+int
+hakios_adsp_pcie_drv(uint32_t command, uint32_t argument)
+{
+	struct __attribute__((packed)) { struct pcie_drv_header h; uint32_t word[4]; } m;
+	uint32_t before;
+	uint64_t deadline;
+	int error = 0;
+
+	lck_mtx_lock(&pcie_drv_lock);
+	if (!glink.up || !glink.channel[CHANNEL_PCIE].open) {
+		lck_mtx_unlock(&pcie_drv_lock);
+		return ENXIO;
+	}
+	bzero(&m, sizeof(m));
+	m.h.major = 1; m.h.minor = 0; m.h.msg_id = 0xc; m.h.seq = pcie_drv.seq++; m.h.payload_size = 16; m.h.dev_id = 0;
+	if (pcie_drv.seq == 0xffff) pcie_drv.seq = 0;
+	m.word[0] = command; m.word[1] = 0; m.word[2] = argument;
+	before = os_atomic_load(&pcie_drv.acks, acquire);
+	if (glink_send(&glink.channel[CHANNEL_PCIE], &m, sizeof(m)) != 0) {
+		lck_mtx_unlock(&pcie_drv_lock);
+		return EIO;
+	}
+	pcie_drv.sent++;
+	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+	while (os_atomic_load(&pcie_drv.acks, acquire) == before) {
+		assert_wait_deadline((event_t)&pcie_drv.acks, THREAD_UNINT, deadline);
+		if (os_atomic_load(&pcie_drv.acks, acquire) != before) { clear_wait(current_thread(), THREAD_AWAKENED); break; }
+		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT && os_atomic_load(&pcie_drv.acks, acquire) == before) {
+			error = ETIMEDOUT;
+			break;
+		}
+	}
+	if (error) pcie_drv.timeouts++;
+	else if (pcie_drv.reply_seq != m.h.seq || pcie_drv.status != 0) { pcie_drv.refused++; error = EIO; }
+	lck_mtx_unlock(&pcie_drv_lock);
+	return error;
+}
+static int
+sysctl_pcie_drv SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	char text[200];
+	snprintf(text, sizeof(text), "channel %s; sent %u acks %u timeouts %u refused %u odd %u last status %u",
+	    glink.channel[CHANNEL_PCIE].open ? "open" : "NOT OPEN", pcie_drv.sent, pcie_drv.acks, pcie_drv.timeouts, pcie_drv.refused,
+	    pcie_drv.odd, pcie_drv.status);
+	return sysctl_handle_string(oidp, text, 0, req);
+}
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, pcie_drv, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_pcie_drv, "A",
+    "the audio DSP's PCIe DRV channel: commands and answers");
+
+/*
+ * What the DSP sends, counted (kern.hakios.adsp_power): its doorbell rang cpu0 out of idle 1.2 times a second with the
+ * screen off and CX collapse at 80%, the DSP's own CX vote in a fifth of the CX monitor's lines (run26). By GLINK
+ * command, by channel (whole packets), and QRTR's by sender and type.
+ */
+static uint32_t rx_kind[16], rx_channel[8], rx_qrtr_lost;
+static struct {
+	uint16_t node, port;
+	uint32_t type, n;
+} rx_qrtr[24];
 
 static struct glink_channel *
 glink_theirs(uint32_t theirs)
@@ -2137,6 +2300,7 @@ glink_pump(void)
 			return;
 		}
 		glink.heard++;
+		rx_kind[message.command & 15]++;
 		if (glink.trace > 0 && message.command != GLINK_DATA && message.command != GLINK_DATA_MORE &&
 		    message.command != GLINK_INTENT && message.command != GLINK_DONE_REUSE) {
 			glink.trace--;
@@ -2298,6 +2462,7 @@ glink_pump(void)
 					channel->last = packet;
 				}
 				channel->our_intents[intent].fill = 0;
+				rx_channel[(unsigned)(channel - glink.channel) & 7]++;
 				glink_say(GLINK_DONE_REUSE, channel->ours, message.param2, NULL, 0);
 			}
 			break;
@@ -2432,6 +2597,7 @@ enum { QRTR_DATA = 1, QRTR_HELLO = 2, QRTR_BYE = 3, QRTR_NEW_SERVER = 4, QRTR_DE
 struct qrtr_header {
 	uint32_t version, type, from_node, from_port, confirm, size, to_node, to_port;
 };
+
 struct qrtr_control {
 	uint32_t command;
 	uint32_t words[4];
@@ -2550,6 +2716,25 @@ qrtr_input(const uint8_t *data, uint32_t length)
 	} else {
 		printf("adsp: qrtr: %u bytes that are no datagram (they begin %#x)\n", length, length ? data[0] : 0);
 		return;
+	}
+	{
+		unsigned i;
+
+		for (i = 0; i < sizeof(rx_qrtr) / sizeof(rx_qrtr[0]); i++) {
+			if (rx_qrtr[i].n == 0) {
+				rx_qrtr[i].node = (uint16_t)header.from_node;
+				rx_qrtr[i].port = (uint16_t)header.from_port;
+				rx_qrtr[i].type = header.type;
+			}
+			if (rx_qrtr[i].node == (uint16_t)header.from_node && rx_qrtr[i].port == (uint16_t)header.from_port &&
+			    rx_qrtr[i].type == header.type) {
+				rx_qrtr[i].n++;
+				break;
+			}
+		}
+		if (i == sizeof(rx_qrtr) / sizeof(rx_qrtr[0])) {
+			rx_qrtr_lost++;
+		}
 	}
 	/* (the datagram's size is the DSP's word: "at + size" could wrap in 32 bits and pass, so it is compared as a difference) */
 	if (header.size == 0 || at > length || header.size > length - at) {
@@ -3021,6 +3206,14 @@ static uint32_t batt_shift = 1;         /* 0 on SM8450 (adsp_soc_8450()) */
 #define BATT_CHG_CTRL_LIM       10              /* uA: the battery's charge current limit (FCC) */
 #define BATT_CHG_EN             24              /* the 10 Pro's firmware (OPLUS): 1 charging allowed */
 #define BATTMGR_SECONDS         10
+/*
+ * With the screen off: a round every battmgr_off_seconds (kern.hakios.battmgr_off_seconds; default BATTMGR_SECONDS),
+ * up to half as long again with another wake. A round is 8 to 11 questions, each answer a doorbell and a wake of the
+ * DSP, its CX vote with it: the battery manager was all the DSP said in steady state, 65 packets a minute (run32), and
+ * the DSP held CX in a fifth of the CX monitor's lines (run26). A notice still starts a round at once.
+ */
+static uint32_t battmgr_off_seconds = BATTMGR_SECONDS;
+extern bool hakios_screen_off(void);
 
 /*
  * Charging on the 10 Pro (adsp_soc=8450, battmgr_charge=0: not). The charger PD keeps its input limit at about 1 A
@@ -3043,8 +3236,16 @@ static struct {
 	volatile uint32_t answers, notices;
 	uint32_t opcode, property, value, result, length;
 	bool wanted;
-	volatile bool runs;
+	volatile bool runs, kick;               /* kick: a notice came; a round now (at most one a second) */
 } battmgr;
+static uint32_t battmgr_notice_count, battmgr_kick_count;
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, battmgr_notices, CTLFLAG_RD | CTLFLAG_LOCKED, &battmgr_notice_count, 0,
+    "the DSP battery manager's notices (opcode 7: a property changed)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, battmgr_off_seconds, CTLFLAG_RW | CTLFLAG_LOCKED, &battmgr_off_seconds, 0,
+    "seconds between the battery manager's rounds while the screen is off (2-600; the default 10)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, battmgr_kicks, CTLFLAG_RD | CTLFLAG_LOCKED, &battmgr_kick_count, 0,
+    "rounds asked for at once by a notice, not after the 10 s wait");
 
 static void
 battmgr_input(const uint8_t *data, uint32_t length)
@@ -3063,6 +3264,11 @@ battmgr_input(const uint8_t *data, uint32_t length)
 			tell("adsp: battmgr: < a notice, opcode %#x, %u bytes (%#x %#x %#x)\n", m.opcode, length, m.words[0], m.words[1],
 			    m.words[2]);
 		}
+		/* (as Linux's qcom_battmgr on BATTMGR_NOTIFICATION: the properties read again now, so a plug-in or an unplug
+		 * reaches the charger flag, and the USB driver's park, at once instead of up to 10 s later) */
+		battmgr_notice_count++;
+		battmgr.kick = true;
+		thread_wakeup((event_t)&battmgr.wanted);
 		return;
 	}
 	battmgr.opcode = m.opcode;
@@ -3071,6 +3277,7 @@ battmgr_input(const uint8_t *data, uint32_t length)
 	battmgr.result = m.words[2];
 	battmgr.length = length;
 	os_atomic_inc(&battmgr.answers, release);
+	thread_wakeup((event_t)&battmgr.answers);
 }
 
 /*
@@ -3082,26 +3289,35 @@ battmgr_get(uint32_t opcode, uint32_t property, uint32_t *value)
 {
 	bool set = opcode == BATTMGR_USB_SET || opcode == BATTMGR_BATTERY_SET;
 	struct battmgr_message q = { BATTMGR_OWNER, BATTMGR_REQUEST, opcode, { 0, property, set ? *value : 0 } };
-	uint32_t before = os_atomic_load(&battmgr.answers, acquire);
+	uint32_t before = os_atomic_load(&battmgr.answers, acquire), answers;
+	uint64_t deadline;
 
 	if (glink_send(&glink.channel[CHANNEL_PMIC], &q, sizeof(q)) != 0) {
 		return false;
 	}
-	for (unsigned ms = 0; ms < 1000; ms++) {
-		if (os_atomic_load(&battmgr.answers, acquire) != before) {
-			if (battmgr.opcode != opcode || battmgr.property != property || battmgr.length < sizeof(struct battmgr_message)) {
-				before = battmgr.answers;       /* (somebody else's answer: wait on) */
-				continue;
-			}
-			if (battmgr.result != 0) {
+	/* woken by the answer (battmgr_received()), not 1 ms looks: those were ~27 wakes a second (llcc-diag) */
+	clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+	for (;;) {
+		assert_wait_deadline((event_t)&battmgr.answers, THREAD_UNINT, deadline);
+		answers = os_atomic_load(&battmgr.answers, acquire);
+		if (answers == before) {
+			if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT &&
+			    os_atomic_load(&battmgr.answers, acquire) == before) {
 				return false;
 			}
-			*value = battmgr.value;
-			return true;
+			continue;
 		}
-		sleep_ms(1);
+		clear_wait(current_thread(), THREAD_AWAKENED);
+		if (battmgr.opcode != opcode || battmgr.property != property || battmgr.length < sizeof(struct battmgr_message)) {
+			before = answers;       /* (somebody else's answer: wait on, until the same deadline) */
+			continue;
+		}
+		if (battmgr.result != 0) {
+			return false;
+		}
+		*value = battmgr.value;
+		return true;
 	}
-	return false;
 }
 
 /*
@@ -3267,6 +3483,7 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 	for (unsigned round = 0; battmgr.wanted && glink.up && glink.channel[CHANNEL_PMIC].open; round++) {
+		uint64_t round_at = mach_absolute_time();
 		struct hakios_battery_state b = { .size = sizeof(b) };
 		uint32_t capacity = 0, status = 0, present = 0, volt = 0, curr = 0, temp = 0, usb = 0;
 		uint32_t usb_type = 0, usb_volt = 0, usb_curr = 0, charge = 0;
@@ -3340,13 +3557,32 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 				tell("adsp: battmgr: full charge %u uAh, as designed %u uAh, %u cycles\n", full, design, cycles);
 			}
 		}
-		/* (one wait, not 50 ms steps: battmgr_stop() ends it at once) */
+		/* (one wait, not 50 ms steps: battmgr_stop() ends it at once; a notice ends it too, kick) */
 		if (battmgr.wanted && glink.up) {
-			assert_wait_timeout((event_t)&battmgr.wanted, THREAD_UNINT, BATTMGR_SECONDS * 1000, NSEC_PER_MSEC);
-			if (!battmgr.wanted) {
+			uint32_t wait_s = hakios_screen_off() && battmgr_off_seconds >= 2 && battmgr_off_seconds <= 600 ?
+			    battmgr_off_seconds : BATTMGR_SECONDS;
+
+			if (wait_s > BATTMGR_SECONDS) {
+				assert_wait_timeout_with_leeway((event_t)&battmgr.wanted, THREAD_UNINT, TIMEOUT_URGENCY_LEEWAY,
+				    wait_s * 1000, wait_s * 500, NSEC_PER_MSEC);
+			} else {
+				assert_wait_timeout((event_t)&battmgr.wanted, THREAD_UNINT, wait_s * 1000, NSEC_PER_MSEC);
+			}
+			if (!battmgr.wanted || battmgr.kick) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
 			} else {
 				(void)thread_block(THREAD_CONTINUE_NULL);
+			}
+			if (battmgr.kick) {
+				uint64_t ns;
+
+				battmgr.kick = false;
+				battmgr_kick_count++;
+				absolutetime_to_nanoseconds(mach_absolute_time() - round_at, &ns);
+				if (ns < NSEC_PER_SEC) {
+					/* (notices come in bursts: one round for each, a second apart at most) */
+					delay_for_interval((uint32_t)((NSEC_PER_SEC - ns) / NSEC_PER_MSEC) + 1, NSEC_PER_MSEC);
+				}
 			}
 		}
 	}
@@ -3413,6 +3649,7 @@ extern void gic_v3_spi_unmask(uint32_t intid);
 extern void gic_v3_spi_detach(uint32_t intid);
 extern bool hakios_screen_off(void);
 extern void hakios_screen_pause(uint32_t on_ms, uint32_t off_ms);
+extern wait_result_t hakios_assert_wait_net(event_t event, uint32_t ms);  /* psci_smp.c: a net, with leeway while the screen is off */
 
 static struct {
 	bool attached, given_up, foreign_now;
@@ -3422,6 +3659,48 @@ static struct {
 } link_irq;
 
 SYSCTL_DECL(_kern_hakios);
+/* Cached transaction evidence only: reading this never contacts RPMh or the DSP. */
+static int
+adsp_power_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	char text[2048];
+	int at;
+	lck_mtx_lock(&dsp_lock);
+	at = snprintf(text, sizeof(text),
+	    "owner adsp-proxy owned %u uncertain %u requested_level %u ack_valid %u acknowledged_level %u "
+	    "attempts %u submitted %u completed %u failures %u release_failures %u error %u\n"
+	    "last_submitted lcx.lvl %#x = %#x status %#x; lmx.lvl %#x = %#x status %#x; irq %#x tcs %#x\n"
+	    "scope APSS proxy only; DSP-owned requests are separate\n",
+	    rails_asked, rail_trace.uncertain, rail_trace.requested, rail_trace.ack_valid, rail_trace.acknowledged,
+	    rail_trace.attempts, rail_trace.submitted, rail_trace.completed, rail_trace.failures, rail_trace.release_failures,
+	    rail_trace.error, rail_trace.address[0], rail_trace.value[0], rail_trace.status[0], rail_trace.address[1],
+	    rail_trace.value[1], rail_trace.status[1], rail_trace.irq, rail_trace.tcs);
+	lck_mtx_unlock(&dsp_lock);
+	/* what the DSP sent: GLINK commands by number, whole packets by channel, QRTR by node:port type */
+	at += snprintf(text + at, sizeof(text) - at, "rx glink");
+	for (unsigned k = 0; k < 16 && at < (int)sizeof(text); k++) {
+		if (rx_kind[k] != 0) {
+			at += snprintf(text + at, sizeof(text) - at, " %u:%u", k, rx_kind[k]);
+		}
+	}
+	for (unsigned c = 0; c < CHANNELS && c < 8 && at < (int)sizeof(text); c++) {
+		at += snprintf(text + at, sizeof(text) - at, "%s %s %u", c ? "," : "; channels", glink.channel[c].name ?
+		    glink.channel[c].name : "?", rx_channel[c]);
+	}
+	if (at < (int)sizeof(text)) {
+		at += snprintf(text + at, sizeof(text) - at, "; qrtr (lost %u)", rx_qrtr_lost);
+	}
+	for (unsigned i = 0; i < sizeof(rx_qrtr) / sizeof(rx_qrtr[0]) && rx_qrtr[i].n != 0 && at < (int)sizeof(text); i++) {
+		at += snprintf(text + at, sizeof(text) - at, " %u:%u/%u:%u", rx_qrtr[i].node, rx_qrtr[i].port, rx_qrtr[i].type,
+		    rx_qrtr[i].n);
+	}
+	if (at < (int)sizeof(text)) {
+		snprintf(text + at, sizeof(text) - at, "\n");
+	}
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, adsp_power, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, adsp_power_sysctl, "A", "cached audio DSP proxy power request and acknowledgement");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, adsp_irq_on, CTLFLAG_RD | CTLFLAG_LOCKED, (uint32_t *)&link_irq.on, 0,
     "the audio DSP's doorbells wake the link's thread (1) or it looks every millisecond (0)");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, adsp_irq_count, CTLFLAG_RD | CTLFLAG_LOCKED, &link_irq.count, 0, "doorbell interrupts taken");
@@ -3504,8 +3783,7 @@ link_wait(void)
 		sleep_us(1000);
 		return true;
 	}
-	assert_wait_timeout((event_t)&link_irq.rang, THREAD_UNINT, hakios_screen_off() ? LINK_NET_OFF_MS : LINK_NET_MS,
-	    NSEC_PER_MSEC);
+	(void)hakios_assert_wait_net((event_t)&link_irq.rang, hakios_screen_off() ? LINK_NET_OFF_MS : LINK_NET_MS);
 	if (os_atomic_xchg(&link_irq.rang, 0, acquire) != 0 || !link_wanted) {
 		clear_wait(current_thread(), THREAD_AWAKENED);
 		link_irq.by_line++;
@@ -3601,6 +3879,8 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 			if (from == CHANNEL_QRTR) {
 				qrtr_input(packet->data, packet->length);
+			} else if (from == CHANNEL_PCIE) {
+				pcie_drv_input(packet->data, packet->length);
 			} else if (from == CHANNEL_PMIC) {
 				battmgr_input(packet->data, packet->length);
 			} else if (gpr) {

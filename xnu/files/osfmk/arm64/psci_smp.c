@@ -45,6 +45,8 @@
 #include <kern/startup.h>
 #include <kern/task.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
+#include <kern/recount.h>
 #include <mach/thread_info.h>
 #include <libkern/kernel_mach_header.h>
 #include <machine/atomic.h>
@@ -58,6 +60,9 @@
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/board_config.h>
 #include <vm/pmap.h>
+
+/* drivers/power/hakios.rpmh-arc.h (with hakios.cpufreq.c): absent in kernels without it */
+extern void hakios_rpmh_llcc_down(void) __attribute__((weak));
 
 #if defined(GENERIC_PSCI_SMP)
 
@@ -314,8 +319,10 @@ psci_smp_cpu_unplug(void)
  * off, the processors of the boot-arg screen_off_cores (a bit per processor number; 0: none) are switched off. The way
  * is the scheduler's own for powering cores down for a while (Apple's CLPC's, sched_perfcontrol_update_powered_cores()):
  * a thread of its own starts and stops them, so this does not wait; the counts user space sees (hw.activecpu) stay as
- * they are. Never the boot processor. On the phone the four fast cores (0xf0): a core that only waits still costs
- * power, and the four Cortex-A510s carry what runs with the screen off.
+ * they are. Never the boot processor. On the phone every core but the boot one (0xfe): a core that only waits still
+ * costs power, and one Cortex-A510 carries what runs with the screen off. With 0xf0 (the fast four off) the other
+ * A510s took threads cpu0 readied, each a wake of its own (POWER-COLLAPSE-PLAN.md 5f: CX collapsed 59% of the time
+ * with four cores, 80% with one).
  */
 TUNABLE_WRITEABLE(uint64_t, psci_smp_screen_off_cores, "screen_off_cores", 0);
 static bool psci_smp_display_off;
@@ -352,19 +359,51 @@ hakios_screen_off(void)
 	return hakios_screen_slow != 0 && os_atomic_load(&psci_smp_display_off, relaxed);
 }
 
+/*
+ * hakios_screen_pause_leeway: the same, and while the display is off the wait may end up to leeway_ms later, at the
+ * next time its processor wakes for something else (XNU's timer coalescing). A poll that keeps its own time (the
+ * cpufreq governor) then costs no wake of its own: with the screen off a core that wakes on a timer of its own, apart
+ * from every other, keeps the SoC out of CX collapse (run16: the governor's 100 ms the most frequent timer of all).
+ */
 void
-hakios_screen_pause(uint32_t on_ms, uint32_t off_ms)
+hakios_screen_pause_leeway(uint32_t on_ms, uint32_t off_ms, uint32_t leeway_ms)
 {
 	if (!hakios_screen_off() || off_ms <= on_ms) {
 		delay_for_interval(on_ms, NSEC_PER_MSEC);
 		return;
 	}
-	assert_wait_timeout((event_t)&hakios_screen_changes, THREAD_UNINT, off_ms, NSEC_PER_MSEC);
+	if (leeway_ms != 0) {
+		assert_wait_timeout_with_leeway((event_t)&hakios_screen_changes, THREAD_UNINT, TIMEOUT_URGENCY_LEEWAY, off_ms,
+		    leeway_ms, NSEC_PER_MSEC);
+	} else {
+		assert_wait_timeout((event_t)&hakios_screen_changes, THREAD_UNINT, off_ms, NSEC_PER_MSEC);
+	}
 	if (!hakios_screen_off()) {
 		clear_wait(current_thread(), THREAD_AWAKENED);
 		return;
 	}
 	(void)thread_block(THREAD_CONTINUE_NULL);
+}
+
+void
+hakios_screen_pause(uint32_t on_ms, uint32_t off_ms)
+{
+	hakios_screen_pause_leeway(on_ms, off_ms, 0);
+}
+
+/*
+ * assert_wait_timeout() for a net: a wait an interrupt (or another thread) normally ends, with a timeout only in case
+ * that is missed. While the display is off the net may go off up to as late again, with the next wake of its processor
+ * for something else: the nets of touch, buttons, the audio DSP's link and the sound watcher, a second each, kept apart
+ * from each other and from everything else, were each a wake of their own (run19). The ring still ends it at once.
+ */
+wait_result_t
+hakios_assert_wait_net(event_t event, uint32_t ms)
+{
+	if (!hakios_screen_off()) {
+		return assert_wait_timeout(event, THREAD_UNINT, ms, NSEC_PER_MSEC);
+	}
+	return assert_wait_timeout_with_leeway(event, THREAD_UNINT, TIMEOUT_URGENCY_LEEWAY, ms, ms, NSEC_PER_MSEC);
 }
 
 void
@@ -404,13 +443,42 @@ psci_smp_display(bool on)
  * a signal ("kicked" in kern.hakios.wakes). A core whose power-downs keep ending before the residency (3 in a row) waits
  * in WFI for its next 8 idles.
  *
+ * Cluster states (step 4). All eight cores are one power domain in the device tree (psci/cluster-pd), with two states
+ * beyond the cores':
+ *
+ *   l3-off    0x41000044  least residency 5309 us   (the L3 off)
+ *   llcc-off  0x4100c344  least residency 13959 us  (and the system cache)
+ *
+ * Their parameters are whole: the core's state is in them (StateID 4 in [3:0]). The firmware's FEATURES(CPU_SUSPEND)
+ * has bit 0 (OS-initiated mode) on the 10 Pro, and psci_idle_init() asks for that mode (SET_SUSPEND_MODE). Then the
+ * cluster's state is the last core's to choose: a core going down that finds every other processor that is up already
+ * down asks for the deepest cluster state that the soonest of their deadlines (its own included) leaves room for. The
+ * firmware refuses (DENIED) a choice that a core waking meanwhile made wrong; that core then waits in WFI as when an
+ * interrupt is pending (about half of the last cores' asks, with the display off). Where the mode cannot be had
+ * (platform-coordinated, the default), each core votes for the deepest state its own deadline allows; the 10 Pro's
+ * firmware refuses every such vote.
+ *
+ * Never while another core is being started (CPU_ON asked, not running yet) or has never been started at all: asking
+ * for l3-off early in boot, before every core had been on once, reset the phone (cluster round 1, variants b and p).
+ * Linux brings every core up before its cpuidle starts; here the idle states start first.
+ *
  * Boot-args: cpu_idle (0: WFI only; the 10 Pro's configuration has 1), cpu_idle_cores (the processors that may power down,
- * a bit per number; all by default). The parameters are the SM8450's: a board whose firmware does not know them answers
- * INVALID_PARAMETERS and that core stays in WFI. Counters: kern.hakios.wakes, a line per processor.
+ * a bit per number; all by default), cpu_idle_states (bit 0 the cores' power-down, 1 l3-off, 2 llcc-off; all three by
+ * default; diag 0x40 asks for llcc-off at every other moment l3-off would do: POWER-COLLAPSE-PLAN.md step 4).
+ * The parameters are the SM8450's: a board whose firmware does not know them answers INVALID_PARAMETERS and that state is
+ * not asked for again (the core's: that core stays in WFI). Counters: kern.hakios.wakes, lines per processor.
+ *
+ * The census of the signals between processors (IPIs) is here too: what each one taken asked for (psci_idle_irq(), from
+ * the GIC's handler), who sent it to whom (psci_ipi_sent()), which functions cross-calls ran, and for every exit from
+ * idle the first interrupt taken after it (what woke the core).
  */
 #define PSCI_FEATURES           0x8400000Au
 #define PSCI_CPU_SUSPEND64      0xC4000001u
+#define PSCI_SET_SUSPEND_MODE   0x8400000Fu
+#define PSCI_MODE_OSI           1
 #define PSCI_INVALID_PARAMETERS (-2)
+#define PSCI_DENIED             (-3)
+#define PSCI_FEATURE_OSI        (1u << 0)
 #define PSCI_FEATURE_EXTENDED_STATEID   (1u << 1)
 #define PSCI_IDLE_PARAM         0x40000004u     /* rail-pc: power-down (bit 30), StateID 4 */
 #define PSCI_IDLE_SMALL_US      4090
@@ -419,14 +487,43 @@ psci_smp_display(bool on)
 #define PSCI_IDLE_SHORT_LIMIT   3
 #define PSCI_IDLE_SHORT_SKIP    8
 
+/* the states: the core's, then the cluster's (deepest last) */
+#define PSCI_STATE_CORE         0
+#define PSCI_STATE_L3           1
+#define PSCI_STATE_LLCC         2
+#define PSCI_STATES             3
+static const struct {
+	const char      *name;
+	uint32_t        param, residency_us;
+} psci_cluster_state[PSCI_STATES] = {
+	[PSCI_STATE_CORE] = { "core", PSCI_IDLE_PARAM, 0 },
+	[PSCI_STATE_L3]   = { "l3", 0x41000044u, 5309 },
+	[PSCI_STATE_LLCC] = { "llcc", 0x4100c344u, 13959 },
+};
+
+/* the IPI census: what the signal taken asked for */
+#define PSCI_IPI_NOP            0       /* nothing: a wake from idle (machine_signal_idle()) */
+#define PSCI_IPI_AST            1       /* an AST check: a preemption, a thread made runnable for it */
+#define PSCI_IPI_XCALL          2
+#define PSCI_IPI_DEC            3
+#define PSCI_IPI_OTHER          4
+#define PSCI_IPI_KINDS          5
+static const char *const psci_ipi_kind_name[PSCI_IPI_KINDS] = { "nop", "ast", "xcall", "dec", "other" };
+#define PSCI_IPI_CPUS           8       /* the sender/target table */
+#define PSCI_WOKE_INTIDS        6       /* the device interrupts that woke a core, per processor */
+#define PSCI_XCALL_FUNCS        8
+
 extern int setPop(uint64_t time);               /* osfmk/arm/rtclock.c */
 
 TUNABLE(uint32_t, psci_idle_level, "cpu_idle", 0);
 TUNABLE(uint64_t, psci_idle_cores, "cpu_idle_cores", ~0ULL);
+TUNABLE(uint32_t, psci_idle_states, "cpu_idle_states", 7);
 
 struct psci_idle_cpu {
 	uint32_t        param;          /* 0: this processor stays in WFI */
 	bool            down;           /* between its CPU_SUSPEND and the way back */
+	bool            waking;         /* out of idle; the next interrupt taken is what woke it */
+	uint8_t         state;          /* while down: the state asked for (PSCI_STATE_*) */
 	uint32_t        shorts, skip;
 	int32_t         last_rc;
 	uint64_t        residency;      /* mach time */
@@ -436,13 +533,281 @@ struct psci_idle_cpu {
 	uint64_t        entered, resumed, returned, denied, shorts_total, timer_wakes, kicked;
 	uint64_t        down_abs, late_abs;
 	uint64_t        calls, soon, soon_abs;      /* idles seen; of them with the deadline too close (and their gaps) */
+	/* per state: asked for, came back from, returned at once, refused; time down; how late after the deadline */
+	uint64_t        st_entered[PSCI_STATES], st_resumed[PSCI_STATES], st_returned[PSCI_STATES], st_denied[PSCI_STATES];
+	uint64_t        st_down_abs[PSCI_STATES], st_late_abs[PSCI_STATES];
+	uint64_t        last_tries, last_soon;      /* found itself the last one up; of them, the cluster's deadline too close */
+	uint64_t        last_starting;              /* no cluster state: another processor was being started */
+	/* llcc-off diagnostics: the cluster's gap at last_tries, by bucket (psci_gap_us); who held the soonest deadline
+	 * when it was too close for llcc-off */
+	uint64_t        last_gap[7], llcc_holder[MAX_CPUS];
+	/* IPIs taken, by kind; sent, by target; what woke it out of idle */
+	uint64_t        ipi_kind[PSCI_IPI_KINDS], ipi_sent[PSCI_IPI_CPUS];
+	uint64_t        woke_timer, woke_ipi[PSCI_IPI_KINDS], woke_dev;
+	uint32_t        woke_intid[PSCI_WOKE_INTIDS];
+	uint64_t        woke_intid_n[PSCI_WOKE_INTIDS];
 } __attribute__((aligned(128)));
 
 static struct psci_idle_cpu psci_idle[MAX_CPUS];
 static bool     psci_idle_ready;
+static bool     psci_idle_osi;                  /* OS-initiated mode: the last core chooses the cluster's state */
+static uint32_t psci_idle_states_live;          /* cpu_idle_states, less what the firmware refused as unknown */
+static uint64_t psci_idle_state_abs[PSCI_STATES];
 static uint64_t psci_idle_entry;                /* physical: the reset vector */
 static uint64_t psci_idle_kick_abs;
-static int64_t  psci_idle_features;
+static int64_t  psci_idle_features, psci_idle_mode_rc;
+static struct {
+	void            *func;
+	uint64_t        n;
+} psci_xcall_funcs[PSCI_XCALL_FUNCS];
+
+/*
+ * llcc-off diagnostics (POWER-COLLAPSE-PLAN.md step 4): the timer callouts (kind 0), running timers (1) and thread calls
+ * (2) each processor ran, by function and, for a thread's own timeout (thread_timer_expire), by thread.
+ */
+#define PSCI_TCALL_FUNCS        128
+static const uint32_t psci_gap_us[6] = { 1000, 2000, 5309, 8000, 11000, 13959 };
+static uint64_t psci_gap_abs[6];
+static uint32_t psci_diag_flip;
+static struct {
+	void            *func;
+	uint64_t        tid;
+	uint32_t        kind;
+	uint64_t        n;
+} psci_tcall[MAX_CPUS][PSCI_TCALL_FUNCS];
+static uint64_t psci_tcall_lost[MAX_CPUS];
+/* the timer callout running now (interrupts off), and the interrupt being handled: for the wakers below */
+static void *psci_cur_callout[MAX_CPUS];
+static uint32_t psci_cur_intid[MAX_CPUS];
+
+/*
+ * Wake diagnostics: who made each thread runnable (thread_unblock), by woken thread, waker and what the waker was
+ * running: a thread call's function (thread_call.c, hakios_thread_call_func), a timer callout, or an interrupt (by
+ * intid, the waker 1 << 63 | intid). A program's threads by the program (1 << 62 | pid): its workqueue threads come and
+ * go, a row each by thread filled the table (run23: 3057 wakes lost in 120 s).
+ */
+#define PSCI_WAKERS             192
+#define PSCI_WAKE_PID           (1ULL << 62)
+extern void proc_name(int pid, char *buf, int size);
+
+/* a thread, or its program's pid (flagged) if it is not the kernel's */
+static uint64_t
+psci_wake_who(thread_t t)
+{
+	task_t task = get_threadtask(t);
+
+	if (task != kernel_task && task != TASK_NULL) {
+		int pid = task_pid(task);
+		return PSCI_WAKE_PID | (uint32_t)(pid < 0 ? 0 : pid);
+	}
+	return t->thread_id;
+}
+static struct {
+	uint64_t        woken, by;
+	void            *func;
+	uint64_t        n;
+} psci_waker[MAX_CPUS][PSCI_WAKERS];
+static uint64_t psci_waker_lost[MAX_CPUS];
+static _Atomic bool psci_waker_clear[MAX_CPUS];  /* read: each processor starts its table again, at its next note */
+
+void hakios_tcall_note(void *func, void *param0, uint32_t kind);
+void hakios_tcall_end(void);
+void hakios_wake_note(thread_t woken, thread_t waker);
+extern void *hakios_thread_call_func(thread_t thread);
+
+void
+hakios_tcall_end(void)
+{
+	int cpu = cpu_number();
+
+	if (cpu >= 0 && cpu < MAX_CPUS) {
+		psci_cur_callout[cpu] = NULL;
+	}
+}
+
+/* thread_unblock(), the thread locked at splsched */
+void
+hakios_wake_note(thread_t woken, thread_t waker)
+{
+	int cpu = cpu_number();
+	uint64_t by, who;
+	void *func;
+	int i;
+
+	if (cpu < 0 || cpu >= MAX_CPUS || woken == NULL) {
+		return;
+	}
+	if (os_atomic_xchg(&psci_waker_clear[cpu], false, relaxed)) {
+		bzero(psci_waker[cpu], sizeof(psci_waker[cpu]));
+		psci_waker_lost[cpu] = 0;
+	}
+	if (ml_at_interrupt_context()) {
+		func = psci_cur_callout[cpu];
+		by = func != NULL ? 0 : (1ULL << 63) | psci_cur_intid[cpu];
+	} else {
+		by = waker != NULL ? psci_wake_who(waker) : 0;
+		func = waker != NULL ? hakios_thread_call_func(waker) : NULL;
+	}
+	who = psci_wake_who(woken);
+	for (i = 0; i < PSCI_WAKERS; i++) {
+		if (psci_waker[cpu][i].n == 0) {
+			psci_waker[cpu][i].woken = who;
+			psci_waker[cpu][i].by = by;
+			psci_waker[cpu][i].func = func;
+		}
+		if (psci_waker[cpu][i].woken == who && psci_waker[cpu][i].by == by &&
+		    psci_waker[cpu][i].func == func) {
+			psci_waker[cpu][i].n++;
+			break;
+		}
+	}
+	if (i == PSCI_WAKERS) {
+		psci_waker_lost[cpu]++;
+	}
+}
+void
+hakios_tcall_note(void *func, void *param0, uint32_t kind)
+{
+	boolean_t istate = ml_set_interrupts_enabled(FALSE);
+	int cpu = cpu_number();
+	uint64_t tid = 0;
+	int i;
+
+	if (func == (void *)thread_timer_expire && param0 != NULL) {
+		tid = ((thread_t)param0)->thread_id;
+	}
+	if (cpu >= 0 && cpu < MAX_CPUS) {
+		if (kind == 0) {
+			psci_cur_callout[cpu] = func;
+		}
+		for (i = 0; i < PSCI_TCALL_FUNCS; i++) {
+			if (psci_tcall[cpu][i].func == NULL) {
+				psci_tcall[cpu][i].tid = tid;
+				psci_tcall[cpu][i].kind = kind;
+				psci_tcall[cpu][i].func = func;
+			}
+			if (psci_tcall[cpu][i].func == func && psci_tcall[cpu][i].tid == tid && psci_tcall[cpu][i].kind == kind) {
+				psci_tcall[cpu][i].n++;
+				break;
+			}
+		}
+		if (i == PSCI_TCALL_FUNCS) {
+			psci_tcall_lost[cpu]++;
+		}
+	}
+	ml_set_interrupts_enabled(istate);
+}
+
+/* the kind of a signal, from the bits pending at the target */
+static int
+psci_ipi_kind(unsigned int bits)
+{
+	bits &= ~SIGPdisabled;
+	if (bits & (SIGPxcall | SIGPxcallImm)) {
+		return PSCI_IPI_XCALL;
+	}
+	if (bits & SIGPast) {
+		return PSCI_IPI_AST;
+	}
+	if (bits & SIGPdec) {
+		return PSCI_IPI_DEC;
+	}
+	return bits == 0 ? PSCI_IPI_NOP : PSCI_IPI_OTHER;
+}
+
+static void
+psci_xcall_note(void *func)
+{
+	if (func == NULL) {
+		return;
+	}
+	for (int i = 0; i < PSCI_XCALL_FUNCS; i++) {
+		void *f = os_atomic_load(&psci_xcall_funcs[i].func, relaxed);
+
+		if (f == NULL && os_atomic_cmpxchg(&psci_xcall_funcs[i].func, NULL, func, relaxed)) {
+			f = func;
+		}
+		if (f == func) {
+			os_atomic_inc(&psci_xcall_funcs[i].n, relaxed);
+			return;
+		}
+	}
+}
+
+/*
+ * The GIC's handler, for every interrupt acknowledged, before it is handled (interrupts off): kind 1 the timer, 2 the
+ * signal between processors, 0 any other. Counts the IPIs by what they ask for, and the first interrupt after an exit
+ * from idle as what woke the core.
+ */
+void
+psci_idle_irq(uint32_t intid, int kind)
+{
+	cpu_data_t *cdp = getCpuDatap();
+	int cpu = cdp->cpu_number;
+	struct psci_idle_cpu *c;
+	int ipi = 0;
+
+	if (cpu < 0 || cpu >= MAX_CPUS) {
+		return;
+	}
+	c = &psci_idle[cpu];
+	psci_cur_intid[cpu] = intid;
+	if (kind == 2) {
+		ipi = psci_ipi_kind(os_atomic_load(&cdp->cpu_signal, relaxed));
+		c->ipi_kind[ipi]++;
+		if (ipi == PSCI_IPI_XCALL) {
+			psci_xcall_note(cdp->cpu_xcall_p0);
+			psci_xcall_note(cdp->cpu_imm_xcall_p0);
+		}
+	}
+	if (!c->waking) {
+		return;
+	}
+	c->waking = false;
+	if (kind == 1) {
+		c->woke_timer++;
+	} else if (kind == 2) {
+		c->woke_ipi[ipi]++;
+	} else {
+		c->woke_dev++;
+		for (int i = 0; i < PSCI_WOKE_INTIDS; i++) {
+			if (c->woke_intid_n[i] == 0) {
+				c->woke_intid[i] = intid;
+			}
+			if (c->woke_intid[i] == intid) {
+				c->woke_intid_n[i]++;
+				break;
+			}
+		}
+	}
+}
+
+/*
+ * gic_v3_irq_signal(): this processor signals the one with that MPIDR. A target that is down is on its way up from
+ * now: its due goes (as psci_idle_kick_late() does), so that this processor, going idle right after, does not take
+ * itself for the last one up and ask for a cluster state the firmware then denies (run16/17: a third of the llcc-off
+ * asks DENIED, most of the wakes of cores 1-3 a signal from cpu0, sent just before cpu0 went idle itself).
+ */
+void
+psci_ipi_sent(uint32_t phys_id)
+{
+	int self = cpu_number();
+
+	if (self < 0 || self >= MAX_CPUS) {
+		return;
+	}
+	for (int cpu = 0; cpu <= ml_get_max_cpu_number() && cpu < PSCI_IPI_CPUS; cpu++) {
+		cpu_data_t *cdp = cpu_datap(cpu);
+
+		if (cdp != NULL && cdp->cpu_phys_id == phys_id) {
+			os_atomic_inc(&psci_idle[self].ipi_sent[cpu], relaxed);
+			if (cpu != self) {
+				os_atomic_store(&psci_idle[cpu].due, 0, release);
+			}
+			return;
+		}
+	}
+}
 
 /* Any processor that is down 2 ms past its deadline is signalled: its timer did not wake it. */
 static void
@@ -471,12 +836,15 @@ psci_idle_resumed(cpu_data_t *cdp, struct psci_idle_cpu *c, uint64_t now)
 	os_atomic_store(&c->due, 0, relaxed);
 	c->down = false;
 	c->resumed++;
+	c->st_resumed[c->state]++;
 
 	uint64_t slept = now - c->t0;
 	c->down_abs += slept;
+	c->st_down_abs[c->state] += slept;
 	if (now >= cdp->rtcPop) {
 		c->timer_wakes++;
 		c->late_abs += now - cdp->rtcPop;
+		c->st_late_abs[c->state] += now - cdp->rtcPop;
 	}
 	if (slept < c->residency) {
 		c->shorts_total++;
@@ -487,6 +855,81 @@ psci_idle_resumed(cpu_data_t *cdp, struct psci_idle_cpu *c, uint64_t now)
 	} else {
 		c->shorts = 0;
 	}
+}
+
+/*
+ * The state for a core about to go down whose own deadline (pop) leaves room for its power-down: a cluster state when
+ * the cluster's deadline leaves room for one. In OS-initiated mode only the last processor up may ask, and the cluster's
+ * deadline is the soonest of all; it reads the others' due, set before their CPU_SUSPEND (and its own is set already).
+ */
+static int
+psci_idle_cluster_choice(int self, uint64_t pop, uint64_t now)
+{
+	uint32_t states = os_atomic_load(&psci_idle_states_live, relaxed);
+	uint64_t due = pop;
+	int holder = self;
+
+	if ((states & ((1u << PSCI_STATE_L3) | (1u << PSCI_STATE_LLCC))) == 0) {
+		return PSCI_STATE_CORE;
+	}
+	if (psci_idle_osi) {
+		uint64_t up = psci_smp_cores_up();
+
+		for (int cpu = 0; cpu <= ml_get_max_cpu_number() && cpu < MAX_CPUS; cpu++) {
+			uint64_t d;
+			uint32_t stage = os_atomic_load(&psci_smp_cpu_stage[cpu], acquire);
+
+			/* one being started (CPU_ON asked, not running yet) is not counted up, but it is not off either:
+			 * no cluster state then (the reset of cluster round 1 came in early boot, while the others started) */
+			if (cpu != self && (stage == PSCI_SMP_CPU_ASKED || stage == PSCI_SMP_CPU_IN_KERNEL ||
+			    /* ... nor while one has never been started at all: early in boot, asking for l3-off with cores
+			     * the firmware has never had on resets the phone (variant p); after one CPU_ON/CPU_OFF it is fine */
+			    (stage == 0 && cpu != master_cpu && cpu_datap(cpu) != NULL))) {
+				psci_idle[self].last_starting++;
+				return PSCI_STATE_CORE;
+			}
+			if (cpu == self || !(up & (1ULL << cpu))) {
+				continue;
+			}
+			d = os_atomic_load(&psci_idle[cpu].due, acquire);
+			if (d == 0) {
+				return PSCI_STATE_CORE;         /* that one is running, in WFI, or on its way back */
+			}
+			if (d < due) {
+				due = d;
+				holder = cpu;
+			}
+		}
+		psci_idle[self].last_tries++;
+		{
+			uint64_t gap = due > now ? due - now : 0;
+			int b = 0;
+
+			while (b < 6 && gap >= psci_gap_abs[b]) {
+				b++;
+			}
+			psci_idle[self].last_gap[b]++;
+			if (gap < psci_idle_state_abs[PSCI_STATE_LLCC] && holder < MAX_CPUS) {
+				psci_idle[self].llcc_holder[holder]++;
+			}
+		}
+	}
+	for (int state = PSCI_STATES - 1; state > PSCI_STATE_CORE; state--) {
+		uint64_t need = psci_idle_state_abs[state];
+
+		/* diag 0x40: ask for llcc-off at every other moment l3-off would do, to tell a refusal of the state from a race
+		 * (the other half asks for l3-off under the same conditions) */
+		if (state == PSCI_STATE_LLCC && (psci_idle_states & 0x40) && (os_atomic_inc(&psci_diag_flip, relaxed) & 1)) {
+			need = psci_idle_state_abs[PSCI_STATE_L3];
+		}
+		if ((states & (1u << state)) && due > now && due - now >= need) {
+			return state;
+		}
+	}
+	if (psci_idle_osi) {
+		psci_idle[self].last_soon++;
+	}
+	return PSCI_STATE_CORE;
 }
 
 /* The processor's cpu_idle_notify: enter = TRUE just before cpu_idle()'s WFI, FALSE in cpu_idle_exit(). Interrupts off. */
@@ -505,6 +948,7 @@ psci_idle_notify(__unused cpu_id_t cpu_id, boolean_t enter, __unused uint64_t *n
 		if (c->down) {
 			psci_idle_resumed(cdp, c, now);
 		}
+		c->waking = true;
 		psci_idle_kick_late(cpu, now);
 		return;
 	}
@@ -529,18 +973,35 @@ psci_idle_notify(__unused cpu_id_t cpu_id, boolean_t enter, __unused uint64_t *n
 	os_atomic_store(&c->due, pop, release);
 	__builtin_arm_dsb(DSB_SY);
 
-	int64_t rc = (int32_t)psci_call(PSCI_CPU_SUSPEND64, c->param, psci_idle_entry, (uint64_t)cpu);
+	int state = psci_idle_cluster_choice(cpu, pop, now);
+	uint32_t param = state == PSCI_STATE_CORE ? c->param : psci_cluster_state[state].param;
+
+	/* the last core up, about to ask for the state in which the RSC runs its sleep set: the ARC entries armed or not
+	 * (drivers/power/hakios.rpmh-arc.h; as Linux flushes its sleep set at the cluster's power-down) */
+	if (state == PSCI_STATE_LLCC && hakios_rpmh_llcc_down != NULL) {
+		hakios_rpmh_llcc_down();
+	}
+
+	c->state = (uint8_t)state;
+	c->st_entered[state]++;
+	int64_t rc = (int32_t)psci_call(PSCI_CPU_SUSPEND64, param, psci_idle_entry, (uint64_t)cpu);
 
 	/* still here: it did not power down */
 	os_atomic_store(&c->due, 0, relaxed);
 	c->down = false;
 	if (rc == 0) {
 		c->returned++;
+		c->st_returned[state]++;
 	} else {
 		c->denied++;
+		c->st_denied[state]++;
 		c->last_rc = (int32_t)rc;
 		if (rc == PSCI_INVALID_PARAMETERS) {
-			c->param = 0;   /* not this firmware's state: never again on this processor */
+			if (state == PSCI_STATE_CORE) {
+				c->param = 0;   /* not this firmware's state: never again on this processor */
+			} else {
+				os_atomic_andnot(&psci_idle_states_live, 1u << state, relaxed);  /* nor this cluster state */
+			}
 		}
 	}
 }
@@ -562,7 +1023,31 @@ psci_idle_init(void)
 		    psci_idle_features < 0 ? "is not there" : "takes the original StateID format", psci_idle_features);
 		return;
 	}
+	if (!(psci_idle_states & (1u << PSCI_STATE_CORE))) {
+		printf("psci: idle: WFI only (cpu_idle_states 0x%x: no power-down of the cores)\n", psci_idle_states);
+		return;
+	}
 	nanoseconds_to_absolutetime((uint64_t)PSCI_IDLE_KICK_US * NSEC_PER_USEC, &psci_idle_kick_abs);
+	for (int state = 0; state < PSCI_STATES; state++) {
+		nanoseconds_to_absolutetime((uint64_t)psci_cluster_state[state].residency_us * NSEC_PER_USEC,
+		    &psci_idle_state_abs[state]);
+	}
+	for (int b = 0; b < 6; b++) {
+		nanoseconds_to_absolutetime((uint64_t)psci_gap_us[b] * NSEC_PER_USEC, &psci_gap_abs[b]);
+	}
+	psci_idle_states_live = psci_idle_states & ((1u << PSCI_STATES) - 1);
+	if (psci_idle_states_live & ~1u) {
+		/* no other processor is suspended yet: the mode can be changed now (PSCI 1.0, 5.20) */
+		if (psci_idle_features & PSCI_FEATURE_OSI) {
+			psci_idle_mode_rc = (int32_t)psci_call(PSCI_SET_SUSPEND_MODE, PSCI_MODE_OSI, 0, 0);
+			psci_idle_osi = psci_idle_mode_rc == 0;
+		} else {
+			psci_idle_mode_rc = 1;      /* not asked */
+		}
+		printf("psci: idle: cluster states 0x%x, %s (SET_SUSPEND_MODE %lld)\n", psci_idle_states_live,
+		    psci_idle_osi ? "OS-initiated: the last core chooses" : "platform-coordinated: every core votes",
+		    psci_idle_mode_rc);
+	}
 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
 		const ml_topology_cpu_t *t = &topology->cpus[i];
 		struct psci_idle_cpu *c;
@@ -603,7 +1088,17 @@ hakios_wakes_text(char *buf, size_t size)
 	}
 	buf[0] = '\0';
 	WAKES_PUT("display %s up 0x%llx\n", os_atomic_load(&psci_smp_display_off, relaxed) ? "off" : "on", psci_smp_cores_up());
-	WAKES_PUT("idle %s features 0x%llx\n", os_atomic_load(&psci_idle_ready, relaxed) ? "on" : "off", psci_idle_features);
+	WAKES_PUT("idle %s features 0x%llx mode %s rc %lld states 0x%x\n", os_atomic_load(&psci_idle_ready, relaxed) ? "on" : "off",
+	    psci_idle_features, psci_idle_osi ? "osi" : "pc", psci_idle_mode_rc, os_atomic_load(&psci_idle_states_live, relaxed));
+	/* the functions that cross-calls ran, and one of the kernel's own for the slide (nm hakios-kernel) */
+	WAKES_PUT("xcall_ref psci_idle_notify %p\n", (void *)VM_KERNEL_UNSLIDE(psci_idle_notify));
+	for (int i = 0; i < PSCI_XCALL_FUNCS; i++) {
+		void *f = os_atomic_load(&psci_xcall_funcs[i].func, relaxed);
+
+		if (f != NULL) {
+			WAKES_PUT("xcall %p %llu\n", (void *)VM_KERNEL_UNSLIDE(f), os_atomic_load(&psci_xcall_funcs[i].n, relaxed));
+		}
+	}
 	for (int cpu = 0; cpu <= ml_get_max_cpu_number() && cpu < MAX_CPUS; cpu++) {
 		cpu_data_t *cdp = cpu_datap(cpu);
 
@@ -625,24 +1120,142 @@ hakios_wakes_text(char *buf, size_t size)
 			    os_atomic_load(&c->shorts_total, relaxed), os_atomic_load(&c->timer_wakes, relaxed), late_ns / NSEC_PER_USEC,
 			    os_atomic_load(&c->kicked, relaxed), down_ns / NSEC_PER_MSEC, os_atomic_load(&c->calls, relaxed),
 			    os_atomic_load(&c->soon, relaxed), soon_ns / NSEC_PER_USEC);
+			/* per state: asked for, came back from, returned at once, refused, time down, late after the deadline */
+			WAKES_PUT("states %d last %llu last_soon %llu starting %llu", cpu, c->last_tries, c->last_soon, c->last_starting);
+			for (int s = 0; s < PSCI_STATES; s++) {
+				uint64_t sd_ns, sl_ns;
+
+				absolutetime_to_nanoseconds(c->st_down_abs[s], &sd_ns);
+				absolutetime_to_nanoseconds(c->st_late_abs[s], &sl_ns);
+				WAKES_PUT(" %s %llu/%llu/%llu/%llu down_ms %llu late_us %llu", psci_cluster_state[s].name,
+				    c->st_entered[s], c->st_resumed[s], c->st_returned[s], c->st_denied[s],
+				    sd_ns / NSEC_PER_MSEC, sl_ns / NSEC_PER_USEC);
+			}
+			/* the cluster's gap when last, by bucket (<1, <2, <5.3, <8, <11, <14 ms, more); who held it under 14 ms */
+			WAKES_PUT("\ngaps %d", cpu);
+			for (int b = 0; b < 7; b++) {
+				WAKES_PUT("%c%llu", b ? ',' : ' ', c->last_gap[b]);
+			}
+			WAKES_PUT(" holder");
+			for (int t = 0; t < PSCI_IPI_CPUS; t++) {
+				WAKES_PUT("%c%llu", t ? ',' : ' ', c->llcc_holder[t]);
+			}
+			/* IPIs taken by kind; sent to each processor */
+			WAKES_PUT("\nipi %d", cpu);
+			for (int k = 0; k < PSCI_IPI_KINDS; k++) {
+				WAKES_PUT(" %s %llu", psci_ipi_kind_name[k], c->ipi_kind[k]);
+			}
+			WAKES_PUT(" to");
+			for (int t = 0; t < PSCI_IPI_CPUS; t++) {
+				WAKES_PUT("%c%llu", t ? ',' : ' ', os_atomic_load(&c->ipi_sent[t], relaxed));
+			}
+			/* what woke it out of idle: the timer, an IPI by kind, a device interrupt (the most frequent intids) */
+			WAKES_PUT("\nwoke %d timer %llu", cpu, c->woke_timer);
+			for (int k = 0; k < PSCI_IPI_KINDS; k++) {
+				WAKES_PUT(" %s %llu", psci_ipi_kind_name[k], c->woke_ipi[k]);
+			}
+			WAKES_PUT(" dev %llu", c->woke_dev);
+			for (int i = 0; i < PSCI_WOKE_INTIDS && c->woke_intid_n[i] != 0; i++) {
+				WAKES_PUT(" irq%u:%llu", c->woke_intid[i], c->woke_intid_n[i]);
+			}
+			WAKES_PUT("\n");
+			/* cpu_idle() (osfmk/arm64/cpu.c): calls, gone back at once (idle not allowed, timer due); idle time */
+			{
+				extern uint64_t hakios_idle_exits[MAX_CPUS][3];
+				extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
+				uint64_t idle_abs = 0, idle_ns;
+
+				(void)ml_cpu_idle_time(cpu, &idle_abs);
+				absolutetime_to_nanoseconds(idle_abs, &idle_ns);
+				WAKES_PUT("idlepath %d calls %llu disallowed %llu due %llu signal 0x%x idle_ms %llu\n", cpu,
+				    hakios_idle_exits[cpu][2], hakios_idle_exits[cpu][0], hakios_idle_exits[cpu][1],
+				    os_atomic_load(&cdp->cpu_signal, relaxed), idle_ns / NSEC_PER_MSEC);
+			}
 		}
 	}
 	lck_mtx_lock(&tasks_threads_lock);
 	queue_iterate(&threads, thread, thread_t, threads) {
 		char name[MAXTHREADNAMESIZE];
 
-		if (get_threadtask(thread) != kernel_task || thread->c_switch < 16) {
+		task_t task = get_threadtask(thread);
+		uint64_t run_ns;
+
+		/* kernel threads switched to 16 times or more; any thread with half a second of processor time */
+		absolutetime_to_nanoseconds(recount_thread_time_mach(thread), &run_ns);
+		if ((task != kernel_task || thread->c_switch < 16) && run_ns < 500 * NSEC_PER_MSEC) {
 			continue;
 		}
 		name[0] = '\0';
 		thread_get_thread_name(thread, name);
 		name[sizeof(name) - 1] = '\0';
-		WAKES_PUT("thread %llu %s %u\n", thread->thread_id, name[0] ? name : "-", thread->c_switch);
+		WAKES_PUT("thread %llu %s %u run_ms %llu pid %d", thread->thread_id, name[0] ? name : "-", thread->c_switch,
+		    run_ns / NSEC_PER_MSEC, task == kernel_task ? 0 : task_pid(task));
+		/* llcc-off diagnostics: where a kernel thread waits (its continuation, wait event, and saved stack) */
+		if (task == kernel_task) {
+			vm_offset_t stack = thread->kernel_stack;
+
+			WAKES_PUT(" cont %p wait %p", (void *)VM_KERNEL_UNSLIDE(thread->continuation),
+			    (void *)VM_KERNEL_UNSLIDE_OR_PERM(thread->wait_event));
+			if (stack != 0 && thread->machine.kstackptr != 0 && (thread->state & TH_WAIT) && !(thread->state & TH_RUN)) {
+				arm_kernel_saved_state_t *ss = &((thread_kernel_state_t)thread->machine.kstackptr)->machine.ss;
+				uint64_t fp = ss->fp;
+
+				WAKES_PUT(" pc %p", (void *)VM_KERNEL_UNSLIDE(ss->lr));
+				for (int f = 0; f < 8 && fp >= stack && fp + 16 <= stack + kernel_stack_size && (fp & 7) == 0; f++) {
+					uint64_t lr = ((uint64_t *)fp)[1];
+
+					WAKES_PUT(",%p", (void *)VM_KERNEL_UNSLIDE(lr));
+					fp = ((uint64_t *)fp)[0];
+				}
+			}
+		}
+		WAKES_PUT("\n");
 		if (at + 1 >= size) {
 			break;
 		}
 	}
 	lck_mtx_unlock(&tasks_threads_lock);
+	/* llcc-off diagnostics: timer callouts (0), running timers (1), thread calls (2) per processor, by function/thread */
+	for (int cpu = 0; cpu <= ml_get_max_cpu_number() && cpu < MAX_CPUS; cpu++) {
+		for (int i = 0; i < PSCI_TCALL_FUNCS; i++) {
+			void *f = psci_tcall[cpu][i].func;
+
+			if (f == NULL) {
+				break;
+			}
+			WAKES_PUT("tc %d %u %p %llu %llu\n", cpu, psci_tcall[cpu][i].kind, (void *)VM_KERNEL_UNSLIDE(f),
+			    psci_tcall[cpu][i].tid, psci_tcall[cpu][i].n);
+		}
+		if (psci_tcall_lost[cpu] != 0) {
+			WAKES_PUT("tc_lost %d %llu\n", cpu, psci_tcall_lost[cpu]);
+		}
+	}
+	/* wake diagnostics: wk cpu woken-thread waker (a thread, 0 a timer callout, 1 << 63 | intid an interrupt) func count,
+	 * since the last read (each processor starts again at its next note) */
+	for (int cpu = 0; cpu <= ml_get_max_cpu_number() && cpu < MAX_CPUS; cpu++) {
+		if (os_atomic_load(&psci_waker_clear[cpu], relaxed)) {
+			continue;       /* nothing noted there since the last read (a processor that is off) */
+		}
+		for (int i = 0; i < PSCI_WAKERS && psci_waker[cpu][i].n != 0; i++) {
+			WAKES_PUT("wk %d 0x%llx 0x%llx %p %llu", cpu, psci_waker[cpu][i].woken, psci_waker[cpu][i].by,
+			    (void *)VM_KERNEL_UNSLIDE(psci_waker[cpu][i].func), psci_waker[cpu][i].n);
+			/* the programs' names: woken, then waker (- for a kernel thread, an interrupt or a callout) */
+			for (int w = 0; w < 2; w++) {
+				uint64_t x = w ? psci_waker[cpu][i].by : psci_waker[cpu][i].woken;
+				char name[32] = "-";
+
+				if ((x >> 62) == 1) {
+					proc_name((int)(uint32_t)x, name, sizeof(name));
+				}
+				WAKES_PUT(" %s", name[0] ? name : "?");
+			}
+			WAKES_PUT("\n");
+		}
+		if (psci_waker_lost[cpu] != 0) {
+			WAKES_PUT("wk_lost %d %llu\n", cpu, psci_waker_lost[cpu]);
+		}
+		os_atomic_store(&psci_waker_clear[cpu], true, relaxed);
+	}
 #undef WAKES_PUT
 	return at;
 }

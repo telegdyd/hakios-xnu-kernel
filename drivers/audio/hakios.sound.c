@@ -84,6 +84,7 @@
 #include <vm/vm_kern.h>
 
 extern bool hakios_screen_off(void);
+extern wait_result_t hakios_assert_wait_net(event_t event, uint32_t ms);  /* psci_smp.c: a net, with leeway while the screen is off */
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern uint64_t kvtophys(vm_offset_t va);
@@ -1535,6 +1536,17 @@ static volatile uint32_t darwin_peak;              /* the largest sample since t
 
 static volatile bool guard_on;                  /* (below) */
 
+/*
+ * Idle (sound_soc=8450): `sound_idle' seconds (10; 0 never) after the last write that was not silence, with the
+ * amplifiers off, the feeder stops writing and, once the DSP has given every period back, parks; the watcher then
+ * stops the graph and releases the bit clock. Darwin's next write that is not silence wakes the watcher, which
+ * gets the clock and starts the graph again, and the feeder goes on (POWER-COLLAPSE-PLAN.md step 3). While parked,
+ * silent writes are not kept, until one that is not silence: from that one on everything is.
+ */
+static uint32_t idle_s = 10;
+static volatile bool want_park, parked, park_heard;
+static uint64_t parked_us;
+
 /* From the writer's thread, under hakios.audio.c's lock: never waits. */
 static uint32_t
 darwin_sink(const int16_t *frames, uint32_t count)
@@ -1542,6 +1554,17 @@ darwin_sink(const int16_t *frames, uint32_t count)
 	uint32_t head = ring_head, room = RING_FRAMES - (head - ring_tail), taken = count < room ? count : room;
 	bool sound = false;
 
+	if (parked && !park_heard) {
+		for (uint32_t i = 0; i < 2 * count && !sound; i++) {
+			sound = frames[i] > SILENCE || frames[i] < -SILENCE;
+		}
+		if (!sound) {
+			darwin_frames += count;
+			return count;                           /* (silence while the stream is stopped: nothing to keep) */
+		}
+		park_heard = true;
+		sound = false;
+	}
 	for (uint32_t i = 0; i < taken; i++) {
 		int16_t left = frames[2 * i], right = frames[2 * i + 1];
 		uint32_t l = left < 0 ? (uint32_t)-(int32_t)left : (uint32_t)left, r = right < 0 ? (uint32_t)-(int32_t)right : (uint32_t)right;
@@ -1664,16 +1687,62 @@ period_fill_darwin(unsigned period)
 static void
 feeder_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint32_t sent = 0, failed = 0;
+	uint32_t sent = 0, failed = 0, queued = 0, parks = 0;
 
 	returned = 0;
 	for (unsigned p = 0; p < PERIODS; p++) {
 		period_fill_darwin(p);
-		sent += period_write(p);
+		if (period_write(p)) {
+			sent++;
+			queued |= 1u << p;
+		}
 	}
 	while (!stopping) {
 		uint32_t back = returned;
 		static bool was_on;
+
+		if (want_park && queued == 0 && back == 0) {
+			/* every period back: parked until the watcher has the graph running again (a 5 s net) */
+			parked_us = now_us();
+			OSMemoryBarrier();
+			parked = true;
+			parks++;
+			thread_wakeup((event_t)&parked);
+			while (want_park && !stopping) {
+				assert_wait_timeout((event_t)&want_park, THREAD_UNINT, 5000, NSEC_PER_MSEC);
+				if (!want_park || stopping) {
+					clear_wait(current_thread(), THREAD_AWAKENED);
+				} else {
+					(void)thread_block(THREAD_CONTINUE_NULL);
+				}
+			}
+			if (stopping) {
+				parked = false;
+				break;
+			}
+			/* (the guard reckons with the silence there was meanwhile: the speakers have cooled) */
+			hakios_guard_silence((now_us() - parked_us) * 48 / 1000);
+			parked = false;
+			OSMemoryBarrier();
+			park_heard = false;
+			returned = 0;
+			primed = false;
+			/*
+			 * Silence first, all the periods (160 ms): the amplifiers are started only now, after the stream, and what
+			 * Darwin wrote reaches them behind it, as it does while the stream runs. It waits in the ring meanwhile.
+			 */
+			for (unsigned p = 0; p < PERIODS; p++) {
+				period_fill(p, true);
+				if (period_write(p)) {
+					sent++;
+					queued |= 1u << p;
+				} else {
+					failed++;
+				}
+			}
+			thread_wakeup((event_t)&parked);
+			continue;
+		}
 
 		if (guard_on && !was_on) {
 			guard_say("", true);    /* (what it did to the silence meanwhile is of no interest) */
@@ -1694,9 +1763,31 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 			OSBitAndAtomic(~back, &returned);
 			for (unsigned p = 0; p < PERIODS; p++) {
 				if (back & 1u << p) {
+					queued &= ~(1u << p);
+					if (want_park) {
+						continue;               /* (the stream is to stop: the period stays with us) */
+					}
 					period_fill_darwin(p);
 					if (period_write(p)) {
 						sent++;
+						queued |= 1u << p;
+					} else {
+						failed++;
+					}
+				}
+			}
+		}
+		if (want_park && queued == 0) {
+			continue;
+		}
+		if (!want_park && queued != (1u << PERIODS) - 1 && back == 0) {
+			/* (a park given up on: the periods that came back meanwhile are written again) */
+			for (unsigned p = 0; p < PERIODS; p++) {
+				if (!(queued & 1u << p) && !stopping) {
+					period_fill_darwin(p);
+					if (period_write(p)) {
+						sent++;
+						queued |= 1u << p;
 					} else {
 						failed++;
 					}
@@ -1708,15 +1799,15 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 		 * 2 ms (STANDBY-PLAN.md). The 40 ms net (two periods) is for the guard's lines and a missed wake.
 		 */
 		assert_wait_timeout((event_t)&returned, THREAD_UNINT, 40, NSEC_PER_MSEC);
-		if (returned != 0 || stopping) {
+		if (returned != 0 || stopping || (want_park && queued == 0)) {
 			clear_wait(current_thread(), THREAD_AWAKENED);
 		} else {
 			(void)thread_block(THREAD_CONTINUE_NULL);
 		}
 	}
 	say("sound: the feeder stops: %u periods written (%u could not be sent), %u given back (%u with an error), %u underflows; "
-	    "from Darwin %llu frames came, %llu went to the DSP, %llu of silence filled in\n", sent, failed, written_done, write_errors,
-	    underflows, darwin_frames, fed_frames, silent_frames);
+	    "from Darwin %llu frames came, %llu went to the DSP, %llu of silence filled in; parked %u times while idle\n", sent, failed,
+	    written_done, write_errors, underflows, darwin_frames, fed_frames, silent_frames, parks);
 	feeder_runs = false;
 	thread_terminate(current_thread());
 }
@@ -1758,6 +1849,88 @@ guard_off(bool unheard)
 	}
 }
 
+static bool graph_idle;                 /* the graph stopped and the clock released while idle (idle_stop()) */
+static uint32_t idle_stops, idle_starts;
+
+/* Idle: the feeder parked, then the graph stopped and the bit clock released. False if the feeder did not park. */
+static bool
+idle_stop(void)
+{
+	uint64_t began = now_us();
+	bool stopped, released;
+
+	want_park = true;
+	OSMemoryBarrier();
+	thread_wakeup((event_t)&returned);
+	while (!parked && !stopping && now_us() - began < 1000000) {
+		assert_wait_timeout((event_t)&parked, THREAD_UNINT, 50, NSEC_PER_MSEC);
+		if (parked || stopping) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+		} else {
+			(void)thread_block(THREAD_CONTINUE_NULL);
+		}
+	}
+	if (!parked) {
+		want_park = false;
+		thread_wakeup((event_t)&want_park);
+		if (!stopping) {
+			say("sound: idle: THE FEEDER DID NOT PARK in a second (the DSP kept periods); the stream goes on, idle stops are off\n");
+		}
+		return false;
+	}
+	lck_mtx_lock(&sound_lock);
+	stopped = ar_graph_command("APM: GRAPH_STOP (idle)", APM_CMD_GRAPH_STOP);
+	ar_started = false;
+	released = ar_clock_on && ar_clock(false);
+	ar_clock_on = false;
+	lck_mtx_unlock(&sound_lock);
+	graph_idle = true;
+	idle_stops++;
+	say("sound: idle %u s: the stream is stopped (the feeder parked after %llu ms; GRAPH_STOP %s, the bit clock %s)\n", idle_s,
+	    (parked_us - began) / 1000, stopped ? "done" : "REFUSED", released ? "released" : "NOT RELEASED");
+	return true;
+}
+
+/*
+ * Sound after idle: the bit clock and the graph started again (PREPARE, START), or if the DSP will not have that,
+ * the graph closed and set up anew; then the feeder goes on. False if there is no stream to play into.
+ */
+static bool
+idle_start(void)
+{
+	uint64_t began = now_us();
+	bool ok, anew = false;
+
+	lck_mtx_lock(&sound_lock);
+	ar_clock_on = ar_clock(true);
+	ok = ar_clock_on && ar_graph_command("APM: GRAPH_PREPARE (after idle)", APM_CMD_GRAPH_PREPARE) &&
+	    ar_graph_command("APM: GRAPH_START (after idle)", APM_CMD_GRAPH_START);
+	if (!ok) {
+		anew = true;
+		say("sound: after idle: THE GRAPH DID NOT START AGAIN: it is closed and set up anew\n");
+		ar_stream_off();
+		if (!ar_clock_on) {
+			ar_clock_on = ar_clock(true);
+		}
+		ok = ar_clock_on && ar_stream_on();
+	} else {
+		ar_started = true;
+	}
+	lck_mtx_unlock(&sound_lock);
+	if (!ok) {
+		say("sound: after idle: THE STREAM COULD NOT BE STARTED AGAIN; Darwin's sound is not played\n");
+		return false;
+	}
+	graph_idle = false;
+	idle_starts++;
+	want_park = false;
+	OSMemoryBarrier();
+	thread_wakeup((event_t)&want_park);
+	say("sound: after idle: the stream runs again %llu ms after Darwin's write%s\n", (now_us() - began) / 1000,
+	    anew ? " (the graph set up anew)" : "");
+	return true;
+}
+
 /*
  * The amplifiers on while there is sound, at the volume Darwin has set (hakios_audio_volume(): how
  * far under the loudest, sound_below under Android's level), and off while Darwin's volume is 0;
@@ -1767,7 +1940,7 @@ static void
 watch(void)
 {
 	bool on = false, given_up = false, muted = false;
-	uint64_t last_look = 0, last_monitor = 0;
+	uint64_t last_look = 0, last_monitor = 0, idle_from = now_us(), idle_sounded = 0;
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0;
 
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
@@ -1799,11 +1972,14 @@ watch(void)
 				guard_level(below_with(extra));
 			}
 		}
-		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
+		if (!on && !given_up && !muted && sounded != 0 && (now - sounded < 100000 || (graph_idle && sounded != idle_sounded))) {
 			say_when("Darwin plays: the amplifiers are started");
 			starts++;
 			darwin_peak = 0;
-			if (!hakios_speaker_start() || !hakios_speaker_volume(below_with(extra), 1)) {
+			if (graph_idle && !idle_start()) {
+				guard_off(true);
+				given_up = true;
+			} else if (!hakios_speaker_start() || !hakios_speaker_volume(below_with(extra), 1)) {
 				say("sound: THE AMPLIFIERS DID NOT START; Darwin's sound goes on to the DSP, unheard\n");
 				guard_off(true);
 				given_up = true;
@@ -1825,6 +2001,13 @@ watch(void)
 			guard_off(false);
 			hakios_speaker_stop();
 			on = false;
+		} else if (!on && !given_up && AR && idle_s != 0 && !graph_idle &&
+		    now - (sounded > idle_from ? sounded : idle_from) > idle_s * 1000000ull) {
+			/* (a write that comes while the stream is being stopped starts it again on the next look, however late) */
+			idle_sounded = sounded;
+			if (!idle_stop()) {
+				idle_s = 0;
+			}
 		} else if (on && now - last_look >= 200000) {
 			last_look = now;
 			if (!hakios_speaker_healthy()) {
@@ -1852,7 +2035,7 @@ watch(void)
 			 * The amplifiers off: until Darwin writes something that is not silence (darwin_sink() wakes this), or
 			 * 200 ms (1 s with the screen off) for the volume, rather than a look every 5 ms (STANDBY-PLAN.md).
 			 */
-			assert_wait_timeout((event_t)&last_sound_us, THREAD_UNINT, hakios_screen_off() ? 1000 : 200, NSEC_PER_MSEC);
+			(void)hakios_assert_wait_net((event_t)&last_sound_us, hakios_screen_off() ? 1000 : 200);
 			if (last_sound_us != sounded || stopping) {
 				clear_wait(current_thread(), THREAD_AWAKENED);
 			} else {
@@ -1861,8 +2044,9 @@ watch(void)
 		}
 	}
 	guard_off(true);
-	say("sound: the watcher stops; the amplifiers were started %u times, Darwin set the volume %u times%s\n", starts, changes,
-	    given_up ? ", and the amplifiers were then given up on" : "");
+	say("sound: the watcher stops; the amplifiers were started %u times, Darwin set the volume %u times%s; the stream stopped "
+	    "%u times while idle and started again %u times\n", starts, changes, given_up ? ", and the amplifiers were then given up on" : "",
+	    idle_stops, idle_starts);
 	watcher_runs = false;
 }
 
@@ -1876,6 +2060,8 @@ take_down(void)
 	stopping = true;
 	thread_wakeup((event_t)&returned);
 	thread_wakeup((event_t)&last_sound_us);
+	thread_wakeup((event_t)&want_park);
+	thread_wakeup((event_t)&parked);
 	if (level >= 4) {
 		hakios_audio_set_sink("nothing", NULL);
 	}
@@ -2057,6 +2243,7 @@ hakios_sound_dsp_up(void)
 	PE_parse_boot_argn("sound_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("sound_guard_as", &guard_as, sizeof(guard_as));
 	PE_parse_boot_argn("sound_gain", &gain, sizeof(gain));
+	PE_parse_boot_argn("sound_idle", &idle_s, sizeof(idle_s));
 	if (gain > HAKIOS_GUARD_MAX_GAIN) {
 		gain = HAKIOS_GUARD_MAX_GAIN;
 	}

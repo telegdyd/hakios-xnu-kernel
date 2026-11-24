@@ -224,7 +224,12 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         # waits for; it now runs through a session.)
         'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced',
         # spins a core from boot, ignores SIGTERM
-        'voicemail')
+        'voicemail',
+        # dasd asks coreduetd for the _DKEvent.Dasd.WidgetView Biome stream and coreduetd has biomed open every
+        # segment of it, ~300 rounds a second for ever: ~1 core between them, display on or off, so no core is ever
+        # the last one idle (POWER-COLLAPSE-PLAN.md step 4). No system call fails; moving the stream aside does not
+        # stop it. Left out until someone reads their own logs (OSLOG) for why the query repeats.
+        'com.apple.dasd', 'coreduetd', 'biomed')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())

@@ -367,6 +367,28 @@ mdssRead(uint32_t offset)
 	return *(volatile uint32_t *)(gMDSS + offset - MDSS_WINDOW_FIRST);
 }
 
+/*
+ * The MDSS's registers while the display's hardware may be off (hakios.display-power.h: from after the panel's sleep
+ * until before its wake): each use between mdssHold() and mdssRelease(); no hold, no access (a read of a domain that is
+ * off does not come back). Without the backlight's driver nothing turns it off.
+ */
+extern "C" bool hakios_display_hold(void) __attribute__((weak));
+extern "C" void hakios_display_release(void) __attribute__((weak));
+
+static inline bool
+mdssHold(void)
+{
+	return hakios_display_hold == NULL || hakios_display_hold();
+}
+
+static inline void
+mdssRelease(void)
+{
+	if (hakios_display_release != NULL) {
+		hakios_display_release();
+	}
+}
+
 /* the registers mapped, once (false: no fb_mdss) */
 static bool
 mdssMapped(void)
@@ -396,8 +418,12 @@ sysctl_fb_dpu SYSCTL_HANDLER_ARGS
 	if (!mdssMapped()) {
 		return SYSCTL_OUT(req, "fb_mdss not given\n", 19);
 	}
+	if (!mdssHold()) {
+		return SYSCTL_OUT(req, "the display's hardware is off (the panel asleep)\n", 50);
+	}
 	text = (char *) IOMalloc(size);
 	if (text == NULL) {
+		mdssRelease();
 		return ENOMEM;
 	}
 #define SAY(...) (used += (size_t) snprintf(text + used, used < size ? size - used : 0, __VA_ARGS__), used = used < size ? used : size)
@@ -442,6 +468,7 @@ sysctl_fb_dpu SYSCTL_HANDLER_ARGS
 	SAY("\nINTF1 in 100 ms: frame_count +%u, tear frames +%u, tear line_count %u\n", mdssRead(i + INTF_FRAME_COUNT) - frames,
 	    ((mdssRead(i + INTF_TEAR_INT_COUNT_VAL) >> 16) - tear) & 0xffff, mdssRead(i + INTF_TEAR_LINE_COUNT));
 #undef SAY
+	mdssRelease();
 	error = SYSCTL_OUT(req, text, used);
 	IOFree(text, size);
 	return error;
@@ -2190,13 +2217,18 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 */
 	int target = -1;
 
-	if (gGPUPresent && gFlip && !gPanelAsleep && fPanelPhys != 0 && (fFlipTried ? gFlipState == 1 : flipSetUp())) {
+	bool mdss = !gPanelAsleep && mdssHold();      /* (released at the end of the swap's own use) */
+
+	if (mdss && gGPUPresent && gFlip && fPanelPhys != 0 && (fFlipTried ? gFlipState == 1 : flipSetUp())) {
 		/* the buffer not shown, once the controller has left it */
 		if (fFlipPending && !flipTaken(FLIP_TAKEN_MS)) {
 			flipOff("a flush not taken in 100 ms");
 		} else {
 			target = fFlipShown == 0 ? 1 : 0;
 		}
+	}
+	if (!mdss) {
+		target = fFlipShown;    /* (the controller is not touched: the frame into the panel's own memory) */
 	}
 	if (gGPUPresent) {
 		onGPU = showOnGPU(swap, surfaces, &target);
@@ -2224,7 +2256,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 * fb_flip: the controller pointed at the buffer once the GPU is done (or back at the panel's own memory). After the
 	 * swap is handed on: CoreAnimation draws the next frame meanwhile (behind this one in the GPU's ring).
 	 */
-	if (onGPU && fFlipTried && target != fFlipShown) {
+	if (mdss && onGPU && fFlipTried && target != fFlipShown) {
 		if (MiniIOSurfacePresentDone(gLastPresent, FLIP_TAKEN_MS)) {
 			flipTo(target);
 		} else {
@@ -2300,8 +2332,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			}
 		}
 	}
-	if (!onGPU && fFlipTried && fFlipShown >= 0) {
+	if (mdss && !onGPU && fFlipTried && fFlipShown >= 0) {
 		flipTo(-1);             /* (drawn into the panel's own memory by the processors) */
+	}
+	if (mdss) {
+		mdssRelease();
 	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {

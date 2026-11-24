@@ -83,6 +83,7 @@
 #include <sys/sysctl.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern void hakios_rpmh_arc_active(uint32_t address, uint32_t value) __attribute__((weak));     /* power/hakios.rpmh-arc.h */
 extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 extern uint64_t kvtophys(vm_offset_t va);
@@ -934,6 +935,12 @@ rails(uint32_t level)
 	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
 	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
+	/* (the APSS sleep and wake sets follow this vote: drivers/power/hakios.rpmh-arc.h) */
+	if (hakios_rpmh_arc_active != NULL) {
+		for (unsigned r = 0; r < 2; r++) {
+			hakios_rpmh_arc_active(addresses[r], values[r]);
+		}
+	}
 	lck_mtx_unlock(&hakios_rsc_lock);
 	return done != 0;
 }
@@ -1011,8 +1018,11 @@ ipa_clock(bool on)
 	if (!option("modem_ipa_bus_off")) {
 		static const char *const buses[] = { "SN8", "SH0", "MC0", "ACV" };
 
+		/* (through the vote keeper, summed with the DDR floor's and the others' votes on these BCMs: hakios.cpufreq.c) */
 		for (unsigned b = 0; b < sizeof(buses) / sizeof(buses[0]); b++) {
-			rpmh_command(buses[b], BCM_VOTE(on, on ? 0x3fffu : 0));
+			if (!hakios_rpmh_bw(HAKIOS_RPMH_MODEM, buses[b], 0, on ? 0x3fffu : 0)) {
+				printf("mpss: %u: the vote keeper did not take %s\n", step, buses[b]);
+			}
 		}
 	}
 	return ok;

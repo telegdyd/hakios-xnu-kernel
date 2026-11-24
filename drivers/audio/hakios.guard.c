@@ -283,6 +283,34 @@ hakios_guard_process(int16_t *frames, uint32_t count)
 	}
 }
 
+/*
+ * `frames' of silence that were not processed (the feeder's stream stopped while idle, hakios.sound.c): the averages
+ * fall as they would have, period by period, and the filter and the peak limiter are at rest. Ten minutes at most
+ * are reckoned (the 60 s average is at nothing long before).
+ */
+void
+hakios_guard_silence(uint64_t frames)
+{
+	uint64_t periods = frames / 960;
+
+	if (periods > 30000) {
+		periods = 30000;
+	}
+	for (uint64_t i = 0; i < periods; i++) {
+		for (unsigned c = 0; c < 2; c++) {
+			guard.rms[c] -= guard.rms[c] * 960 / RMS_FRAMES;
+			guard.fast[c] -= guard.fast[c] * 960 / FAST_FRAMES;
+			guard.slow[c] -= guard.slow[c] * 960 / SLOW_FRAMES;
+		}
+	}
+	for (unsigned c = 0; c < 2; c++) {
+		guard.x1[c] = guard.x2[c] = guard.y1[c] = guard.y2[c] = 0;
+	}
+	if (periods != 0) {
+		guard.envelope = 0;
+	}
+}
+
 /* What has happened since the last call (and the averages and the gain as they are now). */
 void
 hakios_guard_take_report(struct hakios_guard_report *report)

@@ -504,6 +504,9 @@ publish(const struct reading *r)
 
 		if (hakios_battery_get(&soc, &present, &charger) && soc >= 0 && soc <= 100) {
 			est.soc = soc * 100;
+			/* (and the charger as the gauge has it: the estimate's own only turns off on a discharge past DIRECTION_MA,
+			 * which an idle phone never reaches; taking over after an unplug it said a charger was in, run33) */
+			est.external = charger != 0;
 		}
 		return;
 	}

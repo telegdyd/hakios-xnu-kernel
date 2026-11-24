@@ -293,4 +293,7 @@ hakios_input_init(void)
 	hakios_wifi_init();
 	hakios_adsp_init();
 	hakios_mpss_init();
+#ifdef HAKIOS_CAM_PROBE
+	hakios_cam_probe_init();
+#endif
 }
