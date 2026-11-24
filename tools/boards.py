@@ -95,6 +95,7 @@ SOC_SCHEMA = {
     'thermal': {'tsens': ([int], True)},
     'spmi': {'core': (int, True), 'cnfg': (int, True), 'observer': (int, True), 'channels': (int, False),
              'ee': (int, False), 'channel_map': (int, False), 'bus': (int, False)},
+    'usb': {'dwc3': (int, True), 'interrupt': (int, False), 'hsphy': (int, False), 'clkref': (int, False)},
     'adreno': {'gpu': (int, True), 'gmu': (int, True), 'gpucc': (int, True), 'cx_misc': (int, True), 'rscc': (int, True),
                'smmu': (int, True), 'pdc': (int, True), 'qfprom': (int, True), 'tsens': (int, False)},
     'pins': {'tlmm': (int, True)},
@@ -1015,6 +1016,10 @@ def table_text(socs, boards):
                        f'.ee = {spmi.get("ee", 0)}'
                        + (f', .channel_map = {spmi["channel_map"]:#010x}' if spmi.get('channel_map') else '')
                        + (f', .bus = {spmi["bus"]}' if spmi.get('bus') else '') + ' },')
+        usb = soc.get('usb')
+        if usb:
+            out.append(f'\t\t.usb = {{ .dwc3 = {usb["dwc3"]:#010x}, .interrupt = {usb.get("interrupt", 0)}, '
+                       f'.hsphy = {usb.get("hsphy", 0):#010x}, .clkref = {usb.get("clkref", 0):#010x} }},')
         adreno = soc.get('adreno')
         if adreno:
             out += ['\t\t.adreno = {',

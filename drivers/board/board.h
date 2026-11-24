@@ -153,6 +153,14 @@ struct hakios_board {
 		uint32_t bus;                   /* version 7: which of the arbiter's two buses (qcom,bus-id); cnfg is that bus's */
 	} spmi;
 
+	/* the USB controller the boot loader's UEFI drives (soc: usb { }), for usb_net=1 (board/usb_net.c). 0: none named */
+	struct {
+		uint32_t dwc3;                  /* the DWC3 core (snps,dwc3: its reg) */
+		uint32_t interrupt;             /* its event interrupt as the GIC numbers it (the SPI's number + 32); 0: polled */
+		uint32_t hsphy;                 /* the high-speed PHY (usb_phyguard=1); 0: no guard */
+		uint32_t clkref;                /* the GCC register that enables the PHY's reference clock (usb_phyguard=1) */
+	} usb;
+
 	/* the SoC's own pins (soc: pins { }) */
 	struct {
 		uint32_t tlmm;                  /* where GPIO 0's registers are; GPIO n's are 0x1000 n further */

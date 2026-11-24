@@ -25,7 +25,7 @@
 #include <sys/kpi_mbuf.h>
 
 #define HAKIOS_NET_FRAME_MAX   1514
-#define HAKIOS_NET_UNITS       2       /* en0: the radio (or virtio); en1: the modem's packets (hakios_cell.c) */
+#define HAKIOS_NET_UNITS       3       /* en0: the radio (or virtio); en1: the modem's packets (board/cell.c); en2: the USB cable (board/usb_net.c) */
 
 struct hakios_net_link {
 	const char *    name;           /* for the log */
@@ -62,6 +62,8 @@ void hakios_net_init(void);            /* the links there are: each looks for it
 /* an Apple80211 request (SIOCGA80211, SIOCSA80211) for the interface of a radio: board/apple80211.c */
 errno_t hakios_apple80211_ioctl(u_long command, void *data);
 void hakios_virtio_net_init(void);     /* boot-arg virtio_net=1: QEMU's virtio network device */
+void hakios_usb_net_init(void);        /* boot-arg usb_net=1: the phone's USB cable as en2 (CDC-NCM), the log on TCP 5140 */
+void hakios_usb_net_quiesce(void);     /* on the way back to the loader: the USB controller stopped, if usb_net=1 took it */
 #endif /* KERNEL */
 
 #endif /* _SYS_HAKIOS_NET_H_ */
