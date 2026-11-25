@@ -61,6 +61,7 @@ extern void hakios_goodix_quiesce(void);
 extern void hakios_fts_quiesce(void);
 extern void hakios_ft5x06_quiesce(void);
 extern void hakios_s3908_quiesce(void);
+extern void hakios_buttons_quiesce(void);
 extern void hakios_torch_quiesce(void);
 extern void hakios_backlight_quiesce(void);
 extern void hakios_display_power_quiesce(void);
@@ -634,6 +635,7 @@ loader_return(void)
 	hakios_fts_quiesce();          /* the FocalTech touch controller's polling stopped and the chip powered off, likewise */
 	hakios_ft5x06_quiesce();       /* ... and the one on I2C, its bus's pins given back as they were found */
 	hakios_s3908_quiesce();        /* ... and the Synaptics one on I2C the same (the chip left running for the firmware) */
+	hakios_buttons_quiesce();      /* the PMIC button interrupts and PDC pin back as the firmware left them */
 	hakios_torch_quiesce();        /* the flashlight off, if it was lit */
 	hakios_backlight_quiesce();     /* the panel's light back where the loader expects it */
 	hakios_thermal_quiesce();       /* the processors' groups back at the rows they were found at */

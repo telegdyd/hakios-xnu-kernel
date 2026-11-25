@@ -14,6 +14,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -334,6 +335,9 @@ battery_poll(void)
 	struct loader_battery sample;
 	bool fresh, taken_over = false;
 
+	uint32_t new_charger;
+	bool charger_changed;
+
 	if (!battery_snapshot(&sample) || sample.magic != LOADER_BATTERY_MAGIC ||
 	    sample.version != LOADER_BATTERY_VERSION || sample.size < sizeof(sample) ||
 	    !(sample.flags & LOADER_BATTERY_VALID) || sample.soc_percent < 0 || sample.soc_percent > 100) {
@@ -364,12 +368,18 @@ battery_poll(void)
 	battery_current_ma = sample.current_ma;
 	battery_temperature_c = battery_plausible_c(sample.temperature_c);
 	battery_present = (sample.flags & LOADER_BATTERY_PRESENT) != 0;
-	battery_charger_present = (sample.flags & LOADER_BATTERY_CHARGER_PRESENT) != 0;
+	new_charger = (sample.flags & LOADER_BATTERY_CHARGER_PRESENT) != 0;
+	charger_changed = (uint32_t)battery_charger_present != new_charger;
+	battery_charger_present = (int)new_charger;
 	battery_charging = (sample.flags & LOADER_BATTERY_CHARGING) != 0;
 	battery_soc_estimated = (sample.flags & LOADER_BATTERY_SOC_ESTIMATED) != 0;
 	battery_charger_action = (int)sample.charger_action;
 	battery_updates++;
 	lck_mtx_unlock(&battery_report_lock);
+	if (charger_changed) {
+		__atomic_add_fetch(&hakios_battery_charger_changes, 1, __ATOMIC_RELEASE);
+		thread_wakeup((event_t)&hakios_battery_charger_changes);
+	}
 	if (taken_over) {
 		/* (this says it, not battery_quiet(): the source is another now, and it is not quiet) */
 		__atomic_store_n(&battery_quiet_said, false, __ATOMIC_RELAXED);
@@ -392,6 +402,26 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_design_uah, CTLFLAG_RD | CTLFLAG_LOCK
     &battery_design_uah, 0, "the battery's charge as designed, in uAh (0 if unknown)");
 SYSCTL_INT(_kern_hakios, OID_AUTO, battery_cycles, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_cycles, 0, "the battery's charge cycles (0 if unknown)");
+volatile uint32_t hakios_battery_charger_changes;
+
+bool
+hakios_battery_get(int *soc, int *present, int *charger)
+{
+	*soc = battery_soc_percent;
+	*present = battery_present;
+	*charger = battery_charger_present;
+	return battery_updates != 0;
+}
+
+bool
+hakios_battery_power(int *ma, int *mv, int *charger)
+{
+	*ma = battery_current_ma;
+	*mv = battery_voltage_mv;
+	*charger = battery_charger_present;
+	return battery_updates != 0;
+}
+
 SYSCTL_INT(_kern_hakios, OID_AUTO, battery_from_dsp, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_source_dsp, 0, "1 when the values come from the audio DSP's battery manager");
 
@@ -401,7 +431,8 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	int percent = (b->percent_hundredths + 50) / 100;
 	const int hundredths = b->temperature_hundredths;
 	struct hakios_battery_state told = *b;  /* what is handed on: the DSP's, and how long the charge lasts */
-	bool back;
+	int new_charger = b->external != 0;
+	bool back, charger_changed;
 
 	/* (under the lock, as the loader's readings: see battery_report_lock) */
 	lck_mtx_lock(&battery_report_lock);
@@ -415,7 +446,8 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	battery_temperature_c = hundredths >= BATTERY_COLDEST_C * 100 && hundredths <= BATTERY_HOTTEST_C * 100 ?
 	    battery_plausible_c((hundredths + (hundredths < 0 ? -50 : 50)) / 100) : -273;
 	battery_present = b->present != 0;
-	battery_charger_present = b->external != 0;
+	charger_changed = battery_charger_present != new_charger;
+	battery_charger_present = new_charger;
 	battery_charging = b->status == 1;      /* POWER_SUPPLY_STATUS_CHARGING */
 	battery_soc_estimated = 0;
 	battery_charger_action = b->status;
@@ -437,6 +469,10 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	battery_time_tell(&told);
 	HakiosBatteryReport(&told, sizeof(told));
 	lck_mtx_unlock(&battery_report_lock);
+	if (charger_changed) {
+		__atomic_add_fetch(&hakios_battery_charger_changes, 1, __ATOMIC_RELEASE);
+		thread_wakeup((event_t)&hakios_battery_charger_changes);
+	}
 	if (back) {
 		printf("battery: the audio DSP's battery manager speaks again: its readings are passed on again\n");
 	}

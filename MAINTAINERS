@@ -251,11 +251,14 @@ F:	drivers/board/cpufreq.c
 F:	drivers/board/cpufreq_hw.h
 F:	drivers/board/scmi_perf.c
 F:	drivers/board/ddr.c
+F:	drivers/board/gcc8450.h
+F:	drivers/board/soc_sleep.c
 F:	drivers/board/bench.c
 F:	drivers/board/cputop.c
 T:	workbench/cpufreq_driver_test.c
 T:	workbench/scmi_perf_test.c
 T:	workbench/ddr_driver_test.c
+T:	workbench/soc_sleep_test.c
 K:	cpufreq-epss, ddr-rpmh; cpufreq=, ddr=, membench=, cpuload=, cputop=
 
 MODEM
@@ -343,6 +346,8 @@ STORAGE
 F:	drivers/board/ufs.c
 F:	drivers/board/ufshc.c
 F:	drivers/board/ufshc.h
+F:	drivers/board/ufshc_clock.h
+F:	drivers/board/ufshc_power.h
 F:	drivers/board/virtio_blk.c
 T:	workbench/ufs_driver_test.c
 T:	workbench/ufs_whitelist_test.c

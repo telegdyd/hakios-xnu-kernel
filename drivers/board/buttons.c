@@ -51,12 +51,16 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <sys/board/input.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
+#include <stdarg.h>
 
 #include "kernel.h"
 #include "board.h"
@@ -178,7 +182,10 @@ find_channel(struct peripheral *p)
 #define REG_INT_SET_TYPE        0x11            /* interrupts: a bit per input in each of these */
 #define REG_INT_POLARITY_HIGH   0x12
 #define REG_INT_POLARITY_LOW    0x13
+#define REG_INT_LATCHED_CLR     0x14
 #define REG_INT_ENABLED         0x15
+#define REG_INT_EN_SET          0x15
+#define REG_INT_EN_CLR          0x16
 #define REG_INT_LATCHED         0x18
 #define REG_INT_PENDING         0x19
 
@@ -447,6 +454,81 @@ pin_input(void)
 	volume_up.last = !(status & GPIO_LEVEL);
 }
 
+/* ---- interrupts through the PMIC arbiter and PDC (soc.dtsi: spmi { intr, interrupt-pdc }, pins { pdc }) ---- */
+
+#define CHNL_ACC_ENABLE         0x100
+#define CHNL_IRQ_STATUS         0x104
+#define CHNL_IRQ_CLEAR          0x108
+#define PDC_ENABLE_BANK0        0x010
+#define PDC_CFG(pin)            (0x110 + 4 * (pin))
+#define PDC_VERSION             0x1000
+#define PDC_VERSION_3_2         0x30200u
+#define PDC_CFG_ENABLE          (1u << 3)
+#define PDC_LEVEL_HIGH          4u
+#define GPIO_IRQ_BIT            0x01
+#define KEYS_NET_MS             1000
+#define KEYS_STORM              200
+
+extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context) __attribute__((weak));
+extern void gic_v3_spi_mask(uint32_t intid) __attribute__((weak));
+extern void gic_v3_spi_unmask(uint32_t intid) __attribute__((weak));
+extern bool hakios_screen_off(void) __attribute__((weak));
+extern wait_result_t hakios_assert_wait_net(event_t event, uint32_t ms) __attribute__((weak));
+
+static struct {
+	bool            on;
+	bool            delivered;
+	volatile uint32_t rang;
+	uint16_t        pdc_pin, intid;
+	uint32_t        count, edges, spurious, nets, period_count;
+	uint64_t        period, second;
+} keys_irq;
+
+static vm_offset_t pon_chnl, pin_chnl, arb_intr, keys_pdc;
+static uint32_t pdc_found_bank, pdc_found_cfg;
+static uint8_t pon_found[3], pin_found[3];
+static bool pon_written, pin_written;
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_irq_count, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_irq.count, 0,
+    "the PMIC arbiter's interrupts taken by the buttons");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_irq_edges, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_irq.edges, 0,
+    "of them, ones that brought a key's edge");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_irq_spurious, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_irq.spurious, 0,
+    "another channel's interrupt found and switched off");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_irq_nets, CTLFLAG_RD | CTLFLAG_LOCKED, &keys_irq.nets, 0,
+    "waits ended by the net (no interrupt)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_presses, CTLFLAG_RD | CTLFLAG_LOCKED, &power.presses, 0, "presses of power");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_presses_up, CTLFLAG_RD | CTLFLAG_LOCKED, &volume_up.presses, 0,
+    "presses of volume up");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, buttons_presses_down, CTLFLAG_RD | CTLFLAG_LOCKED, &volume_down.presses, 0,
+    "presses of volume down");
+
+static void
+quiet_log(const char *format, ...)
+{
+	char line[200];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+}
+
+static const char *
+spmi_write(vm_offset_t channel, uint8_t reg, uint8_t value)
+{
+	const char *problem;
+
+	hakios_spmi_lock();
+	problem = hakios_spmi_write(channel, reg, value);
+	hakios_spmi_unlock();
+	return problem;
+}
+
 static void
 say_summary(void)
 {
@@ -455,6 +537,293 @@ say_summary(void)
 	    power.down ? " power" : "", volume_up.down ? " volume-up" : "", volume_down.down ? " volume-down" : "",
 	    (power.down || volume_up.down || volume_down.down) ? " held" : " none held", bus.reads,
 	    bus.reads ? bus.total_ns / bus.reads / 1000 : 0, bus.longest_ns / 1000, bus.failed);
+	if (keys_irq.intid != 0) {
+		printf("buttons: interrupts %s: %u taken, %u with a key's edge, %u of others, %u nets\n",
+		    keys_irq.on ? "on" : "OFF", keys_irq.count, keys_irq.edges, keys_irq.spurious, keys_irq.nets);
+	}
+}
+
+static void
+keys_irq_arrived(__unused void *context, uint32_t intid)
+{
+	uint64_t now = mach_absolute_time();
+
+	gic_v3_spi_mask(intid);
+	keys_irq.count++;
+	if (now - keys_irq.period >= keys_irq.second) {
+		keys_irq.period = now;
+		keys_irq.period_count = 0;
+	}
+	if (++keys_irq.period_count > KEYS_STORM) {
+		keys_irq.on = false;
+	}
+	__atomic_store_n(&keys_irq.rang, 1, __ATOMIC_RELEASE);
+	thread_wakeup((event_t)&keys_irq.rang);
+}
+
+static void
+keys_irq_service(uint8_t *pon_bits, uint8_t *pin_bits)
+{
+	uint32_t words = (arb.channels + 31) / 32;
+
+	*pon_bits = *pin_bits = 0;
+	for (uint32_t w = 0; w < words; w++) {
+		uint32_t pending = rd(arb_intr + 4 * w);
+
+		while (pending != 0) {
+			uint32_t apid = 32 * w + (uint32_t)__builtin_ctz(pending);
+			vm_offset_t ch;
+			uint32_t status;
+
+			pending &= pending - 1;
+			ch = (pon.found && apid == pon.channel) ? pon_chnl : (pin.found && apid == pin.channel) ? pin_chnl : 0;
+			if (ch == 0) {
+				ch = hakios_spmi_map_write(&arb, apid);
+				if (ch == 0) {
+					continue;
+				}
+				status = rd(ch + CHNL_IRQ_STATUS);
+				wr(ch + CHNL_ACC_ENABLE, 0);
+				wr(ch + CHNL_IRQ_CLEAR, status);
+				if (keys_irq.spurious++ < 8) {
+					printf("buttons: interrupt of channel %u (%#x), not a key's: switched off\n", apid,
+					    hakios_spmi_channel_map(&arb, apid));
+				}
+				continue;
+			}
+			status = rd(ch + CHNL_IRQ_STATUS);
+			wr(ch + CHNL_IRQ_CLEAR, status);
+			*(ch == pon_chnl ? pon_bits : pin_bits) |= (uint8_t)status;
+		}
+	}
+	if (*pon_bits != 0) {
+		(void)spmi_write(pon_chnl, REG_INT_LATCHED_CLR, *pon_bits);
+	}
+	if (*pin_bits != 0) {
+		(void)spmi_write(pin_chnl, REG_INT_LATCHED_CLR, *pin_bits);
+	}
+}
+
+static bool
+keys_irq_peripheral(const struct peripheral *p, vm_offset_t ch, uint8_t bits, uint8_t found[3], bool *written)
+{
+	static const uint8_t regs[3] = { REG_INT_SET_TYPE, REG_INT_POLARITY_HIGH, REG_INT_POLARITY_LOW };
+	const char *problem = NULL;
+	uint8_t r[8];
+
+	wr(ch + CHNL_IRQ_CLEAR, 0xff);
+	wr(ch + CHNL_ACC_ENABLE, 1);
+	problem = spmi_read(p, REG_RT_STATUS, r, 8);
+	if (problem == NULL) {
+		found[0] = r[1];
+		found[1] = r[2];
+		found[2] = r[3];
+		*written = true;
+	}
+	for (unsigned i = 0; problem == NULL && i < 3; i++) {
+		problem = spmi_write(ch, regs[i], r[regs[i] - REG_RT_STATUS] | bits);
+	}
+	if (problem == NULL) {
+		problem = spmi_write(ch, REG_INT_LATCHED_CLR, bits);
+	}
+	if (problem == NULL) {
+		problem = spmi_write(ch, REG_INT_EN_SET, bits);
+	}
+	if (problem == NULL) {
+		problem = spmi_read(p, REG_RT_STATUS, r, 8);
+	}
+	if (problem != NULL) {
+		printf("buttons: interrupts of %s: %s\n", p->name, problem);
+		return false;
+	}
+	printf("buttons: interrupts of %s (bits %#x): edge %#x, high %#x, low %#x, enabled %#x; arbiter channel %u: enable %#x\n",
+	    p->name, bits, r[1], r[2], r[3], r[5], p->channel, rd(ch + CHNL_ACC_ENABLE));
+	return (r[5] & bits) == bits && (r[1] & bits) == bits;
+}
+
+static void
+keys_irq_start(void)
+{
+	const struct hakios_board *board = hakios_board();
+	uint32_t wanted = 1, version, bank, cfg;
+	uint8_t pon_bits = (power.usable ? pon_kpdpwr : 0) | (volume_down.usable ? pon_resin : 0), a, b;
+	vm_offset_t pdc;
+	bool ok = true;
+
+	PE_parse_boot_argn("buttons_irq", &wanted, sizeof(wanted));
+	if (!wanted || !hakios_spmi_is_v7(&arb) || board->spmi.channels == 0 || board->spmi.intr == 0 ||
+	    board->spmi.pdc_pin == 0 || board->spmi.pdc_intid == 0 || board->pins.pdc == 0 ||
+	    gic_v3_spi_attach == NULL || gic_v3_spi_unmask == NULL || gic_v3_spi_mask == NULL) {
+		printf("buttons: no interrupt (%s): the keys are looked at every %u ms\n",
+		    !wanted ? "buttons_irq=0" : "no arbiter/PDC route for this board", POLL_MS);
+		return;
+	}
+	keys_irq.pdc_pin = board->spmi.pdc_pin;
+	keys_irq.intid = board->spmi.pdc_intid;
+	printf("buttons: interrupts: the arbiter's line (PDC pin %u, GIC %u), channels %u and %u\n", keys_irq.pdc_pin,
+	    keys_irq.intid, pon.channel, pin.channel);
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &keys_irq.second);
+	arb_intr = ml_io_map(board->spmi.intr, 0x1000);
+	pon_chnl = hakios_spmi_map_write(&arb, pon.channel);
+	pin_chnl = hakios_spmi_map_write(&arb, pin.channel);
+	if (pon_chnl == 0 || (volume_up.usable && pin_chnl == 0)) {
+		printf("buttons: cannot map arbiter write channels: looking every %u ms\n", POLL_MS);
+		return;
+	}
+
+	pdc = ml_io_map(board->pins.pdc, 0x2000);
+	version = rd(pdc + PDC_VERSION);
+	bank = rd(pdc + PDC_ENABLE_BANK0);
+	cfg = rd(pdc + PDC_CFG(keys_irq.pdc_pin));
+	keys_pdc = pdc;
+	pdc_found_bank = bank;
+	pdc_found_cfg = cfg;
+	if (version >= PDC_VERSION_3_2) {
+		wr(pdc + PDC_CFG(keys_irq.pdc_pin), PDC_LEVEL_HIGH | PDC_CFG_ENABLE);
+	} else {
+		wr(pdc + PDC_CFG(keys_irq.pdc_pin), PDC_LEVEL_HIGH);
+		wr(pdc + PDC_ENABLE_BANK0, bank | 1u << keys_irq.pdc_pin);
+	}
+	printf("buttons: PDC version %#x: pin %u config %#x -> %#x, bank 0 %#x -> %#x\n", version, keys_irq.pdc_pin, cfg,
+	    rd(pdc + PDC_CFG(keys_irq.pdc_pin)), bank, rd(pdc + PDC_ENABLE_BANK0));
+
+	__atomic_store_n(&keys_irq.rang, 0, __ATOMIC_RELAXED);
+	keys_irq.on = true;
+	if (gic_v3_spi_attach(keys_irq.intid, false, keys_irq_arrived, NULL) != KERN_SUCCESS) {
+		keys_irq.on = false;
+		printf("buttons: THE ARBITER'S INTERRUPT (GIC %u) CANNOT BE TAKEN: looking every %u ms\n", keys_irq.intid, POLL_MS);
+		return;
+	}
+	if (pon_bits != 0) {
+		ok = keys_irq_peripheral(&pon, pon_chnl, pon_bits, pon_found, &pon_written);
+	}
+	if (volume_up.usable) {
+		ok = keys_irq_peripheral(&pin, pin_chnl, GPIO_IRQ_BIT, pin_found, &pin_written) && ok;
+	}
+	keys_irq_service(&a, &b);
+	gic_v3_spi_unmask(keys_irq.intid);
+	if (!ok) {
+		printf("buttons: an interrupt is not set as asked: looking every %u ms as well\n", POLL_MS);
+	}
+	keys_irq.delivered = ok;
+	printf("buttons: interrupts on: %u taken while setting up; the net is %u ms%s\n", keys_irq.count,
+	    ok ? KEYS_NET_MS : POLL_MS, ok ? "" : " until one brings an edge");
+}
+
+void
+hakios_buttons_quiesce(void)
+{
+	uint8_t pon_bits = pon_kpdpwr | pon_resin;
+
+	if (keys_irq.intid == 0 || pon_chnl == 0) {
+		return;
+	}
+	keys_irq.on = false;
+	if (gic_v3_spi_mask != NULL) {
+		gic_v3_spi_mask(keys_irq.intid);
+	}
+	if (pon.found && pon_written) {
+		(void)spmi_write(pon_chnl, REG_INT_EN_CLR, pon_bits);
+		(void)spmi_write(pon_chnl, REG_INT_LATCHED_CLR, pon_bits);
+		(void)spmi_write(pon_chnl, REG_INT_SET_TYPE, pon_found[0]);
+		(void)spmi_write(pon_chnl, REG_INT_POLARITY_HIGH, pon_found[1]);
+		(void)spmi_write(pon_chnl, REG_INT_POLARITY_LOW, pon_found[2]);
+	}
+	if (pon.found) {
+		wr(pon_chnl + CHNL_ACC_ENABLE, 0);
+		wr(pon_chnl + CHNL_IRQ_CLEAR, 0xff);
+	}
+	if (pin.found && pin_chnl != 0 && pin_written) {
+		(void)spmi_write(pin_chnl, REG_INT_EN_CLR, GPIO_IRQ_BIT);
+		(void)spmi_write(pin_chnl, REG_INT_LATCHED_CLR, GPIO_IRQ_BIT);
+		(void)spmi_write(pin_chnl, REG_INT_SET_TYPE, pin_found[0]);
+		(void)spmi_write(pin_chnl, REG_INT_POLARITY_HIGH, pin_found[1]);
+		(void)spmi_write(pin_chnl, REG_INT_POLARITY_LOW, pin_found[2]);
+	}
+	if (pin.found && pin_chnl != 0) {
+		wr(pin_chnl + CHNL_ACC_ENABLE, 0);
+		wr(pin_chnl + CHNL_IRQ_CLEAR, 0xff);
+	}
+	if (keys_pdc != 0) {
+		wr(keys_pdc + PDC_ENABLE_BANK0, pdc_found_bank);
+		wr(keys_pdc + PDC_CFG(keys_irq.pdc_pin), pdc_found_cfg);
+	}
+	if (ml_get_interrupts_enabled()) {
+		printf("buttons: the keys' interrupts off in the PMICs, PDC pin %u as found (bank 0 %#x) (before a reset)\n",
+		    keys_irq.pdc_pin, rd(keys_pdc + PDC_ENABLE_BANK0));
+	} else {
+		quiet_log("buttons: the keys' interrupts off in the PMICs, PDC pin %u as found (bank 0 %#x) (before a reset)\n",
+		    keys_irq.pdc_pin, keys_pdc != 0 ? rd(keys_pdc + PDC_ENABLE_BANK0) : 0);
+	}
+}
+
+static bool
+keys_steady(void)
+{
+	struct button *all[3] = { &power, &volume_up, &volume_down };
+
+	for (unsigned i = 0; i < 3; i++) {
+		if (all[i]->usable && all[i]->last != all[i]->down) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void
+keys_tap(struct button *b, bool edge)
+{
+	if (edge && b->usable && b->live && !b->down && !b->last) {
+		printf("buttons: %s was pressed and released between two looks\n", b->name);
+		b->last = true;
+		button_look(b, true);
+		b->last = false;
+		button_look(b, false);
+	}
+}
+
+static void
+keys_wait(void)
+{
+	uint8_t pon_bits, pin_bits;
+	bool rang;
+
+	if (keys_irq.delivered) {
+		if (hakios_assert_wait_net != NULL) {
+			(void)hakios_assert_wait_net((event_t)&keys_irq.rang, KEYS_NET_MS);
+		} else {
+			assert_wait_timeout((event_t)&keys_irq.rang, THREAD_UNINT, KEYS_NET_MS, NSEC_PER_MSEC);
+		}
+	} else {
+		uint32_t ms = (hakios_screen_off != NULL && hakios_screen_off()) ? 3 * POLL_MS : POLL_MS;
+		assert_wait_timeout((event_t)&keys_irq.rang, THREAD_UNINT, ms, NSEC_PER_MSEC);
+	}
+	if (__atomic_load_n(&keys_irq.rang, __ATOMIC_ACQUIRE) != 0) {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+	} else {
+		(void)thread_block(THREAD_CONTINUE_NULL);
+	}
+	rang = __atomic_exchange_n(&keys_irq.rang, 0, __ATOMIC_ACQUIRE) != 0;
+	if (!rang) {
+		keys_irq.nets++;
+		return;
+	}
+	keys_irq_service(&pon_bits, &pin_bits);
+	if (keys_irq.on) {
+		gic_v3_spi_unmask(keys_irq.intid);
+	} else {
+		printf("buttons: MORE THAN %u INTERRUPTS IN A SECOND: the line is left masked; looking every %u ms\n",
+		    KEYS_STORM, POLL_MS);
+	}
+	if ((pon_bits | pin_bits) == 0) {
+		return;
+	}
+	keys_irq.edges++;
+	keys_irq.delivered = true;
+	buttons_poll();
+	keys_tap(&power, (pon_bits & pon_kpdpwr) != 0);
+	keys_tap(&volume_down, (pon_bits & pon_resin) != 0);
+	keys_tap(&volume_up, (pin_bits & GPIO_IRQ_BIT) != 0);
 }
 
 static void
@@ -516,27 +885,43 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 
 	printf("buttons: step 5: watching%s%s%s, every %u ms: power is the side button\n", power.usable ? " power" : "",
 	    volume_up.usable ? " volume-up" : "", volume_down.usable ? " volume-down" : "", POLL_MS);
-	for (unsigned tick = 1;; tick++) {
-		buttons_poll();
-		/* once early on as well: a short run is to say what the reads cost too */
-		if (tick % MINUTE_TICKS == 0 || tick == 10 * 1000 / POLL_MS) {
-			say_summary();
-		}
-		if (bus.failed >= 1000 && bus.failed * 2 > bus.reads) {
-			printf("buttons: more than half of %llu reads have failed: giving up\n", bus.reads);
-			/* a key that was held when the reads stopped is let go: nobody will see it released any more, and Darwin
-			 * would keep the side or volume button held for the rest of the run */
-			struct button *keys[] = { &power, &volume_down, &volume_up };
-			for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
-				if (keys[k]->down) {
-					keys[k]->down = false;
-					printf("buttons: %s let go: it was held when the reads stopped\n", keys[k]->name);
-					hakios_touch_post(HAKIOS_BUTTON_UP, keys[k]->record, 0, 0);
-				}
+	keys_irq_start();
+	{
+		uint64_t summary_at = mach_absolute_time(), minute_ns;
+
+		nanoseconds_to_absolutetime(60ULL * NSEC_PER_SEC, &minute_ns);
+		for (unsigned tick = 1;; tick++) {
+			uint64_t now;
+
+			if (!keys_irq.on || !keys_steady()) {
+				buttons_poll();
 			}
-			break;
+			now = mach_absolute_time();
+			if ((keys_irq.on ? (now - summary_at >= minute_ns) : (tick % MINUTE_TICKS == 0)) ||
+			    (!keys_irq.on && tick == 10 * 1000 / POLL_MS)) {
+				say_summary();
+				summary_at = now;
+			}
+			if (bus.failed >= 1000 && bus.failed * 2 > bus.reads) {
+				printf("buttons: more than half of %llu reads have failed: giving up\n", bus.reads);
+				/* a key that was held when the reads stopped is let go: nobody will see it released any more, and Darwin
+				 * would keep the side or volume button held for the rest of the run */
+				struct button *keys[] = { &power, &volume_down, &volume_up };
+				for (unsigned k = 0; k < sizeof(keys) / sizeof(keys[0]); k++) {
+					if (keys[k]->down) {
+						keys[k]->down = false;
+						printf("buttons: %s let go: it was held when the reads stopped\n", keys[k]->name);
+						hakios_touch_post(HAKIOS_BUTTON_UP, keys[k]->record, 0, 0);
+					}
+				}
+				break;
+			}
+			if (keys_irq.on && keys_steady()) {
+				keys_wait();
+			} else {
+				hakios_screen_pause(POLL_MS, 50);      /* (50 ms looks with the display off: arch/arm64/kernel/psci_smp.c) */
+			}
 		}
-		hakios_screen_pause(POLL_MS, 50);      /* (50 ms looks with the display off: arch/arm64/kernel/psci_smp.c) */
 	}
 out:
 	if (steps < 5) {

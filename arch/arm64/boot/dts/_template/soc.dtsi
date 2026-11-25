@@ -48,6 +48,8 @@
 		observer = <0x0e600000>;        // "obsrvr": reads
 		channels = <0x0c600000>;        // "chnls": writes; optional, needed only by the drivers that write to a PMIC
 		ee = <0>;                       // qcom,ee; optional, 0 if left out
+		intr = <0x0c4c0000>;            // "intr": per-EE accumulated IRQ status; optional, for buttons_irq=1
+		interrupt-pdc = <1 513>;        // optional: periph_irq in the PDC (pin, GIC INTID); needs pins { pdc }
 		channel-map = <0>;              // arbiter version 8 only: its table of channels (the "core" node's
 		//                              // second block); cnfg is then the table of owners, observer and
 		//                              // channels 0x20 and 0x200 a channel (Linux spmi-pmic-arb.c).
@@ -163,6 +165,10 @@
 		cmd-db-size = <0x20000>;        // ... and size
 		rsc = <0x18220000>;             // the qcom,rpmh-rsc with qcom,drv-id = <2> (apps_rsc): its reg "drv-2"
 		tcs-offset = <0xd00>;           // qcom,tcs-offset of that node
+		sleep-stats = <0x0c3f0000>;     // optional, for soc-sleep: AOP sleep stats (qcom,rpmh-sleep-stats)
+		cx-monitor = <0x0c320000>;      // optional, for soc-sleep: AOP CX vote monitor
+		camcc-gdsc = <0x0adf31dc>;      // optional, for soc-sleep: camera top GDSCR checked before CX collapse
+		videocc-gdsc = <0x0aaf804c 0x0aaf8074>; // optional, for soc-sleep: video MVS0C/MVS1C GDSCRs
 	};
 
 	// The Adreno's blocks, for the feature "gpu-a660". From the SoC's -gpu.dtsi (qcom,kgsl-3d0 and qcom,gmu,

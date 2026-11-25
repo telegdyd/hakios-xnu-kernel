@@ -77,6 +77,8 @@
 
 #define say hakios_say
 
+extern void hakios_display_bandwidth(bool needed) __attribute__((weak));
+
 /* ---- what differs between devices ----------------------------------------------------------------- */
 
 enum bl_backend { BL_NONE, BL_DCS, BL_SOFT };
@@ -871,6 +873,9 @@ run_power_cycle(uint32_t ms)
 		return;
 	}
 	sleep_ms(ms);
+	if (hakios_display_bandwidth != NULL) {
+		hakios_display_bandwidth(true);
+	}
 	dp_up();
 	if (!dp_regs_on()) {
 		dp_stat.cycles++;
@@ -883,6 +888,9 @@ run_power_cycle(uint32_t ms)
 	wake_panel(false);
 	sleep_panel();
 	again = dp_down();
+	if (again && hakios_display_bandwidth != NULL) {
+		hakios_display_bandwidth(false);
+	}
 	dp_stat.cycles++;
 	dp_stat.cycle_frames += wake_frames;
 	good = wake_failed == 0 && wake_frames != 0 && !dp_broken && again;
@@ -928,6 +936,10 @@ bl_thread(__unused void *argument, __unused wait_result_t result)
 			if (can_sleep && panel_asleep && !dp_down() && dp_retry() && dp_tries++ < 3) {
 				retry_dp = true;
 			}
+			if (can_sleep && panel_asleep && !retry_dp && dp_broken == 0 &&
+			    hakios_display_off() && hakios_display_bandwidth != NULL) {
+				hakios_display_bandwidth(false);
+			}
 			if (cycle_ms != 0) {
 				run_power_cycle(cycle_ms);
 				continue;
@@ -951,6 +963,9 @@ bl_thread(__unused void *argument, __unused wait_result_t result)
 			run_power_cycle(cycle_ms);
 		}
 		if (panel_asleep) {
+			if (hakios_display_bandwidth != NULL) {
+				hakios_display_bandwidth(true);
+			}
 			dp_up();
 			if (dp_regs_on()) {
 				wake_panel(false);

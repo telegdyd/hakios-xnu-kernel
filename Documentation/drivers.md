@@ -72,6 +72,7 @@ global surfaces.
 | `bsd/dev/board/cpufreq.c` | CPU frequency through EPSS (SM8350 and later) or the OSM's firmware before it (SDM845 to SM8250). | `cpufreq-epss` / `cpufreq=1` | data (`cpufreq { }`) |
 | `bsd/dev/board/scmi_perf.c` | CPU performance levels and limits through SCMI. | `cpufreq-scmi` / `scmi-perf=1` | data (`scmi-perf { }`) |
 | `bsd/dev/board/ddr.c` | Memory bandwidth votes through RPMh. | `ddr-rpmh` / `ddr=` | data (`rpmh { }`), with the slot layout and BCM names of the 7-series |
+| `bsd/dev/board/soc_sleep.c`, `board/gcc8450.h` | APSS RPMh BCM vote keeper, sleep/wake TCS sets 3/5, HLOS ARC sleep & CX/MMCX collapse (TCS 4/6), AOP sleep/DDR stats, CX monitor, and DDR/LLCC floor following CPU frequency (`cpu_gov` + `thermal=2` cap cooperation). | `soc-sleep` / `rpmh_sleep=` | data (`rpmh { }`, `clocks { }`), SM8450 GCC clock table (`gcc8450.h`) |
 | `bsd/dev/board/bench.c` | Measurements: how fast the cores get at memory, how busy each core is. | — / `membench=`, `cpuload=` | any |
 | `bsd/dev/board/thermal.c` | Reads TSENS; holds CPU groups and the panel back when hot. | `thermal { }` / `thermal=` | data |
 | `bsd/dev/board/battery.c` | The battery as the UEFI's charger drivers report it to the loader. | `battery-uefi` / `battery=1` | any phone whose loader provides it |
@@ -186,7 +187,7 @@ driver's work (`cancel_work_sync`) as before.
 | `bsd/miscfs/apfs/` | APFS: reads the Darwin images in RAM; writes for the data volume. | any |
 | `bsd/miscfs/ramfs/` | The RAM file system for `/private/var`. | any |
 | `bsd/dev/board/image.c` | A file of one of the RAM disks by path, for drivers that need firmware before there is a root. | any |
-| `bsd/dev/board/ufs.c`, `board/ufshc.c` | The phone's UFS: through the resident UEFI's driver, or the host controller directly (read only). | Through UEFI: any phone the loader runs on. Directly: where the controller is is data (`ufs` in `platform { }` of the SoC file), the controller is taken to be Qualcomm's, as on the SM7325 and SM7350 |
+| `bsd/dev/board/ufs.c`, `board/ufshc.c`, `board/ufshc_clock.h`, `board/ufshc_power.h` | The phone's UFS: through the resident UEFI's driver, or the host controller directly (read only), with idle auto-Hibern8 (`ufs_auto_hibern8_ms`), GCC/UTP/UniPro clock gating (`ufs_clock_gating`), and `ufs_phy_gdsc` collapse (`ufs_power_down`). | Through UEFI: any phone the loader runs on. Directly: where the controller is is data (`ufs` in `platform { }` of the SoC file), the controller is taken to be Qualcomm's, as on the SM7325 and SM7350; idle clock/power collapse activates with `soc-sleep` |
 | `bsd/dev/board/sparse.c`, `board/virtio_blk.c`, `board/apfs_check.c` | An image with only some of its blocks; QEMU's block device; a walk of a volume for comparison with the host tools. | any |
 
 ## Which of them run on the host
@@ -203,6 +204,7 @@ says what each test covers and what it leaves out.
 | `board/thermal.c` | `thermal_driver_test.c` | two TSENS controllers, three frequency domains |
 | `board/cpufreq.c` | `cpufreq_driver_test.c` | the frequency block's tables |
 | `board/ddr.c` | `ddr_driver_test.c` | RPMh's slot set, a command database |
+| `board/soc_sleep.c` | `soc_sleep_test.c` | APSS RSC TCS 0/3/4/5/6, cmd-db, GCC branches, and collapse GDSCs |
 | `board/buttons.c` | `buttons_driver_test.c` | the PMIC arbiter |
 | `board/rtc.c` | `rtc_driver_test.c` | the PMIC arbiter with a clock's block behind it |
 | `board/torch.c` | `torch_driver_test.c` | the PMIC arbiter with a flash module behind it |

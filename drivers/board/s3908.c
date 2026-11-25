@@ -69,6 +69,7 @@ extern void gic_v3_spi_unmask(uint32_t intid);
 extern lck_mtx_t hakios_smmu_lock;
 extern void hakios_rpmh_lock(void);
 extern void hakios_rpmh_unlock(void);
+extern bool hakios_rpmh_bw(enum hakios_rpmh_client client, const char *bcm, uint32_t vote_a, uint32_t vote_b) __attribute__((weak));
 
 static vm_offset_t tlmm;
 
@@ -466,6 +467,25 @@ votes_set(bool on)
 	bool locking = !__atomic_load_n(&leaving, __ATOMIC_SEQ_CST);
 
 	if (gpi.rsc == 0) {
+		return false;
+	}
+	if (locking && hakios_board_has(HAKIOS_HAS_SOC_SLEEP) && hakios_rpmh_bw != NULL) {
+		const struct hakios_board *board = hakios_board();
+		bool ok = true;
+
+		for (unsigned i = 0; i < 3; i++) {
+			if (board->touch_i2c.bus_votes[i] != NULL &&
+			    !hakios_rpmh_bw(HAKIOS_RPMH_TOUCH, board->touch_i2c.bus_votes[i], i == 0 ? 0 : (on ? 1 : 0),
+			    on ? 1 : 0)) {
+				ok = false;
+			}
+		}
+		if (ok) {
+			gpi.votes_on = on;
+			return true;
+		}
+		gpi.vote_errors++;
+		gpi.votes_held = true;
 		return false;
 	}
 	if (locking) {

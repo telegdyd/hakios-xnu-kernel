@@ -64,6 +64,8 @@ enum {
 	                                         * cluster's L3 and system cache with it; the processors of cpu-idle { }
 	                                         * screen-off-cores off while the display is off (arch/arm64/kernel/
 	                                         * psci_smp.c, cpu_idle, screen_off_cores) */
+	HAKIOS_HAS_SOC_SLEEP     = 1u << 30,    /* APSS RPMh sleep/wake TCS sets, ARC/MMCX/CX collapse, UFS idle/power-down
+	                                         * and USB cable-out parking (drivers/board/soc_sleep.c, ufshc.c, usb_net.c) */
 	/*
 	 * Drivers of one part, wired the way one phone has it (the pins, the bus, the chip): a board lists
 	 * one only if it has that part wired that way. Asked for on any other board, the driver says so and
@@ -190,8 +192,10 @@ struct hakios_board {
 		uint32_t core, cnfg, observer;
 		uint32_t channel_map;           /* version 8: the table of channels; 0: versions 5 and 7 (in core) */
 		uint32_t channels;              /* writes; 0: not given, and nothing here writes to a PMIC */
+		uint32_t intr;                  /* per-EE accumulated IRQ status ("intr"); 0: not given */
 		uint32_t ee;                    /* who this system is to the arbiter (the device tree's qcom,ee) */
 		uint32_t bus;                   /* version 7: which of the arbiter's two buses (qcom,bus-id); cnfg is that bus's */
+		uint16_t pdc_pin, pdc_intid;    /* optional: periph_irq through the PDC (pin, GIC INTID); 0: polled */
 	} spmi;
 
 	/* the USB controller the boot loader's UEFI drives (soc: usb { }), for usb_net=1 (board/usb_net.c). 0: none named */
@@ -260,6 +264,9 @@ struct hakios_board {
 	struct {
 		uint32_t cmd_db, cmd_db_size;
 		uint32_t rsc, tcs_offset;       /* the application processor's "drv-2"; where its slot sets begin */
+		uint32_t sleep_stats, cx_monitor; /* AOP sleep stats and CX vote monitor; 0: not given */
+		uint32_t camcc_gdsc;            /* camera top GDSCR; 0: not checked before MMCX/CX collapse */
+		uint32_t videocc_gdsc[2];       /* video MVS0C/MVS1C GDSCRs; 0: not checked before MMCX/CX collapse */
 	} rpmh;
 
 	/* the keys on the PMICs (board: buttons { }); a peripheral is slave << 8 | the high byte of its registers */

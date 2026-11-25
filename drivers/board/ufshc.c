@@ -64,6 +64,10 @@
 #include <vm/vm_kern.h>
 #include <vm/vm_kern_xnu.h>  /* xnu-12377: the KMA flags and kmem_alloc moved to the internal header */
 #include <vm/memory_types.h>
+extern const struct hakios_board *hakios_board(void) __attribute__((weak));
+extern bool hakios_board_has(uint32_t feature) __attribute__((weak));
+
+#include "board.h"
 #include "kernel.h"
 #include "cache.h"
 #include "mmio.h"
@@ -168,6 +172,9 @@ static bool hc_usable;
 static uint32_t hc_leave;                       /* ufs_native_leave=1 (a test): the list left in at the end, for the loader */
 static volatile bool hc_in, hc_closed, hc_dead;
 static uint32_t hc_is_in, hc_cnr_in;            /* IS and UTRLCNR when this kernel's list went in */
+static uint32_t hc_ahit_original;
+static int hc_auto_boot_ms = 150, hc_auto_ms;
+static bool hc_auto_owned, hc_idle_applied;
 static uint64_t hc_requests, hc_errors, hc_bytes, hc_wait_us, hc_refused, hc_most_in_flight, hc_proofs;
 static uint64_t hc_switch_in_count, hc_switch_out_count;
 static uint32_t hc_in_flight;
@@ -251,6 +258,158 @@ hc_us_since(uint64_t start)
 
 	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
 	return ns / 1000;
+}
+
+static bool
+hc_auto_restore(void)
+{
+	if (hc_auto_owned) {
+		hc_write(UFSHC_AHIT, hc_ahit_original);
+		if (hc_read(UFSHC_AHIT) != hc_ahit_original) {
+			return false;
+		}
+		hc_auto_ms = 0;
+		hc_auto_owned = false;
+	}
+	return true;
+}
+
+#include "ufshc_power.h"
+#include "ufshc_clock.h"
+
+static int
+hc_auto_set(int value)
+{
+	int error;
+
+	if (value < 0 || value > 150) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&hc_lock);
+	hc_pd_hold();
+	if (!hc || !hc_usable || hc_closed || hc_dead || !hc_in || !hc_proven || *hc_loader.take_back != 0) {
+		error = ENXIO;
+	} else if (value && (hc_uic_failed || hc_clock_errors)) {
+		error = EIO;
+	} else if (value == hc_auto_ms) {
+		error = 0;
+	} else if (hc_in_flight || hc_read(UFSHC_UTRLDBR) || hc_read(UFSHC_UTMRLDBR)) {
+		error = EBUSY;
+	} else if ((hc_read(UFSHC_CAP) & (1u << 23)) == 0) {
+		error = ENOTSUP;
+	} else if (!(hc_read(UFSHC_HCE) & 1u) || (hc_read(UFSHC_IS) & (IS_FATAL | 0x60u))) {
+		error = EIO;
+	} else if (value == 0) {
+		hc_auto_restore();
+		error = hc_read(UFSHC_AHIT) == hc_ahit_original ? 0 : EIO;
+	} else if (hc_read(UFSHC_AHIT) != hc_ahit_original && !hc_auto_owned) {
+		error = EBUSY;
+	} else {
+		uint32_t ahit = (3u << 10) | (uint32_t)value;
+
+		hc_auto_owned = true;
+		hc_write(UFSHC_AHIT, ahit);
+		error = hc_read(UFSHC_AHIT) == ahit ? 0 : EIO;
+		if (error) {
+			hc_auto_restore();
+		} else {
+			hc_auto_ms = value;
+		}
+	}
+	hc_pd_release();
+	lck_mtx_unlock(&hc_lock);
+	return error;
+}
+
+static int
+hc_auto_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	int value, changed = 0, error;
+
+	lck_mtx_lock(&hc_lock);
+	value = hc_auto_ms;
+	lck_mtx_unlock(&hc_lock);
+	error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
+	return (error || !changed) ? error : hc_auto_set(value);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, ufs_auto_hibern8_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, hc_auto_sysctl, "I", "UFS automatic Hibern8 idle time: 1-150 ms (150 at boot), or 0 to restore loader setting");
+
+static int
+hc_idle_stats(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	char text[1536];
+	uint32_t cap, ahit, scale, hw;
+	uint64_t idle_us;
+	int n;
+
+	if (req->oldptr == USER_ADDR_NULL) {
+		return SYSCTL_OUT(req, text, sizeof(text));
+	}
+	lck_mtx_lock(&hc_lock);
+	if (!hc || !hc_usable || hc_closed || (hc_pd_lost && hc_dead)) {
+		lck_mtx_unlock(&hc_lock);
+		return ENXIO;
+	}
+	hc_pd_hold();
+	cap = hc_read(UFSHC_CAP);
+	ahit = hc_read(UFSHC_AHIT);
+	scale = (ahit >> 10) & 7u;
+	idle_us = ahit & 0x3ffu;
+	for (uint32_t i = 0; i < scale; i++) {
+		idle_us *= 10;
+	}
+	hw = hc_read(0xe4u);
+	n = snprintf(text, sizeof(text),
+	    "cap %08x ver %08x auto_hibern8_supported %u ahit %08x idle_us %llu\n"
+	    "hce %08x hcs %08x is %08x ie %08x doorbell %08x tm_doorbell %08x run %08x\n"
+	    "qcom_hw %08x cfg1 %08x cfg2 %08x\n"
+	    "native_in %u closed %u dead %u in_flight %u requests %llu errors %llu bytes %llu\n",
+	    cap, hc_read(UFSHC_VER), !!(cap & (1u << 23)), ahit, idle_us,
+	    hc_read(UFSHC_HCE), hc_read(UFSHC_HCS), hc_read(UFSHC_IS), hc_read(UFSHC_IE),
+	    hc_read(UFSHC_UTRLDBR), hc_read(UFSHC_UTMRLDBR), hc_read(UFSHC_UTRLRSR),
+	    hw, hc_read(0xdcu), hc_read(0xe0u), hc_in, hc_closed, hc_dead, hc_in_flight,
+	    hc_requests, hc_errors, hc_bytes);
+	if ((hw >> 28) >= 3u && n > 0 && n < (int)sizeof(text)) {
+		snprintf(text + n, sizeof(text) - (size_t)n,
+		    "qcom_ah8_cfg %08x hw_h8_enter %u hw_h8_exit %u sw_h8_enter %u sw_h8_exit %u sw_after_hw_h8 %u\n"
+		    "auto_ms %d original_ahit %08x owned %u\n",
+		    hc_read(0xfcu), hc_read(0x2700u), hc_read(0x270cu), hc_read(0x2704u), hc_read(0x2710u), hc_read(0x2708u),
+		    hc_auto_ms, hc_ahit_original, hc_auto_owned);
+	}
+	n = (int)strlen(text);
+	if (hc_gcc != 0 && n < (int)sizeof(text)) {
+		snprintf(text + n, sizeof(text) - (size_t)n,
+		    "clock_mask %d clock_errors %llu uic_commands %llu uic_errors %llu uic_failed %u\n"
+		    "gcc_axi %08x unipro %08x ice %08x aux %08x aggre %08x\n"
+		    "dme_cached_dl %08x pa %08x core %08x original %08x/%08x/%08x\n",
+		    hc_clock_mask, hc_clock_errors, hc_uic_commands, hc_uic_errors, hc_uic_failed,
+		    hc_gcc_read(0), hc_gcc_read(1), hc_gcc_read(2), hc_gcc_read(3), hc_gcc_read(4),
+		    hc_dme_last[0], hc_dme_last[1], hc_dme_last[2], hc_dme_original[0], hc_dme_original[1], hc_dme_original[2]);
+	}
+	hc_pd_release();
+	lck_mtx_unlock(&hc_lock);
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, ufs_idle_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, hc_idle_stats, "A", "passive UFS controller idle configuration and request snapshot");
+
+static void
+hc_idle_start(void)
+{
+	if (hc_idle_applied || hc_gcc == 0) {
+		return;
+	}
+	hc_idle_applied = true;
+	if (hc_clock_boot_mask != 0) {
+		int error = hc_clock_set(hc_clock_boot_mask);
+		hc_say("ufs: native: idle clock gating mask %d, error %d\n", hc_clock_mask, error);
+	}
+	if (hc_auto_boot_ms == 150) {
+		int error = hc_auto_set(150);
+		hc_say("ufs: native: automatic Hibern8 %s (150 ms, AHIT %08x, error %d)\n",
+		    error ? "not enabled" : "enabled", hc_read(UFSHC_AHIT), error);
+	}
 }
 
 /* ---- the whitelist: the one check every command passes before it goes into a slot ---- */
@@ -534,7 +693,8 @@ hc_ring(struct hc_slot *s)
 
 	lck_mtx_lock(&hc_lock);
 	istate = ml_set_interrupts_enabled(FALSE);
-	ok = hc_in && (hc_proven || s->number == SLOT_PROOF) && !hc_closed && !hc_dead && *hc_loader.take_back == 0 &&
+	ok = hc_in && (hc_proven || s->number == SLOT_PROOF) && !hc_closed && !hc_dead && hc_pd_wake() &&
+	    *hc_loader.take_back == 0 &&
 	    hc_read(UFSHC_UTRLBA) == hc_list_lo && hc_read(UFSHC_UTRLBAU) == hc_list_hi &&
 	    (hc_read(UFSHC_UTRLRSR) & 1) != 0 && (hc_read(UFSHC_UTRLDBR) & bit) == 0;
 	if (ok) {
@@ -582,6 +742,11 @@ hc_off(void)
 {
 	hc_dead = true;
 	lck_mtx_lock(&hc_lock);
+	hc_pd_hold();
+	if (!hc_pd_lost) {
+		(void)hc_power_restore();
+	}
+	hc_pd_release();
 	wakeup(&hc_free);
 	lck_mtx_unlock(&hc_lock);
 }
@@ -929,6 +1094,7 @@ hc_put_back(struct hc_put_back_result *r)
 			__builtin_arm_yield();
 		}
 	}
+	(void)hc_power_restore();
 	/* the completion notifications this kernel's requests left: exactly those bits, written with ones */
 	r->cnr_ours = hc_read(UFSHC_UTRLCNR) & ~hc_cnr_in;
 	if (r->cnr_ours != 0) {
@@ -967,7 +1133,7 @@ hc_put_back_print(const char *why, const struct hc_put_back_result *r, bool late
 	say("ufs: native: %s: transfer list %s UEFI's %08x:%08x (run %u, doorbell %08x; IS %08x, at the switch %08x; "
 	    "completion %08x after clearing this kernel's %08x, at the switch %08x%s)\n", why, r->ok ? "back to" :
 	    "NOT BACK TO", r->hi, r->lo, r->rsr, r->db, r->is, hc_is_in, r->cnr, r->cnr_ours, hc_cnr_in,
-	    r->cnr == hc_cnr_in ? ", as it was" : ", NOT AS IT WAS");
+	    r->cnr == hc_cnr_in ? ", as it was" : (hc_pd_downs != 0 && r->cnr == 0) ? ", cleared by power-down" : ", NOT AS IT WAS");
 }
 
 /*
@@ -1075,6 +1241,7 @@ ufshc_switch_in(bool prove)
 			return e;
 		}
 	}
+	hc_idle_start();
 	return 0;
 }
 
@@ -1094,6 +1261,7 @@ ufshc_switch_out(const char *why)
 	hc_in = false;                          /* nothing more is rung */
 	wakeup(&hc_free);
 	lck_mtx_unlock(&hc_lock);
+	hc_pd_hold();
 	/* what is in flight finishes (whoever waits for it sees it done) */
 	for (started = mach_absolute_time(); hc_read(UFSHC_UTRLDBR) != 0 && hc_us_since(started) < 2000000;) {
 		IOSleep(1);
@@ -1101,8 +1269,9 @@ ufshc_switch_out(const char *why)
 	lck_mtx_lock(&hc_lock);
 	istate = ml_set_interrupts_enabled(FALSE);
 	hc_put_back(&r);
-	ml_set_interrupts_enabled(istate);
+	(void)ml_set_interrupts_enabled(istate);
 	lck_mtx_unlock(&hc_lock);
+	hc_pd_release();
 	hc_put_back_print(why, &r, false);
 	if (!r.ok) {
 		hc_lost = true;
@@ -1183,6 +1352,17 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 		return false;
 	}
 	hc_loader = *loader;
+	PE_parse_boot_argn("ufs_clock_gating", &hc_clock_boot_mask, sizeof(hc_clock_boot_mask));
+	if (hc_clock_boot_mask < 0 || hc_clock_boot_mask > 15) {
+		hc_clock_boot_mask = 0;
+	}
+	PE_parse_boot_argn("ufs_auto_hibern8_ms", &hc_auto_boot_ms, sizeof(hc_auto_boot_ms));
+	if (hc_auto_boot_ms != 0 && hc_auto_boot_ms != 150) {
+		hc_say("ufs: native: unsupported ufs_auto_hibern8_ms=%d: preserving loader timer\n", hc_auto_boot_ms);
+		hc_auto_boot_ms = 0;
+	}
+	PE_parse_boot_argn("ufs_power_down", &hc_pd_on, sizeof(hc_pd_on));
+	hc_pd_on = hc_pd_on != 0;
 	/*
 	 * ufs_native_buffer=BYTES: each slot's buffer, whole blocks up to 4 MB (default 256 KB).
 	 * ufs_native_slots=N: how many slots carry reads, 1 to 31 (default 31).
@@ -1212,6 +1392,10 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 		return false;
 	}
 	hc = ml_io_map(UFSHC_PHYS, UFSHC_SIZE);
+	if (hakios_board != NULL && hakios_board_has != NULL &&
+	    hakios_board_has(HAKIOS_HAS_SOC_SLEEP) && hakios_board()->clocks.gcc != 0) {
+		hc_gcc = ml_io_map(hakios_board()->clocks.gcc + 0x87000u, 0x1000);
+	}
 	cap = hc_read(UFSHC_CAP);
 	ver = hc_read(UFSHC_VER);
 	hcs = hc_read(UFSHC_HCS);
@@ -1220,6 +1404,7 @@ ufshc_probe(const struct ufshc_loader *loader, bool only)
 	ie = hc_read(UFSHC_IE);
 	iacr = hc_read(UFSHC_UTRIACR);
 	ahit = hc_read(UFSHC_AHIT);
+	hc_ahit_original = ahit;
 	base = hc_read(UFSHC_UTRLBA);
 	baseu = hc_read(UFSHC_UTRLBAU);
 	db = hc_read(UFSHC_UTRLDBR);
@@ -1358,7 +1543,17 @@ hakios_ufs_quiesce(void)
 	if (!hc_usable) {
 		return;
 	}
+	hc_pd_final();
+	if (hc_gcc != 0) {
+		hc_say_late("ufs: native: power domain: %llu downs, %llu ups, %llu refused%s\n",
+		    hc_pd_downs, hc_pd_ups, hc_pd_refused, hc_pd_lost ? "; REGISTERS WERE LOST at a power-up" : "");
+	}
 	hc_closed = true;
+	if (hc_auto_owned || hc_clock_dirty) {
+		bool restored = hc_power_restore();
+		hc_say_late("ufs: native: idle configuration restore %s: AHIT %08x, loader %08x\n",
+		    restored ? "verified" : "FAILED", hc_read(UFSHC_AHIT), hc_ahit_original);
+	}
 	hakios_barrier();
 	hc_say_late("ufs: native: at the end: entered with doorbell %08x, %u reads of this kernel's in flight, its list %s\n",
 	    hc_read(UFSHC_UTRLDBR), hc_in_flight, hc_in ? "in" : "out");

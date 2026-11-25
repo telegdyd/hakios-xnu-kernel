@@ -16,6 +16,7 @@
  * whose hardware is not in charge of its clock (the block's enable bit clear) is left alone, as Linux leaves it.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
@@ -472,19 +473,48 @@ static bool park_wanted;
 #define GOV_ROWS                40
 static struct gov_group {
 	vm_offset_t base;               /* 0: not governed */
-	uint32_t rows, khz[GOV_ROWS], top, row, down_looks, down_most;
+	uint32_t rows, khz[GOV_ROWS], top, cap_row, row, down_looks, down_most;
 	uint32_t cores;                 /* the kernel's cores in it, by cpu number */
 	uint64_t looks_at[GOV_ROWS];    /* (for the log: how many looks at each row) */
 } gov[CPUFREQ_GROUPS];
 static bool gov_on;
+static LCK_GRP_DECLARE(cpufreq_lck_grp, "hakios-cpufreq");
+static LCK_MTX_DECLARE(cpufreq_lock, &cpufreq_lck_grp);
+
+extern void hakios_soc_sleep_init(void) __attribute__((weak));
+extern void hakios_soc_sleep_follow(const uint32_t *khz, uint32_t groups) __attribute__((weak));
 
 static void
 gov_set(struct gov_group *g, uint32_t row)
 {
+	row = MIN(row, g->cap_row);
 	if (row != g->row) {
 		wr(g->base + layout->perf_state, row);
 		g->row = row;
 	}
+}
+
+/* thermal.c asks to hold a domain at or below row while the governor runs it; false if ungoverned. */
+bool
+hakios_cpufreq_set_cap(uint32_t domain, uint32_t row)
+{
+	struct gov_group *g;
+	bool owned = false;
+
+	if (domain >= CPUFREQ_GROUPS) {
+		return false;
+	}
+	lck_mtx_lock(&cpufreq_lock);
+	g = &gov[domain];
+	if (g->base != 0) {
+		g->cap_row = MIN(row, g->top);
+		if (g->row > g->cap_row) {
+			gov_set(g, g->cap_row);
+		}
+		owned = true;
+	}
+	lck_mtx_unlock(&cpufreq_lock);
+	return owned;
 }
 
 /* the groups the kernel has every core of: their tables, and the governor on (cpufreq=1 has raised them) */
@@ -497,7 +527,7 @@ gov_start(void)
 
 	PE_parse_boot_argn("cpu_gov", &on, sizeof(on));
 	PE_parse_boot_argn("thermal", &thermal, sizeof(thermal));
-	if (!on || thermal >= 2) {
+	if (!on || (thermal >= 2 && !hakios_board_has(HAKIOS_HAS_SOC_SLEEP))) {
 		printf("cpufreq: every group at its top row (%s)\n", !on ? "cpu_gov=0" : "thermal=2 holds them back itself");
 		return;
 	}
@@ -530,6 +560,7 @@ gov_start(void)
 			g->rows = row + 1;
 		}
 		g->top = g->rows - 1;
+		g->cap_row = g->top;
 		/* (an index into khz[] and looks_at[]: never past the table, whatever the register reads; Linux bounds it too) */
 		g->row = MIN(rd(g->base + layout->perf_state), g->top);
 		gov_on = true;
@@ -542,6 +573,7 @@ gov_start(void)
 static void
 gov_look(const uint32_t *busy)
 {
+	lck_mtx_lock(&cpufreq_lock);
 	for (uint32_t d = 0; d < CPUFREQ_GROUPS; d++) {
 		struct gov_group *g = &gov[d];
 		uint32_t most = 0, want, need;
@@ -575,6 +607,7 @@ gov_look(const uint32_t *busy)
 		}
 		g->looks_at[g->row]++;
 	}
+	lck_mtx_unlock(&cpufreq_lock);
 }
 
 /* (every way back to the loader, interrupts off: each governed group at its top row again) */
@@ -645,6 +678,18 @@ park_thread(void *arg __unused, wait_result_t wr __unused)
 		park_stat.looks++;
 		if (gov_on) {
 			gov_look(busy_of);
+		}
+		if (hakios_soc_sleep_follow != NULL) {
+			uint32_t khz[CPUFREQ_GROUPS] = { 0 };
+
+			lck_mtx_lock(&cpufreq_lock);
+			for (uint32_t d = 0; d < CPUFREQ_GROUPS; d++) {
+				if (gov[d].base != 0) {
+					khz[d] = gov[d].khz[gov[d].row];
+				}
+			}
+			lck_mtx_unlock(&cpufreq_lock);
+			hakios_soc_sleep_follow(khz, CPUFREQ_GROUPS);
 		}
 		if (!parking) {
 			/* (no parking: the governor alone) */
@@ -758,5 +803,8 @@ hakios_cpufreq_init(void)
 	llcc_setup();
 	/* the groups by their load from here on (cpu_gov), and the small cores parked (park_small): one thread looks */
 	gov_start();
+	if (hakios_soc_sleep_init != NULL) {
+		hakios_soc_sleep_init();
+	}
 	park_start();
 }

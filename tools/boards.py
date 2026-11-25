@@ -95,6 +95,7 @@ SOC_SCHEMA = {
     'display': {'dsi0': (int, True), 'intf1': (int, False), 'mdss': (int, False), 'vbif': (int, False)},
     'thermal': {'tsens': ([int], True)},
     'spmi': {'core': (int, True), 'cnfg': (int, True), 'observer': (int, True), 'channels': (int, False),
+             'intr': (int, False), 'interrupt_pdc': ([int], False),
              'ee': (int, False), 'channel_map': (int, False), 'bus': (int, False)},
     'usb': {'dwc3': (int, True), 'interrupt': (int, False), 'hsphy': (int, False), 'clkref': (int, False)},
     'adreno': {'gpu': (int, True), 'gmu': (int, True), 'gpucc': (int, True), 'cx_misc': (int, True), 'rscc': (int, True),
@@ -112,7 +113,9 @@ SOC_SCHEMA = {
               'lpi': (int, True), 'lpi_slew': (int, True), 'swr_tx_pins': ([int], True), 'swr_tx_slew': ([int], True)},
     'ipc': {'aoss': (int, True), 'ipcc': (int, True), 'smem': (int, True), 'smem_size': (int, True),
             'smem_lock': (int, True)},
-    'rpmh': {'cmd_db': (int, True), 'cmd_db_size': (int, True), 'rsc': (int, True), 'tcs_offset': (int, True)},
+    'rpmh': {'cmd_db': (int, True), 'cmd_db_size': (int, True), 'rsc': (int, True), 'tcs_offset': (int, True),
+             'sleep_stats': (int, False), 'cx_monitor': (int, False),
+             'camcc_gdsc': (int, False), 'videocc_gdsc': ([int], False)},
     'scmi_perf': {'shmem': (int, True), 'mailbox': (int, True), 'doorbell': (int, True)},
     'virtio': {'mmio': (int, True), 'transports': (int, True)},
     'cpufreq': {'block': (CPUFREQ_BLOCKS, False), 'epss': (int, True), 'epss_domain_size': (int, True),
@@ -200,7 +203,7 @@ KEY_WITH_UNDERSCORE = re.compile(r'(?<![\w.])(' + '|'.join(sorted(
     {key for schema in (SOC_SCHEMA, BOARD_SCHEMA) for section, keys in schema.items() for key in list(keys) + [section]
      if '_' in key} | {key for key in CAMERA_SENSOR if '_' in key}, key=len, reverse=True)) + r')(?![\w(=])')
 # what a feature needs of the SoC file: a board cannot list a feature its SoC has no addresses for
-FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virtio': ('virtio',), 'cpufreq-scmi': ('scmi_perf',), 'cpufreq-epss': ('cpufreq',), 'display-scan': ('display',), 'display-flip': ('display',), 'display-power': ('display', 'clocks'), 'cpu-idle': ('cpu_idle',), 'buttons-pmic': ('spmi',),
+FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virtio': ('virtio',), 'cpufreq-scmi': ('scmi_perf',), 'cpufreq-epss': ('cpufreq',), 'display-scan': ('display',), 'display-flip': ('display',), 'display-power': ('display', 'clocks'), 'cpu-idle': ('cpu_idle',), 'soc-sleep': ('rpmh', 'clocks'), 'buttons-pmic': ('spmi',),
                  'torch-pm8350c': ('spmi',), 'ddr-rpmh': ('rpmh',),
                  'camera-sm7325': ('spmi', 'pins', 'clocks', 'rpmh', 'smmu', 'camera'),
                  'gpu-a660': ('adreno', 'clocks', 'rpmh'), 'gpu-a730': ('adreno', 'clocks', 'rpmh'),
@@ -230,6 +233,7 @@ FEATURE_BOOTARGS = {
     'display-flip': 'fb_flip=1, the default, with the GPU putting frames on the panel (gpu=1; fb_gpu=1, the default)',
     'display-power': 'backlight=2, on by itself; display_power_down=0 keeps the display hardware on while the panel sleeps',
     'cpu-idle': 'on by itself; cpu_idle=0 keeps idle cores in WFI, screen_off_cores=0 every core up with the display off',
+    'soc-sleep': 'cpufreq=1 ddr=2, on by itself; rpmh_sleep=0 disables sleep sets, rpmh_cx_collapse=0 keeps CX up',
     'gpu-a660': 'gpu=1',
     'gpu-a730': 'gpu=1 or adreno=22; gpu_irq=1 for completion interrupts',
     'gpu-dcvs': "gpu=1, on by itself; gpu_dcvs=0 keeps the default speed (the GPU's sensors still cap it)",
@@ -1035,6 +1039,16 @@ def load(problems=None):
             # (board/spmi.h takes neither: a version 8 arbiter's second bus has tables of its own, which nothing here reads)
             problems.add(rel, 'soc.dtsi [spmi]: bus = 1 is for a version 7 arbiter, channel_map for a version 8 one: '
                               'the second bus of a version 8 arbiter is not known to the drivers')
+        spmi_pdc = soc.get('spmi', {}).get('interrupt_pdc') if isinstance(soc.get('spmi'), dict) else None
+        if spmi_pdc is not None:
+            if len(spmi_pdc) != 2 or not 0 < spmi_pdc[0] < 256 or not 32 <= spmi_pdc[1] < 1020:
+                problems.add(rel, 'soc.dtsi [spmi]: interrupt_pdc is the line\'s pin in the PDC (1 to 255) and the '
+                                  'GIC\'s SPI it raises (32 to 1019)')
+            if 'pdc' not in soc.get('pins', {}):
+                problems.add(rel, 'soc.dtsi [spmi]: interrupt_pdc needs pdc in [pins] of soc.dtsi')
+        videocc = soc.get('rpmh', {}).get('videocc_gdsc') if isinstance(soc.get('rpmh'), dict) else None
+        if isinstance(videocc, list) and not 1 <= len(videocc) <= 2:
+            problems.add(rel, 'soc.dtsi [rpmh]: videocc_gdsc takes one or two GDSCR addresses')
         if 'rtc' in data and 'spmi' not in soc:
             # (no feature to list: the section is the board's word that the clock is there, and the arbiter the way to it)
             problems.add(rel, '[rtc] needs [spmi] in soc.dtsi')
@@ -1143,11 +1157,14 @@ def table_text(socs, boards):
             out.append('\t\t},')
         spmi = soc.get('spmi')
         if spmi:
+            pdc = spmi.get('interrupt_pdc')
             out.append(f'\t\t.spmi = {{ .core = {spmi["core"]:#010x}, .cnfg = {spmi["cnfg"]:#010x}, '
                        f'.observer = {spmi["observer"]:#010x}, .channels = {spmi.get("channels", 0):#010x}, '
-                       f'.ee = {spmi.get("ee", 0)}'
+                       + (f'.intr = {spmi["intr"]:#010x}, ' if spmi.get('intr') else '')
+                       + f'.ee = {spmi.get("ee", 0)}'
                        + (f', .channel_map = {spmi["channel_map"]:#010x}' if spmi.get('channel_map') else '')
-                       + (f', .bus = {spmi["bus"]}' if spmi.get('bus') else '') + ' },')
+                       + (f', .bus = {spmi["bus"]}' if spmi.get('bus') else '')
+                       + (f', .pdc_pin = {pdc[0]}, .pdc_intid = {pdc[1]}' if pdc else '') + ' },')
         usb = soc.get('usb')
         if usb:
             out.append(f'\t\t.usb = {{ .dwc3 = {usb["dwc3"]:#010x}, .interrupt = {usb.get("interrupt", 0)}, '
@@ -1202,8 +1219,14 @@ def table_text(socs, boards):
                        f'.smem_size = {ipc["smem_size"]:#x}, .smem_lock = {ipc["smem_lock"]:#010x} }},')
         rpmh = soc.get('rpmh')
         if rpmh:
+            vgdsc = rpmh.get('videocc_gdsc', [])
             out.append(f'\t\t.rpmh = {{ .cmd_db = {rpmh["cmd_db"]:#010x}, .cmd_db_size = {rpmh["cmd_db_size"]:#x}, '
-                       f'.rsc = {rpmh["rsc"]:#010x}, .tcs_offset = {rpmh["tcs_offset"]:#x} }},')
+                       f'.rsc = {rpmh["rsc"]:#010x}, .tcs_offset = {rpmh["tcs_offset"]:#x}'
+                       + (f', .sleep_stats = {rpmh["sleep_stats"]:#010x}' if rpmh.get('sleep_stats') else '')
+                       + (f', .cx_monitor = {rpmh["cx_monitor"]:#010x}' if rpmh.get('cx_monitor') else '')
+                       + (f', .camcc_gdsc = {rpmh["camcc_gdsc"]:#010x}' if rpmh.get('camcc_gdsc') else '')
+                       + (f', .videocc_gdsc = {{ {", ".join(f"{v:#010x}" for v in vgdsc)} }}' if vgdsc else '')
+                       + ' },')
         keys = board.get('buttons')
         if keys:
             names = ''.join(f', .{key} = {c_string(keys[key])}' for key in ('pon_name', 'volume_up_name') if key in keys)

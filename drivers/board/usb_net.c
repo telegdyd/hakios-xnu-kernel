@@ -38,6 +38,7 @@
 #include <sys/sockio.h>
 #include <sys/systm.h>
 #include <sys/sysctl.h>
+#include <sys/board/input.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_kern_xnu.h>  /* xnu-12377: the KMA flags and kmem_alloc moved to the internal header */
 #include "kernel.h"
@@ -55,6 +56,11 @@ extern void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr);
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
 extern void gic_v3_spi_mask(uint32_t intid);
 extern void gic_v3_spi_unmask(uint32_t intid);
+extern int hakios_mmio_try_read32(const volatile void *, unsigned *) __attribute__((weak));
+extern bool hakios_screen_off(void) __attribute__((weak));
+extern wait_result_t hakios_assert_wait_net(event_t event, uint32_t ms) __attribute__((weak));
+extern bool hakios_battery_get(int *soc, int *present, int *charger) __attribute__((weak));
+extern volatile uint32_t hakios_battery_charger_changes __attribute__((weak));
 
 /* both logs; with interrupts off (the way back to the loader), the loader's only */
 #define printf(...) hakios_say(__VA_ARGS__)
@@ -859,7 +865,11 @@ usb_irq_wait(void)
 {
 	wait_result_t result = THREAD_AWAKENED;
 
-	assert_wait_timeout((event_t)&usb_irq.rang, THREAD_UNINT, USB_RECOVERY_MS, NSEC_PER_MSEC);
+	if (hakios_assert_wait_net != NULL) {
+		(void)hakios_assert_wait_net((event_t)&usb_irq.rang, USB_RECOVERY_MS);
+	} else {
+		assert_wait_timeout((event_t)&usb_irq.rang, THREAD_UNINT, USB_RECOVERY_MS, NSEC_PER_MSEC);
+	}
 	if (!usb_quiesced) {
 		gic_v3_spi_unmask(USB_INTID);
 	}
@@ -878,6 +888,430 @@ usb_irq_wait(void)
 	}
 }
 
+/* ---- cable-out parking (usb_park=0/1/2; default 2 on soc-sleep) -------------------------------- */
+
+#define USB_GCC_USB_OFF         0x49000u        /* offset in GCC for usb30_prim block */
+#define USB_BCR_OFF             0x000u
+#define USB_GDSCR_OFF           0x004u
+#define GDSC_SW_COLLAPSE        (1u << 0)
+#define GDSC_PWR_ON             (1u << 31)
+#define QSCRATCH                0xf8800u
+#define HSPHY_SAVED             64u
+
+static const uint32_t usb_park_branch[] = {
+	0x018u,         /* usb30_prim_master_clk */
+	0x024u,         /* usb30_prim_mock_utmi_clk */
+	0x020u,         /* usb30_prim_sleep_clk */
+	0x084u,         /* cfg_noc_usb3_prim_axi_clk */
+	0x088u,         /* aggre_usb3_prim_axi_clk */
+};
+#define USB_PARK_BRANCHES       (sizeof(usb_park_branch) / sizeof(usb_park_branch[0]))
+
+static const uint32_t usb_saved_reg[] = {
+	QSCRATCH + 0x08u, QSCRATCH + 0x10u, QSCRATCH + 0x30u, QSCRATCH + 0x5cu,
+	GSBUSCFG0, GSBUSCFG1, 0xc108u, 0xc10cu,
+	GCTL, GUCTL, GUCTL1, GUCTL2, GFLADJ,
+	GUSB2PHYCFG0, GUSB3PIPECTL0,
+	GTXFIFOSIZ(0), GTXFIFOSIZ(1), GTXFIFOSIZ(2), GTXFIFOSIZ(3), GTXFIFOSIZ(4), GTXFIFOSIZ(5), GTXFIFOSIZ(6),
+	GTXFIFOSIZ(7), GTXFIFOSIZ(8), GTXFIFOSIZ(9), GTXFIFOSIZ(10), GTXFIFOSIZ(11), GTXFIFOSIZ(12), GTXFIFOSIZ(13),
+	GTXFIFOSIZ(14), GTXFIFOSIZ(15), GRXFIFOSIZ(0), GRXFIFOSIZ(1), GRXFIFOSIZ(2),
+	DCFG, DCTL,
+};
+#define USB_SAVED               (sizeof(usb_saved_reg) / sizeof(usb_saved_reg[0]))
+
+static struct {
+	bool            on, parked, gdsc, off, broken;
+	vm_offset_t     gcc;
+	uint32_t        was[USB_PARK_BRANCHES];
+	uint32_t        saved[USB_SAVED], hsphy[HSPHY_SAVED];
+	char            phy_diff[512], diag[512];
+	uint32_t        outs, parks, unparks, take_failures, gdsc_offs, gdsc_refused, phy_lost, step, trace;
+	uint64_t        parked_since, parked_abs;
+} usb_park;
+
+SYSCTL_UINT(_kern_hakios, OID_AUTO, usb_park_gdsc_offs, CTLFLAG_RD | CTLFLAG_LOCKED, &usb_park.gdsc_offs, 0,
+    "times the parked controller's power domain went off");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, usb_park_gdsc_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &usb_park.gdsc_refused, 0,
+    "times it did not go off (left on, the clocks gated)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, usb_park_phy_lost, CTLFLAG_RD | CTLFLAG_LOCKED, &usb_park.phy_lost, 0,
+    "restarts that found the HS PHY's registers changed outside phyguard's words (recorded only)");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, usb_park_diag, CTLFLAG_RD | CTLFLAG_LOCKED, usb_park.diag, 0,
+    "diag: the last restart's power domain, clocks and first controller reads");
+SYSCTL_STRING(_kern_hakios, OID_AUTO, usb_park_phy_diff, CTLFLAG_RD | CTLFLAG_LOCKED, usb_park.phy_diff, 0,
+    "diag: the last restart's HS PHY words that changed while parked (offset:saved>now)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, usb_park_step, CTLFLAG_RD | CTLFLAG_LOCKED, &usb_park.step, 0,
+    "diag: the restart's last step begun (1 domain on, 2 clocks, 3 registers, 4 PHY, 5 controller, 0 done)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, usb_parks, CTLFLAG_RD | CTLFLAG_LOCKED, &usb_park.parks, 0,
+    "times the USB controller was stopped and its clocks gated with no cable in");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, usb_unparks, CTLFLAG_RD | CTLFLAG_LOCKED, &usb_park.unparks, 0,
+    "times it was started again on a cable");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, usb_unpark_failures, CTLFLAG_RD | CTLFLAG_LOCKED, &usb_park.take_failures, 0,
+    "restarts in which dwc3_take() failed (retried each second)");
+
+static bool dwc3_take(void);
+
+static void
+usb_branches_on(bool spin)
+{
+	for (unsigned i = USB_PARK_BRANCHES; i-- > 0;) {
+		if (usb_park.was[i] & 1u) {
+			*(volatile uint32_t *)(usb_park.gcc + usb_park_branch[i]) |= 1u;
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (spin) {
+		delay(1000);
+	} else {
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+}
+
+static void
+usb_park_start(void)
+{
+	const struct hakios_board *board = hakios_board();
+	uint32_t on = hakios_board_has(HAKIOS_HAS_SOC_SLEEP) ? 2u : 0u;
+
+	PE_parse_boot_argn("usb_park", &on, sizeof(on));
+	PE_parse_boot_argn("usb_park_trace", &usb_park.trace, sizeof(usb_park.trace));
+	if (on == 0 || board == NULL || board->clocks.gcc == 0 || hakios_battery_get == NULL) {
+		return;
+	}
+	usb_park.gcc = ml_io_map(board->clocks.gcc + USB_GCC_USB_OFF, 0x1000);
+	usb_park.on = usb_park.gcc != 0;
+	usb_park.gdsc = on >= 2u && phyguard.on;
+	printf("usb_net: park %s%s\n", usb_park.on ? "on: the controller stops with no cable in" : "unavailable (GCC not mapped)",
+	    usb_park.on && usb_park.gdsc ? ", its power domain off" : "");
+}
+
+static void
+usb_park_at(uint32_t step, bool spin)
+{
+	usb_park.step = step;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (usb_park.trace && !spin && step != 0) {
+		IOSleep(1500);
+	}
+}
+
+static void
+usb_regs_save(void)
+{
+	for (unsigned i = 0; i < USB_SAVED; i++) {
+		usb_park.saved[i] = rd(dwc3, usb_saved_reg[i]);
+	}
+	for (unsigned i = 0; i < HSPHY_SAVED; i++) {
+		usb_park.hsphy[i] = rd(phyguard.phy, 4u * i);
+	}
+}
+
+static bool
+hsphy_guarded(unsigned offset)
+{
+	return offset == HSPHY_UTMI_CTRL0 || offset == HSPHY_UTMI_CTRL1 || offset == HSPHY_CTRL2 || offset == HSPHY_CFG0;
+}
+
+static void
+usb_gdsc_off(void)
+{
+	volatile uint32_t *gdscr = (volatile uint32_t *)(usb_park.gcc + USB_GDSCR_OFF);
+	unsigned us;
+
+	*gdscr |= GDSC_SW_COLLAPSE;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (us = 0; us < 1000 && (*gdscr & GDSC_PWR_ON) != 0; us += 10) {
+		delay(10);
+	}
+	if ((*gdscr & GDSC_PWR_ON) != 0) {
+		*gdscr &= ~GDSC_SW_COLLAPSE;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		usb_park.gdsc_refused++;
+		printf("usb_net: the power domain does not go off (GDSCR %x): left on\n", *gdscr);
+		return;
+	}
+	usb_park.off = true;
+	usb_park.gdsc_offs++;
+	printf("usb_net: power domain off after %u us (GDSCR %x)\n", us, *gdscr);
+}
+
+static bool
+usb_gdsc_on(bool spin)
+{
+	volatile uint32_t *gdscr = (volatile uint32_t *)(usb_park.gcc + USB_GDSCR_OFF);
+	unsigned us;
+
+	if (!usb_park.off) {
+		return true;
+	}
+	usb_park_at(1, spin);
+	*gdscr &= ~GDSC_SW_COLLAPSE;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (us = 0; us < 2000 && (*gdscr & GDSC_PWR_ON) == 0; us += 10) {
+		delay(10);
+	}
+	if ((*gdscr & GDSC_PWR_ON) == 0) {
+		if (!spin) {
+			printf("usb_net: the power domain does not come on (GDSCR %x)\n", *gdscr);
+		}
+		return false;
+	}
+	delay(10);
+	usb_park.off = false;
+	return true;
+}
+
+static bool
+usb_power_up_check(bool spin)
+{
+	static const uint32_t clk[] = { 0x018u, 0x020u, 0x024u, 0x05cu, 0x060u, 0x064u, 0x084u, 0x088u };
+	volatile uint32_t *bcr = (volatile uint32_t *)(usb_park.gcc + USB_BCR_OFF);
+	unsigned id = 0, gctl = 0, at = 0;
+	int e1 = -1, e2 = -1;
+
+	*bcr |= 1u;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	delay(10);
+	*bcr &= ~1u;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	delay(10);
+	usb_branches_on(spin);
+	at += (unsigned)snprintf(usb_park.diag + at, sizeof(usb_park.diag) - at, "gdscr %x bcr %x clocks",
+	    *(volatile uint32_t *)(usb_park.gcc + USB_GDSCR_OFF), *bcr);
+	for (unsigned i = 0; i < sizeof(clk) / sizeof(clk[0]) && at < sizeof(usb_park.diag) - 24; i++) {
+		at += (unsigned)snprintf(usb_park.diag + at, sizeof(usb_park.diag) - at, " %x:%x", clk[i],
+		    *(volatile uint32_t *)(usb_park.gcc + clk[i]));
+	}
+	if (hakios_mmio_try_read32 != NULL) {
+		e1 = hakios_mmio_try_read32((const volatile void *)(dwc3 + GSNPSID), &id);
+		if (e1 == 0) {
+			e2 = hakios_mmio_try_read32((const volatile void *)(dwc3 + GCTL), &gctl);
+		}
+	}
+	snprintf(usb_park.diag + at, sizeof(usb_park.diag) - at, "; gsnpsid %d %x gctl %d %x", e1, id, e2, gctl);
+	if (e1 != 0 || e2 != 0 || id == 0 || id == 0xffffffffu) {
+		usb_park.broken = true;
+		usb_park.gdsc = false;
+		if (!spin) {
+			printf("usb_net: the controller does not answer after its power domain came back (%s): USB stays off\n",
+			    usb_park.diag);
+		}
+		return false;
+	}
+	return true;
+}
+
+static void
+usb_regs_back(bool spin)
+{
+	usb_park_at(3, spin);
+	for (unsigned i = 0; i < USB_SAVED; i++) {
+		uint32_t v = usb_park.saved[i];
+
+		if (usb_saved_reg[i] == DCTL) {
+			v &= ~(DCTL_RUN_STOP | DCTL_CSFTRST);
+		}
+		usbn_wr(usb_saved_reg[i], v);
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+	usb_park_at(4, spin);
+	{
+		uint32_t diffs = 0, first = 0;
+
+		for (unsigned i = 0; i < HSPHY_SAVED; i++) {
+			if (!hsphy_guarded(4u * i) && rd(phyguard.phy, 4u * i) != usb_park.hsphy[i]) {
+				first = diffs++ ? first : 4u * i;
+			}
+		}
+		if (diffs != 0) {
+			unsigned at = 0;
+
+			usb_park.phy_lost++;
+			for (unsigned i = 0; i < HSPHY_SAVED && at < sizeof(usb_park.phy_diff) - 32; i++) {
+				uint32_t now = rd(phyguard.phy, 4u * i);
+
+				if (now != usb_park.hsphy[i]) {
+					at += (unsigned)snprintf(usb_park.phy_diff + at, sizeof(usb_park.phy_diff) - at, "%#x:%x>%x ",
+					    4u * i, usb_park.hsphy[i], now);
+				}
+			}
+			if (!spin) {
+				printf("usb_net: the HS PHY changed while parked (%u words outside phyguard's, first at %#x): %s\n",
+				    diffs, first, usb_park.phy_diff);
+			}
+		}
+	}
+}
+
+static void
+usb_park_now(void)
+{
+	unsigned int ms;
+
+	if (usb_irq.on) {
+		gic_v3_spi_mask(USB_INTID);
+	}
+	usbn_ecm_disconnect();
+	usbn_wr(GEVNTSIZ(0), rd(dwc3, GEVNTSIZ(0)) | GEVNTSIZ_INTMASK);
+	usbn_wr(DEVTEN, 0);
+	usbn_wr(DCTL, rd(dwc3, DCTL) & ~DCTL_RUN_STOP);
+	for (ms = 0; ms < 100 && (rd(dwc3, DSTS) & DSTS_DEVCTRLHLT) == 0; ms++) {
+		uint32_t pending = rd(dwc3, GEVNTCOUNT(0)) & 0xfffcu;
+
+		if (pending != 0) {
+			usbn_wr(GEVNTCOUNT(0), pending);
+		}
+		delay_for_interval(1, NSEC_PER_MSEC);
+	}
+	usbn_wr(GEVNTCOUNT(0), rd(dwc3, GEVNTCOUNT(0)) & 0xfffcu);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (unsigned i = 0; i < USB_PARK_BRANCHES; i++) {
+		usb_park.was[i] = *(volatile uint32_t *)(usb_park.gcc + usb_park_branch[i]);
+	}
+	if (usb_park.gdsc) {
+		usb_regs_save();
+	}
+	usb_park.parked = true;
+	for (unsigned i = 0; i < USB_PARK_BRANCHES; i++) {
+		if (usb_park.was[i] & 1u) {
+			*(volatile uint32_t *)(usb_park.gcc + usb_park_branch[i]) &= ~1u;
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (usb_park.gdsc) {
+		usb_gdsc_off();
+	}
+	usb_park.parks++;
+	usb_park.parked_since = mach_absolute_time();
+	printf("usb_net: no cable: controller %s after %u ms, clocks gated (master %x -> %x); park %u\n",
+	    ms < 100 ? "halted" : "NOT halted", ms, usb_park.was[0], *(volatile uint32_t *)(usb_park.gcc + usb_park_branch[0]),
+	    usb_park.parks);
+}
+
+static void
+phyguard_put_back(void)
+{
+	uint32_t now[PHYGUARD_WORDS];
+
+	if (!phyguard.on) {
+		return;
+	}
+	phyguard_read(now);
+	if (memcmp(now, phyguard.base, sizeof(now)) == 0) {
+		return;
+	}
+	if ((now[4] & 1u) == 0 && (phyguard.base[4] & 1u) != 0) {
+		phyguard_write(phyguard.gcc, GCC_CLKREF_EN, now[4] | 1u);
+		delay_for_interval(100, NSEC_PER_USEC);
+	}
+	phyguard_write(phyguard.phy, HSPHY_UTMI_CTRL0, phyguard.base[0]);
+	phyguard_write(phyguard.phy, HSPHY_UTMI_CTRL1, phyguard.base[1]);
+	phyguard_write(phyguard.phy, HSPHY_CTRL2, phyguard.base[2]);
+	phyguard_write(phyguard.phy, HSPHY_CFG0, phyguard.base[3]);
+	delay_for_interval(1, NSEC_PER_MSEC);
+	printf("usb_net: before the restart the PHY was utmi0 %x utmi1 %x ctrl2 %x cfg0 %x clkref %x: put back as the loader left it\n",
+	    now[0], now[1], now[2], now[3], now[4]);
+	phyguard_read(phyguard.last);
+	phyguard.stable_ms = 0;
+}
+
+static bool
+usb_unpark_now(void)
+{
+	bool was_off = usb_park.off;
+
+	if (usb_park.broken) {
+		return false;
+	}
+	if (!usb_gdsc_on(false)) {
+		return false;
+	}
+	usb_park_at(2, false);
+	if (was_off) {
+		if (!usb_power_up_check(false)) {
+			usb_park_at(9, false);
+			return false;
+		}
+		usb_regs_back(false);
+	} else {
+		usb_branches_on(false);
+		if (usb_park.gdsc) {
+			usb_regs_back(false);
+		}
+	}
+	usb_park_at(5, false);
+	phyguard_put_back();
+	usb_park.parked = false;
+	usb_event_at = 0;
+	usb_link_state = 0xffffffffu;
+	if (!dwc3_take()) {
+		usb_park.take_failures++;
+		printf("usb_net: cable in, but the controller does not start again (%u): gated again, retried in 1 s\n",
+		    usb_park.take_failures);
+		for (unsigned i = 0; i < USB_PARK_BRANCHES; i++) {
+			if (usb_park.was[i] & 1u) {
+				*(volatile uint32_t *)(usb_park.gcc + usb_park_branch[i]) &= ~1u;
+			}
+		}
+		usb_park.parked = true;
+		usb_park_at(0, false);
+		return false;
+	}
+	usb_park_at(0, false);
+	if (usb_irq.on) {
+		usbn_wr(GEVNTSIZ(0), rd(dwc3, GEVNTSIZ(0)) & ~GEVNTSIZ_INTMASK);
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+	usb_park.unparks++;
+	usb_park.parked_abs += mach_absolute_time() - usb_park.parked_since;
+	printf("usb_net: cable in: controller running again (unpark %u)\n", usb_park.unparks);
+	return true;
+}
+
+static void
+usb_park_look(void)
+{
+	int soc, present, charger = 1;
+
+	if (!usb_park.on || usb_park.parked || hakios_battery_get == NULL) {
+		return;
+	}
+	if (!hakios_battery_get(&soc, &present, &charger) || charger != 0) {
+		usb_park.outs = 0;
+		return;
+	}
+	if (++usb_park.outs >= 2) {
+		usb_park.outs = 0;
+		usb_park_now();
+	}
+}
+
+static void
+usb_parked_wait(void)
+{
+	while (usb_park.parked && !usb_quiesced) {
+		int soc, present, charger = 0;
+		uint32_t seen = &hakios_battery_charger_changes != NULL ? hakios_battery_charger_changes : 0;
+
+		if (hakios_battery_get != NULL && hakios_battery_get(&soc, &present, &charger) && charger == 0 &&
+		    &hakios_battery_charger_changes != NULL) {
+			assert_wait_timeout((event_t)&hakios_battery_charger_changes, THREAD_UNINT, 60000, NSEC_PER_MSEC);
+			if (hakios_battery_charger_changes != seen || usb_quiesced) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				(void)thread_block(THREAD_CONTINUE_NULL);
+			}
+		} else {
+			IOSleep(1000);
+		}
+		if (usb_quiesced) {
+			break;
+		}
+		if (hakios_battery_get != NULL && hakios_battery_get(&soc, &present, &charger) && charger != 0) {
+			(void)usb_unpark_now();
+		}
+	}
+}
+
 /* Drain immediately in IRQ mode, then sleep. The original adaptive polling is only a fallback.
  * Maintenance uses elapsed time rather than adding the requested sleep duration: traffic can wake
  * us early. In IRQ mode the PHY is checked about once/s, including while USB is busy. */
@@ -885,7 +1319,7 @@ static void
 event_loop(void)
 {
 	uint32_t quiet = 0;
-	uint64_t phy_at = mach_absolute_time(), said_at = phy_at;
+	uint64_t phy_at = mach_absolute_time(), said_at = phy_at, park_at = phy_at;
 
 	for (;;) {
 		uint32_t count, interval;
@@ -893,6 +1327,17 @@ event_loop(void)
 
 		if (usb_quiesced) {
 			thread_terminate(current_thread());
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - park_at, &elapsed_ns);
+		if (elapsed_ns >= 1000ULL * NSEC_PER_MSEC) {
+			park_at = mach_absolute_time();
+			usb_park_look();
+			if (usb_park.parked) {
+				usb_parked_wait();
+				quiet = 0;
+				phy_at = park_at = mach_absolute_time();
+				continue;
+			}
 		}
 		if (usb_irq.on) {
 			gic_v3_spi_mask(USB_INTID);
@@ -938,7 +1383,7 @@ event_loop(void)
 			}
 			continue;
 		}
-		interval = (count != 0 || quiet < 1000) ? 1 : 5;
+		interval = (count != 0 || quiet < 1000) ? 1 : (hakios_screen_off != NULL && hakios_screen_off()) ? 20 : 5;
 		delay_for_interval(interval, NSEC_PER_MSEC);
 	}
 }
@@ -972,6 +1417,23 @@ hakios_usb_net_quiesce(void)
 		return;
 	}
 	usb_quiesced = true;
+	if (usb_park.broken) {
+		return;
+	}
+	if (usb_park.parked) {
+		bool was_off = usb_park.off;
+
+		(void)usb_gdsc_on(true);
+		if (was_off) {
+			if (!usb_power_up_check(true)) {
+				return;
+			}
+			usb_regs_back(true);
+		} else {
+			usb_branches_on(true);
+		}
+		usb_park.parked = false;
+	}
 	if (usb_irq.on) {
 		gic_v3_spi_mask(USB_INTID);
 	}
@@ -2312,6 +2774,7 @@ usbnet_thread(__unused void *parameter, __unused wait_result_t result)
 		thread_terminate(current_thread());
 	}
 	phyguard_start();
+	usb_park_start();
 	usb_irq_start();
 	event_loop();
 }

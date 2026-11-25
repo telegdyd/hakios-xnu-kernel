@@ -194,6 +194,8 @@ tell_look(int32_t t, unsigned which)
 	    limits[0] ? limits : "-", asked[0] ? asked : "-", hakios_adreno_core_mhz());
 }
 
+extern bool hakios_cpufreq_set_cap(uint32_t domain, uint32_t row) __attribute__((weak));
+
 /* a group's frequency table: its top row and the first row at or above its floor */
 static void
 read_table(unsigned d)
@@ -216,13 +218,21 @@ read_table(unsigned d)
 	/*
 	 * never above where the group is now: this only holds back, it does not raise -- nor past the table's last row,
 	 * whatever the register reads (Linux's qcom_cpufreq_get_freq() bounds it the same way); the rows written are between
-	 * the floor and this one
+	 * the floor and this one. When governed alongside soc-sleep, the governor owns idle scaling so top_row is the table top.
 	 */
-	top_row[d] = row_now[d] = MIN(rd(epss[d] + layout->perf_state), last);
+	if (mode >= 2 && hakios_board_has(HAKIOS_HAS_SOC_SLEEP) && hakios_cpufreq_set_cap != NULL &&
+	    hakios_cpufreq_set_cap(d, last)) {
+		top_row[d] = row_now[d] = last;
+	} else {
+		top_row[d] = row_now[d] = MIN(rd(epss[d] + layout->perf_state), last);
+	}
 	if (floor_row[d] == UINT32_MAX || floor_row[d] > top_row[d]) {
 		floor_row[d] = top_row[d];
 	}
 }
+
+extern bool hakios_screen_off(void) __attribute__((weak));
+extern wait_result_t hakios_assert_wait_net(event_t event, uint32_t ms) __attribute__((weak));
 
 static void
 apply(uint32_t s)
@@ -234,9 +244,14 @@ apply(uint32_t s)
 			if (hakios_scmi_perf_set(d, row) == 0) {
 				row_now[d] = row;
 			}
-		} else if (epss[d] != 0 && row != row_now[d]) {
-			wr(epss[d] + layout->perf_state, row);
-			row_now[d] = row;
+		} else if (epss[d] != 0) {
+			if (hakios_board_has(HAKIOS_HAS_SOC_SLEEP) && hakios_cpufreq_set_cap != NULL &&
+			    hakios_cpufreq_set_cap(d, row)) {
+				row_now[d] = row;
+			} else if (row != row_now[d]) {
+				wr(epss[d] + layout->perf_state, row);
+				row_now[d] = row;
+			}
 		}
 	}
 	hakios_backlight_set_cap(th_backlight_cap(s, most, 600));
@@ -305,7 +320,11 @@ th_thread(__unused void *argument, __unused wait_result_t result)
 			say("thermal: hottest sensor %s C%s\n", tenths_text(t, degrees, sizeof(degrees)),
 			    mode >= 2 ? "" : " (thermal=1: looking only)");
 		}
-		assert_wait_timeout(&poke, THREAD_UNINT, period_ms, NSEC_PER_MSEC);
+		if (hakios_assert_wait_net != NULL && hakios_screen_off != NULL && hakios_screen_off()) {
+			(void)hakios_assert_wait_net(&poke, period_ms * 10);
+		} else {
+			assert_wait_timeout(&poke, THREAD_UNINT, period_ms, NSEC_PER_MSEC);
+		}
 		thread_block(THREAD_CONTINUE_NULL);
 	}
 }

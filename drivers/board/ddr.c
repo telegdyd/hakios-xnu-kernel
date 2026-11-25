@@ -210,6 +210,8 @@ ddr_raise(void)
 	    problem == NULL ? "" : ddr_voted ? ": FAILED, or perhaps not: given back at the run's end all the same" : ": FAILED");
 }
 
+extern bool hakios_soc_sleep_quiesce(void) __attribute__((weak));
+
 /* On the way back to the loader (osfmk/arm64/loader_return.c: loader_return(), whatever the reason; the other processors are stopped) */
 void
 hakios_ddr_quiesce(void)
@@ -219,6 +221,9 @@ hakios_ddr_quiesce(void)
 	bool done;
 
 	hakios_cpufreq_quiesce();       /* the cores' groups at their top rows, the cache slices as they were (cpufreq.c) */
+	if (hakios_soc_sleep_quiesce != NULL && hakios_soc_sleep_quiesce()) {
+		return;
+	}
 	if (!ddr_voted) {
 		return;
 	}

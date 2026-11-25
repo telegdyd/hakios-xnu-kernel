@@ -148,6 +148,29 @@ void hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t b
 void hakios_gpu_report(const char *why);
 bool hakios_gpu_recover(void);
 void hakios_gpu_stop(void);
+
+enum hakios_rpmh_client {
+	HAKIOS_RPMH_CPU,
+	HAKIOS_RPMH_TOUCH,
+	HAKIOS_RPMH_DISPLAY,
+	HAKIOS_RPMH_USB,
+	HAKIOS_RPMH_PCIE,
+	HAKIOS_RPMH_CLIENTS
+};
+
+extern volatile uint32_t hakios_battery_charger_changes;
+bool hakios_battery_get(int *soc, int *present, int *charger);
+bool hakios_battery_power(int *ma, int *mv, int *charger);
+bool hakios_aop_message(const char *text);
+bool hakios_cpufreq_set_cap(uint32_t domain, uint32_t row);
+bool hakios_rpmh_bw(enum hakios_rpmh_client client, const char *bcm, uint32_t vote_a, uint32_t vote_b);
+void hakios_display_bandwidth(bool needed);
+bool hakios_pcie_bandwidth(bool needed);
+void hakios_soc_sleep_init(void);
+void hakios_soc_sleep_follow(const uint32_t *khz, uint32_t groups);
+bool hakios_soc_sleep_quiesce(void);
+void hakios_buttons_quiesce(void);
+bool hakios_ufs_power_down(void);
 #endif
 
 #endif /* _SYS_HAKIOS_INPUT_H_ */

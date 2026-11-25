@@ -93,6 +93,7 @@
 #include <sys/errno.h>
 #include <sys/kauth.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/board/input.h>
 #include <sys/vnode.h>
@@ -573,7 +574,7 @@ mailbox_open(void)
 
 /* A message to the always-on processor (Linux's qmp_send()), under the lock the Wi-Fi's start takes too. */
 static bool
-mailbox_send(const char *text)
+mailbox_send_opt(const char *text, bool quiet)
 {
 	uint32_t words[QMP_MESSAGE / 4] = { 0 };
 	bool sent = false;
@@ -581,14 +582,19 @@ mailbox_send(const char *text)
 	if (!leaving) {
 		lck_mtx_lock(&hakios_aop_mailbox_lock);
 	}
-	if (our_box == 0 && (leaving || !mailbox_open())) {
+	if (aoss.base == 0 || (our_box == 0 && (leaving || !mailbox_open()))) {
 		goto out;
 	}
 	strlcpy((char *)words, text, sizeof(words));
-	printf("adsp: %u: about to tell the always-on processor \"%s\"\n", step, text);
-	snprintf(last_write, sizeof(last_write), "step %u sent the always-on processor a message", step);
+	if (!quiet) {
+		printf("adsp: %u: about to tell the always-on processor \"%s\"\n", step, text);
+		snprintf(last_write, sizeof(last_write), "step %u sent the always-on processor a message", step);
+	}
 	if (rd(aoss.base + our_box) != 0) {
-		printf("adsp: %u: our mailbox still holds a message of %u bytes: not sent\n", step, rd(aoss.base + our_box));
+		if (!quiet) {
+			printf("adsp: %u: our mailbox still holds a message of %u bytes: not sent\n", step,
+			    rd(aoss.base + our_box));
+		}
 		goto out;
 	}
 	for (unsigned i = 0; i < QMP_MESSAGE / 4; i++) {
@@ -598,17 +604,34 @@ mailbox_send(const char *text)
 	(void)rd(aoss.base + our_box);
 	ring_aop();
 	if (!mailbox_wait(our_box, 0, 1000)) {
-		printf("adsp: %u: THE ALWAYS-ON PROCESSOR DOES NOT TAKE THE MESSAGE within a second; it is taken back\n", step);
+		if (!quiet) {
+			printf("adsp: %u: THE ALWAYS-ON PROCESSOR DOES NOT TAKE THE MESSAGE within a second; it is taken back\n",
+			    step);
+		}
 		wr(aoss.base + our_box, 0);
 		goto out;
 	}
-	printf("adsp: %u: the always-on processor has taken it\n", step);
+	if (!quiet) {
+		printf("adsp: %u: the always-on processor has taken it\n", step);
+	}
 	sent = true;
 out:
 	if (!leaving) {
 		lck_mtx_unlock(&hakios_aop_mailbox_lock);
 	}
 	return sent;
+}
+
+static bool
+mailbox_send(const char *text)
+{
+	return mailbox_send_opt(text, false);
+}
+
+bool
+hakios_aop_message(const char *text)
+{
+	return hakios_board_has(HAKIOS_HAS_SOC_SLEEP) && !leaving && mailbox_send_opt(text, true);
 }
 
 /* ---- RPMh: the DSP's two rails, asked for while it boots ------------------------------------------------ */
@@ -2678,6 +2701,19 @@ static uint32_t batt_shift = 1;         /* 0 with adsp { } battery-linux-numbers
 #define USB_TYPEC_MODE          19              /* OPLUS: set 0 dual-role, 1 sink only; read 0 sink */
 #define USB_SUSPEND_PMIC        26              /* OPLUS: 1 input suspended */
 #define BATTMGR_SECONDS         10
+static uint32_t battmgr_off_seconds = BATTMGR_SECONDS;
+static uint32_t battmgr_notice_count, battmgr_kick_count;
+extern bool hakios_screen_off(void) __attribute__((weak));
+extern wait_result_t hakios_assert_wait_net(event_t event, uint32_t ms) __attribute__((weak));
+
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, battmgr_notices, CTLFLAG_RD | CTLFLAG_LOCKED, &battmgr_notice_count, 0,
+    "the DSP battery manager's notices (opcode 7: a property changed)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, battmgr_off_seconds, CTLFLAG_RW | CTLFLAG_LOCKED, &battmgr_off_seconds, 0,
+    "seconds between the battery manager's rounds while the screen is off (2-600; the default 10)");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, battmgr_kicks, CTLFLAG_RD | CTLFLAG_LOCKED, &battmgr_kick_count, 0,
+    "rounds asked for at once by a notice, not after the wait");
+
 static bool oplus_charger;              /* adsp { } oplus-charger */
 static bool current_positive_discharging;       /* adsp { } current-positive-discharging */
 static uint32_t pack_uah;               /* adsp { } pack-uah */
@@ -2695,7 +2731,7 @@ static struct {
 	volatile uint32_t answers, notices;
 	uint32_t opcode, property, value, result, length;
 	bool wanted;
-	volatile bool runs;
+	volatile bool runs, kick;
 } battmgr;
 
 static void
@@ -2715,6 +2751,9 @@ battmgr_input(const uint8_t *data, uint32_t length)
 			tell("adsp: battmgr: < a notice, opcode %#x, %u bytes (%#x %#x %#x)\n", m.opcode, length, m.words[0], m.words[1],
 			    m.words[2]);
 		}
+		battmgr_notice_count++;
+		battmgr.kick = true;
+		thread_wakeup((event_t)&battmgr.wanted);
 		return;
 	}
 	battmgr.opcode = m.opcode;
@@ -2723,6 +2762,7 @@ battmgr_input(const uint8_t *data, uint32_t length)
 	battmgr.result = m.words[2];
 	battmgr.length = length;
 	os_atomic_inc(&battmgr.answers, release);
+	thread_wakeup((event_t)&battmgr.answers);
 }
 
 /*
@@ -2735,14 +2775,18 @@ battmgr_get(uint32_t opcode, uint32_t property, uint32_t *value)
 	bool set = opcode == BATTMGR_USB_SET || opcode == BATTMGR_BATTERY_SET;
 	struct battmgr_message q = { BATTMGR_OWNER, BATTMGR_REQUEST, opcode, { 0, property, set ? *value : 0 } };
 	uint32_t before = os_atomic_load(&battmgr.answers, acquire);
+	uint64_t start_ms = now_us() / 1000;
 
 	if (glink_send(&glink.channel[CHANNEL_PMIC], &q, sizeof(q)) != 0) {
 		return false;
 	}
-	for (unsigned ms = 0; ms < 1000; ms++) {
-		if (os_atomic_load(&battmgr.answers, acquire) != before) {
+	for (;;) {
+		uint32_t answers = os_atomic_load(&battmgr.answers, acquire);
+		uint64_t elapsed;
+
+		if (answers != before) {
 			if (battmgr.opcode != opcode || battmgr.property != property || battmgr.length < sizeof(struct battmgr_message)) {
-				before = battmgr.answers;       /* (somebody else's answer: wait on) */
+				before = answers;       /* (somebody else's answer: wait on) */
 				continue;
 			}
 			if (battmgr.result != 0) {
@@ -2751,9 +2795,17 @@ battmgr_get(uint32_t opcode, uint32_t property, uint32_t *value)
 			*value = battmgr.value;
 			return true;
 		}
-		sleep_ms(1);
+		elapsed = now_us() / 1000 - start_ms;
+		if (elapsed >= 1000) {
+			return false;
+		}
+		assert_wait_timeout((event_t)&battmgr.answers, THREAD_UNINT, (uint32_t)(1000 - elapsed), NSEC_PER_MSEC);
+		if (os_atomic_load(&battmgr.answers, acquire) != before) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			continue;
+		}
+		(void)thread_block(THREAD_CONTINUE_NULL);
 	}
-	return false;
 }
 
 /* Some gauges report the charge counter in 1/100 uAh, unlike their full and design capacity fields
@@ -2931,6 +2983,7 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 		}
 	}
 	for (unsigned round = 0; battmgr.wanted && glink.up && glink.channel[CHANNEL_PMIC].open; round++) {
+		uint64_t round_at = mach_absolute_time();
 		struct hakios_battery_state b = { .size = sizeof(b) };
 		uint32_t capacity = 0, status = 0, present = 0, volt = 0, curr = 0, temp = 0, usb = 0;
 		uint32_t usb_type = 0, usb_volt = 0, usb_curr = 0, charge = 0;
@@ -3011,24 +3064,61 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 		 * when a round after such a change is due (board/plug_watch_core.h)
 		 */
 		plug_watch_round(&watch, good ? usb != 0 : -1);
-		for (unsigned ms = 0, next_look = look_ms; ms < BATTMGR_SECONDS * 1000 && battmgr.wanted && glink.up; ms += 50) {
-			sleep_ms(50);
-			if (look_ms != 0 && ms + 50 >= next_look) {
-				uint32_t online = 0;
-				bool answered = battmgr_get(BATTMGR_USB_GET, USB_ONLINE, &online);
+		if (battmgr.wanted && glink.up) {
+			bool off = hakios_screen_off != NULL && hakios_screen_off();
+			uint32_t wait_s = (off && battmgr_off_seconds >= 2 && battmgr_off_seconds <= 600) ?
+			    battmgr_off_seconds : BATTMGR_SECONDS;
 
-				next_look += look_ms;
-
-				if (plug_watch_look(&watch, answered ? online != 0 : -1, now_us() / 1000)) {
-					if (watch.changes <= 20) {
-						tell("adsp: battmgr: %s the USB port between two rounds: asked again at once\n",
-						    online ? "something plugged into" : "nothing on");
+			if (!off && look_ms != 0) {
+				for (unsigned ms = 0, next_look = look_ms;
+				    ms < wait_s * 1000 && battmgr.wanted && glink.up && !battmgr.kick; ms += 50) {
+					assert_wait_timeout((event_t)&battmgr.wanted, THREAD_UNINT, 50, NSEC_PER_MSEC);
+					if (!battmgr.wanted || battmgr.kick) {
+						clear_wait(current_thread(), THREAD_AWAKENED);
+						break;
 					}
-					break;
+					(void)thread_block(THREAD_CONTINUE_NULL);
+					if (!battmgr.wanted || battmgr.kick) {
+						break;
+					}
+					if (ms + 50 >= next_look) {
+						uint32_t online = 0;
+						bool answered = battmgr_get(BATTMGR_USB_GET, USB_ONLINE, &online);
+
+						next_look += look_ms;
+						if (plug_watch_look(&watch, answered ? online != 0 : -1, now_us() / 1000)) {
+							if (watch.changes <= 20) {
+								tell("adsp: battmgr: %s the USB port between two rounds: asked again at once\n",
+								    online ? "something plugged into" : "nothing on");
+							}
+							break;
+						}
+					}
+					if (plug_watch_due(&watch, now_us() / 1000)) {
+						break;
+					}
+				}
+			} else {
+				if (off && hakios_assert_wait_net != NULL) {
+					(void)hakios_assert_wait_net((event_t)&battmgr.wanted, wait_s * 1000);
+				} else {
+					assert_wait_timeout((event_t)&battmgr.wanted, THREAD_UNINT, wait_s * 1000, NSEC_PER_MSEC);
+				}
+				if (!battmgr.wanted || battmgr.kick) {
+					clear_wait(current_thread(), THREAD_AWAKENED);
+				} else {
+					(void)thread_block(THREAD_CONTINUE_NULL);
 				}
 			}
-			if (plug_watch_due(&watch, now_us() / 1000)) {
-				break;
+			if (battmgr.kick) {
+				uint64_t ns = 0;
+
+				battmgr.kick = false;
+				battmgr_kick_count++;
+				absolutetime_to_nanoseconds(mach_absolute_time() - round_at, &ns);
+				if (ns < NSEC_PER_SEC) {
+					delay_for_interval((uint32_t)((NSEC_PER_SEC - ns) / NSEC_PER_MSEC) + 1, NSEC_PER_MSEC);
+				}
 			}
 		}
 	}
@@ -3063,6 +3153,7 @@ static void
 battmgr_stop(void)
 {
 	battmgr.wanted = false;
+	thread_wakeup((event_t)&battmgr.wanted);
 	for (unsigned ms = 0; ms < 2000 && battmgr.runs; ms++) {
 		sleep_ms(1);
 	}
@@ -3081,6 +3172,7 @@ battmgr_stop(void)
  * second give the line up for this boot. adsp_irq=0: never taken (the millisecond look).
  */
 #define LINK_NET_MS             100
+#define LINK_NET_OFF_MS         1000
 #define LINK_IRQ_STORM          5000
 
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
@@ -3163,11 +3255,18 @@ link_irq_stop(void)
 static bool
 link_wait(void)
 {
+	bool off;
+
 	if (!link_irq.attached || !__atomic_load_n(&link_irq.on, __ATOMIC_ACQUIRE) || link_irq.foreign_now) {
 		sleep_us(1000);
 		return true;
 	}
-	assert_wait_timeout((event_t)&link_irq.rang, THREAD_UNINT, LINK_NET_MS, NSEC_PER_MSEC);
+	off = hakios_screen_off != NULL && hakios_screen_off();
+	if (off && hakios_assert_wait_net != NULL) {
+		(void)hakios_assert_wait_net((event_t)&link_irq.rang, LINK_NET_OFF_MS);
+	} else {
+		assert_wait_timeout((event_t)&link_irq.rang, THREAD_UNINT, off ? LINK_NET_OFF_MS : LINK_NET_MS, NSEC_PER_MSEC);
+	}
 	if (__atomic_exchange_n(&link_irq.rang, 0, __ATOMIC_ACQUIRE) != 0 || !link_wanted) {
 		clear_wait(current_thread(), THREAD_AWAKENED);
 		link_irq.by_line++;

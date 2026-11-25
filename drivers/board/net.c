@@ -316,14 +316,21 @@ net_thread(void *parameter, __unused wait_result_t result)
 	unsigned quiet = 0;
 
 	for (unsigned tick = 1;; tick++) {
-		quiet = n->link->poll != NULL && n->link->poll() ? 0 : quiet + 1;
+		if (n->link->poll != NULL) {
+			quiet = n->link->poll() ? 0 : quiet + 1;
+		}
 		/* about once a minute, if anything has moved since */
 		total = n->count.sent + n->count.received + n->count.dropped_out + n->count.dropped_in;
-		if (tick % 8192 == 0 && total != said) {
+		if ((n->link->poll == NULL || tick % 8192 == 0) && total != said) {
 			said = total;
 			printf("net: en%u so far %llu frames sent (%llu bytes), %llu received (%llu bytes); dropped: %llu out, %llu in\n",
 			    n->unit, n->count.sent, n->count.sent_bytes, n->count.received, n->count.received_bytes,
 			    n->count.dropped_out, n->count.dropped_in);
+		}
+		if (n->link->poll == NULL) {
+			/* Frame delivery wakes directly on its own thread; avoid 100 Hz timer wakeups when idle. */
+			delay_for_interval(60 * 1000, NSEC_PER_MSEC);
+			continue;
 		}
 		/*
 		 * While frames come, ask again soon: a TCP sender waits for the acknowledgements this brings in,
