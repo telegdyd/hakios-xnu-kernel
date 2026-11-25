@@ -581,6 +581,7 @@ TEST(a6xx_fui_is_the_floats_bits) {
     static_assert(fui(32.0f) == 0x42000000u, "32.0 is 0x42000000");
     static_assert(fui(-32.0f) == 0xc2000000u, "-32.0 is 0xc2000000");
     static_assert(fui(1.0f) == 0x3f800000u, "1.0 is 0x3f800000");
+    static_assert(fui(-0.0f) == 0x80000000u, "negative zero keeps its sign at compile time");
     // the twin: the sign is a different word, so a viewport scale of the wrong sign cannot pass as the right one
     CHECK(fui(32.0f) != fui(-32.0f));
     CHECK_EQ(fui(32.0f) ^ fui(-32.0f), 0x80000000u);

@@ -136,7 +136,7 @@
  
 --- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
 +++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
-@@ -445,6 +445,21 @@
+@@ -445,6 +445,32 @@
         DRAW == DRAW_INDIRECT_OP_INDIRECT_COUNT)
        ctx->batch->barrier |= FD6_WAIT_FOR_ME;
  
@@ -150,9 +150,20 @@
 +    * triangle of each such quad was wrong, the second right.  A CCU colour
 +    * flush before the draw mends it, and so does a UCHE invalidate alone;
 +    * the first such draw gets both, as a framebuffer barrier would give.
++    * On a730 that is not enough: CoreAnimation's blur and vibrancy came out
++    * as half-drawn quads, black or in stale colours, with GMEM and sysmem,
++    * with UBWC and without, until every draw was flushed on its own
++    * (FD_MESA_DEBUG=flush).  There every draw that reads the framebuffer
++    * gets the flush, and a wait for idle, so that the clean is done before
++    * the draw reads.
 +    */
-+   if (unlikely(emit.fs->fb_read) && !ctx->batch->prev_draw_read_fb)
-+      ctx->batch->barrier |= FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CACHE;
++   if (unlikely(emit.fs->fb_read)) {
++      if (CHIP >= A7XX)
++         ctx->batch->barrier |= FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CACHE |
++                                FD6_WAIT_FOR_IDLE;
++      else if (!ctx->batch->prev_draw_read_fb)
++         ctx->batch->barrier |= FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CACHE;
++   }
 +   ctx->batch->prev_draw_read_fb = emit.fs->fb_read;
 +
     if (ctx->batch->barrier)

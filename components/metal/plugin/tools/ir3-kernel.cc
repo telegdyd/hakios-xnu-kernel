@@ -132,6 +132,40 @@ std::string normalizeInstr(std::string line)
     return out;
 }
 
+// On gen 7 every IBO access is bindless, descriptor N of set 0 (src/compiler.cpp: lowerIboToBindless says why): a
+// kernel's text names its IBOs non-bindless (".imm", ".uniform", ".nonuniform" with no ".baseN"), one source for both
+// chips, and this adds ".base0" to the mode of each stib.b, ldib.b, resinfo.b and atomic.b.* instruction before it is
+// assembled. The round trip then compares the disassembly with the rewritten text, which goes into the fixture.
+std::string bindlessIbos(const std::string& text)
+{
+    std::string out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos)
+            nl = text.size();
+        std::string line = text.substr(pos, nl - pos);
+        pos = nl + 1;
+        const size_t semi = line.find(';');
+        const std::string code = line.substr(0, semi);
+        const bool ibo = code.find("stib.b.") != std::string::npos || code.find("ldib.b.") != std::string::npos ||
+                         code.find("resinfo.b.") != std::string::npos || code.find("atomic.b.") != std::string::npos;
+        if (ibo && code.find(".base") == std::string::npos) {
+            for (const char* mode : {".nonuniform", ".uniform", ".imm"}) {
+                const size_t at = code.find(mode);
+                if (at == std::string::npos)
+                    continue;
+                line.insert(at + strlen(mode), ".base0");
+                break;
+            }
+        }
+        out += line;
+        if (nl < text.size())
+            out += '\n';
+    }
+    return out;
+}
+
 std::vector<std::string> instructionsOf(const std::string& text, bool isSource)
 {
     std::vector<std::string> v;
@@ -229,6 +263,8 @@ int main(int argc, char** argv)
         die("ir3_compiler_create failed");
 
     std::string source = readFile(inPath);
+    if (devInfo->chip >= 7)
+        source = bindlessIbos(source);
     std::string name = nameArg ? std::string(nameArg) : nameFromPath(inPath);
 
     // The assembler reads a FILE*; fmemopen keeps the text in hand for the fixture.

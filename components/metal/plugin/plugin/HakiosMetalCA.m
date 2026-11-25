@@ -1650,6 +1650,14 @@ hm_ca_nearest(NSString *frag)
 	if (w == nil) {
 		return nil;
 	}
+	static NSRegularExpression *filter;
+	static dispatch_once_t filterOnce;
+
+	dispatch_once(&filterOnce, ^{
+		filter = [[NSRegularExpression alloc] initWithPattern:@"_I[A-Za-z0-9]*N[0-9]+O" options:0 error:NULL];
+	});
+	const BOOL filtered = [filter firstMatchInString:want options:0 range:NSMakeRange(0, [want length])] != nil;
+
 	for (NSString *candidate in hm_ca_frag_vert) {
 		if (![candidate hasPrefix:prefix] || hm_ca_variants[candidate] == nil) {
 			continue;
@@ -1671,6 +1679,27 @@ hm_ca_nearest(NSString *frag)
 		if ([wantIn count] != [haveIn count]) {
 			continue;
 		}
+		/* every input the same, or none: another input is another fetch. TmuaA2S1Xhf_Ialp_Isqr (a mask's alpha times
+		 * the colour) drawn by ..._Isrc_Isqr read the one-channel mask as the colour, (r, 0, 0, 1): the home screen's
+		 * edit badges and Done button opaque black squares with red where the circle was (the OnePlus 10 Pro, 10
+		 * November). The function's own module, specialised by Metal, draws what was asked. */
+		if (![part(w, 8, want) isEqualToString:part(h, 8, have)]) {
+			continue;
+		}
+		if (filtered) {
+			/* an input with a filter (N<rows>O<ops>) reads its rows from the buffer CoreAnimation lays out for the
+			 * program it asked for: the other precision (h: half4 rows, cx: float4) reads them at twice or half the
+			 * stride, and the bias comes out as a flat colour added to the picture (the app-open flash). Only the same
+			 * precision. */
+			BOOL alike = YES;
+			for (NSString *p in @[@"h", @"c", @"x"]) {
+				alike = alike && ([wantFlags rangeOfString:p].location == NSNotFound) ==
+						 ([haveFlags rangeOfString:p].location == NSNotFound);
+			}
+			if (!alike) {
+				continue;
+			}
+		}
 		for (NSUInteger i = 0; i < [wantIn count]; i++) {
 			/* (an input that does more than was asked for last: IsrcN3Oc3mtc4 is a colour matrix, not a plain sample) */
 			cost += [wantIn[i] isEqualToString:haveIn[i]] ? 0 : 100 + labs((long)[haveIn[i] length] - (long)[wantIn[i] length]);
@@ -1690,7 +1719,8 @@ hm_ca_nearest(NSString *frag)
 		if (told[frag] == nil) {
 			told[frag] = @YES;
 			hm_print("CoreAnimation's %s is not in the library: %s stands in for it\n", [want UTF8String],
-				 best != nil ? [[best substringFromIndex:[prefix length]] UTF8String] : "nothing of the same kind");
+				 best != nil ? [[best substringFromIndex:[prefix length]] UTF8String] :
+				 filtered ? "nothing with the same filter layout: its own module" : "nothing with the same inputs: its own module");
 		}
 	}
 	return best;
@@ -2237,12 +2267,13 @@ hm_m2v_missing(const char *class, const char *selector)
 
 /*
  * The processes shown the device besides the window server: those whose Metal was seen to work (a comma-separated
- * list; none yet). iconservicesagent was tried: it draws icons with RenderBox (SwiftUI's renderer) and IconRendering's
+ * list): MercuryPosterExtension, which draws the Mercury posters (Celosia) in its own process, on the OnePlus 10 Pro's
+ * A730 (25 November). iconservicesagent was tried: it draws icons with RenderBox (SwiftUI's renderer) and IconRendering's
  * effects, and with the device its home screen icons came out with parts of their symbols missing -- RenderBox's
  * custom effects call visible functions this plug-in does not link (custom_fn, custom_blend) -- where without one it
  * draws them whole on the processor. metal_procs=iconservicesagent shows it the device again, to work on that.
  */
-#define HM_SHOWN        ""
+#define HM_SHOWN        "MercuryPosterExtension"
 
 /* whether this process is the window server, the client the CoreAnimation-only parts of this plug-in were made for */
 static bool
@@ -2662,6 +2693,18 @@ hm_own_cache_dir(const char *dir)
 			 a != nil ? "a MTLTargetDeviceArchitecture" : "NIL: Metal has no such class here");
 	}
 	return _architecture;
+}
+
+/* the sample counts the core draws and resolves (1, 2 and 4: the A730's draw suite and its 4x Depth16Unorm readbacks);
+ * Mercury's posters ask for 2x or 4x and draw nothing when told no */
+- (BOOL)supportsSampleCount:(NSUInteger)count
+{
+	return count == 1 || count == 2 || count == 4;
+}
+
+- (BOOL)supportsTextureSampleCount:(NSUInteger)count
+{
+	return [self supportsSampleCount:count];
 }
 
 - (NSString *)name { return _name != nil ? _name : @"Adreno (hakios-metal; no GPU)"; }
@@ -3160,7 +3203,7 @@ hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned
 		hakios_metal_constant constants[64];
 		unsigned count = hm_function_constants(function, constants, 64);
 
-		kernel = hakios_metal_kernel_compile_bitcode_constants([air bytes], [air length], constants, count);
+		kernel = hakios_metal_kernel_compile_for_device(_gpu, [air bytes], [air length], constants, count);
 		if (kernel != NULL) {
 			hm_dump_function("cs", function, "metal_dump=fn", constants, count);
 		}
@@ -3341,10 +3384,10 @@ hm_set_vertex_descriptor(hakios_metal_program *program, MTLVertexDescriptor *vd)
 	 * an output the function does not write. Their blends are handed over after the compile. */
 	/* blending and the write mask are hakios-metal's (hakios_metal_program_set_blend after the compile), dual-source
 	 * factors included: the draw takes a stage's [[color(0), index(1)]] as the second source */
-	if ([d depthAttachmentPixelFormat] != MTLPixelFormatInvalid && [d depthAttachmentPixelFormat] != MTLPixelFormatDepth32Float &&
-	    [d depthAttachmentPixelFormat] != MTLPixelFormatDepth32Float_Stencil8) {
-		return [NSString stringWithFormat:@"a depth attachment pixel format of %lu; Depth32Float (252) and Depth32Float_Stencil8 "
-						  "(260) are the depth formats served", (unsigned long)[d depthAttachmentPixelFormat]];
+	if ([d depthAttachmentPixelFormat] != MTLPixelFormatInvalid && [d depthAttachmentPixelFormat] != MTLPixelFormatDepth16Unorm &&
+	    [d depthAttachmentPixelFormat] != MTLPixelFormatDepth32Float && [d depthAttachmentPixelFormat] != MTLPixelFormatDepth32Float_Stencil8) {
+		return [NSString stringWithFormat:@"a depth attachment pixel format of %lu; Depth16Unorm (250), Depth32Float (252) and "
+						  "Depth32Float_Stencil8 (260) are the depth formats served", (unsigned long)[d depthAttachmentPixelFormat]];
 	}
 	/* the stencil is the S8 plane of a Depth32Float_Stencil8 texture, so a stencil format is that one, alone or with the
 	 * same depth format beside it */
@@ -3524,13 +3567,13 @@ hm_linked_of(MTLRenderPipelineDescriptor *d, NSString *label, hakios_metal_linke
 				}
 				hm_print("a render pipeline, %s + %s, links%s\n", [[vs name] UTF8String], [[fs name] UTF8String], [names UTF8String]);
 			}
-			program = hakios_metal_program_new_bitcode_linked([vsAir bytes], [vsAir length], vsConstants, vsCount,
-									  fsAir != nil ? [fsAir bytes] : NULL, fsAir != nil ? [fsAir length] : 0, fsConstants,
-									  fsCount, linked, linkedCount, format);
-		} else {
-			program = hakios_metal_program_new_bitcode_constants([vsAir bytes], [vsAir length], vsConstants, vsCount,
+			program = hakios_metal_program_new_linked_for_device(_gpu, [vsAir bytes], [vsAir length], vsConstants, vsCount,
 									     fsAir != nil ? [fsAir bytes] : NULL, fsAir != nil ? [fsAir length] : 0,
-									     fsConstants, fsCount, format);
+									     fsConstants, fsCount, linked, linkedCount, format);
+		} else {
+			program = hakios_metal_program_new_for_device(_gpu, [vsAir bytes], [vsAir length], vsConstants, vsCount,
+								      fsAir != nil ? [fsAir bytes] : NULL, fsAir != nil ? [fsAir length] : 0,
+								      fsConstants, fsCount, format);
 		}
 		if (program != NULL) {
 			hm_dump_function("vs", vs, "metal_dump=fn", vsConstants, vsCount);
@@ -4084,7 +4127,8 @@ hm_memoryless_give(hakios_metal_texture *t, unsigned type, unsigned format, unsi
 		HM_ONCE("a texture was asked for with usage Unknown (0); it is given shader read, shader write and render target, the "
 			"three uses one has here\n");
 		usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
-		if ([descriptor pixelFormat] == MTLPixelFormatDepth32Float || [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8) {
+		if ([descriptor pixelFormat] == MTLPixelFormatDepth16Unorm || [descriptor pixelFormat] == MTLPixelFormatDepth32Float ||
+		    [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8) {
 			usage = MTLTextureUsageRenderTarget;   /* a depth texture is tiled and is an attachment alone (hakios-metal's texture.hpp) */
 		}
 		{
@@ -4472,7 +4516,8 @@ hm_refuse_sampler(NSString *why)
 {
 	MTLTextureUsage usage = [descriptor usage] & ~(MTLTextureUsage)MTLTextureUsagePixelFormatView;
 	const MTLTextureType type = [descriptor textureType];
-	const BOOL depth = [descriptor pixelFormat] == MTLPixelFormatDepth32Float || [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8;
+	const BOOL depth = [descriptor pixelFormat] == MTLPixelFormatDepth16Unorm || [descriptor pixelFormat] == MTLPixelFormatDepth32Float ||
+			   [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8;
 	const unsigned layers = type == MTLTextureType2DArray || type == MTLTextureType1DArray ? (unsigned)[descriptor arrayLength] :
 				type == MTLTextureTypeCubeArray ? (unsigned)[descriptor arrayLength] * 6 : type == MTLTextureTypeCube ? 6 :
 				type == MTLTextureType3D ? (unsigned)[descriptor depth] : 1;

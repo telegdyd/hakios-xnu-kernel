@@ -601,6 +601,29 @@ bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass&
                   bool afterFetch = false);
 void encodeEnd(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& options = Options{});
 
+// The A730 draw ladder's trace (a diagnostic, as gmemBinningTrace is for GMEM): with an address set, every A730 3D pass
+// the encoder writes from then on has the command processor write step N's number into word N there as it gets to
+// step N (kTrace*), so that after a hang the CPU can read which packet it stopped at. 0, the default, writes nothing.
+enum : uint32_t {
+    kTraceBatchStart = 1,   // after the batch start and the static state
+    kTracePassBegin = 2,    // after the sysmem pass begin
+    kTraceClears = 3,       // after the pass's Clears
+    kTraceState = 4,        // a draw's state written, before CP_DRAW_INDX_OFFSET
+    kTraceDrawn = 5,        // after CP_DRAW_INDX_OFFSET
+    kTraceIdle = 6,         // the tail's CP_WAIT_FOR_IDLE done
+    kTraceCcu = 7,          // the colour CCU clean's value seen
+    kTraceLrz = 8,          // after LRZ_FLUSH
+    kTraceCache = 9,        // the cache clean's value seen
+    kTraceEntry = 10,       // the 3D pass's first packet
+    kTraceSetMode = 11,     // after CP_SET_MODE 0
+    kTraceGen7Start = 12,   // after gen7::batchStart (compute's)
+    kTraceStaticIdle = 13,  // in gen7::drawStatic: after its CP_WAIT_FOR_IDLE and RB_CCU_CNTL
+    kTraceStaticRegs = 14,  // ...after the static registers
+    kTraceDrawState = 15,   // ...after CP_SET_DRAW_STATE disable-all
+    kTraceWords = 16,
+};
+void setA730Trace(uint64_t address);
+
 // A pass with no draw: the batch start, the pass begin, the Clear's fill, the tail. What -[MTLRenderCommandEncoder
 // endEncoding] needs for an encoder that recorded nothing; any load action but kClear is refused (nothing to write).
 bool encodeClear(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why,

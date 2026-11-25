@@ -14,6 +14,7 @@
 #include <tuple>
 
 #include "hakios-metal/a6xx.hpp"
+#include "hakios-metal/gen7.hpp"
 #include "hakios-metal/command.hpp"
 #include "hakios-metal/texture.hpp"
 
@@ -38,11 +39,18 @@ bool refuse(std::string* why, const std::string& text) {
 
 const char* stageName(const Stage& s) { return s.k.name != nullptr ? s.k.name : s.kind == kStageVertex ? "the vertex stage" : "the fragment stage"; }
 
-void reg(pm4::Stream& st, uint32_t r, uint32_t v) { st.registers(r, &v, 1); }
+// the A730 trace (render.hpp: setA730Trace): step N's number into word N, by the command processor as it gets there
+uint64_t gA730Trace = 0;
+void crumb(pm4::Stream& st, uint32_t step) {
+    if (!st.gen7() || gA730Trace == 0) return;
+    st.memWrite(gA730Trace + 4ull * step, &step, 1);
+}
+
+void reg(pm4::Stream& st, uint32_t r, uint32_t v) { gen7::registers(st, r, &v, 1); }
 
 void reg64(pm4::Stream& st, uint32_t r, uint64_t a) {
     uint32_t v[2] = {uint32_t(a), uint32_t(a >> 32)};
-    st.registers(r, v, 2);
+    gen7::registers(st, r, v, 2);
 }
 
 // consecutive registers from R on, one type-4 (turnip's pkt4 of several)
@@ -50,13 +58,14 @@ void regs(pm4::Stream& st, uint32_t r, std::initializer_list<uint32_t> values) {
     uint32_t v[16];
     uint32_t count = 0;
     for (uint32_t x : values) v[count++] = x;
-    st.registers(r, v, count);
+    gen7::registers(st, r, v, count);
 }
 
 // a type-7 packet of one word
 void command1(pm4::Stream& st, uint32_t opcode, uint32_t word) { st.packet(opcode, &word, 1); }
 
 void event(pm4::Stream& st, vgt_event_type e) {
+    if (st.gen7()) { gen7::event(st, e); return; }
     uint32_t w = eventWrite0(e, false);
     st.packet(CP_EVENT_WRITE, &w, 1);
 }
@@ -65,6 +74,7 @@ void event(pm4::Stream& st, vgt_event_type e) {
 // tu_cmd_buffer.cc:48-70) has no TIMESTAMP bit; with it the GPU writes a timestamp instead and the wait below never
 // ends (28 October, every compute dispatch). The bit is here for the fake GPU's test of that alone.
 void eventTimestamp(pm4::Stream& st, vgt_event_type e, uint64_t address, uint32_t value, bool timestampBit) {
+    if (st.gen7()) { gen7::event(st, e, address, value, true); return; }
     uint32_t w[4] = {eventWrite0(e, timestampBit), uint32_t(address), uint32_t(address >> 32), value};
     st.packet(CP_EVENT_WRITE, w, 4);
 }
@@ -1067,7 +1077,7 @@ bool checkTarget(const RenderPass& pass, std::string* why) {
     if (pass.depth != nullptr) {
         const Texture& d = *pass.depth;
         if (!d.info().depth) {
-            return refuse(why, std::string("a ") + d.info().name + " texture as the depth attachment: Depth32Float (252) is served");
+            return refuse(why, std::string("a ") + d.info().name + " texture as the depth attachment: a depth format is required");
         }
         if (d.samples() != firstAttachment(pass)->samples()) {
             return refuse(why, "a depth attachment of " + n(d.samples()) + " sample(s) beside colour of " + n(firstAttachment(pass)->samples()) +
@@ -1161,7 +1171,32 @@ void tableStart(uint8_t* tableCpu) {
 
 // steps 1 to 3 of a pass: the batch start, the CCU set to sysmem, the pass begin -- what a draw and a Clear without a
 // draw both need before the 2D engine or the 3D pipe writes the target
-void passStart(pm4::Stream& stream, uint32_t W, uint32_t H, uint64_t table, const Options& o) {
+void passStart(pm4::Stream& stream, uint32_t W, uint32_t H, uint64_t table, const Options& o, bool draw3d = false) {
+    if (stream.gen7()) {
+        // (a 3D batch opens with CP_SET_MODE 0, as fd6_emit_restore and the A6XX path do: no binning mode left by another owner)
+        if (draw3d) crumb(stream, kTraceEntry);
+        if (o.batchStart && draw3d) command1(stream, CP_SET_MODE, 0);
+        if (draw3d) crumb(stream, kTraceSetMode);
+        if (o.batchStart) gen7::batchStart(stream);
+        // A Clear alone: the 2D path, independent of A6xx render/GMEM state. Shared 2D fields keep MUTABLEEN/INDIRECT
+        // clear; their formats are explicit.
+        if (!draw3d) {
+            command1(stream, CP_SET_MARKER, setMarker0(RM6_DIRECT_RENDER));
+            return;
+        }
+        // A pass with draws: freedreno's A7XX batch start and sysmem pass begin, as it wrote them for FD730
+        // (gen7.cpp; device-info/2026-11-08-initial/metal-a730-draw/tri.txt). RB_CCU_CNTL2 is batchStart's.
+        crumb(stream, kTraceGen7Start);
+        if (o.batchStart) gen7::drawStatic(stream, table + kTableBorderColorAt, gA730Trace);
+        crumb(stream, kTraceBatchStart);
+        if (o.passBegin) {
+            gen7::sysmemPassBegin(stream, W, H);
+        } else if (o.marker) {
+            command1(stream, CP_SET_MARKER, setMarker0(RM6_DIRECT_RENDER));
+        }
+        crumb(stream, kTracePassBegin);
+        return;
+    }
     // 1. batch start: fd6_emit_restore (fd6_emit.cc:1090-1160) with turnip's tu6_init_hw as the second witness
     // (tu_cmd_buffer.cc:1584-1660): CP_SET_MODE 0; the three invalidates (fd6_cache_inv, fd6_emit.h:271-276; turnip's A6XX
     // path has CACHE_INVALIDATE alone, the kernel already emits both CCU invalidates per submit); HLSQ_INVALIDATE_CMD;
@@ -1237,11 +1272,13 @@ void passTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth 
     // fd6_gmem.cc:2114); RB_DONE_TS only under tailRbDone (in neither witness's render end); CACHE_FLUSH_TS writing 2 and
     // CP_WAIT_MEM_GTE for it, compute's measured tail
     stream.waitForIdle();
+    crumb(stream, kTraceIdle);
     {
         const uint64_t ts = table + kTableTimestampsAt;
         if (o.tailCcuFlush) {
             eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, ts, 1, o.tailTimestampBit);
             waitForWord(stream, ts, 1);
+            crumb(stream, kTraceCcu);
         }
         // with a depth attachment its CCU too (tu6_emit_flushes' FD_CCU_CLEAN_DEPTH, the 4-word PC_CCU_FLUSH_DEPTH_TS on
         // A6XX): every draw is a pass of its own here, so the next draw's depth test must find this one's depth in memory
@@ -1251,6 +1288,7 @@ void passTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth 
         }
         if (o.tailLrzFlush) {
             event(stream, LRZ_FLUSH);
+            crumb(stream, kTraceLrz);
         }
         if (o.tailRbDone) {
             eventTimestamp(stream, RB_DONE_TS, ts + 8, 3, o.tailTimestampBit);
@@ -1259,6 +1297,7 @@ void passTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth 
         if (o.tailCacheFlush) {
             eventTimestamp(stream, CACHE_FLUSH_TS, ts + 4, 2, o.tailTimestampBit);
             waitForWordAtLeast(stream, ts + 4, 2);
+            crumb(stream, kTraceCache);
         }
     }
 }
@@ -1272,6 +1311,12 @@ namespace {
 bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                 const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
                 const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false) {
+    // The A730's first draws (section 6 step 4 of GPU-PLAN.md): sysmem, colour targets, the state freedreno writes
+    // for FD730. What has not had its own ladder step on the phone yet is refused rather than guessed at.
+    const bool g7 = stream.gen7();
+    if (g7) {
+        if (gmem != nullptr) return refuse(why, "A730 GMEM passes wait for their ladder step");
+    }
     const Stage& vs = program.vs;
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
     // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
@@ -1602,7 +1647,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     const uint32_t* ij = fs.ijRegid;
 
     if (whole) {
-        passStart(stream, W, H, table, o);
+        passStart(stream, W, H, table, o, true);
         // a Clear: the 2D engine fills the target before any draw state is written, as turnip's subpass begin does it;
         // the depth attachment's Clear after it (tu_clear_sysmem_attachment, each attachment in turn)
         clearAll(stream, pass, clears, table);
@@ -1662,16 +1707,20 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         const Texture& d = *pass.depth;
         // (a depth array's layer: that many tiled planes on, sliceBytes apart)
         const uint64_t depthAt = d.levelAddress(pass.depthLevel) + uint64_t(pass.depthSlice) * d.sliceBytes();
+        const a6xx_depth_format depthFormat = d.format() == PixelFormat::kDepth16Unorm ? DEPTH6_16 : DEPTH6_32;
+        // (A7XX: RB_DEPTH_BUFFER_INFO names the tile mode itself, TILEMODE bits 5-6, as tu6_emit_zs and fd6 emit_zs write
+        // it for their A7XX: TILE6_3, the layout the texture has anyway; LOSSLESSCOMPEN 0, no UBWC depth here)
         regs(stream, REG_A6XX_RB_DEPTH_BUFFER_INFO,
-             {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
+             {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(depthFormat) | (g7 ? gen7::A7XX_RB_DEPTH_BUFFER_INFO_TILEMODE(TILE6_3) : 0u), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
               A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(uint32_t(d.depthPlaneBytes())), uint32_t(depthAt), uint32_t(depthAt >> 32), 0});
-        reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32));
+        reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(depthFormat));
         regs(stream, REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE, {0, 0, 0});
         if (pass.stencil != nullptr) {
             // the S8 plane as a separate stencil buffer (tu6_emit_zs's D32_SFLOAT_S8_UINT branch): SEPARATE_STENCIL, its
             // pitch and layer, its base, BASE_GMEM 0; A6XX's RB_STENCIL_INFO has no tile field -- stencil is TILE6_3, as laid out
             const uint64_t sb = d.gpuAddress() + d.stencilOffset();
-            regs(stream, REG_A6XX_RB_STENCIL_INFO, {A6XX_RB_STENCIL_INFO_SEPARATE_STENCIL, uint32_t(d.stencilPitch() >> 6), uint32_t(d.stencilPlaneBytes() >> 6),
+            // (A7XX: its TILEMODE, bits 2-3, TILE6_3 as well)
+            regs(stream, REG_A6XX_RB_STENCIL_INFO, {A6XX_RB_STENCIL_INFO_SEPARATE_STENCIL | (g7 ? gen7::A7XX_RB_STENCIL_INFO_TILEMODE(TILE6_3) : 0u), uint32_t(d.stencilPitch() >> 6), uint32_t(d.stencilPlaneBytes() >> 6),
                                                     uint32_t(sb), uint32_t(sb >> 32), 0});
         } else {
             reg(stream, REG_A6XX_RB_STENCIL_INFO, 0);
@@ -1687,7 +1736,10 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (o.mrt) {
         for (uint32_t i = 0; i < numRt; i++) {
             const MrtWords& m = mrts[i];
-            regs(stream, regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, i), {m.bufInfo, m.pitch, m.arrayPitch, m.baseLo, m.baseHi, m.baseGmem});
+            // (A7XX: a target with a flag buffer says so in its own BUF_INFO, LOSSLESSCOMPEN, bit 11; RB_RENDER_CNTL has
+            // no FLAG_MRTS there -- a6xx.xml's A7XX- variants of both)
+            const uint32_t bufInfo = m.bufInfo | (g7 && m.flagPitch != 0 ? 0x800u : 0u);
+            regs(stream, regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, i), {bufInfo, m.pitch, m.arrayPitch, m.baseLo, m.baseHi, m.baseGmem});
             reg(stream, regSpFsMrtReg(i), m.spFsMrtReg);
             regs(stream, regRbMrtFlagBuffer(REG_A6XX_RB_MRT_FLAG_BUFFER_ADDR, i), {m.flagLo, m.flagHi, m.flagPitch});
         }
@@ -1716,7 +1768,13 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     }
     // 7. RB_RENDER_CNTL: CCUSINGLECACHELINESIZE 2 in both pipelines (tu_cmd_buffer.cc:633-693; fd6_gmem.cc:531-552), 0 in
     // r3d_dst (tu_clear_blit.cc:1408) -- renderCntlZero for the bisect. A plain type-4: has_cp_reg_write is false here.
-    if (o.renderCntl) {
+    if (o.renderCntl && g7) {
+        // A7XX: RB_RENDER_CNTL without the CCU line size or the flag mask, and GRAS_SU_RENDER_CNTL beside it, both 0 in a
+        // sysmem pass (freedreno's FD730 stream)
+        reg(stream, REG_A6XX_RB_RENDER_CNTL, 0);
+        gen7::raw(stream, 0x8116, 0);   // GRAS_SU_RENDER_CNTL
+    }
+    if (o.renderCntl && !g7) {
         uint32_t flagMrts = 0;
         for (uint32_t i = 0; i < numRt; i++) flagMrts |= mrts[i].flagPitch != 0 ? 1u << i : 0u;
         reg(stream, REG_A6XX_RB_RENDER_CNTL, o.renderCntlZero ? 0u : rbRenderCntlSysmem() | A6XX_RB_RENDER_CNTL_FLAG_MRTS(flagMrts));
@@ -1727,16 +1785,26 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_GRAS_LRZ_CNTL, 0);
         reg(stream, REG_A6XX_RB_LRZ_CNTL, 0);
         regs(stream, REG_A6XX_GRAS_LRZ_BUFFER_BASE, {0, 0, 0, 0, 0});
+        if (g7) {
+            gen7::raw(stream, 0x810b, 0);   // GRAS_LRZ_CNTL2
+            gen7::raw(stream, 0x8113, 0);   // GRAS_LRZ_DEPTH_BUFFER_INFO: DEPTH6_NONE
+        }
     }
     // 9. program config (tu6_emit_program_config, tu_pipeline.cc:1272-1300; fd6 setup_config_stateobj, fd6_program.cc:
     // 400-458): HLSQ_INVALIDATE_CMD for the five graphics stages and the 3D IBOs, then SP_xS_CONFIG / HLSQ_xS_CNTL per
     // stage with HS, DS and GS off (NTEX = NSAMP = num_samp = 0; CONSTLEN in the field's units of 4 vec4, the FS's 0 is
     // ENABLED alone), SP_IBO_COUNT 0 (fd6's nibo(fs))
     if (o.programConfig) {
+        // (A7XX: and the graphics stages' bindless sets, GFX_BINDLESS 0xff, as fd6_build_bindless_state<A7XX> invalidates
+        // them before it points SP_BINDLESS_BASE at a table)
         reg(stream, REG_A6XX_HLSQ_INVALIDATE_CMD,
             A6XX_HLSQ_INVALIDATE_CMD_VS_STATE | A6XX_HLSQ_INVALIDATE_CMD_HS_STATE | A6XX_HLSQ_INVALIDATE_CMD_DS_STATE |
-                A6XX_HLSQ_INVALIDATE_CMD_GS_STATE | A6XX_HLSQ_INVALIDATE_CMD_FS_STATE | A6XX_HLSQ_INVALIDATE_CMD_GFX_IBO);
-        reg(stream, REG_A6XX_SP_VS_CONFIG, spXsConfig(vs.k.numSamp, vs.k.numSamp, vs.k.numSsbos));
+                A6XX_HLSQ_INVALIDATE_CMD_GS_STATE | A6XX_HLSQ_INVALIDATE_CMD_FS_STATE | A6XX_HLSQ_INVALIDATE_CMD_GFX_IBO |
+                (g7 && ibos.count != 0 ? gen7::A7XX_HLSQ_INVALIDATE_CMD_GFX_BINDLESS(0xff) : 0u));
+        // (A7XX: a stage with IBOs reads them bindless, BINDLESS_IBO, the compiler having made them set 0's descriptors)
+        const uint32_t vsBindlessIbo = g7 && vs.k.numSsbos != 0 ? A6XX_SP_VS_CONFIG_BINDLESS_IBO : 0u;
+        const uint32_t fsBindlessIbo = g7 && fs.k.numSsbos != 0 ? A6XX_SP_VS_CONFIG_BINDLESS_IBO : 0u;
+        reg(stream, REG_A6XX_SP_VS_CONFIG, spXsConfig(vs.k.numSamp, vs.k.numSamp, vs.k.numSsbos) | vsBindlessIbo);
         reg(stream, REG_A6XX_HLSQ_VS_CNTL, hlsqVsCntl(vs.k.constlen));
         reg(stream, REG_A6XX_SP_HS_CONFIG, 0);
         reg(stream, REG_A6XX_HLSQ_HS_CNTL, 0);
@@ -1744,13 +1812,23 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_HLSQ_DS_CNTL, 0);
         reg(stream, REG_A6XX_SP_GS_CONFIG, 0);
         reg(stream, REG_A6XX_HLSQ_GS_CNTL, 0);
-        reg(stream, REG_A6XX_SP_FS_CONFIG, spXsConfig(fs.k.numSamp, fs.k.numSamp, fs.k.numSsbos));
+        reg(stream, REG_A6XX_SP_FS_CONFIG, spXsConfig(fs.k.numSamp, fs.k.numSamp, fs.k.numSsbos) | fsBindlessIbo);
         reg(stream, REG_A6XX_HLSQ_FS_CNTL, hlsqFsCntl(fs.k.constlen));
         // the 3D IBO table's count (fd6's nibo(fs); here the larger of the two stages', the table being one), and the table
         // itself: CP_LOAD_STATE6 (the plain opcode) of ST6_SHADER into SB6_IBO, as both witnesses load it (tu_pipeline.cc:
         // 183, fd6_image.cc:308-335 -- bindless there, from the table here, the SP_CS_IBO way), then SP_IBO at it
         reg(stream, REG_A6XX_SP_IBO_COUNT, ibos.count);
-        if (ibos.count != 0) {
+        if (ibos.count != 0 && g7) {
+            // the A7XX: the table is bindless set 0 (non-bindless IBOs are unreliable on the A730, GPU-PLAN.md section 7):
+            // SP_BINDLESS_BASE[0] at it with 64-byte descriptors, then the IBO block prefetched from set 0's start
+            // (fd6_build_bindless_state<A7XX>'s graphics branch: CP_LOAD_STATE6 ST6_SHADER SS6_BINDLESS SB6_IBO, the
+            // "address" set << 28 | dword offset)
+            const uint64_t base = table + kGfxIboAt;
+            gen7::raw(stream, gen7::REG_A7XX_SP_BINDLESS_BASE, uint32_t(base) | gen7::BINDLESS_DESCRIPTOR_64B);
+            gen7::raw(stream, gen7::REG_A7XX_SP_BINDLESS_BASE + 1, uint32_t(base >> 32));
+            uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_BINDLESS, SB6_IBO, ibos.count), 0, 0};
+            stream.packet(CP_LOAD_STATE6, w, 3);
+        } else if (ibos.count != 0) {
             uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_IBO, ibos.count), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kGfxIboAt)),
                              CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(uint32_t((table + kGfxIboAt) >> 32))};
             stream.packet(CP_LOAD_STATE6, w, 3);
@@ -1776,7 +1854,13 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
              {0, uint32_t(address), uint32_t(address >> 32), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(pm.perFiber), uint32_t(pm.address),
               uint32_t(pm.address >> 32), A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)});
         reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
-        loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
+        if (g7) {
+            // A7XX (fd6_emit_shader): SP_xS_VGPR_CONFIG 0 after the stack offset, and no instruction preload -- the SP
+            // fetches from OBJ_START, as compute does on this chip (GPU-PLAN.md section 7)
+            gen7::raw(stream, s.kind == kStageVertex ? 0xa82du : 0xaa01u, 0);   // SP_VS_VGPR_CONFIG / SP_FS_VGPR_CONFIG
+        } else {
+            loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
+        }
         if (s.k.numImmediates != 0) {
             std::vector<uint32_t> imm(s.k.immediates, s.k.immediates + s.k.numImmediates);
             imm.resize((imm.size() + 3) & ~size_t(3), 0);
@@ -1922,6 +2006,10 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         stream.registers(regVpcVaryingInterpMode(0), link.interpMode, kVpcVaryingRegs);
         stream.registers(regVpcVaryingPsReplMode(0), link.psReplMode, kVpcVaryingRegs);
         reg(stream, REG_A6XX_PC_PS_CNTL, 0);
+        if (g7) {
+            gen7::raw(stream, 0x8110, 0x2);   // GRAS_UNKNOWN_8110, as fd6_program.cc writes it for A7XX beside PC_PS_CNTL
+            gen7::raw(stream, 0xa9aa, 0);     // HLSQ_FS_UNKNOWN_A9AA: CONSTS_LOAD_DISABLE clear
+        }
         reg(stream, REG_A6XX_VPC_SO_CNTL, 0);
         reg(stream, REG_A6XX_VPC_SO_STREAM_CNTL, 0);
         reg(stream, REG_A6XX_PC_SO_STREAM_CNTL, 0);
@@ -1941,17 +2029,36 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
             // slots in the command, no SP_FS_BINDLESS_PREFETCH_CMD)
             uint32_t w[1 + kMaxSamplerPrefetch];
             w[0] = spFsPrefetchCntl(fs.numSamplerPrefetch, !validReg(ij[IJ_PERSP_PIXEL]), fs.prefetchEndOfQuad != 0);
+            // (A7XX: CONSTSLOTID and CONSTSLOTID4COORD 0x1ff, none, as fd6_program.cc writes them; its commands have their
+            // own field positions with the slots 0, and the slots go into SP_FS_BINDLESS_PREFETCH_CMD[i], bindless or not)
+            if (g7) w[0] |= 0x1ffu << 6 | 0x1ffu << 16;
             for (uint32_t i = 0; i < fs.numSamplerPrefetch; i++) {
                 const SamplerPrefetch& pf = fs.prefetch[i];
-                w[1 + i] = spFsPrefetchCmd(pf.src, pf.sampId, pf.texId, pf.dst, pf.wrmask, pf.half != 0, pf.cmd);
+                w[1 + i] = g7 ? gen7::spFsPrefetchCmd(pf.src, pf.dst, pf.wrmask, pf.half != 0, pf.cmd)
+                              : spFsPrefetchCmd(pf.src, pf.sampId, pf.texId, pf.dst, pf.wrmask, pf.half != 0, pf.cmd);
             }
             stream.registers(REG_A6XX_SP_FS_PREFETCH_CNTL, w, 1 + fs.numSamplerPrefetch);
+            for (uint32_t i = 0; g7 && i < fs.numSamplerPrefetch; i++) {
+                gen7::raw(stream, gen7::REG_A6XX_SP_FS_BINDLESS_PREFETCH_CMD + i, gen7::spFsBindlessPrefetchCmd(fs.prefetch[i].sampId, fs.prefetch[i].texId));
+            }
         }
         regs(stream, REG_A6XX_HLSQ_CONTROL_1_REG,
              {hlsqControl1Reg(), hlsqControl2Reg(fs.faceRegid, fs.sampleIdRegid, fs.sampleMaskInRegid, ij[IJ_PERSP_CENTER_RHW]),
               hlsqControl3Reg(ij[IJ_PERSP_PIXEL], ij[IJ_LINEAR_PIXEL], ij[IJ_PERSP_CENTROID], ij[IJ_LINEAR_CENTROID]),
               hlsqControl4Reg(ij[IJ_PERSP_SAMPLE], ij[IJ_LINEAR_SAMPLE], fs.fragCoordRegid, validReg(fs.fragCoordRegid) ? fs.fragCoordRegid + 2 : kRegidNone),
               hlsqControl5Reg()});
+        if (g7) {
+            // HLSQ_UNKNOWN_A9AE (fd6_program.cc, A7XX): how many registers the system values above fill -- two per ij
+            // pair, one for CENTER_RHW, the face, the sample id and mask, two each for the xy and zw coordinates --
+            // with UNK8 and UNK9 set
+            uint32_t sysvalRegs = 0;
+            for (uint32_t i = 0; i < kIjCount; i++) {
+                if (validReg(ij[i])) sysvalRegs += i == IJ_PERSP_CENTER_RHW ? 1 : 2;
+            }
+            for (uint32_t r : {fs.faceRegid, fs.sampleIdRegid, fs.sampleMaskInRegid}) sysvalRegs += validReg(r) ? 1 : 0;
+            sysvalRegs += validReg(fs.fragCoordRegid) ? 4 : 0;   // (xy and zw: the coordinate's two pairs)
+            gen7::raw(stream, 0xa9ae, sysvalRegs | 0x300u);
+        }
         reg(stream, REG_A6XX_HLSQ_FS_CNTL_0, hlsqFsCntl0(fsThreads, fs.totalIn != 0));
         reg(stream, REG_A6XX_GRAS_CNTL, grasCntl(ijbits, fs.fragcoordCompmask));
         regs(stream, REG_A6XX_RB_RENDER_CONTROL0,
@@ -1985,6 +2092,11 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         stream.registers(REG_A6XX_SP_FS_RENDER_COMPONENTS, out.data(), uint32_t(out.size()));
         regs(stream, REG_A6XX_RB_FS_OUTPUT_CNTL0, {(fragDepth ? A6XX_RB_FS_OUTPUT_CNTL0_FRAG_WRITES_Z : 0u) | (dual ? A6XX_RB_FS_OUTPUT_CNTL0_DUAL_COLOR_IN_ENABLE : 0u),
                                                    A6XX_RB_FS_OUTPUT_CNTL1_MRT(numRt), components});
+        if (g7) {
+            // SP_PS_ALIASED_COMPONENTS_CONTROL and SP_PS_ALIASED_COMPONENTS (fd6_program.cc, A7XX): no output aliased
+            const uint32_t none[2] = {0, 0};
+            stream.registers(0xaa02, none, 2);
+        }
     }
     // 15. the rasterizer (tu6_emit_rast, tu_pipeline.cc:3120-3218; fd6_rasterizer.cc:22-140): GRAS_CL_CNTL with Metal's
     // [0, 1] depth (ZERO_GB_SCALE_Z) and VP_CLIP_CODE_IGNORE (0xc0, turnip's for Vulkan); GRAS_SU_CNTL the draw's cull
@@ -1996,18 +2108,25 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // registers 0 (has_legacy_pipeline_shading_rate); GRAS_SC_CNTL for sysmem (:3351-3380); PC_PRIMITIVE_CNTL_0 0 (the
     // first vertex provokes, no restart)
     if (o.rast) {
-        reg(stream, REG_A6XX_GRAS_CL_CNTL, grasClCntl());
+        // (A7XX: Z_CLAMP_ENABLE always, fd6_rasterizer.cc's ".z_clamp_enable = cso->depth_clamp || CHIP >= A7XX", with
+        // the depth clamp registers below holding the viewport's range; VPC_POLYGON_MODE2 and VPC_PRIMITIVE_CNTL_0 as
+        // the VPC's own copies; no VPC_UNKNOWN_9107, whose offset is PC_RASTER_CNTL there, and no legacy shading-rate
+        // registers, an A6XX feature)
+        reg(stream, REG_A6XX_GRAS_CL_CNTL, grasClCntl(true, true, false, false, g7));
         reg(stream, REG_A6XX_GRAS_SU_CNTL, grasSuCntl(draw.cullMode == 1, draw.cullMode == 2, draw.winding == 0));
         reg(stream, REG_A6XX_VPC_POLYGON_MODE, A6XX_VPC_POLYGON_MODE_MODE(POLYMODE6_TRIANGLES));
         reg(stream, REG_A6XX_PC_POLYGON_MODE, A6XX_PC_POLYGON_MODE_MODE(POLYMODE6_TRIANGLES));
+        if (g7) gen7::raw(stream, 0x9307, A6XX_VPC_POLYGON_MODE_MODE(POLYMODE6_TRIANGLES));   // VPC_POLYGON_MODE2
         reg(stream, REG_A6XX_PC_RASTER_CNTL, 0);
-        reg(stream, REG_A6XX_VPC_UNKNOWN_9107, 0);
+        if (!g7) reg(stream, REG_A6XX_VPC_UNKNOWN_9107, 0);
         regs(stream, REG_A6XX_GRAS_SU_POINT_MINMAX, {grasSuPointMinmax(1, 0xffc0), grasSuPointSize(16)});
         regs(stream, REG_A6XX_GRAS_SU_POLY_OFFSET_SCALE, {0, 0, 0});
-        reg(stream, REG_A6XX_RB_UNKNOWN_8A00, 0);
-        reg(stream, REG_A6XX_RB_UNKNOWN_8A10, 0);
-        reg(stream, REG_A6XX_RB_UNKNOWN_8A20, 0);
-        reg(stream, REG_A6XX_RB_UNKNOWN_8A30, 0);
+        if (!g7) {
+            reg(stream, REG_A6XX_RB_UNKNOWN_8A00, 0);
+            reg(stream, REG_A6XX_RB_UNKNOWN_8A10, 0);
+            reg(stream, REG_A6XX_RB_UNKNOWN_8A20, 0);
+            reg(stream, REG_A6XX_RB_UNKNOWN_8A30, 0);
+        }
         // a framebuffer fetch in raster order, as Metal's programmable blending reads: the rasterizer holds back a
         // fragment over one not yet written and flushes between them (turnip's rasterization_order_attachment_access,
         // tu_pipeline.cc:3351-3380 and 3955-3983: FLUSH_PER_OVERLAP_AND_OVERWRITE in sysmem, FLUSH_PER_OVERLAP in GMEM)
@@ -2018,6 +2137,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         // primitive restart on for an indexed draw (Metal restarts at the all-ones index; tu6_draw_common's primitive_restart,
         // :5851-5862, which is off for a draw without indices, where the index register would be stale)
         reg(stream, REG_A6XX_PC_PRIMITIVE_CNTL_0, draw.indexBuffer != nullptr ? A6XX_PC_PRIMITIVE_CNTL_0_PRIMITIVE_RESTART : 0u);
+        // VPC_PRIMITIVE_CNTL_0, the A7XX VPC's copy (fd6_rasterizer.cc writes the same restart and provoking bits there)
+        if (g7) gen7::raw(stream, 0x9109, draw.indexBuffer != nullptr ? A6XX_PC_PRIMITIVE_CNTL_0_PRIMITIVE_RESTART : 0u);
     }
     // 16. the viewport and the scissors (tu6_emit_viewport, tu_pipeline.cc:2432-2540; tu6_emit_scissor :2657-2688):
     // GRAS_CL_VPORT[0]'s six floats with Metal's NEGATIVE y scale (viewportWords: NDC y up, row 0 at the top -- reasoning
@@ -2057,7 +2178,10 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         // and the Z mode (tu6_build_depth_plane_z_mode, tu_cmd_buffer.cc:5538-5583: LATE_Z with the test off or a kill
         // that writes depth, EARLY_Z otherwise); with no depth attachment r3d's zeros and EARLY_Z, as measured
         const bool stencilWrites = st.enabled && (st.front.writeMask != 0 || st.back.writeMask != 0);
-        const a6xx_ztest_mode zmode = pass.depth == nullptr ? A6XX_EARLY_Z
+        // (the A730 with no depth attachment: LATE_Z, as freedreno and turnip write it whenever the test is off. EARLY_Z
+        // there hung the first A730 draw: the HLSQ held the fragment waves for a depth answer that never came --
+        // RBBM_STATUS 0xe20095, HLSQ, RB and UCHE busy, SP idle; metal-a730-phone/draw-1-netlog.txt)
+        const a6xx_ztest_mode zmode = pass.depth == nullptr ? (g7 ? A6XX_LATE_Z : A6XX_EARLY_Z)
                                       : (!depthTest && !st.enabled) || (fs.hasKill && (draw.depth.write || stencilWrites)) || fs.depthRegid != kRegidNone
                                           ? A6XX_LATE_Z
                                           : A6XX_EARLY_Z;
@@ -2065,7 +2189,9 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
                                    : (depthTest ? A6XX_RB_DEPTH_CNTL_Z_TEST_ENABLE | A6XX_RB_DEPTH_CNTL_Z_READ_ENABLE : 0u) |
                                          (depthTest && draw.depth.write ? A6XX_RB_DEPTH_CNTL_Z_WRITE_ENABLE : 0u) |
                                          A6XX_RB_DEPTH_CNTL_ZFUNC(adreno_compare_func(draw.depth.compare));
-        regs(stream, REG_A6XX_RB_DEPTH_PLANE_CNTL, {A6XX_RB_DEPTH_PLANE_CNTL_Z_MODE(zmode), depthCntl});   // ..., RB_DEPTH_CNTL
+        // (A7XX: RB_DEPTH_CNTL's Z_CLAMP_ENABLE always, as fd6_zsa.cc sets it there)
+        regs(stream, REG_A6XX_RB_DEPTH_PLANE_CNTL,
+             {A6XX_RB_DEPTH_PLANE_CNTL_Z_MODE(zmode), depthCntl | (g7 ? A6XX_RB_DEPTH_CNTL_Z_CLAMP_ENABLE : 0u)});   // ..., RB_DEPTH_CNTL
         regs(stream, REG_A6XX_GRAS_SU_DEPTH_CNTL, {depthTest && pass.depth != nullptr ? A6XX_GRAS_SU_DEPTH_CNTL_Z_TEST_ENABLE : 0u,
                                                   st.enabled ? A6XX_GRAS_SU_STENCIL_CNTL_STENCIL_ENABLE : 0u});   // ..., GRAS_SU_STENCIL_CNTL
         reg(stream, REG_A6XX_GRAS_SU_DEPTH_PLANE_CNTL, A6XX_GRAS_SU_DEPTH_PLANE_CNTL_Z_MODE(zmode));
@@ -2096,6 +2222,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // an occlusion query (turnip's emit_begin_occlusion_query, A6XX path): the word zeroed when the encoder first counts
     // into it, then the running sample count's snapshot before the draw; after it the second snapshot, a wait for both
     // to land, and the word += end - begin
+    crumb(stream, kTraceState);
     const bool counting = draw.visibilityMode != 0;
     const uint64_t snapshots = table + kTableVisibilityAt;
     uint64_t result = 0;
@@ -2108,6 +2235,9 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_RB_SAMPLE_COUNT_CONTROL, A6XX_RB_SAMPLE_COUNT_CONTROL_COPY);
         reg64(stream, REG_A6XX_RB_SAMPLE_COUNT_ADDR, snapshots);
         event(stream, ZPASS_DONE);
+        // (A7XX gen1, the A730, has no CP_EVENT_WRITE7 sample-count write: turnip takes the A6XX's path and follows each
+        // ZPASS_DONE with a CCU_CLEAN_DEPTH, "copied from blob's cmdstream" (tu_query_pool.cc); gen7::event maps it)
+        if (stream.gen7()) event(stream, PC_CCU_FLUSH_DEPTH_TS);
     }
     if (indirect) {
         // tu_CmdDrawIndirect / tu_CmdDrawIndexedIndirect (tu_cmd_buffer.cc:6385-6423): one draw, the CP reading its
@@ -2136,6 +2266,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         uint32_t w[3] = {drawIndxOffset0(prim, DI_SRC_SEL_AUTO_INDEX, o.visCullUse ? USE_VISIBILITY : IGNORE_VISIBILITY), draw.instanceCount, draw.vertexCount};
         stream.packet(CP_DRAW_INDX_OFFSET, w, 3);
     }
+    crumb(stream, kTraceDrawn);
     if (counting) {
         // ZPASS_DONE's copy lands when the RB has it, not when the CP moves on: the end word is set to all ones first and
         // waited on until it is something else, as turnip does, before the CP reads it (on the phone, without that wait
@@ -2147,6 +2278,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_RB_SAMPLE_COUNT_CONTROL, A6XX_RB_SAMPLE_COUNT_CONTROL_COPY);
         reg64(stream, REG_A6XX_RB_SAMPLE_COUNT_ADDR, end);
         event(stream, ZPASS_DONE);
+        if (stream.gen7()) event(stream, PC_CCU_FLUSH_DEPTH_TS);
         waitForWordNot(stream, end, ~0u);
         uint32_t w[9] = {CP_MEM_TO_MEM_0_DOUBLE | CP_MEM_TO_MEM_0_NEG_C, uint32_t(result), uint32_t(result >> 32), uint32_t(result), uint32_t(result >> 32),
                          uint32_t(end), uint32_t(end >> 32), uint32_t(snapshots), uint32_t(snapshots >> 32)};
@@ -2181,11 +2313,13 @@ bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
         return false;
     }
     tableStart(tableCpu);
-    passStart(stream, windowOf(pass).first, windowOf(pass).second, table, o);
+    passStart(stream, windowOf(pass).first, windowOf(pass).second, table, o, true);
     clearAll(stream, pass, clears, table, skipClears);
     zsClears(stream, pass, table);
+    crumb(stream, kTraceClears);
     return true;
 }
+void setA730Trace(uint64_t address) { gA730Trace = address; }
 
 void encodeEnd(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& o) { passTail(stream, table, o, pass.depth != nullptr); }
 
@@ -2612,6 +2746,8 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
 }
 
 bool encodeClear(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o) {
+    if (stream.gen7() && o.tailTimestampBit)
+        return refuse(why, "the A730's events complete by an explicit value (CP_EVENT_WRITE7), not the A6XX's timestamp bit");
     if (!checkTarget(pass, why)) {
         return false;
     }
@@ -2838,7 +2974,8 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
             uint32_t runStart = 0, runLen = 0;
             for (uint32_t k = 0; k < h.count; k++) {
                 const uint32_t reg = h.reg + k, value = w[i + 1 + k];
-                const bool same = regs.hold(reg, value) && reg != REG_A6XX_HLSQ_INVALIDATE_CMD;
+                const uint32_t invalidate = legacyRegisterOffset(*chipInfo(from.chipId()), REG_A6XX_HLSQ_INVALIDATE_CMD);
+                const bool same = regs.hold(reg, value) && reg != invalidate;
                 if (!same) {
                     if (runLen == 0) runStart = k;
                     runLen++;
@@ -2868,7 +3005,14 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
 }
 
 bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
-                         const render::Options& options) {
+                         const render::Options& requested) {
+    // (the A730 draws in sysmem only until GMEM has its own ladder step: render::encodeDraw refuses a tile there)
+    const bool a730 = queue_.gpu().chipId() == kChipA730.id;
+    render::Options options = requested;
+    // Rewriting equal state can trigger work on gen7 (early preambles among it). The A6xx shadow does not model
+    // those side effects: A730 probe 9r corrupts its joined draws with deduplication, and is exact without it.
+    // Keep every draw's state until the gen7 shadow has its own hardware validation.
+    if (a730) options.dedupRegs = false;
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }
@@ -2954,7 +3098,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     // GMEM is decided as a pass opens, before its first draw is encoded (a draw in a tile is encoded for the tile:
     // encodeInPass). A draw a tile cannot replay ends a GMEM pass and opens a sysmem one of its own.
     std::string gmemWhy;
-    const bool tileable = options.gmem && gmem_ && render::gmemDrawOk(program, pass, d, *vsb, *fsb, &gmemWhy);
+    const bool tileable = options.gmem && gmem_ && !a730 && render::gmemDrawOk(program, pass, d, *vsb, *fsb, &gmemWhy);
     // (a draw into an attachment the pass's like did not touch, which has no bin: the tiles end before it, as before a
     // draw they cannot replay, and the pass goes on in a pass of its own planned anew; its like's next time has a bin
     // for it -- closePass notes it as touched)
@@ -2988,7 +3132,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         gmem = open_->gmem;
         dual = open_->dual;
         plan = open_->plan;
-    } else if (options.gmem && gmem_) {
+    } else if (options.gmem && gmem_ && !a730) {
         gmem = render::gmemPlan(pass, &plan, &gmemWhy_) && tileable;
         if (!tileable) gmemWhy_ = gmemWhy;
         if (gmem && gmemMinDraws_ != 0) {
@@ -3041,8 +3185,11 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         }
     }
     Piece passTable;
-    pm4::Stream head, headSys;
-    pm4::Stream& body = drawBody_;
+    // (every stream of a pass is the command buffer's chip: a stream left at the default chip encodes the A6XX path, and
+    // on the A730 that pass hung the GPU before its first packet of A7XX state; metal-a730-draw/phone-tri.txt)
+    const uint32_t chip = stream_.chipId();
+    pm4::Stream head(chip), headSys(chip);
+    pm4::Stream& body = drawBody_;      // (made with the command buffer, its chip)
     pm4::Stream& bodySys = drawBodySys_;
     body.clear();
     bodySys.clear();
@@ -3135,6 +3282,10 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             }
         }
         open_ = takePass();
+        // (a spare pass is this command buffer's, of its chip; a new one is made at the default)
+        for (pm4::Stream* s : {&open_->bodies, &open_->sysStream, &open_->headGmem}) {
+            if (s->chipId() != chip) *s = pm4::Stream(chip);
+        }
         open_->pass = pass;
         open_->options = options;
         open_->table = passTable.gpuAddress();
@@ -3302,7 +3453,7 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
     if (!piece(render::kTableBytes, &table, &why)) {
         return fail(std::string("no memory for the copy's table: ") + why);
     }
-    pm4::Stream added;
+    pm4::Stream added(queue_.gpu().chipId());
     if (!render::encodeBlit(added, src, srcLevel, s, dst, dstLevel, d, linear, table.gpuAddress(), table.contents(), &why, options)) {
         return refuseWork(why);
     }
@@ -3476,7 +3627,7 @@ void CommandBuffer::closePass() {
             keep(v);
             vsc = v->gpuAddress();
         }
-        pm4::Stream tiles;
+        pm4::Stream tiles(stream_.chipId());
         // (the draws as IB2s of whole packets that IB_SIZE's 20 bits can count: a pass of some thousands of draws is more
         // than 2^20 words, which one IB2 ran modulo 2^20)
         std::vector<std::pair<uint64_t, uint32_t>> bodies;
@@ -3495,7 +3646,7 @@ void CommandBuffer::closePass() {
             profiled_.back().touched = uint8_t(open_->written | open_->read);
         }
     }
-    pm4::Stream tail;
+    pm4::Stream tail(stream_.chipId());
     render::encodeEnd(tail, open_->pass, open_->table, open_->options);
     appendStream(stream_, tail);
     stampEnd();
@@ -3540,7 +3691,7 @@ bool CommandBuffer::clear(const RenderPass& pass, const render::Options& options
     if (!piece(render::kTableBytes, &table, &why)) {
         return fail(std::string("no memory for the pass's table: ") + why);
     }
-    pm4::Stream added;
+    pm4::Stream added(queue_.gpu().chipId());
     if (!render::encodeClear(added, pass, table.gpuAddress(), table.contents(), &why, options)) {
         return refuseWork(why);
     }

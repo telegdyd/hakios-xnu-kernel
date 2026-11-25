@@ -50,7 +50,7 @@ private:
     uint64_t length_;
 };
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why);
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, uint64_t minBacking = 0);
 // the live Buffer whose memory holds GPU address ADDRESS, and *OFFSET its offset in it; nullptr when none does. An
 // argument buffer names a buffer member by the address it was encoded with (setBuffer:offset:atIndex:, or the
 // gpuAddress an application writes itself), and this is how the draw finds the Buffer to bind and keep.
@@ -209,7 +209,7 @@ public:
 
 private:
     friend class CommandQueue;
-    explicit CommandBuffer(std::shared_ptr<CommandQueue> queue) : owner_(std::move(queue)), queue_(*owner_) {}
+    explicit CommandBuffer(std::shared_ptr<CommandQueue> queue);
 public:
     ~CommandBuffer();   // (its stamp buffers back to the queue: read until the last reader lets go, which is now)
 private:

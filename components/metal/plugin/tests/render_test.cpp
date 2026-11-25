@@ -3539,7 +3539,7 @@ TEST(a_draw_refuses_a_depth_setup_it_cannot_serve) {
     dr.depth = DepthState{1, true};
     refused(r, flatProgram(), pass, dr, "a depth test (compare 1, write) with no depth attachment");
     pass.depth = colour.get();
-    refused(r, flatProgram(), pass, dr, "a RGBA8Unorm texture as the depth attachment: Depth32Float (252) is served");
+    refused(r, flatProgram(), pass, dr, "a RGBA8Unorm texture as the depth attachment: a depth format is required");
     pass.depth = small.get();
     refused(r, flatProgram(), pass, dr, "a 32 x 32 depth attachment (level 0) beside a 64 x 64 colour attachment (level 0): a depth attachment smaller than the colour leaves pixels without one");
     pass.depth = d.get();

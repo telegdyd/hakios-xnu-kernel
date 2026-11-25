@@ -50,6 +50,7 @@ std::vector<LinkedFunction> gLinked;   // -l NAME=FILE
 KnownBuffer gKnown;
 bool gHaveKnown = false;
 std::vector<KnownBuffer> gMoreKnown;   // (-a with -k more than once: each compiled in turn, as one pipeline's specialisations)
+uint32_t gChip = kChipA635.id;
 
 bool compileApart(bool kernel, const uint8_t* bc, uint64_t len, std::string* why) {
     int fds[2];
@@ -63,7 +64,7 @@ bool compileApart(bool kernel, const uint8_t* bc, uint64_t len, std::string* why
         close(fds[0]);
         dup2(fds[1], 2);   // the child's assertion text goes up the pipe too
         std::string w;
-        bool ok = kernel ? compileAir(bc, len, &w, gConstants) != nullptr : compileStage(bc, len, &w, gConstants) != nullptr;
+        bool ok = kernel ? compileAir(bc, len, &w, gConstants, gChip) != nullptr : compileStage(bc, len, &w, gConstants, 0, nullptr, gChip) != nullptr;
         std::string msg = std::string(ok ? "OK\n" : "NO\n") + w;
         (void)!write(fds[1], msg.data(), msg.size());
         _exit(0);
@@ -177,6 +178,8 @@ int main(int argc, char** argv) {
             verbose = true;
         } else if (std::strcmp(argv[i], "-j") == 0 && i + 1 < argc) {
             threads = unsigned(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--chip") == 0 && i + 1 < argc) {
+            gChip = uint32_t(std::strtoul(argv[++i], nullptr, 0));
         } else if (std::strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
             only = argv[++i];
         } else if (std::strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -224,10 +227,10 @@ int main(int argc, char** argv) {
         }
     }
     if (files.empty() && air.empty()) {
-        std::fprintf(stderr, "usage: sweep [-v] [-j THREADS] LIBRARY.metallib...\n");
+        std::fprintf(stderr, "usage: sweep [--chip CHIP_ID] [-v] [-j THREADS] LIBRARY.metallib...\n");
         return 2;
     }
-    if (!hasCompiler()) {
+    if (!hasCompiler(gChip)) {
         std::fprintf(stderr, "sweep: no compiler in this build (make MESA=1)\n");
         return 2;
     }
@@ -304,7 +307,7 @@ int main(int argc, char** argv) {
                 if (!only.empty() && t != 2) {
                     // the stage's tables as a draw reads them: what samples what, and through which sampler
                     const auto t0 = std::chrono::steady_clock::now();
-                    auto st = compileStage(bc, len, &why, gConstants, 0, gHaveKnown ? &gKnown : nullptr);
+                    auto st = compileStage(bc, len, &why, gConstants, 0, gHaveKnown ? &gKnown : nullptr, gChip);
                     const auto t1 = std::chrono::steady_clock::now();
                     ok = st != nullptr;
                     if (ok) {
@@ -319,7 +322,7 @@ int main(int argc, char** argv) {
                         std::printf("\n");
                     }
                 } else {
-                    ok = !only.empty() ? compileAir(bc, len, &why, gConstants) != nullptr : compileApart(t == 2, bc, len, &why);
+                    ok = !only.empty() ? compileAir(bc, len, &why, gConstants, gChip) != nullptr : compileApart(t == 2, bc, len, &why);
                 }
             }
             seen[t]++;

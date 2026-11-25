@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "hakios-metal/kernel.hpp"
+#include "hakios-metal/chip.hpp"
 #include "hakios-metal/render.hpp"
 #include "hakios-metal/texture.hpp"
 
@@ -63,6 +64,7 @@ bool argumentBufferLayout(const void* bitcode, size_t size, uint32_t set, std::v
 
 // a kernel compiled here, owning what its Kernel points into
 struct CompiledKernel {
+    uint32_t chipId = kChipA635.id;
     Kernel kernel{};
     std::vector<uint32_t> words;
     std::vector<uint32_t> immediates;
@@ -80,6 +82,7 @@ struct CompiledKernel {
 
 // a vertex or fragment function compiled here (render.hpp's Stage), owning what its Stage points into
 struct CompiledStage {
+    uint32_t chipId = kChipA635.id;
     Stage stage{};
     std::vector<uint32_t> words;
     std::vector<uint32_t> immediates;
@@ -100,7 +103,7 @@ struct CompiledProgram {
 };
 
 // whether a compiler is in this build
-bool hasCompiler();
+bool hasCompiler(uint32_t chipId = kChipA635.id);
 
 // A function constant's value as the pipeline supplies it (MTLFunctionConstantValues): INDEX is the module's
 // [[function_constant(n)]], BITS the value as the bits of its type -- a bool 0 or 1, an integer or a float its own bits
@@ -135,7 +138,7 @@ struct KnownBuffer {
     std::vector<uint8_t> fold;
 };
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
-                                           uint32_t iboBase = 0, const KnownBuffer* known = nullptr);
+                                           uint32_t iboBase = 0, const KnownBuffer* known = nullptr, uint32_t chipId = kChipA635.id);
 // Which bytes of the constant buffer at [[buffer(BINDING)]] (LENGTH of them) the function's control flow depends on: what
 // an if's or a loop's condition is computed from, and what a memory access's address is, followed back through the
 // arithmetic to reads of that buffer at constant offsets (*MASK: LENGTH bytes, 1 where so). Reads whose values only go
@@ -144,7 +147,8 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
 bool knownBufferControlBytes(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, size_t length,
                              std::vector<uint8_t>* mask, std::string* why);
 // The name a stage compiled from these is filed under in the cache ("" with no cache configured): for the tests
-std::string stageCacheFileName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known);
+std::string stageCacheFileName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known,
+                               uint32_t chipId = kChipA635.id);
 // The visible functions a pipeline links (MTLLinkedFunctions), for the compiles on this thread while a LinkedScope
 // lives: a call of a function a stage only declares, named NAME by its air.visible_function_references, is a call of
 // the linked function called NAME (the front end's air_to_nir_options::linked). Part of a compiled stage's cache name:
@@ -178,6 +182,7 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
 // One AIR module (the bitcode of one function, as metallib.hpp hands it out, or a .bc) compiled for this chip.
 // nullptr with *why: the front end's refusal, named by stage ("intrinsic: air.simd_sum not handled"), or ir3's, or
 // "not a compute kernel", or that no compiler is in this build.
-std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {});
+std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
+                                         uint32_t chipId = kChipA635.id);
 
 }  // namespace hakios::metal

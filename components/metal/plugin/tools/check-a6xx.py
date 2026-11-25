@@ -108,6 +108,7 @@ def evaluate(expr, env):
         ast.Add: lambda a, b: a + b,
         ast.Sub: lambda a, b: a - b,
         ast.Mult: lambda a, b: a * b,
+        ast.Div: lambda a, b: (abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1),
     }
 
     def ev(n):
@@ -278,6 +279,28 @@ def main(argv):
     for it in uncommented:
         failed = True
         print(f"NO SOURCE: {it['name']} (a6xx.hpp:{it['line']}) has no `file.xml.h:line` comment")
+    # The shared register table uses the same logical names as the XML; Mesa
+    # keeps common registers under REG_A6XX_ even on A7xx. Moved registers use
+    # REG_A7XX_. Check every present offset against those generated headers.
+    table = os.path.join(os.path.dirname(hpp), "chip-registers.inc")
+    if os.path.exists(table):
+        with open(table, encoding="utf-8") as f:
+            rows = re.findall(r"GPU_REG\((\w+), (0x[\da-f]+), (0x[\da-f]+), (true|false)\)", f.read())
+        for name, a6, a7, _ in rows:
+            for gen, value in ((6, int(a6, 16)), (7, int(a7, 16))):
+                if value == 0xffffffff:
+                    continue
+                names = [f"REG_A{gen}XX_{name}"]
+                if gen == 7:
+                    names.append(f"REG_A6XX_{name}")
+                values = [v for key in names for v, _, _ in defines.get(key, [])]
+                values += [arrays[key][0] for key in names if key in arrays]
+                if value not in values:
+                    print(f"MISMATCH: chip-registers.inc {name} gen {gen}: {value:#x}")
+                    failed = True
+        if not rows:
+            failed = True
+        print(f"checked {len(rows)} shared register entries against generated headers")
     print("FAIL" if failed else "ok")
     return 1 if failed else 0
 
