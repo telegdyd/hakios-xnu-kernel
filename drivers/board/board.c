@@ -89,6 +89,31 @@ hakios_display_flip_data(uint64_t *mdss, uint64_t *intf, uint64_t *splash_size)
 	return true;
 }
 
+/*
+ * The cores' idle states for arch/arm64/kernel/psci_smp.c (feature cpu-idle): a core's power-down parameter and least
+ * residency on the small and the other cores; the cluster's l3 and llcc states, parameter and least residency each (0:
+ * not there); the processors switched off while the display is off; the SoC's cores. False without the feature.
+ */
+bool
+hakios_cpu_idle_data(uint32_t *core, uint32_t core_us[2], uint32_t l3[2], uint32_t llcc[2], uint64_t *screen_off_cores,
+    uint32_t *soc_cores)
+{
+	const struct hakios_board *board = hakios_board();
+
+	if (board == NULL || !(board->features & HAKIOS_HAS_CPU_IDLE) || board->cpu_idle.core == 0) {
+		return false;
+	}
+	*core = board->cpu_idle.core;
+	for (int i = 0; i < 2; i++) {
+		core_us[i] = board->cpu_idle.core_us[i];
+		l3[i] = board->cpu_idle.l3[i];
+		llcc[i] = board->cpu_idle.llcc[i];
+	}
+	*screen_off_cores = board->cpu_idle.screen_off_cores;
+	*soc_cores = board->cpu_idle.soc_cores;
+	return true;
+}
+
 unsigned
 hakios_board_cpu_groups(void)
 {

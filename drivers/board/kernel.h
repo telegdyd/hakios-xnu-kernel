@@ -22,5 +22,10 @@ extern void loader_log_putc(char c);
 extern void loader_return(void);
 extern dev_t mdevlookup(int devid);
 extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
+/* arch/arm64/kernel/psci_smp.c: the display's state, for the loops that look at hardware again and again */
+extern bool hakios_screen_off(void);
+extern void hakios_screen_pause(uint32_t on_ms, uint32_t off_ms);
+extern void hakios_screen_pause_leeway(uint32_t on_ms, uint32_t off_ms, uint32_t leeway_ms);
+extern wait_result_t hakios_assert_wait_net(event_t event, uint32_t ms);
 
 #endif /* _HAKIOS_KERNEL_H */

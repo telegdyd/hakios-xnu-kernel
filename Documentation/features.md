@@ -40,6 +40,7 @@ the two the same. What each key means is in `arch/arm64/boot/dts/_template/soc.d
 | `gpu-ifpc` | `adreno { }` | `gpu { }`: `model`, `chip-id`, `firmware`, `gmem-kb`, `primitive-fifo`, `hang-cycles`, `speed-fuse`, `gaming-fuse`, `highest-bank-bit`, `gcc-debug-gpucc`, `speeds-khz`, `speed-levels`, `default-speed` | `gpu=1, on by itself; gpu_ifpc=0 keeps the core up between frames` |
 | `gpu-slumber` | `adreno { }` | `gpu { }`: `model`, `chip-id`, `firmware`, `gmem-kb`, `primitive-fifo`, `hang-cycles`, `speed-fuse`, `gaming-fuse`, `highest-bank-bit`, `gcc-debug-gpucc`, `speeds-khz`, `speed-levels`, `default-speed` | `gpu=1, on by itself; gpu_slumber=0 keeps the GPU awake` |
 | `display-power` | `display { }`: `intf1`, `mdss`, `vbif`; `clocks { }`: `gcc-disp-ahb-cbcr`, `dispcc`, `dispcc-mdss-gdscr`, `dispcc-mdss-ahb-cbcr` | `display { }`: `splash-size` | `backlight=2, on by itself; display_power_down=0 keeps the display hardware on while the panel sleeps` |
+| `cpu-idle` | `cpu-idle { }` | nothing | `on by itself; cpu_idle=0 keeps idle cores in WFI, screen_off_cores=0 every core up with the display off` |
 
 The brightness (`backlight { }`), the thermal floors (`thermal { }`), the PMIC's clock (`rtc { }`, which
 needs `spmi { }` in the SoC file) and the partition that may be written (`storage { }`) are not

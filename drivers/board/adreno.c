@@ -3712,6 +3712,14 @@ gpu_block_suspend(bool runtime)
 	}
 	/* (and what step 5 turned on in the global controller, once nothing of the GPU's runs: as the phone's start leaves it) */
 	if (cx_off) {
+		/*
+		 * In slumber all of them, the boot loader's too, as a6xx_gmu_suspend's clk_bulk_disable: left on, gpu_memnoc_gfx
+		 * ran with the GPU collapsed and kept CX up through the SoC's sleep (negroni-dev, POWER-COLLAPSE-PLAN.md 5e);
+		 * step_clocks() turns them on again at the resume, as ours.
+		 */
+		if (runtime) {
+			gcc_ours.ddrss = gcc_ours.snoc = gcc_ours.memnoc = gcc_ours.pll_vote = true;
+		}
 		if (gcc_ours.ddrss) {
 			put(&gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR, rd(gcc.base + GCC_DDRSS_GPU_AXI_CBCR) & ~CBCR_ENABLE);
 		}
@@ -5774,7 +5782,7 @@ hakios_gpu_power_tick(void)
 		return gpu_recover && adreno_gen7() && gpu_hang_found("gpu-ifpc: the 3D core did not wake") ? 50 : 0;
 	}
 	if (slumber_asleep) {
-		return 250;                     /* asleep: never touch powered-off CX/GMU/GX */
+		return 1000;                    /* asleep: never touch powered-off CX/GMU/GX (a look a second, coalesced: BoardGPU.cpp) */
 	}
 	now = dcvs_ns();
 	if (gpu_hangcheck(now)) {

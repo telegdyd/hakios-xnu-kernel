@@ -21,7 +21,7 @@ needs its feature in the board's `features`.
 | File | What | Portability |
 | --- | --- | --- |
 | `osfmk/arm64/gic_v3_irq.c` | Interrupts through a GICv3. | any (addresses from the loader) |
-| `osfmk/arm64/psci_smp.c` | The other cores, started through PSCI. `cpus=N`. | any |
+| `osfmk/arm64/psci_smp.c` | The other cores, started through PSCI. `cpus=N`. Idle cores powered down (PSCI CPU_SUSPEND), the cluster's states when every core is the kernel's, and the processors of `screen-off-cores` off while the display is off: `cpu-idle` (on by itself; `cpu_idle=0`, `screen_off_cores=0`). | any; `cpu-idle`: data (`cpu-idle { }`) |
 | `osfmk/arm64/loader_return.c` | Return to the loader with the log, on exit and on panic. | any |
 | `osfmk/arm64/a64emu.c` | The few arm64e instructions an ARMv8.2 core lacks, emulated when they trap. | any |
 | `osfmk/arm64/prof.c`, `user_exception_trace.c` | A sampling profiler (`hakios_prof=NAME`) and crash descriptions (`systrace=`). | any |

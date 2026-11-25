@@ -60,6 +60,10 @@ enum {
 	HAKIOS_HAS_DISPLAY_POWER = 1u << 28,    /* panel sleep/wake (DCS 0x28/0x10 and the Samsung AMB670YF08's
 	                                         * on-sequence) and SM8450 MDSS/DSI hardware power-down while the panel
 	                                         * sleeps (board/backlight.c, display_power_down) */
+	HAKIOS_HAS_CPU_IDLE      = 1u << 29,    /* idle cores power down (PSCI CPU_SUSPEND), the last one up taking the
+	                                         * cluster's L3 and system cache with it; the processors of cpu-idle { }
+	                                         * screen-off-cores off while the display is off (arch/arm64/kernel/
+	                                         * psci_smp.c, cpu_idle, screen_off_cores) */
 	/*
 	 * Drivers of one part, wired the way one phone has it (the pins, the bus, the chip): a board lists
 	 * one only if it has that part wired that way. Asked for on any other board, the driver says so and
@@ -464,6 +468,18 @@ struct hakios_board {
 		uint32_t tsens[HAKIOS_TSENS_MAX];       /* the TSENS controllers' readings, 0: none */
 		uint32_t floor_mhz[HAKIOS_CPU_GROUPS];  /* the slowest each group of cores is held back to */
 	} thermal;
+
+	/*
+	 * the cores' idle states (soc: cpu-idle { }; board: cpu-idle { }): PSCI CPU_SUSPEND parameters, as the device tree's
+	 * idle-states have them, and the least time in each worth its way down and back (arch/arm64/kernel/psci_smp.c)
+	 */
+	struct {
+		uint32_t core;                  /* a core's power-down (0: the cores only wait in WFI) */
+		uint32_t core_us[2];            /* its least residency on the small cores, on the others */
+		uint32_t l3[2], llcc[2];        /* the cluster's states, parameter and least residency (0: none) */
+		uint32_t screen_off_cores;      /* board: the processors switched off while the display is off */
+		uint32_t soc_cores;             /* soc: platform { cores }: fewer in the kernel, one is the loader's (no cluster state) */
+	} cpu_idle;
 };
 
 /* The board this kernel runs on; NULL when the loader named none, or one the table has not got. */

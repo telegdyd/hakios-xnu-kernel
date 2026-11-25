@@ -515,6 +515,7 @@ SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_gpu_presents, CTLFLAG_RD | CTLFLAG_LOCKED
  */
 static thread_call_t gDCVSCall;
 static bool gDCVSRunning;
+static bool gDCVSSlow;          /* the GPU in slumber: a look a second, up to a second late (with another wake) */
 
 static void
 dcvsTick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
@@ -526,13 +527,30 @@ dcvsTick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	if (ms != 0) {
 		uint64_t deadline, leeway;
 
+		gDCVSSlow = ms >= 1000;
 		clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
-		nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC / 5, &leeway);
+		nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC / (gDCVSSlow ? 1 : 5), &leeway);
 		thread_call_enter_delayed_with_leeway(gDCVSCall, NULL, deadline, leeway, THREAD_CALL_DELAY_LEEWAY);
 	} else {
 		gDCVSRunning = false;
 	}
 	IOLockUnlock(gGPULock);
+}
+
+/*
+ * A submission (under gGPULock): a worker slowed down for slumber looks again in 50 ms, for the speed and hangs of the
+ * work just woken for (negroni-dev's gpuPowerSubmitted, STANDBY-PLAN.md).
+ */
+static void
+gpuPowerSubmitted(void)
+{
+	if (gDCVSSlow && gDCVSRunning && gDCVSCall != NULL) {
+		uint64_t deadline;
+
+		gDCVSSlow = false;
+		clock_interval_to_deadline(50, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(gDCVSCall, deadline);
+	}
 }
 
 static int
@@ -1241,6 +1259,7 @@ MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned c
 	}
 	hakios_gpu_to_memory(NULL, 0);          /* (what was written is in memory: a barrier) */
 	fence = hakios_gpu_submit(&address, &words, 1);
+	gpuPowerSubmitted();
 	if (fence == 0) {
 		if (!gGPUReported) {
 			hakios_gpu_report("the ring is full (fb_gpu)");
@@ -2560,6 +2579,7 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
 		goto out;
 	}
 	request->fence = hakios_gpu_submit(addresses, words, count);
+	gpuPowerSubmitted();
 	/*
 	 * The ring is full and the core is not reading it: it has stopped. With gpu_recover=1 it is
 	 * reset and given this submission again -- after a reset the ring is empty, so there is

@@ -1335,7 +1335,8 @@ touch_wait(void)
 	/* re-armed only now that what was waiting has been read: a line still low rings again at once */
 	wr(INTR_STATUS(PIN_ATTN), 0);
 	gic_v3_spi_unmask(PDC_INTID);
-	assert_wait_timeout((event_t)&irq.rang, THREAD_UNINT, ms, NSEC_PER_MSEC);
+	/* (with the display off the net may go off later, with another wake of its processor: arch/arm64/kernel/psci_smp.c) */
+	(void)hakios_assert_wait_net((event_t)&irq.rang, ms);
 	if (os_atomic_load(&irq.rang, acquire) != 0) {
 		clear_wait(current_thread(), THREAD_AWAKENED);
 	} else {

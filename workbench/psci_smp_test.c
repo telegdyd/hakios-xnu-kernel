@@ -35,11 +35,13 @@ static void test_delay(uint32_t interval, uint32_t scale);      /* (below: a cor
 
 #define CORES   3                               /* the kernel's cpus 0 (the boot processor), 1 and 2 */
 
-typedef struct { uint32_t cpu_phys_id; } cpu_data_t;
-static cpu_data_t cpu_data[CORES] = { { 0x000 }, { 0x100 }, { 0x200 } };     /* MPIDR: core n is n << 8 */
+typedef struct { uint32_t cpu_phys_id; uint64_t cpu_sleep_token; } cpu_data_t;
+#define ARM_CPU_ON_SLEEP_PATH                   0x50535553UL
+static cpu_data_t cpu_data[CORES] = { { 0x000, 0 }, { 0x100, 0 }, { 0x200, 0 } };     /* MPIDR: core n is n << 8 */
 static int this_cpu;
 #define cpu_number()                            this_cpu
 static cpu_data_t *cpu_datap(int cpu) { return cpu >= 0 && cpu < CORES ? &cpu_data[cpu] : NULL; }
+#define getCpuDatap()                           (&cpu_data[this_cpu])
 static int ml_get_max_cpu_number(void) { return CORES - 1; }
 static struct { int cpu_id; } boot_processor;
 #define master_processor                        (&boot_processor)
@@ -96,6 +98,7 @@ gic_v3_irq_signal_stop(uint32_t phys_id)
 	}
 }
 void gic_v3_irq_cpu_shutdown(void) {}
+void gic_v3_irq_cpu_unplug(void) {}
 static bool stop_sent_to(uint32_t phys_id)
 {
 	for (unsigned i = 0; i < nstops; i++) {

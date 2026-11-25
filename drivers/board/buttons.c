@@ -536,7 +536,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 			}
 			break;
 		}
-		delay_for_interval(POLL_MS, NSEC_PER_MSEC);
+		hakios_screen_pause(POLL_MS, 50);      /* (50 ms looks with the display off: arch/arm64/kernel/psci_smp.c) */
 	}
 out:
 	if (steps < 5) {

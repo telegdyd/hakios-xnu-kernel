@@ -206,6 +206,15 @@
 		                                // qcom,freq-domain); one to four groups, together platform { } cores
 	};
 
+	// The cores' idle states (feature cpu-idle), from the live tree's psci idle-states and the cluster's
+	// domain-idle-states: arm,psci-suspend-param and min-residency-us of each.
+	cpu-idle {
+		core = <0x40000004>;            // a core's power-down (rail-pc)
+		core-residency-us = <4090 4791>; // its least residency on the small cores, on the others
+		l3 = <0x41000044 5309>;         // optional: the cluster's L3 off, parameter and least residency
+		llcc = <0x4100c344 13959>;      // optional: and the system cache with it
+	};
+
 	// What the loader (arch/arm64/boot/) tells the kernel of the machine, for boards with a loader { } section.
 	platform {
 		io-base = <0x00400000>;         // one window over the SoC's peripherals; never 0. Not in a device tree;

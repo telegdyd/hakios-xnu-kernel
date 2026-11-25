@@ -446,6 +446,8 @@ llcc_quiesce(void)
 #define PARK_CALM_TIMES         8               /* ... that many looks in a row (64 ms) */
 extern void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);    /* osfmk/arm64/machine_routines.c (patches/0002) */
+extern bool hakios_screen_off(void);                          /* arch/arm64/kernel/psci_smp.c */
+extern void hakios_screen_pause_leeway(uint32_t on_ms, uint32_t off_ms, uint32_t leeway_ms);
 
 static struct {
 	uint32_t looks, unparked, parks;        /* since the last line in the log */
@@ -617,7 +619,14 @@ park_thread(void *arg __unused, wait_result_t wr __unused)
 		uint64_t now, least = 100;
 		uint32_t busy_of[32] = { 0 };
 
-		delay_for_interval(PARK_MS, NSEC_PER_MSEC);
+		/*
+		 * With the display off (arch/arm64/kernel/psci_smp.c): a look every 400 ms, up to 600 ms later with another wake (a
+		 * timer of its own woke a core out of the SoC's sleep 125 times a second), and the small cores given back: the one
+		 * processor of screen-off-cores still up is a small one.
+		 */
+		const bool screen_off = hakios_screen_off();
+
+		hakios_screen_pause_leeway(PARK_MS, 400, 600);
 		now = mach_absolute_time();
 		for (unsigned int i = 0; i < topology->num_cpus && i < MAX_CPUS && i < 32; i++) {
 			uint64_t idle = 0, busy;
@@ -639,6 +648,13 @@ park_thread(void *arg __unused, wait_result_t wr __unused)
 		}
 		if (!parking) {
 			/* (no parking: the governor alone) */
+		} else if (screen_off) {
+			if (parked) {
+				sched_perfcontrol_update_recommended_cores(all);
+				parked = false;
+				park_stat.unparked++;
+			}
+			calm = 0;
 		} else if (parked && least >= PARK_BUSY) {
 			sched_perfcontrol_update_recommended_cores(all);
 			parked = false;

@@ -17,5 +17,7 @@ void MiniIOSurfaceStart(IOService * provider);
 void MiniIOMobileFramebufferStart(IOService * provider);
 void MiniAppleKeyStoreStart(void);
 void MiniIONetworkStackStart(void);
+/* arch/arm64/kernel/psci_smp.c: RequestPowerChange: the processors of screen_off_cores off while the display is off */
+extern "C" void psci_smp_display(bool on);
 
 #endif /* _IOKIT_MINIDRIVERS_H */

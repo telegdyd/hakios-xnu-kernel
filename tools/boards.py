@@ -117,6 +117,9 @@ SOC_SCHEMA = {
     'virtio': {'mmio': (int, True), 'transports': (int, True)},
     'cpufreq': {'block': (CPUFREQ_BLOCKS, False), 'epss': (int, True), 'epss_domain_size': (int, True),
                 'domains': ([int], False), 'domain_cores': ([int], True)},
+    # the cores' idle states (PSCI CPU_SUSPEND parameters of the device tree's idle-states): a core's power-down and its
+    # least residency in us (small cores, others); the cluster's l3-off and llcc-off, each parameter and least residency
+    'cpu_idle': {'core': (int, True), 'core_residency_us': ([int], True), 'l3': ([int], False), 'llcc': ([int], False)},
 }
 # a camera sensor's supply: a regulator of the sensors' PMIC at a set point (a PM8008's LDO1 to LDO7: it has no more), or one
 # that a pin of the SoC switches
@@ -136,6 +139,7 @@ BOARD_SCHEMA = {
                   'min': (int, False), 'max': (int, False), 'restore': (int, False), 'bytes': (int, False),
                   'byte_order': (('msb-first', 'lsb-first'), False)},
     'thermal': {'floor_mhz': ([int], False)},
+    'cpu_idle': {'screen_off_cores': (int, False)},
     'torch': {'flash': (int, True), 'alarm': (int, True)},
     'haptic': {'sda': (int, True), 'scl': (int, True), 'reset': (int, True), 'interrupt': (int, True),
                'f0_calibration': (int, True)},
@@ -196,7 +200,7 @@ KEY_WITH_UNDERSCORE = re.compile(r'(?<![\w.])(' + '|'.join(sorted(
     {key for schema in (SOC_SCHEMA, BOARD_SCHEMA) for section, keys in schema.items() for key in list(keys) + [section]
      if '_' in key} | {key for key in CAMERA_SENSOR if '_' in key}, key=len, reverse=True)) + r')(?![\w(=])')
 # what a feature needs of the SoC file: a board cannot list a feature its SoC has no addresses for
-FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virtio': ('virtio',), 'cpufreq-scmi': ('scmi_perf',), 'cpufreq-epss': ('cpufreq',), 'display-scan': ('display',), 'display-flip': ('display',), 'display-power': ('display', 'clocks'), 'buttons-pmic': ('spmi',),
+FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virtio': ('virtio',), 'cpufreq-scmi': ('scmi_perf',), 'cpufreq-epss': ('cpufreq',), 'display-scan': ('display',), 'display-flip': ('display',), 'display-power': ('display', 'clocks'), 'cpu-idle': ('cpu_idle',), 'buttons-pmic': ('spmi',),
                  'torch-pm8350c': ('spmi',), 'ddr-rpmh': ('rpmh',),
                  'camera-sm7325': ('spmi', 'pins', 'clocks', 'rpmh', 'smmu', 'camera'),
                  'gpu-a660': ('adreno', 'clocks', 'rpmh'), 'gpu-a730': ('adreno', 'clocks', 'rpmh'),
@@ -225,6 +229,7 @@ FEATURE_BOOTARGS = {
     'display-scan': 'fb_scan=1, the default',
     'display-flip': 'fb_flip=1, the default, with the GPU putting frames on the panel (gpu=1; fb_gpu=1, the default)',
     'display-power': 'backlight=2, on by itself; display_power_down=0 keeps the display hardware on while the panel sleeps',
+    'cpu-idle': 'on by itself; cpu_idle=0 keeps idle cores in WFI, screen_off_cores=0 every core up with the display off',
     'gpu-a660': 'gpu=1',
     'gpu-a730': 'gpu=1 or adreno=22; gpu_irq=1 for completion interrupts',
     'gpu-dcvs': "gpu=1, on by itself; gpu_dcvs=0 keeps the default speed (the GPU's sensors still cap it)",
@@ -956,6 +961,14 @@ def load(problems=None):
                 problems.add(rel, 'feature "display-power" needs [loader] fb_base (cont_splash_region base)')
             if data.get('display', {}).get('splash_size', 0) < 0x4000:
                 problems.add(rel, 'feature "display-power" needs [display] splash_size >= 0x4000')
+        idle = data.get('cpu_idle', {})
+        if 'core_residency_us' in idle and len(idle['core_residency_us']) != 2:
+            problems.add(f'{rel} [cpu-idle]', "core-residency-us: two values, the small cores' and the others'")
+        for state in ('l3', 'llcc'):
+            if state in idle and len(idle[state]) != 2:
+                problems.add(f'{rel} [cpu-idle]', f'{state}: two values, the PSCI parameter and the least residency in us')
+        if idle.get('screen_off_cores', 0) & 1:
+            problems.add(f'{rel} [cpu-idle]', 'screen-off-cores: never the boot processor (bit 0)')
         if 'virtio' in data.get('features', []) and len(data['features']) > 1:
             problems.add(rel, 'feature "virtio" is an emulator\'s: not beside the features of a phone')
         if data.get('screen', {}).get('statusbar_leading_shift', 0) > 200:
@@ -1338,6 +1351,14 @@ def table_text(socs, boards):
             out += [
                 '\t\t},',
             ]
+        idle_soc, idle_board = soc.get('cpu_idle', {}), board.get('cpu_idle', {})
+        if idle_soc:
+            pair = lambda key: ', '.join(str(v) if i else f'{v:#x}' for i, v in enumerate(idle_soc.get(key, [0, 0])))
+            us = ', '.join(str(v) for v in idle_soc['core_residency_us'])
+            out.append(f'\t\t.cpu_idle = {{ .core = {idle_soc["core"]:#x}, .core_us = {{ {us} }}, '
+                       f'.l3 = {{ {pair("l3")} }}, .llcc = {{ {pair("llcc")} }}, '
+                       f'.screen_off_cores = {idle_board.get("screen_off_cores", 0):#x}, '
+                       f'.soc_cores = {soc.get("platform", {}).get("cores", 0)} }},')
         if has_thermal:
             floors = ', '.join(str(v) for v in thermal.get('floor_mhz', [])) or '0'
             out += [

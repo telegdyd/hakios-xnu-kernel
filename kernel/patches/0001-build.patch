@@ -415,7 +415,7 @@ diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
  osfmk/arm64/bcopy.s standard
  osfmk/arm64/bzero.s standard
  osfmk/arm/caches.c		standard
-@@ -123,6 +123,15 @@ osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
+@@ -123,6 +123,16 @@ osfmk/arm64/corecrypto/sha256_compress_arm64.s	standard
  osfmk/arm64/x86_64_compat.c	standard
  
  osfmk/arm/counter.c	standard
@@ -425,6 +425,7 @@ diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
 +osfmk/arm64/user_exception_trace.c	standard
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
++osfmk/arm64/psci_idle.c	optional nos_arm_asm
 +osfmk/arm64/a64emu.c	standard
 +osfmk/arm64/prof.c	standard
 +osfmk/arm64/cpu_idle.c	standard

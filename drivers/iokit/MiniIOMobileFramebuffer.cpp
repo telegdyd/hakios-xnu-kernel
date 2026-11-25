@@ -297,6 +297,7 @@ enum { kRefusedNoPanel, kRefusedBlack, kRefusedOffPanel, kRefusedNotGPUDrawn, kR
  */
 extern "C" bool hakios_display_flip_data(uint64_t * mdss, uint64_t * intf, uint64_t * splash_size);
 __attribute__((weak)) extern "C" void hakios_backlight_display(bool on);
+extern "C" void psci_smp_display(bool on);  /* arch/arm64/kernel/psci_smp.c */
 __attribute__((weak)) extern "C" bool hakios_display_hold(void);
 __attribute__((weak)) extern "C" void hakios_display_release(void);
 static volatile bool gPanelAsleep;
@@ -3697,13 +3698,17 @@ IOMobileFramebufferUserClient::method(uint32_t selector, IOExternalMethodArgumen
 			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()));
 		}
 		return kIOReturnSuccess;
+	case kFBMethodRequestPowerChange:               /* in: 1 the display on, 0 off (backboardd, as the screen locks or wakes) */
+		if (args->scalarInputCount > 0) {
+			if (hakios_backlight_display != NULL) {
+				hakios_backlight_display(in[0] != 0);
+			}
+			psci_smp_display(in[0] != 0);   /* (screen_off_cores, and the drivers' slower looks) */
+		}
+		return kIOReturnSuccess;
 	case kFBMethodSwapSignal:
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
-	case kFBMethodRequestPowerChange:
-		if (args->scalarInputCount > 0 && hakios_backlight_display != NULL) {
-			hakios_backlight_display(in[0] != 0);
-		}
 		return kIOReturnSuccess;
 	case kFBMethodChangeFrameInfo:
 		return kIOReturnSuccess;

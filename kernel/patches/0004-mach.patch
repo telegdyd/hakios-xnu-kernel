@@ -331,6 +331,21 @@ diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
  
  	exception_info_t info = {
  		/*
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -168,7 +168,10 @@ TUNABLE(bool, support_bootcpu_shutdown, "support_bootcpu_shutdown", true);
+ TUNABLE(bool, support_bootcpu_shutdown, "support_bootcpu_shutdown", false);
+ #endif
+ 
+-#if __x86_64__ || XNU_ENABLE_PROCESSOR_EXIT
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>  /* (hakios: GENERIC_PSCI_SMP) */
++#endif
++#if __x86_64__ || XNU_ENABLE_PROCESSOR_EXIT || defined(GENERIC_PSCI_SMP)   /* hakios: psci_smp.c's screen_off_cores */
+ TUNABLE(bool, enable_processor_exit, "processor_exit", true);
+ #else
+ TUNABLE(bool, enable_processor_exit, "processor_exit", false);
 diff --git a/osfmk/kern/sched.h b/osfmk/kern/sched.h
 --- a/osfmk/kern/sched.h
 +++ b/osfmk/kern/sched.h

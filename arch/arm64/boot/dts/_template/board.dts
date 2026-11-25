@@ -25,6 +25,9 @@
 	// display-power   panel sleep/wake (DCS 0x28/0x10 and Samsung AMB670YF08 on-sequence) and MDSS/DSI hardware
 	//                 power-down while the panel sleeps (backlight=2, display_power_down); needs vbif, mdss, intf1
 	//                 and clocks { } in the SoC file and display { splash-size } and loader { fb-base } here
+	// cpu-idle        idle cores power down (PSCI CPU_SUSPEND), the cluster's states when every core is the kernel's;
+	//                 cpu-idle { screen-off-cores } here off while the display is off (cpu_idle=0, screen_off_cores=0);
+	//                 needs cpu-idle { } in the SoC file
 	// virtio          an emulator's virtio devices (network, tablet, keyboard): for QEMU's board, not a phone
 	// gpu-a660        an Adreno of the A660 family (642, 642L, 643, 660 ...) behind a GMU (gpu=1); needs gpu { }
 	// gpu-a730        an Adreno 730 (gen7) behind a GMU: the same gpu { }, steps 1 to 10 so far (adreno=10)
@@ -51,6 +54,12 @@
 		// bytes = <2>;                 // 2 when max is above 255
 		// byte-order = "msb-first";    // "msb-first" when the node has qcom,mdss-dsi-bl-inverted-dbv, else "lsb-first"
 	};
+
+	// The processors switched off while the display is off (feature cpu-idle): a bit per processor number, never the
+	// boot processor's (bit 0); the one left carries what runs with the screen off.
+	// cpu-idle {
+		// screen-off-cores = <0xfe>;
+	// };
 
 	// Holding the processors back when hot (Documentation/thermal.md). Leave the section out until thermal { } and
 	// cpufreq { } are in the SoC file.

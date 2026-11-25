@@ -22,6 +22,7 @@ on the phone" are three different statements: give the date and the Darwin build
 | CPU frequency | `cpufreq-epss` / `cpufreq=1` | |
 | Brightness | `backlight { }` / `backlight=` | |
 | Temperature | `thermal { }` / `thermal=` | |
+| Idle cores powered down, cores off with the screen | `cpu-idle { }` (both files) / `cpu_idle=`, `screen_off_cores=` | |
 | GPU | `gpu-a660` / `gpu=1` | |
 | Sound, camera, Wi-Fi, haptics | | |
 

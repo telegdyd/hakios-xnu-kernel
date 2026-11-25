@@ -88,6 +88,32 @@ assert_wait_timeout(void *event, int interruptible __unused, uint32_t interval, 
 	pthread_mutex_unlock(&big);
 }
 
+/* arch/arm64/kernel/psci_smp.c's display state: the display is always on here */
+bool
+hakios_screen_off(void)
+{
+	return false;
+}
+
+void
+hakios_screen_pause(uint32_t on_ms, uint32_t off_ms __unused)
+{
+	delay_for_interval(on_ms, NSEC_PER_MSEC);
+}
+
+void
+hakios_screen_pause_leeway(uint32_t on_ms, uint32_t off_ms __unused, uint32_t leeway_ms __unused)
+{
+	delay_for_interval(on_ms, NSEC_PER_MSEC);
+}
+
+wait_result_t
+hakios_assert_wait_net(event_t event, uint32_t ms)
+{
+	assert_wait_timeout(event, 0, ms, NSEC_PER_MSEC);
+	return 0;
+}
+
 wait_result_t
 thread_block(thread_continue_t continuation __unused)
 {

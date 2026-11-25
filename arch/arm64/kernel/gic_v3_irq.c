@@ -38,6 +38,7 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/board_config.h>
+#include <kern/processor.h>
 
 #if defined(GENERIC_GIC_V3_IRQ)
 
@@ -114,6 +115,7 @@ struct gic_spi {
 	void    *context;
 	uint32_t busy;                      /* handlers of it running now */
 	uint64_t count;
+	int      home;                      /* the processor it is routed to (the boot processor's while that one is off) */
 };
 static struct gic_spi gic_spi[GIC_SPI_MOST];
 static decl_simple_lock_data(, gic_spi_lock);
@@ -126,6 +128,8 @@ void gic_v3_spi_unmask(uint32_t intid);
 void gic_v3_spi_detach(uint32_t intid);
 uint64_t gic_v3_spi_count(uint32_t intid);
 void gic_v3_irq_cpu_shutdown(void);
+void gic_v3_irq_cpu_unplug(void);
+void gic_v3_irq_cpu_resume(void);
 void gic_v3_irq_signal(uint32_t phys_id);
 void gic_v3_irq_signal_stop(uint32_t phys_id);
 
@@ -179,6 +183,7 @@ gic_send_sgi(uint32_t phys_id, uint32_t sgi)
 void
 gic_v3_irq_signal(uint32_t phys_id)
 {
+	psci_ipi_sent(phys_id);
 	gic_send_sgi(phys_id, GIC_SGI_SIGNAL);
 }
 
@@ -272,6 +277,7 @@ gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *context, uint
 	slot->handler = handler;
 	slot->context = context;
 	slot->count = 0;
+	slot->home = cpu_number();
 	os_atomic_store(&slot->intid, intid, release);
 
 	/*
@@ -342,6 +348,7 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 			break;
 		}
 		gic_active_iar[cpu] = iar | GIC_IAR_TAKEN;
+		psci_idle_irq(intid, intid == GIC_INTID_VTIMER ? 1 : intid == GIC_SGI_SIGNAL ? 2 : 0);
 
 		if (intid == GIC_INTID_VTIMER) {
 			/* same sequence as the FIQ path in sleh_fiq() */
@@ -427,6 +434,57 @@ gic_v3_irq_cpu_shutdown(void)
 
 /* the distance between redistributors when the device tree gives one (redistributor-stride), else 0 */
 static uint64_t gicr_stride;
+/* The boot processor's number (master_cpu is never set on this kernel; before the scheduler's processors exist, 0) */
+static inline int
+gic_boot_cpu(void)
+{
+	return master_processor != PROCESSOR_NULL ? master_processor->cpu_id : 0;
+}
+
+/* The SPIs attached on processor cpu go to the one with that "reg" (the low affinity fields of its MPIDR). */
+static void
+gic_spi_route_home(int cpu, uint32_t phys_id)
+{
+	simple_lock(&gic_spi_lock, LCK_GRP_NULL);
+	for (unsigned i = 0; i < GIC_SPI_MOST; i++) {
+		if (gic_spi[i].intid != 0 && gic_spi[i].home == cpu) {
+			*(volatile uint64_t *)(gicd_base + GICD_IROUTER(gic_spi[i].intid)) = phys_id & 0xffffff;
+		}
+	}
+	simple_unlock(&gic_spi_lock);
+	__builtin_arm_dsb(DSB_SY);
+}
+
+/*
+ * This processor is switched off for a while; the system goes on (psci_smp_cpu_unplug()). Unlike
+ * gic_v3_irq_cpu_shutdown() the drivers keep their interrupts: those routed here go to the boot processor until
+ * this one is back (gic_v3_irq_cpu_init() routes them home again). Its own (timer, signals) are switched off,
+ * and its CPU interface is set up afresh when it comes back.
+ */
+void
+gic_v3_irq_cpu_unplug(void)
+{
+	int cpu = cpu_number();
+	vm_offset_t gicr = gicr_cpu_base[cpu];
+
+	if (gicd_base == 0 || cpu == gic_boot_cpu()) {
+		return;
+	}
+	gic_spi_route_home(cpu, cpu_datap(gic_boot_cpu())->cpu_phys_id);
+	if (gic_active_iar[cpu] != 0) {
+		__builtin_arm_wsr64("ICC_EOIR1_EL1", gic_active_iar[cpu] & ~GIC_IAR_TAKEN);
+		__builtin_arm_isb(ISB_SY);
+		gic_active_iar[cpu] = 0;
+	}
+	if (gicr != 0) {
+		gic_write32(gicr + GICR_ICENABLER0, 0xffffffffu);
+		gic_write32(gicr + GICR_ICPENDR0, 0xffffffffu);
+		gic_write32(gicr + GICR_ICACTIVER0, 0xffffffffu);
+	}
+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 0);
+	__builtin_arm_isb(ISB_SY);
+	gicr_cpu_base[cpu] = 0;         /* (gic_v3_irq_cpu_init() does all of it again) */
+}
 
 static vm_offset_t
 gic_find_redistributor(void)
@@ -581,8 +639,48 @@ gic_v3_irq_cpu_init(void)
 	__builtin_arm_isb(ISB_SY);
 
 	ml_install_interrupt_handler(NULL, 0, NULL, gic_irq_handler, NULL);
+	if (cpu != gic_boot_cpu()) {
+		/* back after a while off (gic_v3_irq_cpu_unplug()): its SPIs come home */
+		gic_spi_route_home(cpu, cpu_datap(cpu)->cpu_phys_id);
+	}
 	kprintf("gic: v3, distributor %p, cpu %d's redistributor %p, virtual timer on PPI %d\n",
 	    (void *)gicd_base, cpu, (void *)gicr, GIC_INTID_VTIMER);
+}
+
+/*
+ * This processor is back from a power-down in idle (psci_smp.c, PSCI CPU_SUSPEND), interrupts off, on the reset path.
+ * The core's own registers were reset: the CPU interface again (as Linux's gic_cpu_sys_reg_init() after cpu_pm). The
+ * redistributor kept what it had, and its SPIs were never moved: only the frame's wake bit and this core's own interrupts
+ * are set again, which costs nothing if they are as they were. No printing: this is the idle path.
+ */
+void
+gic_v3_irq_cpu_resume(void)
+{
+	int cpu = cpu_number();
+	vm_offset_t gicr = gicr_cpu_base[cpu];
+	uint32_t mine = 1u << GIC_INTID_VTIMER;
+
+	if (gicd_base == 0 || gicr == 0) {
+		return;
+	}
+	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | 1);
+	__builtin_arm_isb(ISB_SY);
+	uint32_t waker = gic_read32(gicr + GICR_WAKER);
+	if (waker & (GICR_WAKER_PROCSLEEP | GICR_WAKER_CHILDASLEEP)) {
+		gic_write32(gicr + GICR_WAKER, waker & ~GICR_WAKER_PROCSLEEP);
+		while (gic_read32(gicr + GICR_WAKER) & GICR_WAKER_CHILDASLEEP) {
+			/* spin until the redistributor is awake */
+		}
+	}
+	if (ml_get_cpu_count() > 1) {
+		mine |= (1u << GIC_SGI_SIGNAL) | (1u << GIC_SGI_STOP);
+	}
+	gic_write32(gicr + GICR_ISENABLER0, mine);
+	__builtin_arm_wsr64("ICC_AP1R0_EL1", 0);
+	__builtin_arm_wsr64("ICC_PMR_EL1", 0xff);
+	__builtin_arm_wsr64("ICC_BPR1_EL1", 0);
+	__builtin_arm_wsr64("ICC_IGRPEN1_EL1", 1);
+	__builtin_arm_isb(ISB_SY);
 }
 
 #endif /* GENERIC_GIC_V3_IRQ */

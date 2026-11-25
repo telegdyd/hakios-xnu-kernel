@@ -28,13 +28,21 @@
  * loader (loader_return.c), and the loader gets back only what it started:
  * one core, the boot processor's. psci_smp_stop_others() makes every other
  * core switch itself off first, wherever it is.
+ *
+ * In between, a core may be switched off for a while and started again:
+ * while the display is off, the cores of the boot-arg screen_off_cores
+ * (psci_smp_display()). The scheduler moves their work away and back
+ * (processor_exit() -> psci_smp_cpu_unplug(), processor_start() ->
+ * psci_smp_start_cpu()).
  */
 #include <mach/mach_types.h>
+#include <stdarg.h>
 #include <kern/clock.h>
 #include <kern/cpu_number.h>
 #include <kern/debug.h>
 #include <kern/kalloc.h>
 #include <kern/misc_protos.h>
+#include <kern/processor.h>
 #include <libkern/kernel_mach_header.h>
 #include <machine/atomic.h>
 
@@ -73,8 +81,11 @@ psci_smp_boot_cpu_number(void)
 #define PSCI_CPU_ON             0xC4000003u
 #define PSCI_AFFINITY_INFO      0xC4000004u
 #define PSCI_AFFINITY_OFF       1
+#define PSCI_ALREADY_ON         (-4)
+#define PSCI_ON_PENDING         (-5)
 
 #define PSCI_SMP_START_SECONDS  5       /* how long a started core is waited for */
+#define PSCI_SMP_GONE_MS        1000    /* ... and one that switched itself off, to be off before it is started again */
 #define PSCI_SMP_STOP_SECONDS   3       /* ... and the cores that were told to stop */
 
 extern void loader_return(void);
@@ -139,6 +150,16 @@ psci_error(int64_t status)
 	return (status <= 0 && status > -(int64_t)(sizeof(names) / sizeof(names[0]))) ? names[-status] : "?";
 }
 
+/* CPU_ON at the kernel's reset vector (physical), through the loader's entry when it gives one (the keys first) */
+static int64_t
+psci_smp_cpu_on(uint32_t phys_id, uint64_t entry)
+{
+	if (psci_smp_loader_entry != 0) {
+		return psci_call(PSCI_CPU_ON, phys_id, psci_smp_loader_entry, entry);
+	}
+	return psci_call(PSCI_CPU_ON, phys_id, entry, 0);
+}
+
 void
 psci_smp_init(void)
 {
@@ -199,6 +220,54 @@ psci_smp_clean_segment(const char *name)
 }
 
 /*
+ * What a core reads with its MMU off on its way in at the reset vector (a start, or the way back from a power-down in
+ * idle): the code and the page tables of start.s, and what the reset vector finds its way by (ResetHandlerData,
+ * CpuDataEntries, the boot arguments, cpu_ttep, psci_smp_hvc ...), all of it in the kernel's own segments; and the cpu
+ * data of every processor, which the reset vector goes through looking for its own. Clean, not flush: the processors
+ * that are running keep using all of it.
+ */
+static void
+psci_smp_clean_for_reset(void)
+{
+	psci_smp_clean_segment("__TEXT");
+	psci_smp_clean_segment("__DATA_CONST");
+	psci_smp_clean_segment("__TEXT_EXEC");
+	psci_smp_clean_segment("__DATA");
+	psci_smp_clean_segment("__BOOTDATA");
+	for (int other = 0; other <= ml_get_max_cpu_number(); other++) {
+		if (cpu_datap(other) != NULL) {
+			CleanPoC_DcacheRegion((vm_offset_t)cpu_datap(other), sizeof(cpu_data_t));
+		}
+	}
+	__builtin_arm_dsb(DSB_SY);
+}
+
+/* For psci_idle.c: the firmware's call, a core's stage, the loader's entry, the clean before a reset-vector entry */
+int64_t
+psci_smp_call(uint64_t function, uint64_t arg1, uint64_t arg2, uint64_t arg3)
+{
+	return psci_call(function, arg1, arg2, arg3);
+}
+
+uint32_t
+psci_smp_stage_of(int cpu)
+{
+	return cpu >= 0 && cpu < MAX_CPUS ? os_atomic_load(&psci_smp_cpu_stage[cpu], acquire) : 0;
+}
+
+uint64_t
+psci_smp_loader_entry_pa(void)
+{
+	return psci_smp_loader_entry;
+}
+
+void
+psci_smp_clean_for_reset_all(void)
+{
+	psci_smp_clean_for_reset();
+}
+
+/*
  * Start a registered processor: the platform's half of cpu_start(). Waits until the core has
  * joined the scheduler, and says what became of it if it has not: on a phone the log is all
  * there is to go by.
@@ -220,26 +289,21 @@ psci_smp_start_cpu(int cpu)
 		psci_smp_init();
 	}
 
-	/*
-	 * What that core reads with its MMU off: the code and the page tables of start.s, and what
-	 * the reset vector finds its way by (ResetHandlerData, CpuDataEntries, the boot arguments,
-	 * cpu_ttep, psci_smp_hvc ...), all of it in the kernel's own segments; and the cpu data of
-	 * every processor, which the reset vector goes through looking for its own.
-	 * Clean, not flush: the processors that are running keep using all of it.
-	 */
 	psci_smp_start_fault.valid = 0;
-	psci_smp_clean_segment("__TEXT");
-	psci_smp_clean_segment("__DATA_CONST");
-	psci_smp_clean_segment("__TEXT_EXEC");
-	psci_smp_clean_segment("__DATA");
-	psci_smp_clean_segment("__BOOTDATA");
-	for (int other = 0; other <= ml_get_max_cpu_number(); other++) {
-		if (cpu_datap(other) != NULL) {
-			CleanPoC_DcacheRegion((vm_offset_t)cpu_datap(other), sizeof(cpu_data_t));
+	psci_smp_clean_for_reset();
+
+	/*
+	 * A core that was switched off for a while (psci_smp_cpu_unplug()) has told the kernel it is done just before it
+	 * asked the firmware: it may not be off yet, and CPU_ON then answers "already on" or "on pending".
+	 */
+	bool again = os_atomic_load(&psci_smp_cpu_stage[cpu], acquire) == PSCI_SMP_CPU_OFF;
+
+	clock_interval_to_deadline(PSCI_SMP_GONE_MS, NSEC_PER_MSEC, &deadline);
+	if (again) {
+		while (psci_call(PSCI_AFFINITY_INFO, phys_id, 0, 0) == 0 && mach_absolute_time() < deadline) {
+			delay_for_interval(100, NSEC_PER_USEC);
 		}
 	}
-	__builtin_arm_dsb(DSB_SY);
-
 	os_atomic_store(&psci_smp_cpu_stage[cpu], PSCI_SMP_CPU_ASKED, release);
 	/*
 	 * Counted among the started before the firmware is asked, not once it has answered: the core may run before
@@ -248,17 +312,17 @@ psci_smp_start_cpu(int cpu)
 	 * not told to stop.
 	 */
 	os_atomic_or(&psci_smp_started, 1u << cpu, release);
-	{
+	if (!again) {
 		extern void loader_log_line(const char *line);
 		char line[120];
 		snprintf(line, sizeof(line), "hakios: psci CPU_ON cpu %d (MPIDR 0x%x) at 0x%llx, kernel entry 0x%llx\n", cpu,
 		    phys_id, psci_smp_loader_entry ? psci_smp_loader_entry : entry, entry);
 		loader_log_line(line);
 	}
-	if (psci_smp_loader_entry != 0) {
-		status = psci_call(PSCI_CPU_ON, phys_id, psci_smp_loader_entry, entry);
-	} else {
-		status = psci_call(PSCI_CPU_ON, phys_id, entry, 0);
+	status = psci_smp_cpu_on(phys_id, entry);
+	while (again && (status == PSCI_ALREADY_ON || status == PSCI_ON_PENDING) && mach_absolute_time() < deadline) {
+		delay_for_interval(100, NSEC_PER_USEC);
+		status = psci_smp_cpu_on(phys_id, entry);
 	}
 	if (status != 0) {
 		os_atomic_andnot(&psci_smp_started, 1u << cpu, relaxed);
@@ -323,6 +387,34 @@ psci_smp_cpu_off(void)
 		__builtin_arm_wfi();    /* the firmware refused: stay out of the way all the same */
 	}
 }
+
+/*
+ * The calling processor is switched off for a while, the system goes on (the end of processor_exit(): cpu_sleep() ->
+ * GenericARMCPU::quiesceCPU()). Its threads and timers are elsewhere by now; the devices' interrupts that came to it go to
+ * the boot processor until it is back. Its cache needs no cleaning: the firmware cleans a core it switches off. It comes
+ * back through psci_smp_start_cpu(), at the reset vector, and the kernel resumes it where processor_offline() left it.
+ */
+void
+psci_smp_cpu_unplug(void)
+{
+	cpu_data_t *cdp = getCpuDatap();
+	int cpu = cpu_number();
+
+	__builtin_arm_wsr("DAIFSet", DAIFSC_ALL);
+	__builtin_arm_wsr64("CNTV_CTL_EL0", CNTV_CTL_EL0_IMASKED);
+	gic_v3_irq_cpu_unplug();
+	os_atomic_andnot(&psci_smp_started, 1u << cpu, relaxed);        /* nothing of it to stop on the way to the loader */
+	os_atomic_store(&psci_smp_cpu_stage[cpu], PSCI_SMP_CPU_OFF, release);
+	/* what the processor that asked waits for (cpu_exit_wait()): this one is done with the kernel's data */
+	cdp->cpu_sleep_token = ARM_CPU_ON_SLEEP_PATH;
+	__builtin_arm_dsb(DSB_SY);
+
+	(void) psci_call(PSCI_CPU_OFF, 0, 0, 0);
+	for (;;) {
+		__builtin_arm_wfi();
+	}
+}
+
 
 static void
 psci_smp_note(const char *what, int cpu)
@@ -473,7 +565,6 @@ psci_smp_stop_here(void)
  * is no such core, and the thread is left as it was.
  */
 #include <kern/processor.h>
-#include <kern/sched_prim.h>
 
 unsigned
 hakios_slow_cores(void)

@@ -182,6 +182,17 @@ dt_property(const DTEntry entry, const char *name, void const **value, unsigned 
 #define SecureDTLookupEntry     dt_lookup
 #define SecureDTGetProperty     dt_property
 
+/* psci_idle.c's census and the boot processor (the test's core is it) */
+static void psci_ipi_sent(uint32_t phys_id) { (void)phys_id; }
+static void psci_idle_irq(uint32_t intid, int kind) { (void)intid; (void)kind; }
+static struct { int cpu_id; } test_boot_processor;
+#define master_processor                        (&test_boot_processor)
+#define PROCESSOR_NULL                          ((void *)0)
+#define __builtin_arm_dsb(what)                 ((void)(what), __sync_synchronize())
+#define DSB_SY                                  0xf
+static struct { uint32_t cpu_phys_id; } test_cpu_datap;
+#define cpu_datap(cpu)                          ((void)(cpu), &test_cpu_datap)
+
 #define GENERIC_GIC_V3_IRQ 1
 #include "../arch/arm64/kernel/gic_v3_irq.c"
 
