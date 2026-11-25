@@ -95,6 +95,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
@@ -3949,6 +3950,7 @@ static void gpu_block_stop(void);
 #define GPU_IRQ_MASK            GPU_WORD(0x0038)
 #define GPU_IRQ_STORM           20000u          /* maximum interrupts in one second */
 
+uint32_t hakios_gpu_fence_event;                /* address used as a scheduler event; no payload */
 static uint32_t gpu_irq_state;                 /* 0 off, 1 armed, 2 disabled after an unsafe/storm IRQ */
 static uint32_t gpu_irq_count, gpu_irq_completions, gpu_irq_unexpected, gpu_irq_unsafe, gpu_irq_status;
 
@@ -4006,23 +4008,25 @@ gpu_irq_arrived(__unused void *context, uint32_t intid)
 	/* Leave fault bits for the existing hang report; only completion is enabled by us. */
 	if (status & GPU_IRQ_COMPLETION) {
 		wr(gpu.base + RBBM_INT_CLEAR_CMD, GPU_IRQ_COMPLETION);
-		__asm__ volatile ("dsb sy" ::: "memory");
+		hakios_barrier();
 		__atomic_fetch_add(&gpu_irq_completions, 1, __ATOMIC_RELAXED);
 	}
 	gpu_gx_ref(false);
 	if (!(status & GPU_IRQ_COMPLETION)) {
 		goto disable;
 	}
+	thread_wakeup((event_t)&hakios_gpu_fence_event);
 	return;
 disable:
 	gic_v3_spi_mask(intid);
 	__atomic_store_n(&gpu_irq_state, 2, __ATOMIC_RELEASE);
 	__atomic_fetch_add(&gpu_irq_unexpected, 1, __ATOMIC_RELAXED);
+	thread_wakeup((event_t)&hakios_gpu_fence_event);
 }
 #endif
 
-static bool
-gpu_irq_active(void)
+bool
+hakios_gpu_irq_active(void)
 {
 	return __atomic_load_n(&gpu_irq_state, __ATOMIC_ACQUIRE) == 1;
 }
@@ -4048,7 +4052,7 @@ gpu_irq_start(void)
 	gpu_irq_old_mask = rd(gpu.base + GPU_IRQ_MASK);
 	wr(gpu.base + GPU_IRQ_MASK, 0);
 	wr(gpu.base + RBBM_INT_CLEAR_CMD, GPU_IRQ_COMPLETION);
-	__asm__ volatile ("dsb sy" ::: "memory");
+	hakios_barrier();
 	/* attach enables the GIC line: handler state and device masking must be ready first. */
 	__atomic_store_n(&gpu_irq_state, 1, __ATOMIC_RELEASE);
 	if (gic_v3_spi_attach(intid, false, gpu_irq_arrived, NULL) != KERN_SUCCESS) {
@@ -4059,7 +4063,7 @@ gpu_irq_start(void)
 	}
 	gpu_irq_intid = intid;
 	wr(gpu.base + GPU_IRQ_MASK, GPU_IRQ_COMPLETION);
-	__asm__ volatile ("dsb sy" ::: "memory");
+	hakios_barrier();
 	if (!quiet) {
 		printf("adreno: GPU completion IRQ armed on GIC INTID %u\n", intid);
 	}
@@ -4094,7 +4098,8 @@ gpu_irq_stop(void)
 			wr(gpu.base + GPU_IRQ_MASK, gpu_irq_old_mask);
 			wr(gpu.base + RBBM_INT_CLEAR_CMD, GPU_IRQ_COMPLETION);
 		}
-		__asm__ volatile ("dsb sy" ::: "memory");
+		hakios_barrier();
+		thread_wakeup((event_t)&hakios_gpu_fence_event);
 	}
 #endif
 }
@@ -4125,6 +4130,7 @@ hakios_gpu_stop(void)
 				zap_is_loaded = false;
 			}
 			printf("adreno: the run is about to end: the GPU was already asleep\n");
+			thread_wakeup((event_t)&hakios_gpu_fence_event);
 			return;
 		}
 		/*
@@ -4482,7 +4488,7 @@ ring_fence_a730(uint32_t at, uint32_t fence)
 {
 	ring_command(CP_EVENT_WRITE, 4);
 	ring(EVENT_CACHE_CLEAN | EVENT_WRITE_ENABLED |
-	    (at == GPU_FENCE_AT && gpu_irq_active() ? GPU_EVENT_IRQ : 0));
+	    (at == GPU_FENCE_AT && hakios_gpu_irq_active() ? GPU_EVENT_IRQ : 0));
 	ring(CORE_SCRATCH_ADDRESS + at);
 	ring(0);
 	ring(fence);
@@ -5397,7 +5403,7 @@ gpu_runtime_suspend(void)
 	bool gx_access, off;
 
 	slumber_stream1 = second_stream_is_on;
-	slumber_irq = gpu_irq_active();
+	slumber_irq = hakios_gpu_irq_active();
 	gx_access = gpu_gx_get();
 	core_stuck = !gx_access;
 	if (gx_access) {
@@ -5479,7 +5485,7 @@ gpu_runtime_resume(void)
 	}
 	if (slumber_irq) {
 		gpu_irq_start();
-		if (!gpu_irq_active()) {
+		if (!hakios_gpu_irq_active()) {
 			goto failed;
 		}
 	}
@@ -5572,7 +5578,7 @@ gpu_recover_a730(void)
 	if (!slumber_asleep) {
 		/* (asleep, nothing was outstanding: there is nothing to take down) */
 		slumber_stream1 = second_stream_is_on;
-		slumber_irq = gpu_irq_active();
+		slumber_irq = hakios_gpu_irq_active();
 		if (!gpu_gx_get()) {
 			core_runs = false;      /* (a core that does not wake is not reached: no register of its half is read) */
 		}
@@ -5597,6 +5603,7 @@ gpu_recover_a730(void)
 	*(volatile uint32_t *)(core_scratch.memory + GPU_BV_FENCE_AT) = gpu_fence;
 	*(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT) = gpu_fence;
 	to_memory(core_scratch.memory + GPU_FENCE_AT, 0x20);
+	thread_wakeup((event_t)&hakios_gpu_fence_event);
 	gpu_given_up += (uint32_t)(gpu_fence - done);
 	gpu_timed = gpu_fence;
 	gpu_hang_since = 0;

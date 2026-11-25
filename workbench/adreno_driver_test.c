@@ -212,10 +212,38 @@ in_memory(const void *table)
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #define KERNEL 1
 #define HAKIOS_MMIO_TEST 1
+#define GENERIC_GIC_V3_IRQ 1
 #define get adreno_get
 #define set adreno_set
 #include "board/board.c"
+
+static uint32_t gic_attached_intid, gic_masks, gic_detaches;
+static void (*gic_attached_handler)(void *, uint32_t);
+static void *gic_attached_context;
+kern_return_t
+gic_v3_spi_attach(uint32_t intid, bool edge __unused, void (*handler)(void *, uint32_t), void *context)
+{
+	gic_attached_intid = intid;
+	gic_attached_handler = handler;
+	gic_attached_context = context;
+	return KERN_SUCCESS;
+}
+void gic_v3_spi_mask(uint32_t intid __unused) { gic_masks++; }
+void gic_v3_spi_detach(uint32_t intid __unused) { gic_detaches++; }
+
+static unsigned fence_wakeups;
+static void *fence_event_ptr;
+static void
+test_thread_wakeup(void *event)
+{
+	if (event == fence_event_ptr) {
+		fence_wakeups++;
+	}
+	thread_wakeup(event);
+}
+#define thread_wakeup(event) test_thread_wakeup(event)
 #include "board/adreno.c"
+#undef thread_wakeup
 #undef get
 #undef set
 
@@ -607,6 +635,50 @@ a730_forced_suspend(void)
 	CHECK(written(gbif.base + GBIF_HALT, 0, 0) < 0, "and the bus is not let go again before CX goes");
 }
 
+/*
+ * A730 completion IRQ wakeups: completion wakes waiters, unexpected status masks and disables
+ * while still waking waiters, panic quiesce masks without waking, and thread-context stop
+ * detaches and wakes waiters.
+ */
+static void
+a730_irq_wakeup(void)
+{
+	phone();
+	need(&gpu);
+	need(&gmu);
+	need(&gpucc);
+	fence_event_ptr = &hakios_gpu_fence_event;
+	gpu_irq_second = NSEC_PER_SEC;
+	gpu_irq_intid = 332;
+	__atomic_store_n(&gpu_irq_state, 1, __ATOMIC_RELEASE);
+	*reg(GPUCC + GPUCC_GX_GDSCR) = GDSC_POWER_ON;
+	*reg(gmu.base + GMU_AO_AHB_FENCE_CTRL) = 0;
+
+	/* 1. Completion interrupt clears status, counts completion, stays armed, and wakes waiters. */
+	*reg(gpu.base + RBBM_INT_0_STATUS) = GPU_IRQ_COMPLETION;
+	gpu_irq_arrived(NULL, 332);
+	CHECK(written(gpu.base + RBBM_INT_CLEAR_CMD, GPU_IRQ_COMPLETION, 0) >= 0, "completion bit cleared");
+	CHECK(gpu_irq_completions == 1 && hakios_gpu_irq_active(), "completion counted and IRQ stays active");
+	CHECK(fence_wakeups == 1, "completion woke fence waiters (%u)", fence_wakeups);
+
+	/* 2. Unexpected status masks the GIC line, disables IRQ, and wakes waiters to fall back. */
+	*reg(gpu.base + RBBM_INT_0_STATUS) = 0;
+	gpu_irq_arrived(NULL, 332);
+	CHECK(gic_masks == 1 && gpu_irq_state == 2 && !hakios_gpu_irq_active(), "unexpected IRQ masked and disabled");
+	CHECK(gpu_irq_unexpected == 1 && fence_wakeups == 2, "unexpected IRQ woke waiters (%u)", fence_wakeups);
+
+	/* 3. Panic quiesce masks without calling thread_wakeup(). */
+	__atomic_store_n(&gpu_irq_state, 1, __ATOMIC_RELEASE);
+	gpu_irq_quiesce();
+	CHECK(gic_masks == 2 && gpu_irq_state == 0 && fence_wakeups == 2, "quiesce masked without wakeup (%u)", fence_wakeups);
+
+	/* 4. Thread-context stop detaches and wakes waiters. */
+	__atomic_store_n(&gpu_irq_state, 1, __ATOMIC_RELEASE);
+	gpu_irq_stop();
+	CHECK(gic_detaches == 1 && gpu_irq_intid == 0 && gpu_irq_state == 0 && fence_wakeups == 3,
+	    "stop detached and woke waiters (%u)", fence_wakeups);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -618,7 +690,7 @@ main(int argc, char **argv)
 		{ "stop_with_cx_not_ours", stop_with_cx_not_ours }, { "short_answer", short_answer }, { "error_text", error_text },
 		{ "zap_header_short", zap_header_short }, { "display_probe_bounded", display_probe_bounded },
 		{ "a730_submission", a730_submission }, { "a730_hang_due", a730_hang_due },
-		{ "a730_forced_suspend", a730_forced_suspend },
+		{ "a730_forced_suspend", a730_forced_suspend }, { "a730_irq_wakeup", a730_irq_wakeup },
 	};
 
 	if (argc < 2) {
