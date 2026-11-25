@@ -53,7 +53,7 @@ global surfaces.
 
 | File | Part | Feature / boot argument | Portability |
 | --- | --- | --- | --- |
-| `bsd/dev/board/backlight.c` | Panel brightness: MIPI DCS through a Qualcomm DSI controller, or software. Automatic brightness. | `backlight { }` / `backlight=` | data |
+| `bsd/dev/board/backlight.c` | Panel brightness: MIPI DCS through a Qualcomm DSI controller, or software. Automatic brightness. With `display-power`: panel sleep/wake and MDSS/DSI/PHY/dispcc power-down while asleep. | `backlight { }` (`display-power` for sleep/power-down) / `backlight=` (`display_sleep=0` keeps panel/MDSS on) | data (`vbif` in `display { }` and `splash-size` in `loader { }` when `display-power` is enabled) |
 | `bsd/dev/board/adreno.c` | Adreno 642/642L and A730 bring-up, diagnostic fill and BoardGPU; the speed by the GPU's load (GMU busy counter), capped by its own sensors; the A730 collapsed between frames and put to deeper slumber while idle. | `gpu-a660`, `gpu-a730` / `gpu=1`, `adreno=`; A730 `gpu_irq=1` (`gpu_irq_wait=0` keeps polling); `gpu-dcvs` (on with `gpu=1`, `gpu_dcvs=0` fixes the speed); `gpu-ifpc` (on with `gpu=1`, `gpu_ifpc=0` keeps the core up); `gpu-slumber` (on with `gpu=1`, `gpu_slumber=0` keeps the GPU awake) | `gpu { }` for the board profile (`speed-bus`: a bus vote for each speed) and `adreno { }` for the block addresses, reserved zap memory and `tsens` |
 | `bsd/dev/board/input.c` | `/dev/hakios-touch`: the queue of touches and button presses every source feeds. | — | any |
 | `bsd/dev/board/goodix.c` | Goodix GT9916 or FocalTech FT3680 touch controller on an SPI serial engine. | `touch-goodix` / `touchscreen=1`; `touchscreen=-1` only looks | part; which engine, its clocks, the pins and the supply are data (`touch { }`) |

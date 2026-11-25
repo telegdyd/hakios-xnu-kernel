@@ -296,6 +296,31 @@ enum { kRefusedNoPanel, kRefusedBlack, kRefusedOffPanel, kRefusedNotGPUDrawn, kR
  * interface's counters, tear check and auto-refresh. Reads only.
  */
 extern "C" bool hakios_display_flip_data(uint64_t * mdss, uint64_t * intf, uint64_t * splash_size);
+__attribute__((weak)) extern "C" void hakios_backlight_display(bool on);
+__attribute__((weak)) extern "C" bool hakios_display_hold(void);
+__attribute__((weak)) extern "C" void hakios_display_release(void);
+static volatile bool gPanelAsleep;
+
+extern "C" void
+hakios_fb_panel_asleep(bool asleep)
+{
+	gPanelAsleep = asleep;
+}
+
+static inline bool
+mdssHold(void)
+{
+	return hakios_display_hold != NULL ? hakios_display_hold() : !gPanelAsleep;
+}
+
+static inline void
+mdssRelease(void)
+{
+	if (hakios_display_release != NULL) {
+		hakios_display_release();
+	}
+}
+
 #define MDSS_WINDOW_FIRST       0x01000                 /* what is mapped of it: the top's interrupts, the pipes, CTLs, mixers */
 #define MDSS_WINDOW_END         0x47000
 #define MDP_INTR_EN             0x01010                 /* (Linux's dpu_hw_interrupts.c, MDP_SSPP_TOP0) */
@@ -435,8 +460,12 @@ sysctl_fb_dpu SYSCTL_HANDLER_ARGS
 	if (!mdssMapped()) {
 		return SYSCTL_OUT(req, "no display-flip on this board\n", 31);
 	}
+	if (!mdssHold()) {
+		return SYSCTL_OUT(req, "the display's hardware is off (the panel asleep)\n", 50);
+	}
 	text = (char *) IOMalloc(size);
 	if (text == NULL) {
+		mdssRelease();
 		return ENOMEM;
 	}
 #define SAY(...) (used += (size_t) snprintf(text + used, used < size ? size - used : 0, __VA_ARGS__), used = used < size ? used : size)
@@ -497,6 +526,7 @@ sysctl_fb_dpu SYSCTL_HANDLER_ARGS
 	SAY("\nINTF in 100 ms: frame_count +%u, tear frames +%u, tear line_count %u\n", intfRead(INTF_FRAME_COUNT) - frames,
 	    ((intfRead(INTF_TEAR_INT_COUNT_VAL) >> 16) - tear) & 0xffff, intfRead(INTF_TEAR_LINE_COUNT));
 #undef SAY
+	mdssRelease();
 	error = SYSCTL_OUT(req, text, used);
 	IOFree(text, size);
 	return error;
@@ -2814,11 +2844,16 @@ IOMobileFramebuffer::flipHome(void)
 	int was = fFlipShown;
 	bool taken;
 
+	if (!mdssHold()) {
+		loader_log_line("fb_flip: at the end the display's hardware is off\n");
+		return;
+	}
 	if (fFlipShown < 0 || fFlipShown > 1 || fBase == NULL) {
 		if (fVideoOn) {
 			fVideoNext.valid = false;
 			mdssWrite(ctl + CTL_FLUSH, videoProgram(-1));
 		}
+		mdssRelease();
 		snprintf(line, sizeof(line), "fb_flip: at the end the controller is on the panel's memory already (%u flips)\n",
 		    fFlipCount);
 		loader_log_line(line);
@@ -2846,6 +2881,7 @@ IOMobileFramebuffer::flipHome(void)
 	snprintf(line, sizeof(line), "fb_flip: at the end the controller back from buffer %d to the panel's memory %#llx: flush "
 	    "%s, pipe source %#x (%u flips)\n", was, fPanelPhys, taken ? "taken" : "NOT taken",
 	    mdssRead(fFlipPipe[0] + SSPP_SRC0_ADDR), fFlipCount);
+	mdssRelease();
 	loader_log_line(line);
 	fFlipShown = -1;
 	fFlipPending = false;
@@ -2960,10 +2996,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 * fb_gpu: the frame into the GPU's ring, behind what drew it; fb_flip: into the buffer the controller does not read,
 	 * once it has left it. A frame the GPU does not take is drawn by the processors below, into the panel's own memory.
 	 */
+	bool mdss = !gPanelAsleep && mdssHold();
 	int target = -1;
 	bool onGPU = false;
 
-	if (gGPUPresent && gFlip && fPanelPhys != 0 && (fFlipTried ? gFlipState == 1 : flipSetUp())) {
+	if (mdss && gGPUPresent && gFlip && fPanelPhys != 0 && (fFlipTried ? gFlipState == 1 : flipSetUp())) {
 		if (fFlipPending && !flipTaken(FLIP_TAKEN_MS)) {
 			flipOff("a flush not taken in 100 ms");
 		} else {
@@ -3162,13 +3199,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 * controller pointed at the buffer once the GPU is done with it, or back at the panel's own memory after the
 	 * processors drew there; after the swap is handed on, so the next frame is drawn meanwhile.
 	 */
-	if (onGPU && fFlipTried && target != fFlipShown) {
+	if (mdss && onGPU && fFlipTried && target != fFlipShown) {
 		if (MiniIOSurfacePresentDone(gLastPresent, FLIP_TAKEN_MS)) {
 			flipTo(target);
 		} else {
 			flipOff("the GPU not done with a frame in 100 ms");
 		}
-	} else if (!onGPU && fFlipTried && fFlipShown >= 0) {
+	} else if (mdss && !onGPU && fFlipTried && fFlipShown >= 0) {
 		flipTo(-1);
 	}
 	drawn = mach_absolute_time();
@@ -3238,7 +3275,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				fStatFlipWait = 0;
 			}
 			/* fb_video: frames with a video on the controller, and whether the panel's interface ran short meanwhile */
-			if (gVideoState == 1 && (fStatVideoFrames != 0 || fVideoOn)) {
+			if (mdss && gVideoState == 1 && (fStatVideoFrames != 0 || fVideoOn)) {
 				bool under = (mdssRead(MDP_INTR_STATUS) & MDP_INTR_INTF1_UNDERRUN) != 0;
 
 				fStatVideoUnderruns += under;
@@ -3306,6 +3343,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatFrames = 0;
 		fStatDrawing = 0;
 		fStatSince = 0;
+	}
+	if (mdss) {
+		mdssRelease();
 	}
 	IOLockUnlock(fLock);
 }
@@ -3661,6 +3701,10 @@ IOMobileFramebufferUserClient::method(uint32_t selector, IOExternalMethodArgumen
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
 	case kFBMethodRequestPowerChange:
+		if (args->scalarInputCount > 0 && hakios_backlight_display != NULL) {
+			hakios_backlight_display(in[0] != 0);
+		}
+		return kIOReturnSuccess;
 	case kFBMethodChangeFrameInfo:
 		return kIOReturnSuccess;
 

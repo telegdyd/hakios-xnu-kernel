@@ -48,6 +48,7 @@ values, and the slider follows the light when brightness is automatic.
 | `bl_bytes=1/2`, `bl_le=1` | per board | Width of the 0x51 parameter; `bl_le=1` sends the least significant byte first |
 | `bl_floor=N` | 24 | `soft` backend: share of each pixel kept at level 0, out of 256 |
 | `bl_trace=1` | 0 | The library logs every CoreBrightness key it sees (to find the keys of a newer Darwin) |
+| `display_sleep=0` | 1 (when `display-power` feature is present) | Keep the panel and MDSS hardware powered on when `hw.backlight.power=0` (brightness-0 blackout only) |
 
 ## sysctl `hw.backlight`
 
@@ -61,6 +62,8 @@ values, and the slider follows the light when brightness is automatic.
 | `raw` | ro | Last value sent to the panel (`dcs`) |
 | `offset` | ro | User's shift of the automatic curve |
 | `backend`, `als` | ro | `dcs`/`soft`/`none`; source of the light readings |
+
+With the `display-power` feature (unless `display_sleep=0`), setting `hw.backlight.power=0` sleeps the panel (DCS `0x28`/`0x10`) and collapses the SM8450 MDSS/VBIF/DSI/PHY/PLL/dispcc clocks and GDSCs, and setting `hw.backlight.power=1` restores the clocks, PHY/PLL, DSI controller, and `kPanelOn` init sequence. Kernel sysctls `kern.hakios.display_power_cycle` (rw: wait milliseconds between sleep and wake) and `kern.hakios.display_power_stats` (ro) exercise and report sleep/wake transitions.
 
 ## Automatic brightness
 

@@ -66,6 +66,7 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <sys/kauth.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 
@@ -98,6 +99,11 @@ struct bl_profile {
 	/* the clocks the DSI controller's registers need (the same chain as the display scan) */
 	uint32_t gcc, gcc_disp_ahb_cbcr;
 	uint32_t dispcc, dispcc_core_gdscr, dispcc_ahb_cbcr;
+	/* display-power: panel sleep/wake and SM8450 MDSS/DSI hardware power-down */
+	uint32_t mdss, intf, vbif;
+	uint64_t splash_base;
+	uint32_t splash_size;
+	bool has_display_power;
 };
 
 /* the profile in use: the board's, with the boot-args over it */
@@ -140,6 +146,12 @@ bl_choose(void)
 		profile.dispcc = board->clocks.dispcc;
 		profile.dispcc_core_gdscr = board->clocks.dispcc_mdss_gdscr;
 		profile.dispcc_ahb_cbcr = board->clocks.dispcc_mdss_ahb_cbcr;
+		profile.mdss = board->display.mdss;
+		profile.intf = board->display.intf;
+		profile.vbif = board->display.vbif;
+		profile.splash_base = board->display.splash_base;
+		profile.splash_size = board->display.splash_size;
+		profile.has_display_power = hakios_board_has(HAKIOS_HAS_DISPLAY_POWER);
 	}
 	if (!PE_parse_boot_argn("backlight", &mode, sizeof(mode))) {
 		mode = 0;
@@ -199,6 +211,19 @@ static uint32_t unsent;                         /* backend dcs: commands not sen
 static bool error_said;                         /* backend dcs: the controller's error said, for the commands since */
 static int poke;                                /* the thread's wait channel */
 static void (*soft_redraw)(void);
+/* Boot-arg display_sleep=0: disable panel sleep/wake on display-power boards (DBV 0 only; default 1). */
+static TUNABLE(uint32_t, display_sleep_arg, "display_sleep", 1);
+static LCK_MTX_DECLARE(dsi_lock, &bl_lock_group);
+static LCK_MTX_DECLARE(dp_cycle_lock, &bl_lock_group);
+static vm_offset_t intf, dsi_buf;
+static uint64_t dsi_buf_phys;
+static bool dsi_buf_failed, can_sleep;
+static volatile bool panel_asleep;
+static uint32_t sleep_autorefresh, dp_tries;
+static uint32_t wake_sent, wake_failed, wake_frames;
+static bool dp_cycle_busy, dp_cycle_done;
+static uint32_t dp_cycle_ms;
+static int dp_cycle_rc;
 
 static volatile uint32_t pokes;                 /* how many times it was poked: what a turn of the thread read may be older */
 
@@ -217,17 +242,23 @@ bl_poke(void)
 #define   DSI_CTRL_VIDEO_MODE           (1u << 1)
 #define   DSI_CTRL_CMD_MODE             (1u << 2)
 #define DSI_STATUS                      0x008
+#define   DSI_STATUS_CMD_DMA_BUSY       (1u << 1)
 #define   DSI_STATUS_CMD_MDP_BUSY       (1u << 2)
 #define DSI_COMMAND_MODE_DMA_CTRL       0x03c
 #define   DMA_CTRL_EMBEDDED             (1u << 28)
 #define   DMA_CTRL_LOW_POWER            (1u << 26)
 #define   DMA_CTRL_BROADCAST            (3u << 30)
+#define DSI_DMA_CMD_OFFSET              0x048
 #define DSI_DMA_CMD_LENGTH              0x04c
+#define DSI_DMA_FIFO_CTRL               0x050
+#define DSI_TRIG_CTRL                   0x084
+#define   DSI_TRIGGER_SW                4u
 #define DSI_CMD_MODE_DMA_SW_TRIGGER     0x090
 #define DSI_INT_CTRL                    0x110
 #define   INT_CMD_DMA_DONE              (1u << 0)
 #define   INT_VIDEO_DONE                (1u << 16)
 #define   INT_ERROR                     (1u << 24)
+#define   DSI_INT_ENABLES               0xaaaaaaaau
 /* the status bits of INT_CTRL (written 1: cleared); the others enable interrupts and are kept as they are */
 #define   INT_STATUS_BITS               (0x1u | 0x100u | 0x400u | 0x1000u | 0x4000u | 0x10000u | 0x100000u | \
 	                                 0x1000000u | 0x10000000u | 0x40000000u)
@@ -236,6 +267,11 @@ bl_poke(void)
 #define DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL 0x17c
 #define DSI_TPG_DMA_FIFO_RESET          0x1ec
 #define DSI_SIZE                        0x400
+#define DSI_MAX_PAYLOAD                 60
+#define DSI_MEM_MAX_PAYLOAD             1024
+#define DSI_CMD_BUFFER_SIZE             0x4000
+#define INTF_FRAME_COUNT                0x0ac
+#define INTF_TEAR_AUTOREFRESH_CONFIG    0x2b4
 
 #define CBCR_ENABLE                     (1u << 0)
 #define CBCR_OFF                        (1u << 31)
@@ -247,6 +283,9 @@ static vm_offset_t dsi, gcc, dispcc;
 #define HAKIOS_MMIO_SYNC
 #include "mmio.h"
 #include "time.h"
+
+SYSCTL_DECL(_kern_hakios);
+#include "display_power.h"
 
 /*
  * May the DSI controller's registers be touched now? The display block powered, the bus clock of its
@@ -329,6 +368,20 @@ dcs_start(void)
 		    control & DSI_CTRL_VIDEO_MODE ? "video" : "command", profile.video_mode ? "video" : "command");
 		profile.video_mode = (control & DSI_CTRL_VIDEO_MODE) != 0;
 	}
+	if (profile.has_display_power && mode >= 2) {
+		if (profile.intf != 0) {
+			intf = ml_io_map((vm_offset_t)(profile.intf & ~0x3fffu), 0x4000) + (profile.intf & 0x3fffu);
+		}
+		if (profile.splash_base != 0 && profile.splash_size >= DSI_CMD_BUFFER_SIZE) {
+			dsi_buf_phys = profile.splash_base + profile.splash_size - DSI_CMD_BUFFER_SIZE;
+			dsi_buf = ml_io_map_wcomb((vm_offset_t)dsi_buf_phys, DSI_CMD_BUFFER_SIZE);
+		}
+		can_sleep = display_sleep_arg != 0 && intf != 0 && dsi_buf != 0;
+		say("backlight: display sleep %s (buffer %#llx %s, intf %#x %s); display hardware power-down: %s\n",
+		    can_sleep ? "on" : "off", (unsigned long long)dsi_buf_phys,
+		    dsi_buf != 0 ? "mapped" : "NOT mapped", profile.intf, intf != 0 ? "mapped" : "NOT mapped",
+		    can_sleep && dp_enabled() ? "on" : "off");
+	}
 	return true;
 }
 
@@ -365,21 +418,33 @@ static bool found_known, found_cmd_mode;
 static uint32_t found_dma_control;
 
 static bool
-dcs_send(uint32_t raw)
+dcs_send_mode(uint32_t raw, bool quiescing)
 {
 	uint32_t words[4], length = 0, control, dma_control;
 	unsigned n = bl_dcs_brightness_words(raw, profile.bytes, profile.little_endian, 0, words, &length);
 	bool sent, error;
 	uint64_t began = now_us();
 
+	if (n == 0) {
+		return false;
+	}
+	if (!quiescing) {
+		lck_mtx_lock(&dsi_lock);
+	}
 	/* (`broken' is the caller's to look at: the run's end tries once more even so) */
-	if (n == 0 || !dsi_reachable(true)) {
+	if (!dp_regs_on() || !dsi_reachable(true)) {
+		if (!quiescing) {
+			lck_mtx_unlock(&dsi_lock);
+		}
 		return false;
 	}
 	control = rd(dsi + DSI_CTRL);
 	if (!(control & DSI_CTRL_ENABLE)) {
 		say("backlight: dcs: the controller has been switched off: no more commands this run\n");
 		broken = true;
+		if (!quiescing) {
+			lck_mtx_unlock(&dsi_lock);
+		}
 		return false;
 	}
 	if (profile.video_mode) {
@@ -437,6 +502,9 @@ dcs_send(uint32_t raw)
 		broken = broken || ++unsent >= DCS_UNSENT_MAX;
 		say("backlight: dcs: brightness %u NOT SENT in 20 ms (int %#x, status %#x)%s\n", raw, rd(dsi + DSI_INT_CTRL),
 		    rd(dsi + DSI_STATUS), broken ? ": no more commands this run" : "");
+		if (!quiescing) {
+			lck_mtx_unlock(&dsi_lock);
+		}
 		return false;
 	}
 	unsent = 0;
@@ -447,7 +515,157 @@ dcs_send(uint32_t raw)
 	}
 	error_said = error;
 	(void)began;
+	if (!quiescing) {
+		lck_mtx_unlock(&dsi_lock);
+	}
 	return true;
+}
+
+static bool
+dcs_send(uint32_t raw)
+{
+	return dcs_send_mode(raw, false);
+}
+
+static bool
+dsi_long_type(uint8_t type)
+{
+	return type == 0x39 || type == 0x29 || type == 0x0a;
+}
+
+/*
+ * Send one DSI packet on virtual channel 0 (short 0x05/0x15 or long 0x39/0x29/0x0a),
+ * using the TPG DMA FIFO up to 60 bytes and memory DMA from dsi_buf above that.
+ */
+static int
+dsi_packet(uint8_t type, const uint8_t *buf, uint32_t len, bool low_power, bool spin)
+{
+	uint32_t words[2 + DSI_MAX_PAYLOAD / 4];
+	uint32_t n = 0, i, bytes;
+	bool is_long = dsi_long_type(type), memory = is_long && len > DSI_MAX_PAYLOAD;
+	int rc = 0;
+
+	if (dsi == 0 || len == 0 || (!is_long && len > 2) || len > DSI_MEM_MAX_PAYLOAD ||
+	    (memory && (dsi_buf == 0 || dsi_buf_failed))) {
+		return -1;
+	}
+	if (!is_long) {
+		words[n++] = (1u << 31) | ((uint32_t)type << 16) | (len == 2 ? (uint32_t)buf[1] << 8 : 0u) | buf[0];
+		bytes = 4;
+		words[n++] = 0;
+	} else if (!memory) {
+		words[n++] = (1u << 31) | (1u << 30) | ((uint32_t)type << 16) | len;
+		for (i = 0; i < len; i += 4) {
+			uint32_t w = 0;
+			for (uint32_t b = 0; b < 4 && i + b < len; b++) {
+				w |= (uint32_t)buf[i + b] << (8 * b);
+			}
+			words[n++] = w;
+		}
+		bytes = n * 4;
+		if (n & 1u) {
+			words[n++] = 0;
+		}
+	} else {
+		bytes = 4 + ((len + 3) & ~3u);
+	}
+
+	if (!spin) {
+		lck_mtx_lock(&dsi_lock);
+	}
+	if (broken || !dp_regs_on() || !dsi_reachable(true)) {
+		if (!spin) {
+			lck_mtx_unlock(&dsi_lock);
+		}
+		return -1;
+	}
+	for (i = 0; i < 250 && (rd(dsi + DSI_STATUS) & DSI_STATUS_CMD_DMA_BUSY); i++) {
+		delay(20);
+	}
+	if (rd(dsi + DSI_STATUS) & DSI_STATUS_CMD_DMA_BUSY) {
+		rc = -2;
+	} else {
+		uint32_t tpg, dma, trig, fifo, ctrl;
+		bool done;
+
+		for (i = 0; i < 1000 && (rd(dsi + DSI_STATUS) & DSI_STATUS_CMD_MDP_BUSY); i++) {
+			delay(20);
+		}
+		tpg = rd(dsi + DSI_TEST_PATTERN_GEN_CTRL);
+		dma = rd(dsi + DSI_COMMAND_MODE_DMA_CTRL);
+		trig = rd(dsi + DSI_TRIG_CTRL);
+		fifo = rd(dsi + DSI_DMA_FIFO_CTRL);
+		ctrl = (dma & ~(DMA_CTRL_BROADCAST | DMA_CTRL_LOW_POWER)) | DMA_CTRL_EMBEDDED |
+		    (low_power ? DMA_CTRL_LOW_POWER : 0u);
+		if ((trig & 0xfu) != DSI_TRIGGER_SW) {
+			wr(dsi + DSI_TRIG_CTRL, (trig & ~0xfu) | DSI_TRIGGER_SW);
+		}
+		int_clear(INT_CMD_DMA_DONE | INT_ERROR);
+		if (memory) {
+			volatile uint8_t *bufp = (volatile uint8_t *)dsi_buf;
+			uint32_t header = (1u << 31) | (1u << 30) | ((uint32_t)type << 16) | len;
+
+			for (uint32_t b = 0; b < 4; b++) {
+				bufp[b] = (uint8_t)(header >> (8 * b));
+			}
+			for (uint32_t b = 0; b < bytes - 4; b++) {
+				bufp[4 + b] = b < len ? buf[b] : 0xff;
+			}
+#if !defined(HAKIOS_MMIO_TEST)
+			__builtin_arm_dsb(0xf);
+#endif
+			wr(dsi + DSI_TEST_PATTERN_GEN_CTRL, 0);
+			wr(dsi + DSI_COMMAND_MODE_DMA_CTRL, ctrl & ~((1u << 24) | (1u << 29)));
+			wr(dsi + DSI_DMA_FIFO_CTRL, fifo | (1u << 20) | (1u << 16));
+			wr(dsi + DSI_DMA_CMD_OFFSET, (uint32_t)dsi_buf_phys);
+			wr(dsi + DSI_DMA_CMD_LENGTH, bytes & 0xffffffu);
+		} else {
+			wr(dsi + DSI_TEST_PATTERN_GEN_CTRL, 0);
+			wr(dsi + DSI_TPG_DMA_FIFO_RESET, 1);
+			delay(1);
+			wr(dsi + DSI_TPG_DMA_FIFO_RESET, 0);
+			wr(dsi + DSI_TEST_PATTERN_GEN_CTRL, TPG_CMD_DMA_FIFO);
+			for (uint32_t w = 0; w < n; w++) {
+				wr(dsi + DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL, words[w]);
+			}
+			wr(dsi + DSI_COMMAND_MODE_DMA_CTRL, ctrl);
+			wr(dsi + DSI_DMA_CMD_LENGTH, bytes);
+		}
+		wr(dsi + DSI_CMD_MODE_DMA_SW_TRIGGER, 1);
+		done = int_wait(INT_CMD_DMA_DONE, 25000);
+		int_clear(INT_CMD_DMA_DONE);
+		wr(dsi + DSI_TEST_PATTERN_GEN_CTRL, 0);
+		wr(dsi + DSI_TPG_DMA_FIFO_RESET, 1);
+		delay(1);
+		wr(dsi + DSI_TPG_DMA_FIFO_RESET, 0);
+		wr(dsi + DSI_TEST_PATTERN_GEN_CTRL, tpg);
+		wr(dsi + DSI_COMMAND_MODE_DMA_CTRL, dma);
+		if (memory) {
+			wr(dsi + DSI_DMA_FIFO_CTRL, fifo);
+		}
+		if ((trig & 0xfu) != DSI_TRIGGER_SW) {
+			wr(dsi + DSI_TRIG_CTRL, trig);
+		}
+		if (!done) {
+			rc = -3;
+			dsi_buf_failed = dsi_buf_failed || memory;
+		}
+	}
+	if (rc != 0) {
+		unsent++;
+		say("backlight: DSI packet %#04x %#04x (%u bytes%s) failed %d, status %#010x int %#010x (failure %u)\n", type,
+		    buf[0], len, memory ? ", from memory" : "", rc, rd(dsi + DSI_STATUS), rd(dsi + DSI_INT_CTRL), unsent);
+		if (unsent >= DCS_UNSENT_MAX) {
+			broken = true;
+			say("backlight: three DSI commands failed in a row; none sent until the next boot\n");
+		}
+	} else {
+		unsent = 0;
+	}
+	if (!spin) {
+		lck_mtx_unlock(&dsi_lock);
+	}
+	return rc;
 }
 
 /* ---- the light, followed ------------------------------------------------------------------------- */
@@ -525,6 +743,158 @@ apply_dark(void)
 
 #define TICK_MS         50
 
+extern void hakios_fb_panel_asleep(bool asleep) __attribute__((weak));
+
+static void
+sleep_panel(void)
+{
+	uint64_t began = now_us();
+	uint8_t off = 0x28, enter = 0x10;
+	uint32_t autorefresh, i;
+	int rc;
+
+	if (hakios_fb_panel_asleep != NULL) {
+		hakios_fb_panel_asleep(true);
+	}
+	sleep_ms(20);
+	autorefresh = rd(intf + INTF_TEAR_AUTOREFRESH_CONFIG);
+	if (autorefresh & (1u << 31)) {
+		sleep_autorefresh = autorefresh;
+		wr(intf + INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh & ~(1u << 31));
+	}
+	for (i = 0; i < 50 && (rd(dsi + DSI_STATUS) & DSI_STATUS_CMD_MDP_BUSY); i++) {
+		sleep_ms(1);
+	}
+	if (rd(dsi + DSI_STATUS) & DSI_STATUS_CMD_MDP_BUSY) {
+		say("backlight: display off: a frame still in flight after 50 ms (DSI status %#x)\n", rd(dsi + DSI_STATUS));
+	}
+	rc = dsi_packet(0x05, &off, 1, true, false);
+	sleep_ms(21);
+	rc = rc != 0 ? rc : dsi_packet(0x05, &enter, 1, true, false);
+	sleep_ms(101);
+	panel_asleep = true;
+	say("backlight: display off: panel asleep in %llu ms (DCS 0x28 0x10 %s)\n", (unsigned long long)((now_us() - began) / 1000),
+	    rc == 0 ? "ok" : "FAILED");
+}
+
+static void
+wake_panel(bool spin)
+{
+	uint64_t began = now_us();
+	uint32_t autorefresh = rd(intf + INTF_TEAR_AUTOREFRESH_CONFIG), sent = 0, failed = 0, i = 0, j = 0;
+	int first = 0;
+
+	if (!(autorefresh & (1u << 31)) && (sleep_autorefresh & (1u << 31))) {
+		autorefresh = sleep_autorefresh;
+	}
+	if (rd(intf + INTF_TEAR_AUTOREFRESH_CONFIG) & (1u << 31)) {
+		wr(intf + INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh & ~(1u << 31));
+	}
+	while (i + 2 <= sizeof(kPanelOn)) {
+		uint8_t type = kPanelOn[i], len = kPanelOn[i + 1];
+
+		if (type == 0xff) {
+			hakios_wait_ms(len, spin);
+			i += 2;
+			continue;
+		}
+		if (i + 2 + len > sizeof(kPanelOn)) {
+			break;
+		}
+		int rc = dsi_packet(type, &kPanelOn[i + 2], len, true, spin);
+
+		if (rc == 0) {
+			sent++;
+		} else {
+			failed++;
+			first = first != 0 ? first : rc;
+		}
+		i += 2 + len;
+	}
+	if (autorefresh & (1u << 31)) {
+		wr(intf + INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh);
+	}
+	uint32_t frames0 = rd(intf + INTF_FRAME_COUNT);
+	hakios_wait_ms(50, spin);
+	uint32_t frames = rd(intf + INTF_FRAME_COUNT) - frames0;
+	if (frames == 0 && (autorefresh & (1u << 31))) {
+		wr(intf + INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh & ~(1u << 31));
+		delay(100);
+		wr(intf + INTF_TEAR_AUTOREFRESH_CONFIG, autorefresh);
+		if (dp_stat.ups != 0 && dp_mdss != 0) {
+			wr(dp_mdss + 0x1601c, 1);
+		}
+		frames0 = rd(intf + INTF_FRAME_COUNT);
+		hakios_wait_ms(50, spin);
+		frames = rd(intf + INTF_FRAME_COUNT) - frames0;
+		j = 1;
+	}
+	panel_asleep = false;
+	shown_raw = 0;
+	wake_sent = sent;
+	wake_failed = failed;
+	wake_frames = frames;
+	if (hakios_fb_panel_asleep != NULL) {
+		hakios_fb_panel_asleep(false);
+	}
+	say("backlight: display on: panel woken in %llu ms (%u of %u packets%s, error %d; auto-refresh %#x; in 50 ms "
+	    "%u frames%s; CTL0 flush now %#x)\n", (unsigned long long)((now_us() - began) / 1000), sent,
+	    (uint32_t)PANEL_ON_PACKETS, failed ? " FAILED" : "", first, autorefresh, frames,
+	    j ? ", auto-refresh re-armed" : "", dp_mdss != 0 ? rd(dp_mdss + 0x16018) : 0);
+}
+
+static void
+complete_power_cycle(int rc)
+{
+	lck_mtx_lock(&dp_cycle_lock);
+	dp_cycle_ms = 0;
+	dp_cycle_rc = rc;
+	dp_cycle_done = true;
+	lck_mtx_unlock(&dp_cycle_lock);
+	thread_wakeup((event_t)&dp_cycle_done);
+}
+
+static void
+run_power_cycle(uint32_t ms)
+{
+	bool again, good;
+
+	if (!can_sleep || !panel_asleep) {
+		snprintf(dp_stat.cycle, sizeof(dp_stat.cycle), "not tried: the panel is not asleep");
+		complete_power_cycle(EIO);
+		return;
+	}
+	if (!dp_down()) {
+		dp_stat.cycle_failed++;
+		snprintf(dp_stat.cycle, sizeof(dp_stat.cycle), "FAILED: not powered down (%s)", dp_stat.why);
+		complete_power_cycle(EIO);
+		return;
+	}
+	sleep_ms(ms);
+	dp_up();
+	if (!dp_regs_on()) {
+		dp_stat.cycles++;
+		dp_stat.cycle_failed++;
+		snprintf(dp_stat.cycle, sizeof(dp_stat.cycle), "FAILED: the display did not come back on (%s)", dp_stat.why);
+		say("display power: cycle %s\n", dp_stat.cycle);
+		complete_power_cycle(EIO);
+		return;
+	}
+	wake_panel(false);
+	sleep_panel();
+	again = dp_down();
+	dp_stat.cycles++;
+	dp_stat.cycle_frames += wake_frames;
+	good = wake_failed == 0 && wake_frames != 0 && !dp_broken && again;
+	if (!good) {
+		dp_stat.cycle_failed++;
+	}
+	snprintf(dp_stat.cycle, sizeof(dp_stat.cycle), "%s: %u ms off, woken with %u of %u packets and %u frames in 50 ms; off "
+	    "again %s", good ? "ok" : "FAILED", ms, wake_sent, (uint32_t)PANEL_ON_PACKETS, wake_frames, again ? "yes" : "NO");
+	say("display power: cycle %s\n", dp_stat.cycle);
+	complete_power_cycle(0);
+}
+
 static void
 bl_thread(__unused void *argument, __unused wait_result_t result)
 {
@@ -540,17 +910,33 @@ bl_thread(__unused void *argument, __unused wait_result_t result)
 		 * and the next turn sees it).
 		 */
 		uint32_t seen = pokes, on = power, cap = thermal_cap, lux = ambient_mlx, goal, want;
+		uint32_t cycle_ms = __atomic_load_n(&dp_cycle_ms, __ATOMIC_ACQUIRE);
 		bool by_hand = automatic == 0;
 
 		want = by_hand ? user_level : bl_auto_target(lux, auto_offset);
 		if (on == 0) {
+			bool retry_dp = false;
+
 			/* dark once the panel was told; until then tried again every tick (no use once broken) */
 			if (!dark) {
 				dark = apply_dark();
 			}
+			if (dark && can_sleep && !panel_asleep) {
+				sleep_panel();
+				dp_tries = 0;
+			}
+			if (can_sleep && panel_asleep && !dp_down() && dp_retry() && dp_tries++ < 3) {
+				retry_dp = true;
+			}
+			if (cycle_ms != 0) {
+				run_power_cycle(cycle_ms);
+				continue;
+			}
 			behind = true;                  /* lit again at once, where it was, when it is switched on */
-			if (dark || broken) {
+			if ((dark || broken) && (!can_sleep || panel_asleep) && !retry_dp) {
 				assert_wait(&poke, THREAD_UNINT);
+			} else if (retry_dp) {
+				assert_wait_timeout(&poke, THREAD_UNINT, 2000, NSEC_PER_MSEC);
 			} else {
 				assert_wait_timeout(&poke, THREAD_UNINT, TICK_MS, NSEC_PER_MSEC);
 			}
@@ -560,6 +946,21 @@ bl_thread(__unused void *argument, __unused wait_result_t result)
 			}
 			thread_block(THREAD_CONTINUE_NULL);
 			continue;
+		}
+		if (cycle_ms != 0) {
+			run_power_cycle(cycle_ms);
+		}
+		if (panel_asleep) {
+			dp_up();
+			if (dp_regs_on()) {
+				wake_panel(false);
+			} else {
+				panel_asleep = false;
+				if (hakios_fb_panel_asleep != NULL) {
+					hakios_fb_panel_asleep(false);
+				}
+			}
+			behind = true;
 		}
 		dark = false;
 
@@ -645,7 +1046,64 @@ hakios_als_report(uint32_t millilux, const char *source)
 	}
 }
 
-/* ---- sysctl hw.backlight ------------------------------------------------------------------------ */
+/* the display driver: RequestPowerChange (0 off, 1 on; preserves dimmed=2 when already on) */
+void
+hakios_backlight_display(bool on)
+{
+	uint32_t want;
+
+	if (!chosen || profile.backend == BL_NONE) {
+		return;
+	}
+	want = on ? 1u : 0u;
+	if ((on && power == 0) || (!on && power != 0)) {
+		power = want;
+		say("backlight: display %s (RequestPowerChange)\n", on ? "on" : "off");
+		bl_poke();
+	}
+}
+
+/* ---- sysctl hw.backlight and kern.hakios.display_power_cycle ------------------------------------- */
+
+static int
+display_power_cycle_sysctl(struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	uint32_t ms = dp_stat.cycles;
+	int error = sysctl_io_number(req, ms, sizeof(ms), &ms, NULL);
+	int changed = req->newptr != USER_ADDR_NULL;
+
+	if (error != 0 || !changed) {
+		return error;
+	}
+	if (suser(kauth_cred_get(), NULL) != 0) {
+		return EPERM;
+	}
+	if (ms == 0 || ms > 60000 || profile.backend != BL_DCS || !can_sleep) {
+		return EINVAL;
+	}
+	lck_mtx_lock(&dp_cycle_lock);
+	while (dp_cycle_busy) {
+		lck_mtx_sleep(&dp_cycle_lock, LCK_SLEEP_DEFAULT, (event_t)&dp_cycle_busy, THREAD_UNINT);
+	}
+	dp_cycle_busy = true;
+	dp_cycle_done = false;
+	dp_cycle_rc = 0;
+	__atomic_store_n(&dp_cycle_ms, ms, __ATOMIC_RELEASE);
+	lck_mtx_unlock(&dp_cycle_lock);
+	bl_poke();
+	lck_mtx_lock(&dp_cycle_lock);
+	while (!dp_cycle_done) {
+		lck_mtx_sleep(&dp_cycle_lock, LCK_SLEEP_DEFAULT, (event_t)&dp_cycle_done, THREAD_UNINT);
+	}
+	error = dp_cycle_rc;
+	dp_cycle_busy = false;
+	lck_mtx_unlock(&dp_cycle_lock);
+	thread_wakeup((event_t)&dp_cycle_busy);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, display_power_cycle, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    display_power_cycle_sysctl, "IU", "write ms with the panel asleep: the display off, that long, on, woken, asleep, off "
+    "(read: cycles done; the result in display_power_stats)");
 
 SYSCTL_NODE(_hw, OID_AUTO, backlight, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "the panel's light");
 
@@ -753,6 +1211,25 @@ hakios_backlight_init(void)
 }
 
 /*
+ * At the run's end (and on a panic's way out), before hakios_fb_quiesce(): if the panel is asleep
+ * or the display hardware powered down, bring MDSS/DSI and the panel back so fb_flip can return
+ * to the panel's memory and the loader sees a lit display. One core, interrupts off.
+ */
+void
+hakios_display_power_quiesce(void)
+{
+	if (profile.backend != BL_DCS || !panel_asleep) {
+		return;
+	}
+	if (!dp_regs_on()) {
+		dp_up();
+	}
+	if (dp_regs_on()) {
+		wake_panel(true);
+	}
+}
+
+/*
  * At the run's end (and on a panic's way out): the panel left lit for the loader and whatever comes next (also when it was dark).
  * Tried also when the backend stopped for the run: a dark panel is worse than one more command the controller may not
  * send, and a send has its own limits of time.
@@ -760,10 +1237,10 @@ hakios_backlight_init(void)
 void
 hakios_backlight_quiesce(void)
 {
-	if (profile.backend != BL_DCS || profile.raw_restore == 0) {
+	if (profile.backend != BL_DCS || profile.raw_restore == 0 || !dp_regs_on()) {
 		return;
 	}
-	if (dcs_send(profile.raw_restore)) {
+	if (dcs_send_mode(profile.raw_restore, true)) {
 		say("backlight: at the run's end: the panel back at %u\n", profile.raw_restore);
 	}
 }

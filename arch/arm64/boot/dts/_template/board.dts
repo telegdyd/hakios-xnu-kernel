@@ -21,7 +21,10 @@
 	// display-scan    a command-mode panel: frames are written ahead of its readout, read from the DSI
 	// interface's counters (fb_scan); needs intf1 in the SoC file's display { }
 	// display-flip    frames shown by flipping the display controller between two buffers the GPU draws into
-	// (fb_flip, with gpu=1); needs display { } here and mdss and intf1 in the SoC file's display { }
+	//                 (fb_flip, with gpu=1); needs display { } here and mdss and intf1 in the SoC file's display { }
+	// display-power   panel sleep/wake (DCS 0x28/0x10 and Samsung AMB670YF08 on-sequence) and MDSS/DSI hardware
+	//                 power-down while the panel sleeps (backlight=2, display_power_down); needs vbif, mdss, intf1
+	//                 and clocks { } in the SoC file and display { splash-size } and loader { fb-base } here
 	// virtio          an emulator's virtio devices (network, tablet, keyboard): for QEMU's board, not a phone
 	// gpu-a660        an Adreno of the A660 family (642, 642L, 643, 660 ...) behind a GMU (gpu=1); needs gpu { }
 	// gpu-a730        an Adreno 730 (gen7) behind a GMU: the same gpu { }, steps 1 to 10 so far (adreno=10)

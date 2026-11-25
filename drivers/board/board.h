@@ -57,6 +57,9 @@ enum {
 	HAKIOS_HAS_GPU_SLUMBER  = 1u << 27,     /* deeper idle collapse of a kept A730 after 1 s without work: GMU, SMMU
 	                                         * and CX off, client allocations and fences kept (board/adreno.c,
 	                                         * gpu_slumber) */
+	HAKIOS_HAS_DISPLAY_POWER = 1u << 28,    /* panel sleep/wake (DCS 0x28/0x10 and the Samsung AMB670YF08's
+	                                         * on-sequence) and SM8450 MDSS/DSI hardware power-down while the panel
+	                                         * sleeps (board/backlight.c, display_power_down) */
 	/*
 	 * Drivers of one part, wired the way one phone has it (the pins, the bus, the chip): a board lists
 	 * one only if it has that part wired that way. Asked for on any other board, the driver says so and
@@ -132,7 +135,9 @@ struct hakios_board {
 	struct {
 		uint32_t intf;                  /* the interface the panel hangs on (INTF_*): its timing and counters */
 		uint32_t mdss;                  /* the display subsystem's registers (its "mdss_mdp" reg): display-flip */
+		uint32_t vbif;                  /* the display VBIF (mdss_mdp's "vbif_phys" reg): display-power */
 		uint32_t splash_size;           /* board: the firmware's display memory from the panel's on (cont_splash_region) */
+		uint64_t splash_base;           /* board: loader { fb-base } (where cont_splash_region starts) */
 	} display;
 
 	/* the panel's light (board: backlight { }; soc: display { }) */

@@ -17,22 +17,38 @@ extern char log_text[];
 
 /* ---- the hardware's model ----------------------------------------------------------------------- */
 
+#define MDSS_BASE       0x0ae00000u
+#define INTF_BASE       0x0ae36000u
 #define DSI_BASE        0x0ae94000u
+#define VBIF_BASE       0x0aeb0000u
 #define GCC_BASE        0x00100000u
 #define DISPCC_BASE     0x0af00000u
+#define DP_SPLASH_BASE  0xb8000000u
+#define DP_SPLASH_SIZE  0x02b00000u
+#define DP_CMD_BUF_PHYS (DP_SPLASH_BASE + DP_SPLASH_SIZE - 0x4000u)
+
+static uint8_t dp_dma_buf[0x4000];
+static uint32_t dp_mdss_regs[0x90000 / 4];
+static uint32_t dp_vbif_regs[0x2000 / 4];
+static uint32_t dp_dsi_regs[0x1000 / 4];
+static uint32_t dp_dispcc_regs[0x20000 / 4];
 
 struct dsi_model {
-	uint32_t version, ctrl, status, dma_ctrl, length, tpg, int_enables, int_status;
-	uint32_t fifo[16];
+	uint32_t version, ctrl, status, dma_ctrl, dma_offset, dma_fifo, trig_ctrl, length, tpg, int_enables, int_status;
+	uint32_t fifo[64];
 	unsigned fifo_n;
 	bool deaf;                      /* never says a command was sent */
 	unsigned deaf_for;              /* ... or not for so many commands, from the next on */
 	bool erring;                    /* every command ends with the error bit (INT_CTRL bit 24) set */
+	bool display_power;             /* SM8450 display-power hardware model enabled for this scenario */
 	unsigned reads_since_clear;     /* (video mode: a frame ends a few reads after VIDEO_DONE was cleared) */
 	unsigned busy_reads;            /* (command mode: so many reads of STATUS busy after a command) */
 	/* what the panel was sent */
 	uint32_t sent[4096];
 	unsigned sent_n;
+	uint8_t lp_cmds[256];
+	unsigned lp_packets, mem_dma_count, mem_dma_len;
+	uint8_t mem_dma_cmd;
 	unsigned errors;                /* something done out of the protocol */
 	char error[160];
 	unsigned accesses;
@@ -42,7 +58,7 @@ struct dsi_model {
 } m;
 
 struct clock_model {
-	uint32_t gcc_disp_ahb, gdsc, ahb;
+	uint32_t gcc_disp_ahb, gcc_hf_axi, gcc_sf_axi, gdsc, ahb;
 	uint32_t gdsc_offset, ahb_offset;
 } c;
 
@@ -54,12 +70,13 @@ model_error(const char *what)
 	fprintf(stderr, "MODEL: %s\n", what);
 }
 
-/* the command in the FIFO, read as the controller would, then what the panel does with it */
+/* the command in the FIFO or memory DMA buffer, read as the controller would, then what the panel does with it */
 static void
 model_trigger(void)
 {
-	uint8_t b[64];
+	uint8_t b[256];
 	unsigned type;
+	bool memory = m.display_power && m.tpg == 0 && m.dma_offset == DP_CMD_BUF_PHYS;
 
 	if ((m.ctrl & 1) == 0) {
 		model_error("triggered with the controller off");
@@ -67,13 +84,13 @@ model_trigger(void)
 	if ((m.ctrl & 4) == 0) {
 		model_error("triggered without the command engine");
 	}
-	if (m.tpg != ((1u << 1) | (1u << 2) | (3u << 16))) {
+	if (!memory && m.tpg != ((1u << 1) | (1u << 2) | (3u << 16))) {
 		model_error("triggered without the TPG DMA FIFO selected");
 	}
 	if ((m.dma_ctrl & (1u << 28)) == 0 || (m.dma_ctrl & (3u << 30)) != 0) {
 		model_error("triggered without embedded mode, or broadcast");
 	}
-	if (m.dma_ctrl & (1u << 26)) {
+	if ((m.dma_ctrl & (1u << 26)) && !m.display_power) {
 		model_error("triggered in low power mode: a panel takes its brightness at high speed");
 	}
 	/* a command goes between two frames: after one's end (video), not while one is on its way (command) */
@@ -87,29 +104,59 @@ model_trigger(void)
 		model_error("the FIFO was not emptied after the command before");
 	}
 	m.to_be_emptied = true;
-	if (m.fifo_n == 0 || (m.fifo_n & 1) != 0 || m.length == 0 || m.length > m.fifo_n * 4 || (m.length & 3) != 0) {
-		model_error("FIFO words and length do not agree");
-	}
 	m.cmd_mode_during_send = (m.ctrl & 4) != 0;
-	for (unsigned i = 0; i < m.fifo_n && i < 16; i++) {
-		memcpy(b + 4 * i, &m.fifo[i], 4);
+	if (memory) {
+		if (m.length == 0 || m.length > sizeof(b) || (m.length & 3) != 0) {
+			model_error("memory DMA length out of range");
+			return;
+		}
+		memcpy(b, dp_dma_buf, m.length);
+	} else {
+		if (m.fifo_n == 0 || (m.fifo_n & 1) != 0 || m.length == 0 || m.length > m.fifo_n * 4 || (m.length & 3) != 0) {
+			model_error("FIFO words and length do not agree");
+		}
+		for (unsigned i = 0; i < m.fifo_n && i < 64; i++) {
+			memcpy(b + 4 * i, &m.fifo[i], 4);
+		}
 	}
 	type = b[2] & 0x3f;
 	if ((b[3] & 0x80) == 0) {
 		model_error("not marked the last command");
 	}
 	if (type == 0x39) {
-		unsigned wc = b[0] | b[1] << 8;
+		unsigned wc = b[0] | (unsigned)b[1] << 8;
 
-		if (wc != 3 || (b[3] & 0x40) == 0 || b[4] != 0x51) {
-			model_error("long write that is not 0x51 with two bytes");
+		if ((b[3] & 0x40) == 0) {
+			model_error("long write without long packet bit");
 		}
-		m.sent[m.sent_n++ % 4096] = (uint32_t)b[5] << 8 | b[6];     /* the panels here: MSB first (0: dark) */
-	} else if (type == 0x15) {
-		if (b[0] != 0x51) {
-			model_error("short write that is not 0x51");
+		if (m.display_power && b[4] != 0x51) {
+			if (m.lp_packets < sizeof(m.lp_cmds)) {
+				m.lp_cmds[m.lp_packets] = b[4];
+			}
+			m.lp_packets++;
+			if (memory) {
+				m.mem_dma_count++;
+				m.mem_dma_len = wc;
+				m.mem_dma_cmd = b[4];
+			}
+		} else {
+			if (wc != 3 || b[4] != 0x51) {
+				model_error("long write that is not 0x51 with two bytes");
+			}
+			m.sent[m.sent_n++ % 4096] = (uint32_t)b[5] << 8 | b[6];     /* the panels here: MSB first (0: dark) */
 		}
-		m.sent[m.sent_n++ % 4096] = b[1];
+	} else if (type == 0x15 || (m.display_power && type == 0x05)) {
+		if (m.display_power && (type == 0x05 || b[0] != 0x51)) {
+			if (m.lp_packets < sizeof(m.lp_cmds)) {
+				m.lp_cmds[m.lp_packets] = b[0];
+			}
+			m.lp_packets++;
+		} else {
+			if (b[0] != 0x51) {
+				model_error("short write that is not 0x51");
+			}
+			m.sent[m.sent_n++ % 4096] = b[1];
+		}
 	} else {
 		model_error("neither a DCS short nor a long write");
 	}
@@ -128,9 +175,11 @@ model_trigger(void)
 uint32_t
 hakios_test_rd(vm_offset_t a)
 {
-	if (a >= DSI_BASE && a < DSI_BASE + 0x400) {
+	if (a >= DSI_BASE && a < DSI_BASE + (m.display_power ? 0x1000u : 0x400u)) {
+		uint32_t o = (uint32_t)(a - DSI_BASE);
+
 		m.accesses++;
-		switch (a - DSI_BASE) {
+		switch (o) {
 		case 0x000: return m.version;
 		case 0x004: return m.ctrl;
 		case 0x008:
@@ -140,22 +189,56 @@ hakios_test_rd(vm_offset_t a)
 			}
 			return m.status;
 		case 0x03c: return m.dma_ctrl;
+		case 0x048: return m.display_power ? m.dma_offset : 0;
+		case 0x050: return m.display_power ? m.dma_fifo : 0;
+		case 0x084: return m.display_power ? m.trig_ctrl : 0;
 		case 0x110:
 			if ((m.ctrl & 2) && !(m.int_status & 0x10000) && ++m.reads_since_clear > 3) {
 				m.int_status |= 0x10000;        /* the frame ends */
 			}
 			return m.int_status | m.int_enables;
-		default: return 0;
+		case 0x540: /* PHY_PHY_STATUS: ready when PHY_DIGTOP_SPARE10 bit 0 is set */
+			if (m.display_power) {
+				return (dp_dsi_regs[0x5ac >> 2] & 1u) ? 1u : dp_dsi_regs[o >> 2];
+			}
+			return 0;
+		case 0xab0: /* PLL_COMMON_STATUS_ONE: locked when PHY_PLL_CNTRL bit 0 is set */
+			if (m.display_power) {
+				return (dp_dsi_regs[0x43c >> 2] & 1u) ? 1u : 0u;
+			}
+			return 0;
+		default:
+			return m.display_power ? dp_dsi_regs[o >> 2] : 0;
 		}
+	}
+	if (m.display_power && a >= MDSS_BASE && a < MDSS_BASE + 0x90000u) {
+		uint32_t o = (uint32_t)(a - MDSS_BASE);
+
+		if (o == 0x360ac && (dp_mdss_regs[0x362b4 >> 2] & (1u << 31)) && (c.gdsc & 0x80000000u)) {
+			dp_mdss_regs[o >> 2]++;
+		}
+		return dp_mdss_regs[o >> 2];
+	}
+	if (m.display_power && a >= VBIF_BASE && a < VBIF_BASE + 0x2000u) {
+		return dp_vbif_regs[(a - VBIF_BASE) >> 2];
 	}
 	if (a == GCC_BASE + 0x27004) {
 		return c.gcc_disp_ahb;
+	}
+	if (m.display_power && a == GCC_BASE + 0x3700c) {
+		return c.gcc_hf_axi;
+	}
+	if (m.display_power && a == GCC_BASE + 0x37014) {
+		return c.gcc_sf_axi;
 	}
 	if (a == DISPCC_BASE + c.gdsc_offset) {
 		return c.gdsc;
 	}
 	if (a == DISPCC_BASE + c.ahb_offset) {
 		return c.ahb;
+	}
+	if (m.display_power && a >= DISPCC_BASE && a < DISPCC_BASE + 0x20000u) {
+		return dp_dispcc_regs[(a - DISPCC_BASE) >> 2];
 	}
 	model_error("read of a register the driver has no business with");
 	return 0;
@@ -167,19 +250,39 @@ hakios_test_wr(vm_offset_t a, uint32_t v)
 	const uint32_t status_bits = 0x1u | 0x100u | 0x400u | 0x1000u | 0x4000u | 0x10000u | 0x100000u | 0x1000000u |
 	    0x10000000u | 0x40000000u;
 
-	if (a >= DSI_BASE && a < DSI_BASE + 0x400) {
+	if (a >= DSI_BASE && a < DSI_BASE + (m.display_power ? 0x1000u : 0x400u)) {
+		uint32_t o = (uint32_t)(a - DSI_BASE);
+
 		m.accesses++;
 		m.writes++;
-		switch (a - DSI_BASE) {
+		switch (o) {
 		case 0x004:
 			m.ctrl = v;
 			return;
 		case 0x03c:
 			m.dma_ctrl = v;
 			return;
+		case 0x048:
+			if (m.display_power) {
+				m.dma_offset = v;
+				return;
+			}
+			break;
 		case 0x04c:
 			m.length = v;
 			return;
+		case 0x050:
+			if (m.display_power) {
+				m.dma_fifo = v;
+				return;
+			}
+			break;
+		case 0x084:
+			if (m.display_power) {
+				m.trig_ctrl = v;
+				return;
+			}
+			break;
 		case 0x090:
 			if (v == 1) {
 				model_trigger();
@@ -199,7 +302,7 @@ hakios_test_wr(vm_offset_t a, uint32_t v)
 			if (m.tpg == 0) {
 				model_error("FIFO written with the TPG off");
 			}
-			if (m.fifo_n < 16) {
+			if (m.fifo_n < (m.display_power ? 64u : 16u)) {
 				m.fifo[m.fifo_n++] = v;
 			}
 			return;
@@ -211,16 +314,64 @@ hakios_test_wr(vm_offset_t a, uint32_t v)
 			m.reset_asked = v == 1;
 			return;
 		default:
-			model_error("write to a DSI register the driver has no business with");
-			return;
+			if (m.display_power) {
+				dp_dsi_regs[o >> 2] = v;
+				return;
+			}
+			break;
 		}
+		model_error("write to a DSI register the driver has no business with");
+		return;
+	}
+	if (m.display_power && a >= MDSS_BASE && a < MDSS_BASE + 0x90000u) {
+		dp_mdss_regs[(a - MDSS_BASE) >> 2] = v;
+		return;
+	}
+	if (m.display_power && a >= VBIF_BASE && a < VBIF_BASE + 0x2000u) {
+		dp_vbif_regs[(a - VBIF_BASE) >> 2] = v;
+		return;
 	}
 	if (a == GCC_BASE + 0x27004) {
 		c.gcc_disp_ahb = v;
 		return;
 	}
+	if (m.display_power && a == GCC_BASE + 0x3700c) {
+		c.gcc_hf_axi = v;
+		return;
+	}
+	if (m.display_power && a == GCC_BASE + 0x37014) {
+		c.gcc_sf_axi = v;
+		return;
+	}
+	if (a == DISPCC_BASE + c.gdsc_offset) {
+		if (m.display_power) {
+			c.gdsc = (v & 1u) ? (v & ~0x80000000u) : (v | 0x80000000u);
+		}
+		return;
+	}
 	if (a == DISPCC_BASE + c.ahb_offset) {
 		c.ahb = v & 1 ? v & ~0x80000000u : v | 0x80000000u;     /* on when asked */
+		return;
+	}
+	if (m.display_power && a >= DISPCC_BASE && a < DISPCC_BASE + 0x20000u) {
+		uint32_t o = (uint32_t)(a - DISPCC_BASE);
+
+		if (o == 0xb000u) {             /* DP_GDSC_INT2 */
+			v = (v & 1u) ? (v & ~0x80000000u) : (v | 0x80000000u);
+		} else if (o == 0x0000u || o == 0x1000u || o == 0x0004u || o == 0x1004u || o == 0x0018u || o == 0x1018u) {
+			/* disp_cc_pll0 / pll1: lock when OPMODE bit 0 and MODE bit 2 are set */
+			uint32_t p = o & 0x1000u;
+			dp_dispcc_regs[o >> 2] = v;
+			if ((dp_dispcc_regs[(p + 0x04u) >> 2] & 1u) && (dp_dispcc_regs[p >> 2] & 4u)) {
+				dp_dispcc_regs[p >> 2] |= 0x80000000u;
+			} else {
+				dp_dispcc_regs[p >> 2] &= ~0x80000000u;
+			}
+			return;
+		} else if (o >= 0x8000u) {
+			v = (v & 1u) ? (v & ~0x80000000u) : (v | 0x80000000u);
+		}
+		dp_dispcc_regs[o >> 2] = v;
 		return;
 	}
 	model_error("write to a register the driver has no business with");
@@ -232,9 +383,36 @@ ml_io_map(vm_offset_t phys, vm_size_t size __unused)
 	return phys;            /* (an address of the model's: hakios_test_rd/wr tell them apart) */
 }
 
+vm_offset_t
+ml_io_map_wcomb(vm_offset_t phys, vm_size_t size __unused)
+{
+	if (m.display_power && phys == DP_CMD_BUF_PHYS) {
+		return (vm_offset_t)dp_dma_buf;
+	}
+	return phys;
+}
+
 /* ---- the driver, and the board table it reads (arch/arm64/boot/dts/, through tools/boards.py) -------------- */
 
 #include "board/board.c"
+
+static const struct hakios_board *test_board_override;
+static inline const struct hakios_board *
+test_hakios_board(void)
+{
+	return test_board_override ? test_board_override : hakios_board();
+}
+static inline bool
+test_hakios_board_has(uint32_t feature)
+{
+	return test_board_override ? ((test_board_override->features & feature) != 0) : hakios_board_has(feature);
+}
+#define hakios_board() test_hakios_board()
+#define hakios_board_has(f) test_hakios_board_has(f)
+#ifndef TUNABLE
+#define TUNABLE(type, var, name, value) type var = (value)
+#endif
+
 #define HAKIOS_MMIO_TEST 1
 #include "board/backlight.c"
 
@@ -902,6 +1080,112 @@ soft_quiesce(void)
 	CHECK(m.sent_n == 0 && m.accesses == 0 && !logged("at the run's end"), "%u sent, %u accesses", m.sent_n, m.accesses);
 }
 
+/* display-power: sleep (0x28/0x10) + MDSS/DSI/PHY/PLL off, wake (101 packets + 129-byte 9E memory DMA) with 0 diffs */
+static void
+phone_display_power(void)
+{
+	static struct hakios_board dp_board;
+	static const uint32_t branch_offsets[] = {
+		0x8038, 0x8004, 0x802c, 0x8028, 0x800c, 0x801c, 0x8014, 0x8024,
+		0xa004, 0xa014, 0xa00c, 0xa01c, 0xa020, 0xc008, 0xc00c, 0xc004, 0x80a4,
+	};
+	static const uint32_t rcg_offsets[] = { 0x80ec, 0x8104, 0x8324, 0x8134, 0x80bc };
+
+	phone("phone-cmd", false);
+	dp_board = *(hakios_boards);
+	for (unsigned i = 0; i < hakios_board_count; i++) {
+		if (strcmp(hakios_boards[i].name, "phone-cmd") == 0) {
+			dp_board = hakios_boards[i];
+			break;
+		}
+	}
+	dp_board.features |= HAKIOS_HAS_DISPLAY_POWER | HAKIOS_HAS_DISPLAY_FLIP;
+	dp_board.display.mdss = MDSS_BASE;
+	dp_board.display.intf = INTF_BASE;
+	dp_board.display.vbif = VBIF_BASE;
+	dp_board.display.splash_base = DP_SPLASH_BASE;
+	dp_board.display.splash_size = DP_SPLASH_SIZE;
+	test_board_override = &dp_board;
+
+	m.display_power = true;
+	c.gcc_hf_axi = 1;
+	c.gcc_sf_axi = 1;
+	dp_dispcc_regs[0xb000 >> 2] = 0x80000000u;      /* DP_GDSC_INT2 on */
+	dp_dispcc_regs[0x0000 >> 2] = 0x80000005u;      /* disp_cc_pll0 locked */
+	dp_dispcc_regs[0x0004 >> 2] = 1u;
+	dp_dispcc_regs[0x0018 >> 2] = 7u;
+	dp_dispcc_regs[0x1000 >> 2] = 0x80000005u;      /* disp_cc_pll1 locked */
+	dp_dispcc_regs[0x1004 >> 2] = 1u;
+	dp_dispcc_regs[0x1018 >> 2] = 7u;
+	for (unsigned i = 0; i < sizeof(branch_offsets) / sizeof(branch_offsets[0]); i++) {
+		dp_dispcc_regs[branch_offsets[i] >> 2] = 1u;
+	}
+	for (unsigned i = 0; i < sizeof(rcg_offsets) / sizeof(rcg_offsets[0]); i++) {
+		dp_dispcc_regs[rcg_offsets[i] >> 2] = 0x80000000u;
+	}
+	dp_mdss_regs[0x362b4 >> 2] = 0x80000001u;       /* INTF_TEAR_AUTOREFRESH_CONFIG on */
+	dp_dsi_regs[0x5ac >> 2] = 1u;                   /* PHY_DIGTOP_SPARE10 */
+	dp_dsi_regs[0x43c >> 2] = 1u;                   /* PHY_PLL_CNTRL */
+	dp_dsi_regs[0x414 >> 2] = 0x35u;                /* PHY_CLK_CFG1 */
+	dp_dsi_regs[0x41c >> 2] = 0x12u;                /* PHY_RBUF_CTRL */
+	dp_dsi_regs[0x424 >> 2] = 0x7fu;                /* PHY_CTRL_0 */
+	dp_dsi_regs[0x430 >> 2] = 0x04u;                /* PHY_CTRL_3 */
+	dp_dsi_regs[0x928 >> 2] = 0xc0u;                /* PLL_SYSTEM_MUXES */
+}
+
+static void
+display_power_sleep_wake(void)
+{
+	phone_display_power();
+	boot_args = "backlight=2 bl_level=500";
+	hakios_backlight_init();
+	WAIT_FOR(m.sent_n >= 1, 2000);
+	CHECK(!hakios_display_off(), "hardware initially on");
+	CHECK(hakios_display_hold(), "hold succeeds while awake");
+	hakios_display_release();
+
+	set("power", 0);
+	WAIT_FOR(hakios_display_off(), 4000);
+	CHECK(hakios_display_off(), "display powered down while sleeping");
+	CHECK(!hakios_display_hold(), "hold blocked while hardware off");
+	CHECK(m.lp_packets >= 2 && m.lp_cmds[0] == 0x28 && m.lp_cmds[1] == 0x10,
+	    "DCS 0x28 then 0x10 sent (lp_packets %u: %#x %#x)", m.lp_packets, m.lp_cmds[0], m.lp_cmds[1]);
+
+	m.lp_packets = 0;
+	set("power", 1);
+	WAIT_FOR(!hakios_display_off() && last_sent() == bl_level_to_raw(500, 1, 2047) && dp_stat.ups >= 1 && m.lp_packets >= PANEL_ON_PACKETS, 4000);
+	CHECK(!hakios_display_off(), "display back on after wake");
+	CHECK(dp_stat.downs == 1 && dp_stat.ups == 1 && dp_stat.up_failed == 0,
+	    "downs %u ups %u up_failed %u (%s)", dp_stat.downs, dp_stat.ups, dp_stat.up_failed, dp_stat.why);
+	CHECK(dp_stat.mdss_diff == 0 && dp_stat.dsi_diff == 0 && dp_stat.phy_diff == 0,
+	    "0 diffs: mdss %u dsi %u phy %u", dp_stat.mdss_diff, dp_stat.dsi_diff, dp_stat.phy_diff);
+	CHECK(m.lp_packets == PANEL_ON_PACKETS, "sent all %u wake packets (got %u)", PANEL_ON_PACKETS, m.lp_packets);
+	CHECK(m.mem_dma_count == 1 && m.mem_dma_len == 0x81 && m.mem_dma_cmd == 0x9e,
+	    "129-byte 9E memory DMA packet sent (count %u len %u cmd %#x)", m.mem_dma_count, m.mem_dma_len, m.mem_dma_cmd);
+	CHECK(m.errors == 0, "%s", m.error);
+}
+
+/* quiescing while panel asleep: wakes hardware + panel before restoring loader brightness */
+static void
+display_power_quiesce(void)
+{
+	phone_display_power();
+	boot_args = "backlight=2 bl_level=500";
+	hakios_backlight_init();
+	WAIT_FOR(m.sent_n >= 1, 2000);
+	hakios_backlight_display(false);
+	WAIT_FOR(hakios_display_off(), 4000);
+	CHECK(hakios_display_off(), "asleep before quiesce");
+
+	m.lp_packets = 0;
+	hakios_display_power_quiesce();
+	hakios_backlight_quiesce();
+	CHECK(!hakios_display_off(), "hardware powered back on for loader");
+	CHECK(m.lp_packets == PANEL_ON_PACKETS, "wake sequence sent at quiesce: %u", m.lp_packets);
+	CHECK(last_sent() == 0x133, "restore brightness sent after wake: %u", last_sent());
+	CHECK(m.errors == 0, "%s", m.error);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -914,7 +1198,7 @@ main(int argc, char **argv)
 		{ "lit_again_after_a_failed_send", lit_again_after_a_failed_send }, { "dark_once_told", dark_once_told },
 		{ "quiesce_after_broken", quiesce_after_broken }, { "controller_error", controller_error },
 		{ "soft_unknown_board", soft_unknown_board }, { "asked_just_before_it_sleeps", asked_just_before_it_sleeps }, { "automatic", automatic_brightness },
-		{ "display_power", display_power }, { "soft_power", soft_power },
+		{ "display_power", display_power }, { "display_power_sleep_wake", display_power_sleep_wake }, { "display_power_quiesce", display_power_quiesce }, { "soft_power", soft_power },
 		{ "backend_from_boot_arg", backend_from_boot_arg }, { "incomplete_profile", incomplete_profile }, { "no_controller", no_controller },
 		{ "no_range", no_range }, { "lowest_is_dark", lowest_is_dark }, { "one_byte_too_few", one_byte_too_few },
 		{ "least_significant_first", least_significant_first }, { "held_by_the_thermal_cap", held_by_the_thermal_cap },

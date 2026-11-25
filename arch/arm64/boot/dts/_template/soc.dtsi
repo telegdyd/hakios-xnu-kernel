@@ -28,6 +28,7 @@
 		dsi0 = <0x0ae94000>;            // the first DSI controller (cell-index 0), reg "dsi_ctrl"
 		intf1 = <0x0ae6b800>;           // optional, for "display-scan": the same node's reg "mdp_intf_base"
 		mdss = <0x0ae00000>;            // optional, for "display-flip" (with intf1): the display subsystem, reg "mdss_mdp"
+		vbif = <0x0aeb0000>;            // optional, for "display-power" (with mdss and intf1): mdss_mdp's reg "vbif_phys"
 	};
 
 	// The SoC's own pins (TLMM), for the part drivers that drive them: the touch controllers', the speaker

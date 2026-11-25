@@ -63,6 +63,7 @@ extern void hakios_ft5x06_quiesce(void);
 extern void hakios_s3908_quiesce(void);
 extern void hakios_torch_quiesce(void);
 extern void hakios_backlight_quiesce(void);
+extern void hakios_display_power_quiesce(void);
 extern void hakios_fb_quiesce(void);
 extern void hakios_thermal_quiesce(void);
 extern void hakios_scmi_perf_quiesce(void);
@@ -617,6 +618,7 @@ loader_return(void)
 		return;
 	}
 	quiescing = true;
+	hakios_display_power_quiesce();
 	hakios_fb_quiesce();           /* the display controller off fb_flip's buffers: the loader's screen and a panic's seen */
 	hakios_bt_uart_quiesce();     /* Bluetooth enable low and its power/clock votes dropped */
 	hakios_usb_net_quiesce();      /* the USB controller stopped, if usb_net=1 took it from the loader's UEFI */
