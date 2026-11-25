@@ -24,10 +24,11 @@
  * Not here yet: interrupts (waiting is asking again five times a millisecond), more than one
  * program's worth of care (every client's buffers are in the one address space; a client that
  * goes takes its own away), fences and buffers as file descriptors. A GPU that has stopped
- * answering is reported (hakios_gpu_report()) and, with boot-arg gpu_recover=1, reset and
- * started again, so that the submission that hung is all that is lost: what that does and
- * which source says so is at hakios_gpu_recover() in bsd/dev/board/adreno.c. Without the
- * boot-arg it stays stopped and nothing is waited for again.
+ * answering is reported (hakios_gpu_report()) and, with boot-arg gpu_recover=1 (on the A730
+ * without it; gpu_recover=0 turns it off), reset and started again, so that what was outstanding
+ * is all that is lost: what that does and which source says so is at hakios_gpu_recover() in
+ * drivers/board/adreno.c. On the A730 the power worker also finds a core that has stopped when
+ * nobody waits for it. Without recovery it stays stopped and nothing is waited for again.
  */
 
 #include <IOKit/IOLib.h>
@@ -72,6 +73,8 @@ uint32_t hakios_gpu_last(void);
 void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t by[7]);
 void hakios_gpu_report(const char * why);
 bool hakios_gpu_recover(void);
+int hakios_gpu_hang_test(int kind);
+void hakios_gpu_recover_line(char * line, size_t size);
 void hakios_gpu_stop(void);
 bool hakios_gpu_power_start(void);
 uint32_t hakios_gpu_power_tick(void);
@@ -595,6 +598,42 @@ slumberStateSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __un
 SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_slumber_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, slumberStateSysctl, "A",
     "gpu-slumber: allowed, asleep, failed, suspends, resumes, last transition us, cx_off");
 
+/* Hang recovery (board/adreno.c, gpu_recover): how often, and a hang made on purpose to test it (root). */
+static int
+recoverStateSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	char line[192] = "off (no GPU)\n";
+
+	if (gGPULock != NULL) {
+		IOLockLock(gGPULock);
+		hakios_gpu_recover_line(line, sizeof(line));
+		IOLockUnlock(gGPULock);
+	}
+	return SYSCTL_OUT(req, line, strlen(line));
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_recover_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, recoverStateSysctl, "A",
+    "gpu_recover: on, recoveries, of them found by the worker, failed, given up, submissions given up, last us");
+
+static int
+hangSysctl(struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	int value = 0, error;
+
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (gGPULock == NULL) {
+		return ENXIO;
+	}
+	IOLockLock(gGPULock);
+	error = hakios_gpu_hang_test(value);
+	IOLockUnlock(gGPULock);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_hang, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, hangSysctl, "I",
+    "gpu_recover: written 1 or 2, a submission the A730 never finishes (to test the recovery; root)");
+
 static inline uint32_t
 pm4Parity(uint32_t v)
 {
@@ -1017,8 +1056,8 @@ MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned c
 	fence = hakios_gpu_submit(&address, &words, 1);
 	if (fence == 0) {
 		if (!gGPUReported) {
-			gGPUReported = true;
 			hakios_gpu_report("the ring is full (fb_gpu)");
+			gGPUReported = !hakios_gpu_recover();   /* (this frame is lost either way; the next is the GPU's again) */
 		}
 		IOLockUnlock(gGPULock);
 		return 0;

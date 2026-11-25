@@ -3572,6 +3572,14 @@ core_bus_halt(bool for_good)
 }
 
 static bool core_stuck;                 /* the 3D core has not finished what it was given, and is not waited for */
+/*
+ * The A730's hang recovery (gpu_recover_a730()): the block is taken down as Linux's a6xx_gmu_force_off() does for a GMU
+ * that has hung (a6xx_gmu.c, also the A7xx's): the core's bus halted for good, the core's own half reset, the GMU's
+ * processor reset -- and none of the GMU's handshakes asked for first, neither its idle state nor "slumber", which a
+ * GMU with a core busy for good does not give.
+ */
+static bool gpu_forcing;
+#define RBBM_SW_RESET_CMD       GPU_WORD(0x0043)        /* a6xx.xml (also the A7xx's); 1 holds the 3D core's own half (GX) in reset */
 
 static bool
 gpu_block_suspend(bool runtime)
@@ -3614,11 +3622,15 @@ gpu_block_suspend(bool runtime)
 		wr(gmu.base + GMU_KEEPALIVE, 0);
 		lck_spin_unlock(&gpu_gx_lock);
 		ml_set_interrupts_enabled(interrupts);
-		if (gmu_talks && (!wait_for(&gmu, GMU_RPMH_POWER_STATE, 0xf, 3, 100) || !wait_for(&gmu, GMU_GX_STATUS, 3, 3, 100))) {
+		if (gmu_talks && !gpu_forcing &&
+		    (!wait_for(&gmu, GMU_RPMH_POWER_STATE, 0xf, 3, 100) || !wait_for(&gmu, GMU_GX_STATUS, 3, 3, 100))) {
 			printf("adreno: %u: gpu-ifpc: the GMU does not go down to its idle state (power state %#x, gx status %#x)\n",
 			    step, rd(gmu.base + GMU_RPMH_POWER_STATE), rd(gmu.base + GMU_GX_STATUS));
 			ok = false;
 		}
+	}
+	if (gmu_talks && gpu_forcing) {
+		gmu_talks = false;                      /* (a6xx_gmu_force_off: no message; the GMU is reset below) */
 	}
 	if (gmu_talks) {
 		if (!hfi_send("\"slumber\"", HFI_PREPARE_SLUMBER, slumber, 3)) {
@@ -3631,6 +3643,12 @@ gpu_block_suspend(bool runtime)
 		get(&gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK_STATUS);
 		get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
 		gmu_talks = false;
+	}
+	if (gpu_forcing && core_runs) {
+		/* a6xx_gmu_force_off: "Reset GPU core blocks", 100 us, before the GMU's processor is halted */
+		wr(gpu.base + RBBM_SW_RESET_CMD, 1);
+		rd(gpu.base + RBBM_SW_RESET_CMD);
+		sleep_us(100);
 	}
 	if (gmu_runs) {
 		put(&gmu, "cm3_sysreset", GMU_CM3_SYSRESET, 1);
@@ -3788,10 +3806,13 @@ hakios_adreno_quiesce(void)
  * far it has got (a "fence": a submission's number, written by the core when it is through
  * with it). The caller holds one lock around all of these.
  *
- * Boot-arg gpu_recover=1: a submission the core never finishes does not cost the rest of the
- * run. The core's own half is reset and started again, and what was outstanding is given up
+ * Boot-arg gpu_recover=1 (on the A730 without it; gpu_recover=0 off): a submission the core never finishes does not
+ * cost the rest of the run. The core's own half is reset and started again, and what was outstanding is given up
  * (hakios_gpu_recover() below, which says what is done and which source says so). Without it
- * such a submission is only reported, and the GPU stays stopped.
+ * such a submission is only reported, and the GPU stays stopped. On the A730 (gen7) it is on
+ * unless gpu_recover=0, and is the whole block powered down and up again, as Linux does it for
+ * a GMU of its own (gpu_recover_a730()); the power worker also looks for a core that has stopped
+ * when nobody waits for it (gpu_hangcheck(): 2 s without a fence, KGSL's drawobj timeout).
  */
 #define GPU_CHIP_ID             (gpu_profile ? (uint64_t)gpu_profile->chip_id : 0x06030500ull)
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
@@ -3811,7 +3832,6 @@ hakios_adreno_quiesce(void)
 #define EVENT_INVALIDATE_DEPTH  0x18
 #define EVENT_INVALIDATE_COLOR  0x19
 /* and, for a core that has stopped answering (gpu_recover=1: hakios_gpu_recover() below) */
-#define RBBM_SW_RESET_CMD       GPU_WORD(0x0043)        /* a6xx.xml; 1 holds the 3D core's own half (GX) in reset */
 #define RBBM_INT_CLEAR_CMD      GPU_WORD(0x0037)        /* the bits of rbbm_int_0_status written here are forgotten */
 #define GMU_PWR_COL_KEEPALIVE   GMU_WORD(0x50c3)        /* a6xx_gmu.xml; 1: the GMU keeps the core powered, whatever it makes of it */
 #define GMU_AHB_FENCE_STATUS_CLR GMU_WORD(0x9314)       /* the bits of ahb_fence_status written here are forgotten */
@@ -3829,6 +3849,14 @@ static uint32_t gpu_timed_by[7];        /* ... how many of them under 0.1, 0.25,
 static uint32_t gpu_exact = 1;          /* boot-arg gpu_exact=0: the core does not wait to be idle before it notes the time */
 static uint32_t gpu_recover;            /* boot-arg gpu_recover=1: a core that has stopped answering is reset and given work again */
 static uint32_t gpu_recoveries;         /* ... and how many times that has been done in this run */
+static uint32_t gpu_recover_failures;   /* ... tried and did not work (the GPU is then given up: gpu_lost) */
+static uint64_t gpu_recover_us;         /* the last one's length */
+static uint64_t gpu_given_up;           /* submissions given up as done by them */
+static uint32_t gpu_hangchecks;         /* of them, started by gpu_hangcheck() (nobody was waiting) */
+static bool gpu_lost;                   /* a recovery did not work: nothing more is taken */
+static uint32_t gpu_hang_seen;          /* gpu_hangcheck(): the fence word last seen, and since when (0: nothing outstanding) */
+static uint64_t gpu_hang_since;
+#define GPU_HANG_NS             2000000000ull
 uint32_t gpu_log;                       /* boot-arg gpu_log=1: a line for every submission and the time the core spent on it */
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 static struct {
@@ -4530,7 +4558,7 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	 * caller holds the lock hakios_gpu_stop() is called under, so what it sees here stays so until it lets go; a
 	 * submission that looked before taking the lock -- BoardGPU.cpp's externalMethod -- is turned away here.)
 	 */
-	if (!gpu_kept || ifpc_failed || slumber_failed || __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
+	if (!gpu_kept || gpu_lost || ifpc_failed || slumber_failed || __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
 		return 0;
 	}
 	if (slumber_asleep && !gpu_runtime_resume()) {
@@ -4674,13 +4702,18 @@ hakios_gpu_report(const char *why)
  * register bus's clock (some 28 ms each) and leave `quiet` false, so the recovery says every
  * register it writes. Once per hang, that is evidence rather than noise.
  */
+static bool gpu_recover_a730(void);
+
 bool
 hakios_gpu_recover(void)
 {
 	uint32_t fence_status;
 
-	if (!gpu_kept || !gpu_recover || adreno_gen7()) {
+	if (!gpu_kept || !gpu_recover || gpu_lost) {
 		return false;
+	}
+	if (adreno_gen7()) {
+		return gpu_recover_a730();
 	}
 	if (gpu_recoveries >= GPU_RECOVERIES) {
 		printf("adreno: gpu: the 3D core has been recovered %u times in this run already: no more\n", gpu_recoveries);
@@ -5276,7 +5309,8 @@ hakios_gpu_ifpc_line(char *line, size_t size)
  * and collapses CX. Client allocations, page tables, VAs, fence numbering, and the authenticated zap shader are
  * retained; on the next submission (or runtime sysctl write), resume restores CX, clocks, GMU firmware/HFI, SMMU,
  * ring, CP/IFPC, IRQs, counters and DCVS policy before publishing work. A failed transition latches slumber_failed
- * and refuses later submissions (no retry or hang recovery).
+ * and refuses later submissions (no retry). The resume is also the second half of the A730's hang recovery
+ * (gpu_recover_a730(), below).
  *
  *   gpu_slumber=0                 not set up at all (the GPU stays awake)
  *   kern.hakios.gpu_slumber       1 deeper idle collapse allowed; 0 kept awake (wakes immediately if asleep)
@@ -5423,6 +5457,187 @@ failed:
 	return false;
 }
 
+/* ---- beside the steps: the A730's hang recovery (gpu_recover, on by default on gen7) ----------------------------- */
+
+/*
+ * A submission the A730 does not finish: the whole GPU block is powered down by force and brought up again, and what
+ * was outstanding is given up as done. As Linux does it for a GPU whose GMU runs firmware of its own (a6xx_recover():
+ * the GMU stopped -- a6xx_gmu_force_off() once it has hung -- and the GPU started afresh; KGSL's gen7 fault recovery
+ * the same: gen7_gmu_suspend(), then the full boot), and not as the A6XX path above does it, by the core's reset line
+ * alone with the GMU left running, which Linux never does on such a part.
+ *
+ * Down: the core's bus halted for good, the core reset, the GMU's processor reset, its RPMh channel put to sleep, the
+ * SMMU's streams sent to fault, CX collapsed -- gpu_block_suspend() with gpu_forcing, which skips the GMU's idle state
+ * and "slumber", neither of which a GMU with a core stuck at work gives. Up: gpu-slumber's resume (gpu_runtime_resume()),
+ * verified on the phone: CX, clocks, GMU firmware and HFI, the SMMU's streams, an empty ring, the command processor,
+ * IFPC, IRQs, counters and the DCVS vote. What persists across it is what persists across slumber: every client's
+ * buffers and addresses, page tables, the fence numbering, the zap shader that TrustZone has already authenticated (Linux
+ * does not load it again after a recovery either: a6xx_zap_shader_init keeps a flag).
+ *
+ * Given up: every submission up to the last is called done (msm_gpu.c recover_worker: "advance the fence by one more to
+ * clear the faulting submit"); they did not run, and whatever they were to draw is not there. Their times are not
+ * counted. A program whose next frame draws everything it needs (CoreAnimation, Metal) carries on.
+ *
+ * gpu_recover=0 turns it off: a hung core then costs the run, as it did before.
+ */
+static bool
+gpu_recover_a730(void)
+{
+	uint64_t began = dcvs_ns(), resumes = slumber_resumes, resume_us = slumber_resume_us;
+	uint32_t done = *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+	bool off = true, up = true;
+
+	if (slumber_failed || __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
+		return false;
+	}
+	if (gpu_recoveries >= GPU_RECOVERIES) {
+		printf("adreno: gpu: the 3D core has been recovered %u times in this run already: no more\n", gpu_recoveries);
+		gpu_lost = true;
+		return false;
+	}
+	gpu_recoveries++;
+	step = 0;
+	newest_step = ~0u;
+	if (!slumber_asleep) {
+		/* (asleep, nothing was outstanding: there is nothing to take down) */
+		slumber_stream1 = second_stream_is_on;
+		slumber_irq = gpu_irq_active();
+		if (!gpu_gx_get()) {
+			core_runs = false;      /* (a core that does not wake is not reached: no register of its half is read) */
+		}
+		busy_valid = false;
+		if (dcvs_running || ifpc_config) {
+			wr(gmu.base + GMU_POWER_ENABLE, 0);
+		}
+		gpu_irq_stop();
+		hfi_quiet = true;
+		core_stuck = gpu_forcing = true;
+		off = gpu_block_suspend(true);
+		core_stuck = gpu_forcing = false;
+		if (off) {
+			slumber_asleep = true;
+			up = gpu_runtime_resume();
+		}
+		hfi_quiet = false;
+		slumber_resumes = resumes;      /* (a recovery is not a slumber) */
+		slumber_resume_us = resume_us;
+	}
+	/* (and the waiters let go, also if it did not work: a GPU with no power writes no fence) */
+	*(volatile uint32_t *)(core_scratch.memory + GPU_BV_FENCE_AT) = gpu_fence;
+	*(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT) = gpu_fence;
+	to_memory(core_scratch.memory + GPU_FENCE_AT, 0x20);
+	gpu_given_up += (uint32_t)(gpu_fence - done);
+	gpu_timed = gpu_fence;
+	gpu_hang_since = 0;
+	gpu_recover_us = (dcvs_ns() - began) / 1000;
+	if (!off || !up) {
+		gpu_lost = true;
+		gpu_recover_failures++;
+		printf("adreno: gpu: THE A730 DOES NOT COME BACK after a hang (%s, %llu us): it is given up for this run\n",
+		    !off ? "it did not power down" : "it did not start again", gpu_recover_us);
+		return false;
+	}
+	ifpc_failed = 0;                        /* (a core that did not wake was the hang; IFPC is set up afresh by the resume) */
+	printf("adreno: gpu: THE A730 IS RECOVERED (%u time%s in this run, %llu us): submissions %u to %u given up as done\n",
+	    gpu_recoveries, gpu_recoveries == 1 ? "" : "s", gpu_recover_us, done + 1, gpu_fence);
+	return true;
+}
+
+/*
+ * For the power worker: a submission outstanding and no fence written for GPU_HANG_NS (2 s, KGSL's drawobj timeout;
+ * the longest frame seen on the phone is some 55 ms). `seen` and `since` are the worker's: the fence word last seen and
+ * when it was first seen so (0: nothing outstanding). Pure, for the host test.
+ */
+static bool
+adreno_hang_due(uint32_t done, uint32_t last, uint64_t now, uint32_t *seen, uint64_t *since)
+{
+	if ((int32_t)(done - last) >= 0) {
+		*since = 0;
+		return false;
+	}
+	if (*since == 0 || done != *seen) {
+		*seen = done;
+		*since = now;
+		return false;
+	}
+	return now - *since >= GPU_HANG_NS;
+}
+
+static bool
+gpu_hangcheck(uint64_t now)
+{
+	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
+
+	if (!gpu_recover || gpu_lost || !adreno_gen7()) {
+		return false;
+	}
+	to_memory((vm_offset_t)word, 4);
+	return adreno_hang_due(*word, gpu_fence, now ? now : 1, &gpu_hang_seen, &gpu_hang_since);
+}
+
+/* The worker found the core stopped (or gpu-ifpc gave it up): reported, and recovered. False: the GPU is given up. */
+static bool
+gpu_hang_found(const char *why)
+{
+	gpu_hangchecks++;
+	hakios_gpu_report(why);
+	return hakios_gpu_recover();
+}
+
+/*
+ * kern.hakios.gpu_hang (root, written; for testing the recovery): one submission of the kernel's own that the A730
+ * never finishes. 1: the command processor waits for a word of memory that never changes (CP_WAIT_REG_MEM); 2: a
+ * command buffer at an address nothing is mapped at (the SMMU answers with an abort: no command the core can run).
+ */
+#define GPU_HANG_IB_AT          0xc00           /* in the scratch page: the commands of kind 1 */
+#define GPU_HANG_WORD_AT        0xd00           /* ... and the word they wait for */
+#define GPU_HANG_UNMAPPED       0x1ff00000ull   /* below GPU_ADDRESSES_START, above everything the steps map */
+#define CP_WAIT_REG_MEM         0x3c
+
+int
+hakios_gpu_hang_test(int kind)
+{
+	uint32_t *ib = (uint32_t *)(core_scratch.memory + GPU_HANG_IB_AT);
+	uint64_t address;
+	uint32_t words = 0, fence;
+
+	if (!gpu_kept || !adreno_gen7() || gpu_lost) {
+		return ENXIO;
+	}
+	if (kind == 1) {
+		*(volatile uint32_t *)(core_scratch.memory + GPU_HANG_WORD_AT) = 0;
+		ib[words++] = 7u << 28 | 6 | odd_parity(6) << 15 | CP_WAIT_REG_MEM << 16 | odd_parity(CP_WAIT_REG_MEM) << 23;
+		ib[words++] = 3 | 1u << 4;              /* WRITE_EQ, POLL_MEMORY (adreno_pm4.xml) */
+		ib[words++] = CORE_SCRATCH_ADDRESS + GPU_HANG_WORD_AT;
+		ib[words++] = 0;
+		ib[words++] = 1;                        /* the word is to become 1, and stays 0 */
+		ib[words++] = ~0u;
+		ib[words++] = 16;
+		to_memory(core_scratch.memory + GPU_HANG_IB_AT, 0x200);
+		address = CORE_SCRATCH_ADDRESS + GPU_HANG_IB_AT;
+	} else if (kind == 2) {
+		address = GPU_HANG_UNMAPPED;
+		words = 64;
+	} else {
+		return EINVAL;
+	}
+	fence = hakios_gpu_submit(&address, &words, 1);
+	printf("adreno: gpu: kern.hakios.gpu_hang=%d: submission %u %s\n", kind, fence,
+	    kind == 1 ? "waits for memory that never changes" : "runs commands at an address nothing is mapped at");
+	return fence != 0 ? 0 : EIO;
+}
+
+void
+hakios_gpu_recover_line(char *line, size_t size)
+{
+	if (!gpu_kept || !gpu_recover) {
+		snprintf(line, size, "off (%s)\n", !gpu_kept ? "the GPU is not kept" : "gpu_recover=0");
+		return;
+	}
+	snprintf(line, size, "on 1 recoveries %u hangchecks %u failed %u lost %d given_up %llu last_us %llu\n",
+	    gpu_recoveries, gpu_hangchecks, gpu_recover_failures, gpu_lost, gpu_given_up, gpu_recover_us);
+}
+
 static bool
 gpu_slumber_start(void)
 {
@@ -5460,7 +5675,10 @@ hakios_gpu_power_start(void)
 	bool dcvs = gpu_dcvs_start();
 	bool slumber = gpu_slumber_start();
 
-	return dcvs || slumber;
+	if (gpu_kept && gpu_recover && adreno_gen7()) {
+		printf("adreno: gpu: hang recovery on: a submission without a fence for 2 s powers the A730 down and up again\n");
+	}
+	return dcvs || slumber || (gpu_kept && gpu_recover && adreno_gen7());
 }
 
 /* The worker's tick under gGPULock: returns ms until the next tick, or 0 to stop. */
@@ -5468,14 +5686,22 @@ uint32_t
 hakios_gpu_power_tick(void)
 {
 	uint64_t now;
+	uint32_t idle = slumber_config ? 50 : gpu_recover && adreno_gen7() ? 250 : 0;
 
-	if (!gpu_kept || slumber_failed || ifpc_failed || __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
+	if (!gpu_kept || gpu_lost || slumber_failed || __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
 		return 0;
+	}
+	if (ifpc_failed) {
+		/* (gpu-ifpc gave a core up that did not wake: with gpu_recover, that is a hang like any other) */
+		return gpu_recover && adreno_gen7() && gpu_hang_found("gpu-ifpc: the 3D core did not wake") ? 50 : 0;
 	}
 	if (slumber_asleep) {
 		return 250;                     /* asleep: never touch powered-off CX/GMU/GX */
 	}
 	now = dcvs_ns();
+	if (gpu_hangcheck(now)) {
+		return gpu_hang_found("no fence for 2 s") ? 50 : 0;
+	}
 	if (slumber_on && gpu_irq_state != 2 && hakios_gpu_done(gpu_fence)) {
 		if (slumber_idle_ns == 0) {
 			slumber_idle_ns = now;
@@ -5490,11 +5716,11 @@ hakios_gpu_power_tick(void)
 		uint32_t ms = gpu_dcvs_tick();
 
 		if (ms == 0) {
-			return slumber_config ? 50 : 0;
+			return idle;
 		}
 		return slumber_on ? 50 : ms;
 	}
-	return slumber_config ? 50 : 0;
+	return idle;
 }
 
 int
@@ -5980,7 +6206,9 @@ hakios_adreno_init(void)
 			to_memory(core_scratch.memory, 4096);
 			PE_parse_boot_argn("gpu_exact", &gpu_exact, sizeof(gpu_exact));
 			PE_parse_boot_argn("gpu_log", &gpu_log, sizeof(gpu_log));
-			PE_parse_boot_argn("gpu_recover", &gpu_recover, sizeof(gpu_recover));
+			if (!PE_parse_boot_argn("gpu_recover", &gpu_recover, sizeof(gpu_recover))) {
+				gpu_recover = adreno_gen7();    /* (the A730's: on; gpu_recover=0 turns it off) */
+			}
 			/* before any client exists: gpu_address_span() must not change under a live buffer */
 			PE_parse_boot_argn("gpu_va", &gpu_va, sizeof(gpu_va));
 			gpu_kept = true;

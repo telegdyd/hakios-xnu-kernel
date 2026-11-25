@@ -560,6 +560,53 @@ a730_submission(void)
 	CHECK(bv != 0 && bv < wait && wait < br, "BV fence, BR wait and final BR IRQ were emitted in order");
 }
 
+/* The worker's hang rule: 2 s with something outstanding and the fence word not moving; any fence written starts again */
+static void
+a730_hang_due(void)
+{
+	uint32_t seen = 0;
+	uint64_t since = 0, s = 1000000000ull;
+
+	CHECK(!adreno_hang_due(10, 10, 1 * s, &seen, &since) && since == 0, "nothing outstanding: no hang");
+	CHECK(!adreno_hang_due(10, 12, 2 * s, &seen, &since) && seen == 10 && since == 2 * s, "outstanding: the clock starts");
+	CHECK(!adreno_hang_due(10, 12, 3 * s, &seen, &since), "1 s on: not yet");
+	CHECK(!adreno_hang_due(11, 12, 3 * s + 1, &seen, &since) && since == 3 * s + 1, "a fence written: the clock starts again");
+	CHECK(!adreno_hang_due(11, 13, 5 * s, &seen, &since), "a new submission is not progress; 2 s less 1 ns is not yet");
+	CHECK(adreno_hang_due(11, 13, 5 * s + 1, &seen, &since), "2 s without a fence: a hang");
+	CHECK(!adreno_hang_due(13, 13, 6 * s, &seen, &since) && since == 0, "all done: the clock stops");
+	CHECK(!adreno_hang_due(0xfffffffeu, 1, 7 * s, &seen, &since) && since == 7 * s, "across the fence's wrap: outstanding");
+	CHECK(!adreno_hang_due(1, 1, 8 * s, &seen, &since) && since == 0, "and done");
+}
+
+/*
+ * The A730's recovery takes the block down by force (a6xx_gmu_force_off): the core's bus halted for good, the core reset
+ * before the GMU's processor, no "slumber" asked of the GMU, CX switched off
+ */
+static void
+a730_forced_suspend(void)
+{
+	int halt, reset, cm3;
+
+	phone();
+	need(&gpu);
+	need(&gmu);
+	need(&gbif);
+	core_runs = core_is_on = gmu_runs = gmu_talks = cx_ours = true;
+	*reg(GPUCC + GPUCC_CX_GDSCR) = GDSC_POWER_ON;
+	core_stuck = gpu_forcing = true;
+	(void)gpu_block_suspend(true);
+	core_stuck = gpu_forcing = false;
+	halt = written(gpu.base + RBBM_GBIF_HALT, 1, 0);
+	reset = written(gpu.base + RBBM_SW_RESET_CMD, 1, 0);
+	cm3 = written(GMU + GMU_CM3_SYSRESET, 1, 0);
+	CHECK(halt >= 0 && reset > halt && cm3 > reset, "bus halted (%d), core reset (%d), then the GMU's processor (%d)", halt,
+	    reset, cm3);
+	CHECK(!logged("\"slumber\""), "no slumber asked for: %s", log_text);
+	CHECK(!gmu_talks && !gmu_runs && !core_runs, "nothing of the GMU or the core is reached after it");
+	CHECK(!(*reg(GPUCC + GPUCC_CX_GDSCR) & GDSC_POWER_ON), "CX is off: %#x", *reg(GPUCC + GPUCC_CX_GDSCR));
+	CHECK(written(gbif.base + GBIF_HALT, 0, 0) < 0, "and the bus is not let go again before CX goes");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -570,7 +617,8 @@ main(int argc, char **argv)
 		{ "stop_as_asked_keeps_cx", stop_as_asked_keeps_cx },
 		{ "stop_with_cx_not_ours", stop_with_cx_not_ours }, { "short_answer", short_answer }, { "error_text", error_text },
 		{ "zap_header_short", zap_header_short }, { "display_probe_bounded", display_probe_bounded },
-		{ "a730_submission", a730_submission },
+		{ "a730_submission", a730_submission }, { "a730_hang_due", a730_hang_due },
+		{ "a730_forced_suspend", a730_forced_suspend },
 	};
 
 	if (argc < 2) {

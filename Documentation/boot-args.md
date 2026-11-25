@@ -39,7 +39,7 @@ beside the code, so the file named in each heading has the full explanation.
 | `gpu_irq` | gpu_irq=1: A730 final-fence interrupt and counters; default keeps the old path. |
 | `gpu_log` | gpu_log=1: a line for every submission and the time the core spent on it |
 | `gpu_private` | gpu_private=1: the ring and the page of fences for the core's privileged accesses alone, as Linux maps them (MSM_BO_MAP_PRIV): CP_APRIV_CNTL makes the ring's own fetches and writes privileged, and a program's command buffer, run unprivileged, then cannot write into the ring or forge a fence. |
-| `gpu_recover` | gpu_recover=1: a submission the core never finishes does not cost the rest of the run. |
+| `gpu_recover` | gpu_recover=1 (on the A730 without it; gpu_recover=0 off): a submission the core never finishes does not cost the rest of the run. |
 | `gpu_slumber` | gpu_slumber=0: deeper idle collapse off (gpu-slumber; on without it) |
 | `gpu_va` | gpu_va: 0 (the default) as it has always been. |
 
