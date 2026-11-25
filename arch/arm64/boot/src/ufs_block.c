@@ -34,6 +34,7 @@ static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
 static int block_dsu_part = -1;         /* the DSU image's entry (BLOCK_PART_DSU); -1: none */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
+static uint8_t block_gpt[8][4096] __attribute__((aligned(0x2000)));     /* the units' GPT headers (native.gpt_pa) */
 
 /* the bytes of a device path before its end node */
 static uint64_t

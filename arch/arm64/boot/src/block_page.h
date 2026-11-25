@@ -108,6 +108,18 @@ struct loader_block {
 		uint64_t area_pa;              /* the list (1 KB, at the start) and command descriptors */
 		uint32_t area_size, ucd_offset, ucd_size, slots;
 		uint32_t uefi_utrlba, uefi_utrlbau;
+		/*
+		 * So that a kernel with all the cores (no bootcpu=: nobody here to ask) needs nothing of
+		 * this loader once it runs: block 1 (the GPT header) of each of the first 8 units, read
+		 * here before the run, at gpt_pa + 4096 * unit (gpt_mask: which ones; gpt_version 1) --
+		 * what the kernel's own reads must match to know a unit by -- and the DSU image's extents,
+		 * pairs of {sector, count} in 512-byte sectors of partition dsu_data_part (userdata). In
+		 * what was padding: a loader before them leaves them zero, which is "not offered".
+		 */
+		uint64_t gpt_pa;
+		uint32_t gpt_version, gpt_mask;
+		uint64_t dsu_pa;
+		uint32_t dsu_extents, dsu_data_part;
 	} native __attribute__((aligned(128)));
 	/* written by the loader during a run: it takes the controller back (a hung kernel); send nothing more */
 	struct {

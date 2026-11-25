@@ -65,6 +65,13 @@ static struct loader_block *const page = (struct loader_block *)(void *)(page_me
 static _Alignas(16384) uint8_t buffer[BUFFER];
 static unsigned mapped_elsewhere;
 
+/* what the loader keeps for a kernel on its own core (no bootcpu=): the units' GPT headers, the DSU image's extents */
+#define GPT_PA          0x9f900000ull
+#define DSU_PA          0x9fa00040ull           /* (a static of the loader's: not at the start of a page) */
+static _Alignas(16384) uint8_t gpt_memory[8 * 4096];
+static _Alignas(16384) uint64_t dsu_memory[MAP_PAGE / 8];
+boolean_t pmap_valid_address(uint64_t addr __unused) { return false; }
+
 vm_offset_t
 ml_io_map_unmappable(vm_offset_t phys, vm_size_t size __unused, unsigned int flags __unused)
 {
@@ -73,6 +80,12 @@ ml_io_map_unmappable(vm_offset_t phys, vm_size_t size __unused, unsigned int fla
 	}
 	if (phys == BUFFER_PA) {
 		return (vm_offset_t)buffer;
+	}
+	if (phys == GPT_PA) {
+		return (vm_offset_t)gpt_memory;
+	}
+	if (phys == (DSU_PA & ~(MAP_PAGE - 1))) {
+		return (vm_offset_t)dsu_memory;
 	}
 	mapped_elsewhere++;
 	fprintf(stderr, "MODEL: %#lx mapped, which is neither the loader's page nor its buffer\n", (unsigned long)phys);
@@ -210,8 +223,10 @@ void loader_return(void) {}
  */
 static unsigned switched_out, switched_in, native_reads;
 static int native_error = EIO, switch_in_error = EIO;
-bool ufshc_probe(const struct ufshc_loader *loader __unused, bool only __unused) { return false; }
-bool ufshc_available(void) { return false; }
+static bool probe_ok;                           /* the controller as the loader offers it */
+static bool whole_unit;                         /* its reads are of unit 0 as a whole (unit_byte), not darwin's */
+bool ufshc_probe(const struct ufshc_loader *loader __unused, bool only __unused) { return probe_ok; }
+bool ufshc_available(void) { return probe_ok; }
 void ufshc_set_luns(uint32_t mask __unused) {}
 static void (*while_switching_in)(void);       /* (what happens elsewhere while the list goes in, with the mailbox held) */
 int ufshc_switch_in(bool prove __unused) { switched_in++; if (while_switching_in != NULL) { while_switching_in(); } return switch_in_error; }
@@ -224,6 +239,12 @@ ufshc_read(uint8_t lun __unused, uint64_t offset, uint8_t *dst, uint64_t len)
 	native_reads++;
 	if (native_error != 0) {
 		return native_error;
+	}
+	if (whole_unit) {
+		for (uint64_t i = 0; i < len; i++) {
+			dst[i] = offset + i >= 4096 && offset + i < 8192 ? gpt_memory[offset + i - 4096] : made_up(UNIT0, offset + i);
+		}
+		return 0;
 	}
 	for (uint64_t i = 0; i < len; i++) {
 		dst[i] = made_up(2, offset - DARWIN_ON_ITS_UNIT + i);  /* (darwin's, part 2) */
@@ -268,7 +289,8 @@ loader(const char *arguments)
 	page->write_first = WRITE_FIRST;
 	page->answer.answered = 40;                     /* (it has served a kernel before this one) */
 	page->ask.request = 40;
-	snprintf(line, sizeof(line), "ufs_shared_pa=%#llx %s", PAGE_PA, arguments);
+	/* (core 0 is the loader's, the kernel on another: bootcpu=; loader_on_its_core() takes it away) */
+	snprintf(line, sizeof(line), "ufs_shared_pa=%#llx bootcpu=7 %s", PAGE_PA, arguments);
 	boot_args = line;
 	pthread_create(&thread, NULL, core0, NULL);
 }
@@ -1065,6 +1087,166 @@ a_request_that_waits(void)
 	    sizeof(data)) && ufs_async == 0, "served at once, not queued");
 }
 
+/* ---- the kernel on the loader's own core (no bootcpu=): nobody to ask, its own driver or nothing --------------- */
+
+#define USERDATA        PARTS                   /* (two more partitions: userdata, and the DSU image in it) */
+#define DSU             (PARTS + 1)
+#define USERDATA_FIRST  1000000ull
+#define USERDATA_BLOCKS 20000000ull
+/* the image's extents, in userdata's 512-byte sectors: 50 blocks, 10, 40 */
+static const uint64_t extents[3][2] = { { 8 * 100, 8 * 50 }, { 8 * 5000, 8 * 10 }, { 8 * 200, 8 * 40 } };
+#define DSU_BLOCKS      100ull
+
+/* byte o of the image is that byte of unit 0 */
+static uint64_t
+dsu_on_unit(uint64_t o)
+{
+	uint64_t image_at = 0;
+
+	for (unsigned x = 0; x < 3; x++) {
+		uint64_t bytes = extents[x][1] * 512;
+
+		if (o < image_at + bytes) {
+			return USERDATA_FIRST * 4096 + extents[x][0] * 512 + (o - image_at);
+		}
+		image_at += bytes;
+	}
+	return UINT64_MAX;
+}
+
+static bool
+is_unit(uint64_t unit_offset, const uint8_t *data, size_t size)
+{
+	for (size_t i = 0; i < size; i++) {
+		if (data[i] != made_up(UNIT0, unit_offset + i)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+is_dsu(uint64_t offset, const uint8_t *data, size_t size)
+{
+	for (size_t i = 0; i < size; i++) {
+		if (data[i] != made_up(UNIT0, dsu_on_unit(offset + i))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * The loader before a run with the kernel on its core: the units' GPT headers and the image's extents kept, its
+ * mailbox never served (it has no core left), this kernel's own driver offered and reading unit 0 as a whole.
+ */
+static void
+loader_on_its_core(const char *arguments)
+{
+	static char line[160];
+	uint32_t crc;
+
+	loader(arguments);
+	silent = true;
+	snprintf(line, sizeof(line), "ufs_shared_pa=%#llx ufs_native=1 %s", PAGE_PA, arguments);
+	boot_args = line;
+	page->parts = PARTS + 2;
+	partition(USERDATA, "userdata", 4096, USERDATA_BLOCKS, USERDATA_FIRST, 0);
+	partition(DSU, "dsu", 4096, DSU_BLOCKS, 0, BLOCK_PART_DSU);
+	page->part[DSU].unit = 0xffff;
+	memset(gpt_memory, 0, sizeof(gpt_memory));
+	memcpy(gpt_memory, "EFI PART", 8);
+	gpt_memory[10] = 1;                                     /* (revision 1.0) */
+	gpt_memory[12] = 92;                                    /* header size */
+	memset(gpt_memory + 56, 0x5a, 16);                      /* (the unit's GUID: anything) */
+	crc = crc32(0, gpt_memory, 92);
+	memcpy(gpt_memory + 16, &crc, 4);
+	page->native.gpt_pa = GPT_PA;
+	page->native.gpt_version = 1;
+	page->native.gpt_mask = 1;
+	memcpy(&dsu_memory[(DSU_PA & (MAP_PAGE - 1)) / 8], extents, sizeof(extents));
+	page->native.dsu_pa = DSU_PA;
+	page->native.dsu_extents = 3;
+	page->native.dsu_data_part = USERDATA;
+	probe_ok = true;
+	switch_in_error = 0;
+	native_error = 0;
+	whole_unit = true;
+}
+
+/* the image through its extents, the partitions from where their unit has them, and the loader asked nothing */
+static void
+on_its_core_reads_natively(void)
+{
+	static uint8_t data[20 * 4096];
+	size_t done = 0;
+
+	loader_on_its_core("");
+	hakios_ufs_init();
+	CHECK(ufs_native_only && ufs_native_on, "this kernel's own driver, and only it: %s", log_text);
+	CHECK(logged("ufs: native: unit0 is LUN 0: its GPT header read both ways is the same"), "known by the loader's copy: %s", log_text);
+	CHECK(logged("ufs: native: dsu: 3 extents in userdata"), "the image's extents taken: %s", log_text);
+	CHECK(logged("and nothing through the loader: it has no core this run"), "said: %s", log_text);
+	/* from the middle of the first extent over the whole second into the third */
+	CHECK(fake_dev_pread("rufs_dsu", data, sizeof(data), AT(45) + 100, &done) == 0 && done == sizeof(data) &&
+	    is_dsu(45 * 4096 + 100, data, sizeof(data)), "the image across three extents: %s", log_text);
+	CHECK(fake_dev_pread("rufs_dsu", data, 8192, AT(DSU_BLOCKS) - 4096, &done) == 0 && done == 4096 &&
+	    is_dsu((DSU_BLOCKS - 1) * 4096, data, 4096), "up to its end: %zu", done);
+	CHECK(fake_dev_pread("rufs_darwin", data, 5000, AT(7) + 3, &done) == 0 && done == 5000 &&
+	    is_unit((DARWIN_FIRST + 7) * 4096 + 3, data, 5000), "darwin from where its unit has it");
+	CHECK(asked_n == 0 && ufs_mailbox_refused == 0 && ufs_native_fallbacks == 0, "the loader asked nothing: %u", asked_n);
+	/* a read of its own that fails is the read's error: nothing falls back, the driver stays */
+	native_error = EIO;
+	CHECK(fake_dev_pread("rufs_dsu", data, 4096, AT(3), &done) == EIO, "a failed read fails");
+	CHECK(asked_n == 0 && ufs_native_on && ufs_native_fallbacks == 1, "and still nothing asked of the loader");
+	CHECK(try_as_root("ufs_native", 0) == EBUSY && ufs_native_on, "no switch to the loader by hand either");
+}
+
+/* without the loader's copies of the GPT headers no unit is known, and nothing is read -- at once, not after 20 s */
+static void
+on_its_core_without_the_headers(void)
+{
+	static uint8_t data[4096];
+	size_t done = 0;
+
+	loader_on_its_core("");
+	if (getenv("UFS_CASE") != NULL && getenv("UFS_CASE")[0] == '1') {
+		gpt_memory[60] ^= 1;                    /* (the header's CRC no longer right) */
+	} else {
+		page->native.gpt_version = 0;           /* (a loader before them) */
+	}
+	hakios_ufs_init();
+	CHECK(logged("ufs: native: unit0: no GPT header to know it by"), "said: %s", log_text);
+	CHECK(logged("ufs: NOTHING of the storage can be read"), "said so: %s", log_text);
+	CHECK(fake_dev_pread("rufs_darwin", data, 4096, AT(1), &done) == ENXIO && fake_dev_pread("rufs_dsu", data, 4096, 0, &done) == ENXIO,
+	    "reads refused");
+	CHECK(asked_n == 0 && ufs_mailbox_refused >= 1, "none asked of the loader");
+}
+
+/* extents that do not fit userdata, or do not make the image's size: the image is not read */
+static void
+on_its_core_extents_wrong(void)
+{
+	static uint8_t data[4096];
+	size_t done = 0;
+	const char *c = getenv("UFS_CASE");
+	uint64_t *table = &dsu_memory[(DSU_PA & (MAP_PAGE - 1)) / 8];
+
+	loader_on_its_core("");
+	switch (c != NULL ? c[0] - '0' : 0) {
+	case 0: table[4] = USERDATA_BLOCKS * 8 - 8; break;          /* (the third past userdata's end) */
+	case 1: table[3] = 8 * 11; break;                           /* (one block more than the image) */
+	case 2: table[2] = 8 * 5000 + 1; break;                     /* (not on a block) */
+	case 3: page->native.dsu_data_part = UNIT0; break;          /* (a whole unit, not a partition) */
+	default: page->native.dsu_extents = 0; break;
+	}
+	hakios_ufs_init();
+	CHECK(logged("ufs: native: dsu: not read by this kernel's own driver"), "said: %s", log_text);
+	CHECK(fake_dev_pread("rufs_dsu", data, 4096, 0, &done) == ENXIO, "the image is not read");
+	CHECK(fake_dev_pread("rufs_darwin", data, 4096, 0, &done) == 0 && is_unit(DARWIN_FIRST * 4096, data, 4096), "the rest is");
+	CHECK(asked_n == 0, "none asked of the loader");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1084,6 +1266,9 @@ main(int argc, char **argv)
 		{ "a_request_that_waits", a_request_that_waits, 1 }, { "reference_names", reference_names, 1 }, { "the_writes_own_checks", the_writes_own_checks, 1 },
 		{ "reads_short_of_a_block", reads_short_of_a_block, 1 }, { "reads_that_follow", reads_that_follow, 1 }, { "its_devices", its_devices, 1 },
 		{ "the_report", the_report, 1 }, { "the_report_read_only", the_report_read_only, 1 }, { "one_past_the_last", one_past_the_last, 1 },
+		{ "on_its_core_reads_natively", on_its_core_reads_natively, 1 },
+		{ "on_its_core_without_the_headers", on_its_core_without_the_headers, 2 },
+		{ "on_its_core_extents_wrong", on_its_core_extents_wrong, 5 },
 	};
 
 	if (argc < 2) {

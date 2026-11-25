@@ -10,7 +10,13 @@
  * page (ufs_shared_pa=) with the table of partitions, a request and an answer, and a buffer; this
  * driver writes a request -- which partition, which blocks -- and core 0 reads them with that
  * driver's ReadBlocks into the buffer (xnuloader/loader.c, block_poll). Nothing in this kernel
- * touches the storage controller.
+ * touches the storage controller on that path.
+ *
+ * Without bootcpu= the kernel has every core and nobody is left in the loader to answer: then only
+ * this kernel's own driver reads (ufs_native=1, board/ufshc.c), the mailbox is never asked and
+ * nothing falls back to it. The units are known by the GPT headers the loader kept before the run
+ * (native.gpt_pa), and the DSU image is read through the extents it found (native.dsu_pa), each
+ * checked against userdata's bounds.
  *
  * Read only wherever a write could do harm, by construction. The block devices never write: the
  * strategy routine refuses, so no filesystem mounted from one can write, and opening one for
@@ -64,6 +70,7 @@
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
 #define BLOCK_PART_UNIT    1u                          /* a whole logical unit, not a partition */
+#define BLOCK_PART_DSU     2u                          /* the DSU image: its blocks those of its extents in userdata */
 #define BLOCK_PART_RAW_GPT 4u                          /* GPT slice on raw UEFI Block I/O */
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
@@ -127,6 +134,10 @@ struct loader_block {
 		uint64_t area_pa;
 		uint32_t area_size, ucd_offset, ucd_size, slots;
 		uint32_t uefi_utrlba, uefi_utrlbau;
+		uint64_t gpt_pa;               /* the units' block 1, kept by the loader before the run */
+		uint32_t gpt_version, gpt_mask;
+		uint64_t dsu_pa;               /* the DSU image's extents: {sector, count} of 512 bytes in dsu_data_part */
+		uint32_t dsu_extents, dsu_data_part;
 	} native __attribute__((aligned(128)));
 	struct {
 		volatile uint32_t take_back;   /* the loader's: it takes the controller back, send nothing more */
@@ -171,6 +182,16 @@ static bool ufs_native_mapped;
 static uint32_t ufs_native_luns;                /* how many units are mapped (LUN 0..n-1) */
 static volatile bool ufs_native_on;
 static uint64_t ufs_native_fallbacks, ufs_mailbox_refused;
+/* no bootcpu=: no loader core to ask; this kernel's own driver or nothing */
+static bool ufs_native_only;
+
+/* The DSU image (BLOCK_PART_DSU) through its extents in userdata: bytes of that partition, in image order */
+#define UFS_DSU_MAX        4096
+struct ufs_dsu_extent {
+	uint64_t at, bytes;             /* in the data partition */
+};
+static struct ufs_dsu_extent *ufs_dsu;
+static uint32_t ufs_dsu_count, ufs_dsu_part = BLOCK_MAX_PARTS, ufs_dsu_data = BLOCK_MAX_PARTS;
 
 static LCK_GRP_DECLARE(ufs_lck_grp, "hakios-ufs");
 static LCK_MTX_DECLARE(ufs_lock, &ufs_lck_grp);
@@ -352,6 +373,14 @@ ufs_request(uint32_t op, uint32_t part, uint64_t lba, uint64_t count, uint8_t *d
 
 	if (ufs_dead || ufs_closing) {
 		return EIO;
+	}
+	if (ufs_native_only) {
+		/* nobody in the loader to answer: the request would only wait out UFS_TIMEOUT_MS */
+		if (ufs_mailbox_refused++ < 4) {
+			printf("ufs: %s: not asked of the loader: no core of its own this run (no bootcpu=)\n",
+			    ufs_page->part[part].name);
+		}
+		return ENXIO;
 	}
 	if (op == BLOCK_OP_READ) {
 		if (part == ufs_last_part && lba == ufs_last_end) {
@@ -571,6 +600,36 @@ ufs_read_native(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 	return ufshc_read(ufs_lun[part], ufs_lun_offset[part] + offset, dst, len);
 }
 
+/* The DSU image's bytes [offset, offset + len), through its extents in the data partition (bounds checked at the map) */
+static int
+ufs_read_dsu(uint64_t offset, uint8_t *dst, uint64_t len)
+{
+	uint64_t image_at = 0;
+	int error = 0;
+
+	for (uint32_t x = 0; x < ufs_dsu_count && len > 0 && error == 0; x++) {
+		uint64_t end = image_at + ufs_dsu[x].bytes;
+
+		if (offset < end) {
+			uint64_t piece = MIN(len, end - offset);
+
+			error = ufs_read_native(ufs_dsu_data, ufs_dsu[x].at + (offset - image_at), dst, piece);
+			offset += piece;
+			dst += piece;
+			len -= piece;
+		}
+		image_at = end;
+	}
+	return error == 0 && len != 0 ? EIO : error;
+}
+
+/* Whether this kernel's own driver can read partition part */
+static inline bool
+ufs_native_reads(uint32_t part)
+{
+	return ufs_lun[part] != 0xff || (part == ufs_dsu_part && ufs_dsu_count != 0);
+}
+
 /* The switches of lists, with the loader's mailbox held: nothing is asked of UEFI meanwhile */
 static int
 ufs_native_in(bool prove)
@@ -601,10 +660,17 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 {
 	int error;
 
-	if (ufs_native_on && ufs_lun[part] != 0xff) {
-		error = ufs_read_native(part, offset, dst, len);
+	if (ufs_native_on && ufs_native_reads(part)) {
+		error = part == ufs_dsu_part ? ufs_read_dsu(offset, dst, len) : ufs_read_native(part, offset, dst, len);
 		if (error == 0) {
 			return 0;
+		}
+		if (ufs_native_only) {
+			/* nothing to fall back to: the error is the read's */
+			ufs_native_fallbacks++;
+			printf("ufs: %s: bytes %llu..%llu: this kernel's own read failed (%d)\n", ufs_page->part[part].name,
+			    offset, offset + len - 1, error);
+			return error;
 		}
 		if (!ufs_write_busy) {
 			/* (with the list out for a write of ours, not broken: this read just goes the other way) */
@@ -618,7 +684,7 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 		}
 	}
 	error = ufs_read_mailbox(part, offset, dst, len);
-	if (error != 0 && ufs_lun[part] != 0xff && ufshc_list_in()) {
+	if (error != 0 && ufs_native_reads(part) && ufshc_list_in()) {
 		/*
 		 * This kernel's own list went back in while the read waited for the loader's mailbox --
 		 * the writing over (ufs_write_restore puts the list in with the mailbox held, and says
@@ -628,7 +694,7 @@ ufs_read(uint32_t part, uint64_t offset, uint8_t *dst, uint64_t len)
 		 * volume, with DSU=2). A list that may be in but is not usable (lost, the path off)
 		 * reads nothing here, and the error stands.
 		 */
-		error = ufs_read_native(part, offset, dst, len);
+		error = part == ufs_dsu_part ? ufs_read_dsu(offset, dst, len) : ufs_read_native(part, offset, dst, len);
 	}
 	return error;
 }
@@ -647,7 +713,8 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 	uint64_t nbs, per;
 	int error = 0;
 
-	if (!ufs_ready || ufs_write_part < 0 || part != (uint32_t)ufs_write_part) {
+	if (!ufs_ready || ufs_write_part < 0 || part != (uint32_t)ufs_write_part || ufs_native_only) {
+		/* (writes go through the loader, which has no core this run without bootcpu=) */
 		ufs_write_refused++;
 		return EROFS;
 	}
@@ -1263,6 +1330,111 @@ hakios_ufs_read_partition(const char *name, uint64_t offset, uint8_t *dst, uint6
  * is the same as block 1 of that LUN read here; no other LUN is read. The loader's reads are made
  * first, with UEFI's list in; then this kernel's list goes in (with its proof) and stays in.
  */
+extern boolean_t pmap_valid_address(uint64_t addr);
+
+/* Loader memory the page points at (outside the kernel's own, whole pages), mapped uncached; 0: not such memory */
+static vm_offset_t
+ufs_loader_map(uint64_t pa, uint64_t bytes)
+{
+	if (pa == 0 || bytes == 0 || pa > UINT64_MAX - bytes || pmap_valid_address(pa) || pmap_valid_address(pa + bytes - 1)) {
+		return 0;
+	}
+	vm_offset_t base = ml_io_map_unmappable((vm_offset_t)(pa & ~(UFS_PAGE - 1)),
+	    ((pa & (UFS_PAGE - 1)) + bytes + UFS_PAGE - 1) & ~(UFS_PAGE - 1), VM_WIMG_WCOMB);
+	return base == 0 ? 0 : base + (vm_offset_t)(pa & (UFS_PAGE - 1));
+}
+
+/* Unit unit's block 1 as the loader read it before the run (native.gpt_pa), its header's CRC right */
+static int
+ufs_gpt_snapshot(uint32_t unit, uint8_t *dst)
+{
+	static vm_offset_t map;
+	uint32_t bytes, wanted;
+
+	if (ufs_page->native.gpt_version != 1 || unit >= 8 || (ufs_page->native.gpt_mask & (1u << unit)) == 0 ||
+	    (ufs_page->native.gpt_pa & 0xfff) != 0) {
+		return ENXIO;
+	}
+	if (map == 0 && (map = ufs_loader_map(ufs_page->native.gpt_pa, 8 * 4096)) == 0) {
+		return ENOMEM;
+	}
+	memcpy(dst, (const void *)(map + unit * 4096), 4096);
+	if (memcmp(dst, "EFI PART", 8) != 0) {
+		return EINVAL;
+	}
+	memcpy(&bytes, dst + 12, sizeof(bytes));
+	memcpy(&wanted, dst + 16, sizeof(wanted));
+	if (bytes < 92 || bytes > 4096) {
+		return EINVAL;
+	}
+	memset(dst + 16, 0, 4);
+	uint32_t got = crc32(0, dst, bytes);
+	memcpy(dst + 16, &wanted, sizeof(wanted));
+	return got == wanted ? 0 : EINVAL;
+}
+
+/*
+ * The DSU image's extents (native.dsu_pa), for this kernel's own driver: each whole 4096-byte
+ * blocks inside the data partition (which must be one this driver reads), together the image's
+ * size exactly. Any doubt and the image is not read here at all.
+ */
+static bool
+ufs_dsu_map(void)
+{
+	uint32_t n = ufs_page->native.dsu_extents, data = ufs_page->native.dsu_data_part, dsu = BLOCK_MAX_PARTS;
+	uint64_t total = 0, part_bytes;
+	const uint64_t *table = NULL;
+	const char *why = NULL;
+
+	for (uint32_t i = 0; i < ufs_parts; i++) {
+		if (ufs_page->part[i].flags & BLOCK_PART_DSU) {
+			dsu = i;
+		}
+	}
+	if (dsu == BLOCK_MAX_PARTS) {
+		return false;           /* no DSU image this run: nothing to say */
+	}
+	if (n == 0 || n > UFS_DSU_MAX || ufs_page->native.dsu_pa == 0) {
+		why = "the loader gave no extents";
+	} else if (data >= ufs_parts || (ufs_page->part[data].flags & (BLOCK_PART_UNIT | BLOCK_PART_DSU)) ||
+	    ufs_lun[data] == 0xff || ufs_page->part[data].block_size != 4096) {
+		why = "its data partition is not one this driver reads";
+	} else if ((table = (const uint64_t *)(uintptr_t)ufs_loader_map(ufs_page->native.dsu_pa, (uint64_t)n * 16)) == NULL) {
+		why = "the extents could not be mapped";
+	} else if ((ufs_dsu = kalloc_data(n * sizeof(*ufs_dsu), Z_WAITOK | Z_ZERO)) == NULL) {
+		why = "no memory";
+	} else {
+		part_bytes = ufs_part_bytes(data);
+		for (uint32_t x = 0; x < n && why == NULL; x++) {
+			uint64_t sector = table[2 * x], count = table[2 * x + 1];
+
+			if (count == 0 || sector % 8 || count % 8 || sector > part_bytes / 512 || count > part_bytes / 512 - sector) {
+				why = "an extent is not whole blocks inside the data partition";
+			}
+			ufs_dsu[x].at = sector * 512;
+			ufs_dsu[x].bytes = count * 512;
+			total += count * 512;
+		}
+		if (why == NULL && total != ufs_part_bytes(dsu)) {
+			why = "the extents are not the image's size";
+		}
+	}
+	if (why != NULL) {
+		printf("ufs: native: %s: not read by this kernel's own driver: %s\n", ufs_page->part[dsu].name, why);
+		if (ufs_dsu != NULL) {
+			kfree_data(ufs_dsu, n * sizeof(*ufs_dsu));
+			ufs_dsu = NULL;
+		}
+		return false;
+	}
+	ufs_dsu_data = data;
+	ufs_dsu_part = dsu;
+	ufs_dsu_count = n;
+	printf("ufs: native: %s: %u extents in %s, %llu MB, read by this kernel's own driver\n", ufs_page->part[dsu].name, n,
+	    ufs_page->part[data].name, total >> 20);
+	return true;
+}
+
 static bool
 ufs_native_map(bool all_units)
 {
@@ -1280,8 +1452,13 @@ ufs_native_map(bool all_units)
 		if (!all_units && (darwin == BLOCK_MAX_PARTS || ufs_page->part[darwin].unit != e->unit)) {
 			continue;
 		}
-		if (e->block_size != 4096 || ufs_read_mailbox(i, 4096, theirs + n * 4096, 4096) != 0 ||
-		    memcmp(theirs + n * 4096, "EFI PART", 8) != 0) {
+		/* (the loader's copy from before the run; read through it only while it has a core to answer) */
+		int got = e->block_size != 4096 ? EINVAL : ufs_gpt_snapshot(e->unit, theirs + n * 4096);
+
+		if (got != 0 && e->block_size == 4096 && !ufs_native_only) {
+			got = ufs_read_mailbox(i, 4096, theirs + n * 4096, 4096);
+		}
+		if (got != 0 || memcmp(theirs + n * 4096, "EFI PART", 8) != 0) {
 			printf("ufs: native: %s: no GPT header to know it by (block size %u)\n", e->name, e->block_size);
 			good = false;
 			break;
@@ -1616,6 +1793,9 @@ ufs_sysctl_native(__unused struct sysctl_oid *oidp, __unused void *arg1, __unuse
 	if (error != 0 || !changed) {
 		return error;
 	}
+	if (ufs_native_only) {
+		return value != 0 && ufs_native_on ? 0 : EBUSY;        /* (no loader to read through this run) */
+	}
 	if (value != 0) {
 		if (!(ufs_native_mapped && ufshc_available()) || ufs_native_in(true) != 0) {
 			return ENXIO;
@@ -1630,7 +1810,9 @@ ufs_sysctl_native(__unused struct sysctl_oid *oidp, __unused void *arg1, __unuse
 SYSCTL_PROC(_kern_hakios, OID_AUTO, ufs_native, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
     ufs_sysctl_native, "I", "1: the phone's storage is read by this kernel's own UFS driver, 0: through the loader");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_native_fallbacks, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_native_fallbacks,
-    "times a read of this kernel's own UFS driver failed and the loader's was used instead");
+    "times a read of this kernel's own UFS driver failed (and, with a loader core, the loader's was used instead)");
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_mailbox_refused, CTLFLAG_RD | CTLFLAG_LOCKED, &ufs_mailbox_refused,
+    "requests not asked of the loader: this kernel's list in, or no loader core this run");
 
 /* ---- bringing it up ---- */
 
@@ -1644,6 +1826,9 @@ hakios_ufs_init(void)
 	if (!PE_parse_boot_argn("ufs_shared_pa", &pa, sizeof(pa)) || pa == 0) {
 		return;                 /* the loader was not asked for ufs=2: there is nothing to read through */
 	}
+	/* the kernel on the loader's own core (no bootcpu=): the loader answers nothing until the run is over */
+	ufs_native_only = !PE_parse_boot_argn("bootcpu", &check, sizeof(check));
+	check = 0;
 	base = ml_io_map_unmappable((vm_offset_t)(pa & ~(UFS_PAGE - 1)),
 	    ((pa & (UFS_PAGE - 1)) + sizeof(struct loader_block) + UFS_PAGE - 1) & ~(UFS_PAGE - 1), VM_WIMG_WCOMB);
 	ufs_page = (volatile struct loader_block *)(base + (pa & (UFS_PAGE - 1)));
@@ -1782,6 +1967,11 @@ hakios_ufs_init(void)
 			}
 		} else if (ufs_native_map(true)) {
 			ufs_native_mapped = true;
+			(void)ufs_dsu_map();
+			if (compare != 0 && ufs_native_only) {
+				printf("ufs: native check: not made: it compares with the loader's reads, and the loader has no core this run\n");
+				compare = 0;
+			}
 			if (compare != 0) {
 				/* right here, in bsd_init's thread, and then back to the loader */
 				ufs_native_check();
@@ -1796,13 +1986,20 @@ hakios_ufs_init(void)
 				loader_return();
 			}
 			printf("ufs: the partitions (LUN 0-%u) are read by this kernel's own UFS driver, its list in the "
-			    "controller (kern.hakios.ufs_native=0: through the loader)\n", ufs_native_luns - 1);
+			    "controller (%s)\n", ufs_native_luns - 1, ufs_native_only ?
+			    "and nothing through the loader: it has no core this run" : "kern.hakios.ufs_native=0: through the loader");
 		} else {
 			printf("ufs: this kernel's own UFS driver is not used: through the loader\n");
 		}
 	}
+	if (ufs_native_only && !ufs_native_on) {
+		printf("ufs: NOTHING of the storage can be read: no bootcpu= (the loader has no core to answer) and this "
+		    "kernel's own driver is not in use (ufs_native=1)\n");
+	}
 
-	if (PE_parse_boot_argn("ufs_bench", &check, sizeof(check)) && check != 0) {
+	if (ufs_native_only && PE_parse_boot_argn("ufs_bench", &check, sizeof(check)) && check != 0) {
+		printf("ufs: bench: not made: it measures the loader's reads, and the loader has no core this run\n");
+	} else if (PE_parse_boot_argn("ufs_bench", &check, sizeof(check)) && check != 0) {
 		/* right here, in bsd_init's thread, and then back to the loader: nothing else is wanted */
 		ufs_bench(NULL, THREAD_AWAKENED);
 		loader_return();

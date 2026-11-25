@@ -222,11 +222,43 @@ block_start(void)
 			block_dsu_part = (int)block_shared.parts;
 			block_bios[block_shared.parts++] = data;
 			block_keep_last();
+			/* (for the kernel's own driver: where the image is, in userdata's sectors) */
+			for (uint32_t p = 0; p + 1 < block_shared.parts; p++) {
+				if (block_bios[p] == data && !(block_shared.part[p].flags & BLOCK_PART_UNIT)) {
+					clean_dcache((uint64_t)(uintptr_t)dsu_extent,
+					    (uint64_t)(uintptr_t)dsu_extent + dsu_extents * sizeof(dsu_extent[0]));
+					block_shared.native.dsu_pa = (uint64_t)(uintptr_t)dsu_extent;
+					block_shared.native.dsu_extents = dsu_extents;
+					block_shared.native.dsu_data_part = p;
+					break;
+				}
+			}
 			print("ufs: dsu: the DSU image as partition %d, %d blocks of 4096 in %d extents\n",
 			    (uint64_t)block_dsu_part, bp->blocks, (uint64_t)dsu_extents);
 		} else {
 			log_len = saved;        /* (no DSU image: nothing to say about it) */
 		}
+	}
+	/*
+	 * The units' GPT headers, read now with UEFI's list in, for a kernel that has nobody to ask
+	 * (no bootcpu=). Reads, so UEFI's slot 0 still holds a read for the kernel's proof.
+	 */
+	if (hc_requested) {
+		memset(block_gpt, 0, sizeof(block_gpt));
+		for (uint64_t u = 0; u < nunits && u < 8; u++) {
+			efi_block_io *bio = units[u].bio;
+
+			if (bio->media->block_size == 4096 && bio->media->last_block >= 1 &&
+			    !EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, 4096, block_buffer)) &&
+			    memcmp(block_buffer, "EFI PART", 8) == 0) {
+				memcpy(block_gpt[u], block_buffer, 4096);
+				block_shared.native.gpt_mask |= 1u << u;
+			}
+		}
+		clean_dcache((uint64_t)(uintptr_t)block_gpt, (uint64_t)(uintptr_t)block_gpt + sizeof(block_gpt));
+		block_shared.native.gpt_pa = (uint64_t)(uintptr_t)block_gpt;
+		block_shared.native.gpt_version = 1;
+		print("ufs: the units' GPT headers kept for the kernel (mask %x)\n", (uint64_t)block_shared.native.gpt_mask);
 	}
 	/* the kernel's own transfer list: this loader's area, if the controller is as UEFI keeps it */
 	if (hc_known && hc_list_is_uefis() && hc_rd(HC_UTRLDBR) == 0 && (hc_rd(HC_HCE) & 1)) {
