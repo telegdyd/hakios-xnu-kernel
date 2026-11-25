@@ -6,7 +6,8 @@
  * collections poster (com.apple.WallpaperKit.CollectionsPoster) showing the device's default wallpaper
  * ([[PBFWallpaperKitBridge defaultBridge] defaultWallpaperIdentifier], which the image builder makes
  * Stripe, drawn by CoreAnimation: darwin/tools/mkimage26.py default_wallpaper()); on every other one
- * com.apple.MercuryPoster, whose 3D scene is drawn with Metal, which this phone has not got: black.
+ * com.apple.MercuryPoster, whose 3D scene is drawn with Metal, which a phone without the GPU's Metal has not got:
+ * black. With boot-arg metal=1 (Metal on the GPU) Mercury is left as it is.
  * (Without the hero poster PosterBoard makes a legacy poster from the wallpaper of an older Darwin, and on a
  * new device there is none: black as well.)
  *
@@ -625,6 +626,26 @@ watchdogs_off_later(void *context)
 	render_timeouts_longer();
 }
 
+/* whether Metal is drawn by the GPU (boot-arg metal=1: the Metal plug-in serves a device, darwin/userland/metal.sh):
+ * then Mercury draws, as on an iPhone, and is left as it is (the OnePlus 10 Pro's A730, 25 November) */
+static bool
+gpu_metal(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	const char *at;
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
+		return false;
+	}
+	for (at = strstr(args, "metal=1"); at != NULL; at = strstr(at + 1, "metal=1")) {
+		if ((at == args || at[-1] == ' ') && (at[7] == 0 || at[7] == ' ')) {
+			return true;
+		}
+	}
+	return false;
+}
+
 __attribute__((constructor)) static void
 poster_init(void)
 {
@@ -638,6 +659,10 @@ poster_init(void)
 		dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), later, NULL, watchdogs_off_later);
 	}
 
+	if (gpu_metal()) {
+		say("hakios: PosterBoard: Metal is drawn by the GPU (metal=1): Mercury left as it is\n");
+		return;
+	}
 	Method initial = method_of("PBFInitialPosterHelper", true, "initialPosterConfigurationsWithModelCoordinatorProvider:role:", "@@:@@");
 	Method incoming = method_of("PBFInitialPosterHelper", true, "incomingPosterConfigurationForRole:templatePath:userInfo:", "@@:@@@");
 	Method coordinator = method_of("PBFPosterExtensionDataStore", false, "pbf_posterExtensionStoreCoordinatorForProviderIdentifier:error:", "@@:@^@");
