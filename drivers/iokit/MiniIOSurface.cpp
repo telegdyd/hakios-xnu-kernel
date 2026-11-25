@@ -72,6 +72,9 @@ enum {
 	kSurfaceMethodEventRemoveListener = 41, /* in the listener */
 	kSurfaceMethodDetachModeCode    = 43,
 	kSurfaceMethodSetOwnershipIdentity = 44,
+	/* Darwin 26/27 */
+	kSurfaceMethodSetCoreVideoBridgedKeys = 54,     /* in: 12 bytes, then the keys as an IOCFSerialize'd set */
+	kSurfaceMethodQueryTransactionList = 58,        /* in: surface, buffer, entries, 2 more; out: written, full, selected */
 };
 
 /* IOConnectTrap indices */
@@ -1142,6 +1145,8 @@ class IOSurfaceRootUserClient : public IOUserClient
 	IOReturn methodCopyValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize);
 	IOReturn methodRemoveValue(IOExternalMethodArguments * args, const uint8_t * in, size_t inSize);
 	IOReturn methodSetBulkAttachments(const uint8_t * in, size_t inSize);
+	IOReturn methodSetCoreVideoBridgedKeys(const uint8_t * in, size_t inSize);
+	IOReturn methodQueryTransactionList(IOExternalMethodArguments * args);
 
 	IOReturn trapIncrementUseCount(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
 	IOReturn trapDecrementUseCount(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
@@ -1489,6 +1494,63 @@ unserialize(const uint8_t * data, size_t size)
 		return NULL;
 	}
 	return OSUnserializeXML((const char *) data, size, NULL);
+}
+
+/*
+ * The attachment keys CoreVideo bridges to its buffers (IOSurfaceSetCoreVideoBridgedKeys): one set for all, set again
+ * by each CoreVideo client. Kept; nothing here treats those keys differently from any other value.
+ */
+static OSObject *       gBridgedKeys;
+
+IOReturn
+IOSurfaceRootUserClient::methodSetCoreVideoBridgedKeys(const uint8_t * in, size_t inSize)
+{
+	OSObject * keys, * old;
+	static bool logged;
+
+	if (inSize <= 12 || inSize > (64u << 10)) {
+		return kIOReturnBadArgument;
+	}
+	keys = unserialize(in + 12, inSize - 12);
+	if (keys == NULL) {
+		return kIOReturnBadArgument;
+	}
+	if (!logged) {
+		OSCollection * set = OSDynamicCast(OSCollection, keys);
+		logged = true;
+		IOLog("MiniIOSurface: CoreVideo bridged keys: %u\n", set != NULL ? set->getCount() : 0);
+	}
+	IOLockLock(gSurfaceLock);
+	old = gBridgedKeys;
+	gBridgedKeys = keys;
+	IOLockUnlock(gSurfaceLock);
+	OSSafeReleaseNULL(old);
+	return kIOReturnSuccess;
+}
+
+/*
+ * IOSurfaceQueryTransactionList: the transactions (shared event waits) appended to a surface. Appending and pruning
+ * are traps 11 and 12, not here, so every list is empty: nothing written, 0 long, 0 selected.
+ */
+IOReturn
+IOSurfaceRootUserClient::methodQueryTransactionList(IOExternalMethodArguments * args)
+{
+	struct minisurf_client_ref * ref;
+
+	if (args->scalarInputCount < 1 || args->scalarOutputCount < 3) {
+		return kIOReturnBadArgument;
+	}
+	IOLockLock(gSurfaceLock);
+	ref = findRef((uint32_t) args->scalarInput[0], false);
+	IOLockUnlock(gSurfaceLock);
+	if (ref == NULL) {
+		return kIOReturnNotFound;
+	}
+	args->scalarOutput[0] = 0;
+	args->scalarOutput[1] = 0;
+	args->scalarOutput[2] = 0;
+	args->scalarOutputCount = 3;
+	return kIOReturnSuccess;
 }
 
 IOReturn
@@ -2072,6 +2134,7 @@ IOSurfaceRootUserClient::method(uint32_t selector, IOExternalMethodArguments * a
 	case kSurfaceMethodCopyValue:
 	case kSurfaceMethodRemoveValue:
 	case kSurfaceMethodSetBulkAttachments:
+	case kSurfaceMethodSetCoreVideoBridgedKeys:
 		if (args->structureInputDescriptor != NULL) {
 			inMap = args->structureInputDescriptor->map(kIOMapReadOnly);
 			if (inMap == NULL) {
@@ -2088,6 +2151,8 @@ IOSurfaceRootUserClient::method(uint32_t selector, IOExternalMethodArguments * a
 			ret = methodCopyValue(args, in, inSize);
 		} else if (selector == kSurfaceMethodRemoveValue) {
 			ret = methodRemoveValue(args, in, inSize);
+		} else if (selector == kSurfaceMethodSetCoreVideoBridgedKeys) {
+			ret = methodSetCoreVideoBridgedKeys(in, inSize);
 		} else {
 			ret = methodSetBulkAttachments(in, inSize);
 		}
@@ -2138,6 +2203,21 @@ IOSurfaceRootUserClient::method(uint32_t selector, IOExternalMethodArguments * a
 		}
 		IOLockUnlock(gSurfaceLock);
 		return ref ? kIOReturnSuccess : kIOReturnNotFound;
+
+	case kSurfaceMethodQueryTransactionList:
+		return methodQueryTransactionList(args);
+
+	case kSurfaceMethodCommPageAddress:
+		/*
+		 * IOSurfaceGetGraphicsCommPageAddress: the address of a page the GPU driver shares with every task. There is
+		 * none here; the caller reads 0 as "none", as it does a failure.
+		 */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		args->scalarOutput[0] = 0;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
 
 	case kSurfaceMethodSetOwnership:
 	case kSurfaceMethodSetOwnershipIdentity:
