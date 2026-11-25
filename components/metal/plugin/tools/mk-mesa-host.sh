@@ -37,14 +37,16 @@ if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.hakios-patches" 2>/dev/null)" != "$PATCHES
 		patch -s --no-backup-if-mismatch -d "$SRC" -p1 < "$HERE/mesa/$p"
 	done
 	# glibc 2.43 and later declare C11's once_flag and call_once in <stdlib.h>, which clashes with Mesa 25.0's own
-	# definitions in src/c11/threads.h; only a build against glibc meets it
+	# definitions in src/c11/threads.h; only a build against glibc meets it (and only from 2.43: 2.41 with C23 on
+	# declares neither, and the definitions are Mesa's again there)
 	python3 - "$SRC" <<-'PY'
 		import sys
 		root = sys.argv[1]
 		p = root + '/src/c11/threads.h'
 		s = open(p).read()
 		old = "typedef pthread_once_t  once_flag;\n#  define ONCE_FLAG_INIT PTHREAD_ONCE_INIT\n"
-		new = ("#  if defined(__GLIBC__) && __GLIBC_USE(ISOC23) && !defined(__cplusplus)\n"
+		new = ("#  if defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 43) && __GLIBC_USE(ISOC23) && \\\n"
+		       "      !defined(__cplusplus)\n"
 		       "#    define C11_LIBC_HAS_CALL_ONCE 1\n"
 		       "#  else\n"
 		       "typedef pthread_once_t  once_flag;\n"
