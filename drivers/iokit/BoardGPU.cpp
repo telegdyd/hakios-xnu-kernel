@@ -1071,7 +1071,7 @@ MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned c
 	static uint32_t said;
 
 	/* (why not, for kern.hakios.fb_gpu_state while nothing has been set up: 10 the arguments, 11 no GPU, 12 the GPU reported) */
-	if (gGPULock == NULL || count == 0 || count > 4 || panelPhys == 0 || (panelPhys & 63)) {
+	if (gGPULock == NULL || (count == 0 && (video == NULL || !video->hole)) || count > 4 || panelPhys == 0 || (panelPhys & 63)) {
 		gPresentState = gPresentState == 0 ? 10 : gPresentState;
 		return 0;
 	}

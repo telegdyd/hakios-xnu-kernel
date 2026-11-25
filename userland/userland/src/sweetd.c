@@ -27,8 +27,8 @@
  *
  * The client is the device package's tools/sweet-sh.py (the OnePlus 10 Pro's). Only peers on the USB Ethernet link (192.168.7.0/24)
  * are served, and only with the token: TOKEN_IMAGE (darwin/userland/root26-darwin.sh copies userland/sweetd.token, made on the PC
- * and never in git, into the image), else TOKEN_PATH. Without either nothing runs. Clients are served
- * one at a time.
+ * and never in git, into the image), else TOKEN_PATH. Without either nothing runs. Each client runs in a
+ * forked child so a long command (like video_test) does not hold up sysctl, touch or screencap calls.
  */
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -649,11 +649,27 @@ dhcp_serve(void)
 	}
 }
 
+static void
+reap_children(int sig)
+{
+	int saved = errno;
+	(void)sig;
+	while (waitpid(-1, NULL, WNOHANG) > 0) {
+	}
+	errno = saved;
+}
+
 int
 main(void)
 {
 	signal(SIGPIPE, SIG_IGN);
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = reap_children;
+	sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+	sigaction(SIGCHLD, &sa, NULL);
 	if (fork() == 0) {
+		signal(SIGCHLD, SIG_DFL);
 		dhcp_serve();
 		_exit(0);
 	}
@@ -662,7 +678,7 @@ main(void)
 	setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 	struct sockaddr_in a = { .sin_len = sizeof(a), .sin_family = AF_INET, .sin_port = htons(PORT),
 		                 .sin_addr.s_addr = htonl(INADDR_ANY) };
-	while (bind(ls, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(ls, 4) != 0) {
+	while (bind(ls, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(ls, 8) != 0) {
 		sleep(2);       /* (the network may not be up yet) */
 	}
 	fprintf(stderr, "sweetd: listening on port %d\n", PORT);
@@ -675,7 +691,17 @@ main(void)
 		}
 		/* any IPv4 peer: the USB Ethernet link (192.168.7.0/24) or Wi-Fi (en0); the token is what guards it */
 		if (peer.sin_family == AF_INET) {
-			serve(cs);
+			pid_t worker = fork();
+			if (worker == 0) {
+				signal(SIGCHLD, SIG_DFL);
+				close(ls);
+				serve(cs);
+				close(cs);
+				_exit(0);
+			}
+			if (worker < 0) {
+				serve(cs);
+			}
 		}
 		close(cs);
 	}

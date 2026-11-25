@@ -819,10 +819,10 @@ public:
 		uint32_t        chromaOffset;           /* from the buffer's start */
 	}               fVideoNext;             /* the frame of the next flip's, put into the target's video buffer */
 	uint64_t        fVideoRegionPhys, fVideoRegionSize, fVideoPhys[2], fVideoBufferSize;
-	bool            fVideoOn;               /* the controller shows a video now */
+	bool            fVideoOn, fVideoFull;   /* the controller shows a video now, and its range ('420f' vs '420v') */
 	unsigned        fVideoLMs;              /* the mixers CTL0 drives (the boot loader's: 2) */
 	uint32_t        fVideoUIStage;          /* the frame's stage in them (the boot loader's VIG0's) */
-	uint32_t        fVideoHomeLayer[5], fVideoHomeFetch, fVideoHomeLMOp[5], fVideoHomeBlend[5][2];
+	uint32_t        fVideoHomeLayer[5], fVideoHomeFetch, fVideoHomeLMOp[5], fVideoHomeBlend[5][2], fVideoHomeBlend1[5][2];
 	uint32_t        fVideoPipesOn;          /* 1: VIG2, 2: VIG3 */
 	uint32_t        fStatVideoFrames, fStatVideoRefused, fStatVideoUnderruns;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
@@ -2213,9 +2213,17 @@ IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, 
 		full = full || (qx0 == 0 && qy0 == 0 && qx1 == fPanelWidth && qy1 == fPanelHeight);
 		count++;
 	}
-	if (count == 0) {
+	if (count == 0 && video == NULL) {
 		fStatRefused[kRefusedNothing]++;
 		return false;
+	}
+	if (count == 0 && video != NULL) {
+		if (!fGraphics) {
+			fGraphics = true;
+			PE_initialize_console(NULL, kPEGraphicsMode);
+			PE_initialize_console(NULL, kPEReleaseScreen);
+		}
+		full = true;            /* (video alone: the GPU clears the whole flip buffer to transparent black) */
 	}
 	/* (fb_flip: a frame into a buffer of its own only when it covers all of it; what was there is two frames old) */
 	if (*target >= 0 && !full) {
@@ -2249,7 +2257,13 @@ IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, 
 		}
 		video = NULL;
 	}
-	if (video != NULL && test) {
+	if (video != NULL && count == 0) {
+		v.hole = true;
+		v.hx = 0;
+		v.hy = 0;
+		v.hw = fPanelWidth;
+		v.hh = fPanelHeight;
+	} else if (video != NULL && test) {
 		v.hole = true;
 		v.hx = VIDEO_TEST_X;
 		v.hy = VIDEO_TEST_Y;
@@ -2272,8 +2286,10 @@ IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, 
 	gLastPresent = fence;
 	fGPUBase = *target >= 0 ? fFlipBase[*target] : fBase;
 	fGPURowBytes = rowBytes;
-	fGPUFirst = layers[0];
-	fGPUDrawn = layers[0].surface->drawn;
+	if (count > 0) {
+		fGPUFirst = layers[0];
+		fGPUDrawn = layers[0].surface->drawn;
+	}
 	fGPULayers = count;
 	fGPUFrames++;
 	return true;
@@ -2449,6 +2465,8 @@ IOMobileFramebuffer::videoSetUp(void)
 		}
 		stage = (layer & 7) - 1;
 		fVideoHomeLMOp[m] = mdssRead(LM_BASE(m) + LM_OP_MODE);
+		fVideoHomeBlend1[m][0] = mdssRead(LM_BASE(m) + LM_BLEND_OP(1));
+		fVideoHomeBlend1[m][1] = mdssRead(LM_BASE(m) + LM_BLEND_CONST(1));
 		fVideoHomeBlend[m][0] = mdssRead(LM_BASE(m) + LM_BLEND_OP(stage));
 		fVideoHomeBlend[m][1] = mdssRead(LM_BASE(m) + LM_BLEND_CONST(stage));
 		fVideoLMs++;
@@ -2666,6 +2684,8 @@ IOMobileFramebuffer::videoProgram(int buffer)
 			mdssWrite(b + LM_BLEND_CONST(fVideoUIStage), LM_BLEND_CONST_FG);
 			mdssWrite(b + LM_OP_MODE, fVideoHomeLMOp[m] | 1u << 1);
 		} else {
+			mdssWrite(b + LM_BLEND_OP(1), fVideoHomeBlend1[m][0]);
+			mdssWrite(b + LM_BLEND_CONST(1), fVideoHomeBlend1[m][1]);
 			mdssWrite(b + LM_BLEND_OP(fVideoUIStage), fVideoHomeBlend[m][0]);
 			mdssWrite(b + LM_BLEND_CONST(fVideoUIStage), fVideoHomeBlend[m][1]);
 			mdssWrite(b + LM_OP_MODE, fVideoHomeLMOp[m]);
@@ -2679,7 +2699,7 @@ IOMobileFramebuffer::videoProgram(int buffer)
 			flush |= 1u << kDPUPipes[kPipes[k]].flush;
 		}
 	}
-	if (used != 0 && !fVideoOn) {
+	if (used != 0 && (!fVideoOn || fVideoFull != f->full)) {
 		IOLog("MiniIOMobileFramebuffer: fb_video: on: %ux%u at %u,%u of the luma onto %ux%u at %u,%u by %s ('420%c')\n",
 		    f->sw, f->sh, f->sx, f->sy, f->dw, f->dh, f->dx, f->dy, used == 3 ? "VIG2 and VIG3" : used == 1 ? "VIG2" : "VIG3",
 		    f->full ? 'f' : 'v');
@@ -2687,6 +2707,7 @@ IOMobileFramebuffer::videoProgram(int buffer)
 		IOLog("MiniIOMobileFramebuffer: fb_video: off (%u frames with one)\n", gVideoFrames);
 	}
 	fVideoOn = used != 0;
+	fVideoFull = used != 0 && f->full;
 	fVideoPipesOn = used;
 	gVideoFrames += used != 0;
 	return flush;
