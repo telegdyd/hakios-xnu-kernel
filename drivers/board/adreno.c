@@ -99,6 +99,7 @@
 #include <mach/vm_param.h>
 #include <pexpert/pexpert.h>
 #include <sys/board/input.h>
+#include <sys/errno.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
@@ -2241,6 +2242,8 @@ gmu_post_mortem(void)
 	get(&gmu, "ahb_fence_status", GMU_AHB_FENCE_STATUS);
 }
 
+static bool hfi_quiet;                  /* a speed asked for while the GPU is kept (gpu-dcvs): said only when refused */
+
 /* Send a message whose first word is yet to be made and wait for the GMU's verdict on it. */
 static bool
 hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
@@ -2251,7 +2254,9 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 	bool answered = false;
 
 	message[0] = id | words << 8 | number << 20;
-	printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	if (!hfi_quiet) {
+		printf("adreno: %u: about to send the GMU %s: message %u, %u words, number %u\n", step, what, id, words, number);
+	}
 	snprintf(last_write, sizeof(last_write), "step %u sent the GMU message %u (%s)", step, id, what);
 	hold(true);
 	for (uint32_t i = 0; i < (words + 3) / 4 * 4; i++) {
@@ -2284,7 +2289,9 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 		}
 		return false;
 	}
-	printf("adreno: %u: the GMU accepts %s\n", step, what);
+	if (!hfi_quiet) {
+		printf("adreno: %u: the GMU accepts %s\n", step, what);
+	}
 	return true;
 }
 
@@ -2320,6 +2327,9 @@ static struct block gpu = { "gpu", 0, 0x40000 };                        /* soc: 
 #define GMU_CORE_GRANTED        (1u << 31)      /* of gmu2host_intr_info */
 
 static uint32_t core_khz;               /* the 3D core's speed, as asked of the GMU */
+static uint32_t core_speed;             /* ... which of the board's speeds that is, from 1 */
+static uint32_t core_bus = HFI_NO_INDEX;        /* the bus vote asked for with it (HFI_NO_INDEX: none) */
+static uint32_t core_bus_levels;        /* how many bus votes the GMU's table has */
 
 /*
  * What the vendor's driver sends at this point (a6xx_hfi_start; Linux the same with fewer
@@ -2399,6 +2409,7 @@ step_core_power(void)
 		bw.cnoc_data[0][0] = 0x40000000;
 		bw.cnoc_data[1][0] = 0x60000001;
 	}
+	core_bus_levels = bw.levels;
 	printf("adreno: %u: RPMh's bus resources: SH0 %#x, MC0 %#x, ACV %#x, CN0 %#x (Linux has 0x50004, 0x50000, 0x50088, "
 	    "0x5006c)\n", step, bw.ddr_address[0], bw.ddr_address[1], bw.ddr_address[2], bw.cnoc_address[0]);
 	if (bw.ddr_address[0] == 0 || bw.ddr_address[1] == 0 || bw.ddr_address[2] == 0 ||
@@ -2410,6 +2421,7 @@ step_core_power(void)
 		vote[2] = speed;
 	}
 	core_khz = speeds[vote[2]].khz;
+	core_speed = vote[2];
 	printf("adreno: %u: the speed wanted: %u MHz\n", step, core_khz / 1000);
 	announce("send the GMU its tables (speeds and supply levels, bus votes), \"start\", and the speed wanted; "
 	    "from here on it casts votes in RPMh by itself");
@@ -3500,6 +3512,9 @@ hakios_adreno_quiesce(void)
 #define GPU_RECOVERIES          64                      /* at most in one run: a program that hangs every submission fills no log with this */
 
 static bool gpu_kept;
+static bool dcvs_running;               /* gpu-dcvs: the speed follows the load (hakios_gpu_dcvs_start() below) */
+static void gpu_dcvs_submitted(void);
+static void gpu_dcvs_stop(void);
 static uint32_t gpu_fence;              /* the number of the last submission */
 static uint32_t gpu_timed;              /* ... of the last whose times have been added up */
 static uint64_t gpu_ticks;              /* how long the core has worked on the submissions added up */
@@ -3772,6 +3787,7 @@ hakios_gpu_stop(void)
 			waited++;
 		}
 		core_stuck = !hakios_gpu_done(gpu_fence);
+		gpu_dcvs_stop();
 		gpu_irq_stop();
 		printf("adreno: the run is about to end: the GPU is given back (%s after %u us)\n",
 		    core_stuck ? "STILL AT WORK" : "it had finished what it was given", 100 * waited);
@@ -3832,8 +3848,8 @@ hakios_gpu_parameter(uint32_t which, uint64_t *value)
 	case 0x03:                              /* CHIP_ID, with the speed bin above it */
 		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
 		return true;
-	case 0x04:                              /* MAX_FREQ */
-		*value = core_khz * 1000ull;
+	case 0x04:                              /* MAX_FREQ: with gpu-dcvs, the fastest it may be asked for */
+		*value = (dcvs_running ? gpu_profile->speeds[gpu_profile->speed_count - 1].khz : core_khz) * 1000ull;
 		return true;
 	case 0x05:                              /* TIMESTAMP */
 		*value = mach_absolute_time();
@@ -4199,6 +4215,7 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	if (room < wanted) {
 		return 0;
 	}
+	gpu_dcvs_submitted();                   /* (a new burst: the speed up before the core sees the work) */
 	gpu_times();
 	if (++gpu_fence == 0) {
 		gpu_fence = 1;
@@ -4445,6 +4462,319 @@ hakios_adreno_minute(void)
 	printf("adreno: the GPU's sensors read %d.%d and %d.%d degrees; its clock is set to %u MHz\n", tenths[0] / 10,
 	    tenths[0] % 10 < 0 ? -(tenths[0] % 10) : tenths[0] % 10, tenths[1] / 10,
 	    tenths[1] % 10 < 0 ? -(tenths[1] % 10) : tenths[1] % 10, core_khz / 1000);
+}
+
+/* ---- beside the steps: how fast the GPU runs (board feature gpu-dcvs) --------------------------------------- */
+
+/*
+ * Without the feature, the 3D core runs at the board's default speed for the whole run. With it, a worker of
+ * BoardGPU.cpp (every 50 ms, 250 ms while the GPU idles at the slowest; under the GPU's lock, as everything here)
+ * asks the GMU for the speed the load wants, by the policy of adreno_dcvs.h, and never above what the GPU's two
+ * sensors allow; a submission after 200 ms without one asks for the fastest allowed before the core sees it.
+ * The load is the GMU's busy counter, which counts 19.2 MHz ticks while the GPU is busy whatever its speed
+ * (Linux v6.12 a6xx_gpu.c: hw_init and a6xx_gpu_busy, a6xx_gmu.xml). The bus vote that goes with each speed is the
+ * board's gpu { } speed-bus (an index into the GMU's table of bus votes, step 17); without it, none is changed.
+ * A refused vote ends it: the speed is then the GMU's last accepted, left as it is.
+ *
+ *   gpu_dcvs=0                    the speed does not follow the load (the board's default; the sensors still cap it)
+ *   kern.hakios.gpu_speed         the speed asked for now, from 1; written, a fixed one (and gpu_dcvs off)
+ *   kern.hakios.gpu_dcvs          1 the speed follows the load, 0 it does not
+ *   kern.hakios.gpu_max_speed     the fastest the load may ask for (the sensors' cap comes on top)
+ *   kern.hakios.gpu_dcvs_state    a line: speed, cap, load, temperatures, votes, time spent at each speed
+ *
+ * From the OnePlus 10 Pro's port (negroni-dev's hakios.adreno.c, GPU-POWER-PLAN.md task 2).
+ */
+#include "adreno_dcvs.h"
+
+#define GMU_POWER_ENABLE        GMU_WORD(0x5040)        /* cx_gmu_power_counter_enable */
+#define GMU_POWER_SELECT        GMU_WORD(0x5041)        /* cx_gmu_power_counter_select_0: bit 5 of its low byte, busy */
+#define GMU_BUSY_LO             GMU_WORD(0x5044)        /* cx_gmu_power_counter_xoclk_0, low and high words */
+#define GMU_BUSY_HI             GMU_WORD(0x5045)
+#define GMU_BUSY_MASK           GMU_WORD(0x930e)        /* gpu_gmu_ao_gpu_cx_busy_mask */
+
+static bool dcvs_auto = true;           /* boot-arg gpu_dcvs=0, kern.hakios.gpu_dcvs */
+static bool dcvs_failed;
+static unsigned dcvs_top, dcvs_cap, dcvs_limit, dcvs_manual;
+static uint8_t dcvs_bus[5];
+static bool dcvs_has_bus;
+static uint64_t dcvs_last_load, dcvs_last_submit, dcvs_last_tick;
+static uint64_t dcvs_ms_at[6];          /* time spent at each speed, in ns (by the worker's ticks) */
+static uint32_t dcvs_votes, dcvs_rejected;
+static uint64_t busy_previous, busy_sample_ns;
+static bool busy_valid;
+static unsigned busy_pct;
+static int32_t dcvs_mc[2];
+static uint32_t dcvs_temps_valid;
+
+static uint64_t
+dcvs_ns(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
+
+/* The GPU's two sensors, in thousandths of a degree; bit 0 and 1 of the result: which have a reading. */
+static uint32_t
+gpu_temperatures(int32_t mc[2])
+{
+	uint32_t valid = 0;
+
+	if (tsens.phys == 0) {
+		return 0;
+	}
+	need(&tsens);
+	for (unsigned i = 0; i < 2; i++) {
+		for (unsigned again = 0; again < 16; again++) {
+			uint32_t status = rd(tsens.base + TSENS_STATUS(tsens_sensor[i]));
+
+			if (status & TSENS_VALID) {
+				mc[i] = ((int32_t)(status << 20) >> 20) * 100;
+				if (mc[i] >= -40000 && mc[i] <= 125000) {
+					valid |= 1u << i;
+				}
+				break;
+			}
+		}
+	}
+	return valid;
+}
+
+/* The busy counter since the last look: busy_valid and busy_pct. The high word read twice, the low between. */
+static void
+gpu_busy_sample(uint64_t now)
+{
+	busy_valid = false;
+	for (unsigned i = 0; i < 4; i++) {
+		uint32_t hi = rd(gmu.base + GMU_BUSY_HI), lo = rd(gmu.base + GMU_BUSY_LO);
+
+		if (rd(gmu.base + GMU_BUSY_HI) == hi) {
+			uint64_t ticks = (uint64_t)hi << 32 | lo;
+
+			if (busy_sample_ns != 0) {
+				int pct = adreno_busy_pct(ticks, busy_previous, now - busy_sample_ns);
+
+				if (pct >= 0) {
+					busy_pct = (unsigned)pct;
+					busy_valid = true;
+				} else {
+					dcvs_rejected++;
+				}
+			}
+			busy_previous = ticks;
+			busy_sample_ns = now;
+			return;
+		}
+	}
+	dcvs_rejected++;
+}
+
+/* Ask the GMU for speed `level` (1 to dcvs_top) and its bus vote; nothing is sent for what is asked for already. */
+static void
+gpu_vote(unsigned level)
+{
+	uint32_t vote[4] = { 0, 1, level, HFI_NO_INDEX };
+	bool accepted;
+
+	if (dcvs_failed || level < 1 || level > dcvs_top) {
+		return;
+	}
+	if (dcvs_has_bus && dcvs_bus[level - 1] < core_bus_levels) {
+		vote[3] = dcvs_bus[level - 1];
+	}
+	if (level == core_speed && (vote[3] == HFI_NO_INDEX || vote[3] == core_bus)) {
+		return;
+	}
+	hfi_quiet = true;
+	accepted = hfi_send("a speed", HFI_GX_BW_PERF_VOTE, vote, 4);
+	hfi_quiet = false;
+	if (!accepted) {
+		dcvs_failed = true;
+		printf("adreno: gpu-dcvs: the GMU refused speed %u (%u MHz): the speed stays as the GMU has it, "
+		    "%u MHz last accepted; nothing more is asked\n", level, gpu_profile->speeds[level].khz / 1000, core_khz / 1000);
+		return;
+	}
+	dcvs_votes++;
+	core_speed = level;
+	core_khz = gpu_profile->speeds[level].khz;
+	if (vote[3] != HFI_NO_INDEX) {
+		core_bus = vote[3];
+	}
+}
+
+static unsigned
+dcvs_ceiling(void)
+{
+	return dcvs_cap < dcvs_limit ? dcvs_cap : dcvs_limit;
+}
+
+/*
+ * With the GPU's lock held, once the GPU is kept: whether the speed is to follow the load (the board's feature
+ * gpu-dcvs, more than one speed); if so, the busy counter is started and the worker is to run.
+ */
+bool
+hakios_gpu_dcvs_start(void)
+{
+	const struct hakios_board *board = hakios_board();
+	uint32_t off = 1;
+
+	if (!gpu_kept || board == NULL || !hakios_board_has(HAKIOS_HAS_GPU_DCVS) || gpu_profile->speed_count < 3) {
+		return false;
+	}
+	dcvs_top = gpu_profile->speed_count - 1;
+	dcvs_cap = dcvs_limit = dcvs_top;
+	dcvs_manual = core_speed >= 1 && core_speed <= dcvs_top ? core_speed : 1;
+	/* gpu_dcvs=0: the speed stays the board's default, under the sensors' cap (gpu-dcvs; on without it) */
+	if (PE_parse_boot_argn("gpu_dcvs", &off, sizeof(off)) && off == 0) {
+		dcvs_auto = false;
+	}
+	dcvs_has_bus = board->gpu.speed_bus_count == dcvs_top;
+	for (unsigned i = 0; dcvs_has_bus && i < dcvs_top; i++) {
+		dcvs_bus[i] = board->gpu.speed_bus[i];
+	}
+	wr(gmu.base + GMU_BUSY_MASK, 0xff000000);
+	wr(gmu.base + GMU_POWER_SELECT, (rd(gmu.base + GMU_POWER_SELECT) & ~0xffu) | 1u << 5);
+	wr(gmu.base + GMU_POWER_ENABLE, 1);
+	dcvs_last_load = dcvs_last_tick = dcvs_ns();
+	dcvs_running = true;
+	printf("adreno: gpu-dcvs: %u to %u MHz %s, at most what the GPU's sensors allow (%s); bus votes %s\n",
+	    gpu_profile->speeds[1].khz / 1000, gpu_profile->speeds[dcvs_top].khz / 1000,
+	    dcvs_auto ? "by the GPU's load" : "fixed (gpu_dcvs=0)",
+	    tsens.phys != 0 ? "one speed less from 75 degrees, the slowest from 85" : "NONE: the slowest",
+	    dcvs_has_bus ? "with each speed" : "left alone");
+	return true;
+}
+
+/* The worker's look, with the GPU's lock held: the milliseconds until the next; 0, no more. */
+uint32_t
+hakios_gpu_dcvs_tick(void)
+{
+	int32_t mc[2] = { 0, 0 };
+	unsigned previous_cap = dcvs_cap, target;
+	uint64_t now;
+
+	if (!dcvs_running || !gpu_kept || dcvs_failed) {
+		return 0;
+	}
+	now = dcvs_ns();
+	if (core_speed >= 1 && core_speed <= dcvs_top) {
+		dcvs_ms_at[core_speed] += now - dcvs_last_tick;
+	}
+	dcvs_last_tick = now;
+	gpu_busy_sample(now);
+	dcvs_temps_valid = gpu_temperatures(mc);
+	dcvs_mc[0] = mc[0];
+	dcvs_mc[1] = mc[1];
+	dcvs_cap = adreno_thermal_cap(dcvs_cap, dcvs_top, dcvs_temps_valid, mc[0], mc[1]);
+	if (dcvs_cap != previous_cap) {
+		printf("adreno: gpu-dcvs: the GPU's sensors read %d and %d millidegrees (valid %u): at most %u MHz\n",
+		    mc[0], mc[1], dcvs_temps_valid, gpu_profile->speeds[dcvs_cap].khz / 1000);
+	}
+	if (dcvs_auto) {
+		target = adreno_dcvs_target(core_speed, dcvs_top, dcvs_ceiling(), busy_valid, busy_pct,
+		    !hakios_gpu_done(gpu_fence), now - dcvs_last_submit < ADRENO_DCVS_IDLE_NS, now, &dcvs_last_load);
+	} else {
+		target = dcvs_manual < dcvs_ceiling() ? dcvs_manual : dcvs_ceiling();
+	}
+	gpu_vote(target);
+	if (dcvs_failed) {
+		return 0;
+	}
+	return core_speed == 1 && now - dcvs_last_submit >= 1000000000ull ? 250 : 50;
+}
+
+/* A submission is about to be put in the ring (the lock held): after 200 ms without one, the fastest allowed now. */
+static void
+gpu_dcvs_submitted(void)
+{
+	uint64_t now;
+
+	if (!dcvs_running || dcvs_failed || !dcvs_auto) {
+		return;
+	}
+	now = dcvs_ns();
+	if (now - dcvs_last_submit >= ADRENO_DCVS_IDLE_NS) {
+		gpu_vote(dcvs_ceiling());
+		dcvs_last_load = now;
+	}
+	dcvs_last_submit = now;
+}
+
+/* The run ends (hakios_gpu_stop(), the worker already stopped): the counter off; the GMU's slumber follows. */
+static void
+gpu_dcvs_stop(void)
+{
+	if (dcvs_running) {
+		dcvs_running = false;
+		wr(gmu.base + GMU_POWER_ENABLE, 0);
+		printf("adreno: gpu-dcvs: %u votes; ms at %u/%u/%u/%u/%u MHz: %llu/%llu/%llu/%llu/%llu; %u busy readings refused\n",
+		    dcvs_votes, gpu_profile->speeds[1].khz / 1000, dcvs_top >= 2 ? gpu_profile->speeds[2].khz / 1000 : 0,
+		    dcvs_top >= 3 ? gpu_profile->speeds[3].khz / 1000 : 0, dcvs_top >= 4 ? gpu_profile->speeds[4].khz / 1000 : 0,
+		    dcvs_top >= 5 ? gpu_profile->speeds[5].khz / 1000 : 0, dcvs_ms_at[1] / 1000000, dcvs_ms_at[2] / 1000000,
+		    dcvs_ms_at[3] / 1000000, dcvs_ms_at[4] / 1000000, dcvs_ms_at[5] / 1000000, dcvs_rejected);
+	}
+}
+
+/*
+ * The sysctls (BoardGPU.cpp), with the GPU's lock held. kind 0: the speed (written: fixed, and the load no longer
+ * followed), 1: whether it follows the load, 2: the fastest the load may ask for. Returns the value read, or 0 / an
+ * errno for a write.
+ */
+int
+hakios_gpu_dcvs_control(unsigned kind, int value, bool write)
+{
+	if (!write) {
+		switch (kind) {
+		case 0: return (int)core_speed;
+		case 1: return dcvs_auto;
+		case 2: return (int)dcvs_limit;
+		default: return -EINVAL;
+		}
+	}
+	if (!dcvs_running || dcvs_failed || !gpu_kept) {
+		return ENXIO;
+	}
+	if (kind == 1 ? (value < 0 || value > 1) : (value < 1 || (unsigned)value > dcvs_top)) {
+		return EINVAL;
+	}
+	switch (kind) {
+	case 0:
+		dcvs_manual = (unsigned)value;
+		dcvs_auto = false;
+		gpu_vote(dcvs_manual < dcvs_ceiling() ? dcvs_manual : dcvs_ceiling());
+		break;
+	case 1:
+		dcvs_auto = value != 0;
+		dcvs_manual = core_speed;
+		dcvs_last_load = dcvs_ns();
+		break;
+	case 2:
+		dcvs_limit = (unsigned)value;
+		if (core_speed > dcvs_ceiling()) {
+			gpu_vote(dcvs_ceiling());
+		}
+		break;
+	default:
+		return EINVAL;
+	}
+	return dcvs_failed ? EIO : 0;
+}
+
+/* kern.hakios.gpu_dcvs_state, with the GPU's lock held */
+void
+hakios_gpu_dcvs_line(char *line, size_t size)
+{
+	if (!dcvs_running) {
+		snprintf(line, size, "off (%s)\n", dcvs_failed ? "a speed was refused" : !hakios_board_has(HAKIOS_HAS_GPU_DCVS) ?
+		    "no gpu-dcvs on this board" : "not started");
+		return;
+	}
+	snprintf(line, size, "speed %u (%u MHz) auto %d cap %u limit %u busy %d temps %d %d valid %u votes %u refused %d "
+	    "rejected %u ms %llu %llu %llu %llu %llu\n", core_speed, core_khz / 1000, dcvs_auto, dcvs_cap, dcvs_limit,
+	    busy_valid ? (int)busy_pct : -1, dcvs_mc[0], dcvs_mc[1], dcvs_temps_valid, dcvs_votes, dcvs_failed,
+	    dcvs_rejected, dcvs_ms_at[1] / 1000000, dcvs_ms_at[2] / 1000000, dcvs_ms_at[3] / 1000000,
+	    dcvs_ms_at[4] / 1000000, dcvs_ms_at[5] / 1000000);
 }
 
 /* ---- beside the steps: what the firmware left the display doing (boot-arg display_probe=1) ---------------- */

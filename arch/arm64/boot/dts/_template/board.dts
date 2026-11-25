@@ -275,6 +275,7 @@
 		// speeds-khz = <285000 365000 443000 490000>; // qcom,gpu-pwrlevels of the phone's speed bin, slowest first
 		// speed-levels = <64 80 128 144>; // the supply level of each (qcom,level / the OPP table's opp-level)
 		// default-speed = <4>;         // which of them to run at, counted from 1
+		// speed-bus = <2 2 4 6>;       // gpu-dcvs: the GMU's bus vote with each (qcom,bus-freq of the pwrlevels)
 		// alt-model = "Adreno 643";    // qcom,gpu-models: another name for the parts with the speed bins
 		// alt-bins = <0xac 0xbe>;      // ... listed here
 	// };

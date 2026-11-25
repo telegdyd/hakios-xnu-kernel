@@ -39,6 +39,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 #include <mach/mach_time.h>
 #include <mach/vm_param.h>
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
@@ -72,6 +73,10 @@ void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t
 void hakios_gpu_report(const char * why);
 bool hakios_gpu_recover(void);
 void hakios_gpu_stop(void);
+bool hakios_gpu_dcvs_start(void);
+uint32_t hakios_gpu_dcvs_tick(void);
+int hakios_gpu_dcvs_control(unsigned kind, int value, bool write);
+void hakios_gpu_dcvs_line(char * line, size_t size);
 
 void HakiosGPUStart(void);
 void HakiosGPUStop(void);
@@ -439,6 +444,74 @@ static uint32_t gPresentState;
 SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_gpu_state, CTLFLAG_RD | CTLFLAG_LOCKED, &gPresentState, 0, "fb_gpu: the GPU's present set up");
 static uint32_t gPresentTotal;
 SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_gpu_presents, CTLFLAG_RD | CTLFLAG_LOCKED, &gPresentTotal, 0, "fb_gpu: frames put on the panel by the GPU");
+
+/*
+ * gpu-dcvs (board/adreno.c): the worker that has the GPU's speed follow its load, every 50 ms (250 ms while it idles at
+ * the slowest), and its sysctls. Under gGPULock, as the submissions; never copied out with it held.
+ */
+static thread_call_t gDCVSCall;
+static bool gDCVSRunning;
+
+static void
+dcvsTick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint32_t ms;
+
+	IOLockLock(gGPULock);
+	ms = gDCVSRunning ? hakios_gpu_dcvs_tick() : 0;
+	if (ms != 0) {
+		uint64_t deadline, leeway;
+
+		clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+		nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC / 5, &leeway);
+		thread_call_enter_delayed_with_leeway(gDCVSCall, NULL, deadline, leeway, THREAD_CALL_DELAY_LEEWAY);
+	} else {
+		gDCVSRunning = false;
+	}
+	IOLockUnlock(gGPULock);
+}
+
+static int
+dcvsSysctl(struct sysctl_oid * oidp, __unused void * arg1, int arg2, struct sysctl_req * req)
+{
+	int value, error;
+
+	if (gGPULock == NULL) {
+		return ENXIO;
+	}
+	IOLockLock(gGPULock);
+	value = hakios_gpu_dcvs_control((unsigned)arg2, 0, false);
+	IOLockUnlock(gGPULock);
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	IOLockLock(gGPULock);
+	error = hakios_gpu_dcvs_control((unsigned)arg2, value, true);
+	IOLockUnlock(gGPULock);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_speed, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, dcvsSysctl, "I",
+    "gpu-dcvs: the GPU's speed now, from 1; written, a fixed one (gpu_dcvs off)");
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_dcvs, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 1, dcvsSysctl, "I",
+    "gpu-dcvs: 1 the GPU's speed follows its load, 0 it does not");
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_max_speed, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 2, dcvsSysctl, "I",
+    "gpu-dcvs: the fastest speed the load may ask for (the GPU's sensors cap it too)");
+
+static int
+dcvsStateSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	char line[256] = "off (no GPU)\n";
+
+	if (gGPULock != NULL) {
+		IOLockLock(gGPULock);
+		hakios_gpu_dcvs_line(line, sizeof(line));
+		IOLockUnlock(gGPULock);
+	}
+	return SYSCTL_OUT(req, line, strlen(line));
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_dcvs_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, dcvsStateSysctl, "A",
+    "gpu-dcvs: speed, cap, load, the GPU's temperatures, votes, ms at each speed");
 
 static inline uint32_t
 pm4Parity(uint32_t v)
@@ -1020,6 +1093,17 @@ HakiosGPUStart(void)
 	hakios_cputop_start();                         /* (boot-arg cputop=S: who the CPUs work for; bsd/dev/board/cputop.c) */
 	gGPUFairMs = MIN(gGPUFairMs, 500u);             /* (a wait of a second is taken for a GPU that has stopped: gpuWait) */
 	gGPULock = IOLockAlloc();
+	if (gGPULock != NULL) {
+		IOLockLock(gGPULock);
+		if (hakios_gpu_dcvs_start() && (gDCVSCall = thread_call_allocate(dcvsTick, NULL)) != NULL) {
+			uint64_t deadline;
+
+			gDCVSRunning = true;
+			clock_interval_to_deadline(50, NSEC_PER_MSEC, &deadline);
+			thread_call_enter_delayed(gDCVSCall, deadline);
+		}
+		IOLockUnlock(gGPULock);
+	}
 	gpu = OSTypeAlloc(HakiosGPU);
 	if (gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
 		OSSafeReleaseNULL(gpu);
@@ -1037,6 +1121,12 @@ HakiosGPUStart(void)
 void
 HakiosGPUStop(void)
 {
+	IOLockLock(gGPULock);
+	gDCVSRunning = false;
+	IOLockUnlock(gGPULock);
+	if (gDCVSCall != NULL) {
+		thread_call_cancel_wait(gDCVSCall);     /* (without the lock: a worker that has started waits for it) */
+	}
 	IOLockLock(gGPULock);
 	hakios_gpu_stop();
 	IOLockUnlock(gGPULock);

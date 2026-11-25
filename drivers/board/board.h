@@ -48,6 +48,9 @@ enum {
 	                                         * buffers in turn while the GPU draws into the other (an SM8450-layout
 	                                         * DPU under the firmware's auto-refresh; iokit/MiniIOMobileFramebuffer.cpp,
 	                                         * fb_flip) */
+	HAKIOS_HAS_GPU_DCVS     = 1u << 25,     /* the GPU's speed follows its load, by the GMU's busy counter, and is
+	                                         * capped by the GPU's own sensors (adreno { } tsens): the board's gpu { }
+	                                         * speeds and speed-bus (board/adreno.c, gpu_dcvs) */
 	/*
 	 * Drivers of one part, wired the way one phone has it (the pins, the bus, the chip): a board lists
 	 * one only if it has that part wired that way. Asked for on any other board, the driver says so and
@@ -163,6 +166,8 @@ struct hakios_board {
 		uint8_t zap_must_authenticate;  /* stop when TrustZone does not confirm the zap shader */
 		uint8_t speed_count, default_speed;     /* how many of speeds_khz; the one to run at, counted from 1 */
 		uint32_t speeds_khz[5], speed_levels[5];        /* the core clock's steps and their supply levels */
+		uint8_t speed_bus_count;        /* gpu-dcvs: how many of speed_bus (0, or one for each speed) */
+		uint8_t speed_bus[5];           /* ... the GMU's bus vote that goes with each speed (its index in the table) */
 	} gpu;
 
 	/* the PMICs' bus (soc: spmi { }): the blocks of the SPMI arbiter this system reads and writes through */

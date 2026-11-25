@@ -189,12 +189,28 @@ bi_cat(int cs, const char *path)
 }
 
 static int
-bi_sysctl(int cs, const char *name)
+bi_sysctl(int cs, const char *arg)
 {
 	unsigned char buf[4096];
+	char name[256];
+	const char *eq = strchr(arg, '=');
 	size_t len = sizeof(buf) - 1;
 	bool text = true;
 
+	/* "name=value": written first (a number as an int, anything else as a string), then read back */
+	snprintf(name, sizeof(name), "%.*s", eq != NULL ? (int)(eq - arg) : (int)strlen(arg), arg);
+	if (eq != NULL) {
+		char *end;
+		long number = strtol(eq + 1, &end, 0);
+		int value = (int)number;
+		int failed = eq[1] != 0 && *end == 0 ? sysctlbyname(name, NULL, NULL, &value, sizeof(value)) :
+		    sysctlbyname(name, NULL, NULL, (void *)(eq + 1), strlen(eq + 1) + 1);
+
+		if (failed != 0) {
+			dprintf(cs, "sysctl: %s: %s\n", arg, strerror(errno));
+			return 1;
+		}
+	}
 	if (sysctlbyname(name, buf, &len, NULL, 0) != 0) {
 		dprintf(cs, "sysctl: %s: %s\n", name, strerror(errno));
 		return 1;

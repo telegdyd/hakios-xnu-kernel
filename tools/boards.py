@@ -175,7 +175,7 @@ BOARD_SCHEMA = {
             'speed_fuse': (int, True), 'gaming_fuse': (int, True), 'highest_bank_bit': (int, True),
             'gcc_debug_gpucc': (int, True), 'zap_must_authenticate': (bool, False),
             'speeds_khz': ([int], True), 'speed_levels': ([int], True), 'default_speed': (int, True),
-            'alt_model': (str, False), 'alt_bins': ([int], False)},
+            'alt_model': (str, False), 'alt_bins': ([int], False), 'speed_bus': ([int], False)},
     'mic': {'codec_reset': (int, True)},
     'camera': {'pmic_pins': ([int], True), 'pmic_reset': (int, True), 'sensors': ([CAMERA_SENSOR], True), 'test_sensor': (str, False),
                'darwin_sensor': (str, False), 'darwin_front': (str, False)},
@@ -200,6 +200,7 @@ FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virt
                  'torch-pm8350c': ('spmi',), 'ddr-rpmh': ('rpmh',),
                  'camera-sm7325': ('spmi', 'pins', 'clocks', 'rpmh', 'smmu', 'camera'),
                  'gpu-a660': ('adreno', 'clocks', 'rpmh'), 'gpu-a730': ('adreno', 'clocks', 'rpmh'),
+                 'gpu-dcvs': ('adreno',),
                  # the part drivers that drive the SoC's pins, switch a bus's clocks on in the GCC, ask RPMh
                  # for a part's supply, and give a device its addresses in the SMMU
                  'touch-goodix': ('pins', 'clocks', 'rpmh'), 'touch-ft3658u': ('pins', 'clocks', 'rpmh'),
@@ -225,6 +226,7 @@ FEATURE_BOOTARGS = {
     'display-flip': 'fb_flip=1, the default, with the GPU putting frames on the panel (gpu=1; fb_gpu=1, the default)',
     'gpu-a660': 'gpu=1',
     'gpu-a730': 'gpu=1 or adreno=22; gpu_irq=1 for completion interrupts',
+    'gpu-dcvs': "gpu=1, on by itself; gpu_dcvs=0 keeps the default speed (the GPU's sensors still cap it)",
     'virtio': 'virtio_net=1, virtio_input=1',
     'touch-goodix': 'touchscreen=1',
     'touch-ft3658u': 'touchscreen=1',
@@ -243,7 +245,7 @@ FEATURE_BOOTARGS = {
 # features that are a driver of one part as one phone has it wired, by the first word of their names
 PART_DRIVERS = ('bluetooth', 'touch', 'speaker', 'haptic', 'imu', 'torch', 'camera', 'wifi', 'mic', 'modem')
 # ... and of the board's own file
-FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'display-flip': 'display', 'gpu-a660': 'gpu', 'gpu-a730': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
+FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'display-flip': 'display', 'gpu-a660': 'gpu', 'gpu-a730': 'gpu', 'gpu-dcvs': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
                           'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
                           'touch-ft3658u': 'touch', 'touch-ft5x06': 'touch_i2c', 'touch-s3908': 'touch_i2c', 'camera-sm7325': 'camera', 'imu-lsm6dso': 'imu',
                           'imu-bmi160': 'imu'}
@@ -405,6 +407,9 @@ def feature_needs(feature, board, soc):
         needs.append(f'intf1 in [display] and [clocks] in {soc_file}')
     if feature == 'display-scan' and clocks_missing(soc):
         needs.append(f'{clocks_missing(soc)} in [clocks] of {soc_file}')
+    adreno = soc.get('adreno')
+    if feature == 'gpu-dcvs' and isinstance(adreno, dict) and 'tsens' not in adreno:
+        needs.append(f"tsens in [adreno] of {soc_file} (the GPU's sensors cap its speed)")
     if feature in ('gpu-a660', 'gpu-a730') and clocks_missing(soc, ('gcc_disp_ahb_cbcr',)):
         needs.append(f'gcc_disp_ahb_cbcr in [clocks] of {soc_file}')
     radio = board.get('wifi')
@@ -431,6 +436,8 @@ def feature_requirements(feature):
         of_soc['display'] += ['intf1', 'mdss']
     if feature in ('gpu-a660', 'gpu-a730'):
         of_soc['clocks'].append('gcc_disp_ahb_cbcr')
+    if feature == 'gpu-dcvs':
+        of_soc['adreno'].append('tsens')
     of_board = {}
     section = FEATURE_NEEDS_OF_BOARD.get(feature)
     if section:
@@ -898,6 +905,9 @@ def load(problems=None):
                 problems.add(f'{rel} [gpu]', 'firmware: the name of a directory of the small image, without slashes')
             if gpu['chip_id'] == 0:
                 problems.add(f'{rel} [gpu]', 'chip_id must not be 0')
+            if 'speed_bus' in gpu and (len(gpu['speed_bus']) != len(speeds) or
+                                       not all(0 <= v <= 15 for v in gpu['speed_bus'])):
+                problems.add(f'{rel} [gpu]', "speed_bus: the GMU's bus vote for each of speeds_khz, 0 to 15")
             if ('alt_model' in gpu) != ('alt_bins' in gpu) or not 1 <= len(gpu.get('alt_bins', [0])) <= 2:
                 problems.add(f'{rel} [gpu]', 'alt_model goes with alt_bins, one or two speed bins')
         if 'mic' in data and not 0 <= data['mic']['codec_reset'] <= 255:
@@ -1298,6 +1308,11 @@ def table_text(socs, boards):
                 f'\t\t\t.speed_count = {len(gpu["speeds_khz"])}, .default_speed = {gpu["default_speed"]},',
                 f'\t\t\t.speeds_khz = {{ {", ".join(str(v) for v in gpu["speeds_khz"])} }},',
                 f'\t\t\t.speed_levels = {{ {", ".join(str(v) for v in gpu["speed_levels"])} }},',
+            ]
+            if 'speed_bus' in gpu:
+                out.append(f'\t\t\t.speed_bus_count = {len(gpu["speed_bus"])}, '
+                           f'.speed_bus = {{ {", ".join(str(v) for v in gpu["speed_bus"])} }},')
+            out += [
                 '\t\t},',
             ]
         if has_thermal:
