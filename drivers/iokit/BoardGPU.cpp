@@ -385,7 +385,7 @@ MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds)
 static TUNABLE(uint32_t, gGPUPresentMode, "fb_gpu", 1);
 #define PRESENT_SLOTS           16             /* submissions of ours the GPU may be at, at most */
 #define PRESENT_SLOT_WORDS      512             /* commands of one; its last 4 words: the GPU's clock at its start and end */
-#define PRESENT_MAPS            6               /* surfaces kept in the GPU's address space */
+#define PRESENT_MAPS            12              /* surfaces kept in the GPU's address space (fb_video: a decoder's pool of frames too) */
 #define PRESENT_TARGETS         3               /* memories frames are put into: the panel's, fb_flip's two */
 #define PRESENT_IDLE_MS         1000            /* ... one not shown for so long is let go */
 #define PRESENT_WAIT_MS         200             /* for a slot or a mapping the GPU is still at */
@@ -407,6 +407,8 @@ static TUNABLE(uint32_t, gGPUPresentMode, "fb_gpu", 1);
 #define R2D_SRC_FILTER          (1u << 16)
 #define R2D_SRC_UNK20_UNK22     (1u << 20 | 1u << 22)
 #define R2D_TEX_2D              (1u << 29)      /* TPL1_2D_SRC_CNTL.TYPE = A6XX_TEX_2D */
+#define R2D_SOLID_COLOR         (1u << 7)       /* a6xx_2d_blit_cntl.SOLID_COLOR: the colour of RB_2D_SRC_SOLID_C0.. */
+#define R2D_RB_SRC_SOLID_C0     0x8c2c          /* .. C3 0x8c2f */
 #define PM4_THREAD_CONTROL      0x17
 #define PM4_WAIT_FOR_IDLE       0x26
 #define PM4_BLIT                0x2c
@@ -443,6 +445,9 @@ static struct {
 	uint64_t                stagingAddress;
 	uint32_t                stagingPitch;
 	struct present_map      maps[PRESENT_MAPS];
+	struct {
+		uint64_t        phys, size, address;
+	}                       video;          /* fb_video: the display controller's memory for videos, entered once */
 	/* since MiniIOSurfacePresentCost() was asked */
 	uint32_t                presents, mapped, timed;
 	uint64_t                submitting, gpuTicks;
@@ -887,6 +892,85 @@ pm4BlitBarrier(struct present_stream * st)
 }
 
 /*
+ * fb_video's test hole: a rectangle of memory at DST (rows DPITCH apart) made transparent black by the 2D engine's solid
+ * colour (turnip's r2d_clear: SOLID_COLOR in both BLIT_CNTLs, the colour in RB_2D_SRC_SOLID_C0..C3), then the BLIT_CNTLs
+ * back as pm4Blit() wants them.
+ */
+static void
+pm4Clear(struct present_stream * st, uint64_t dst, uint32_t dpitch, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+	const uint32_t rect[6] = {
+		x << 8, (x + w - 1) << 8, y << 8, (y + h - 1) << 8, x | y << 16, (x + w - 1) | (y + h - 1) << 16,
+	};
+	const uint32_t destination[4] = { R2D_FMT_8888, (uint32_t) dst, (uint32_t) (dst >> 32), dpitch >> 6 };
+	const uint32_t none[4] = { 0, 0, 0, 0 };
+
+	pm4Reg(st, R2D_RB_BLIT_CNTL, R2D_BLIT_CNTL | R2D_SOLID_COLOR);
+	pm4Reg(st, R2D_GRAS_BLIT_CNTL, R2D_BLIT_CNTL | R2D_SOLID_COLOR);
+	pm4Regs(st, R2D_RB_SRC_SOLID_C0, none, 4);
+	pm4Regs(st, R2D_GRAS_SRC_TL_X, rect, 6);
+	pm4Regs(st, R2D_RB_DST_INFO, destination, 4);
+	pm4Regs(st, R2D_RB_DST_FLAGS, none, 3);
+	pm4Packet1(st, PM4_BLIT, PM4_BLIT_OP_SCALE);
+	pm4Reg(st, R2D_RB_BLIT_CNTL, R2D_BLIT_CNTL);
+	pm4Reg(st, R2D_GRAS_BLIT_CNTL, R2D_BLIT_CNTL);
+}
+
+/*
+ * fb_video: a two-plane surface's planes into the display controller's memory as they are (rows of 4-byte pixels,
+ * unscaled: the bytes copied). With the lock held; false: what the 2D engine cannot copy so (the processors draw the
+ * frame). GPU is where the surface's pixels (pixels()) are in the GPU's address space.
+ */
+static bool
+presentVideoPlanes(struct present_stream * st, const struct MiniIOSurfacePresentVideo * v, uint64_t gpu)
+{
+	MiniIOSurface * s = v->surface;
+	const uint64_t dst[2] = { v->lumaPhys, v->chromaPhys };
+	const uint32_t pitch[2] = { v->lumaPitch, v->chromaPitch };
+
+	if (s->info.planeCount != 2 || v->regionSize == 0 || (v->regionPhys & 0xfff) || (v->regionSize & 0xfff)) {
+		return false;
+	}
+	if (gPresent.video.phys != v->regionPhys || gPresent.video.size != v->regionSize) {
+		if (gPresent.video.address != 0) {
+			hakios_gpu_unmap(gPresent.video.address, gPresent.video.size);
+			hakios_gpu_address_free(gPresent.video.address, gPresent.video.size);
+			gPresent.video.address = 0;
+		}
+		gPresent.video.address = presentMapMemory(NULL, 0, v->regionPhys, v->regionSize, false);
+		if (gPresent.video.address == 0) {
+			return false;
+		}
+		gPresent.video.phys = v->regionPhys;
+		gPresent.video.size = v->regionSize;
+		IOLog("HakiosGPU: fb_video: the display controller's video memory %#llx (%llu bytes) at %#llx\n", v->regionPhys,
+		    v->regionSize, gPresent.video.address);
+	}
+	for (unsigned p = 0; p < 2; p++) {
+		const struct minisurf_plane * plane = &s->planes[p];
+		uint32_t w = (plane->width * (p == 0 ? 1u : 2u) + 3) / 4;
+		uint64_t at = (uint64_t) s->info.offset + plane->offset;
+
+		if (plane->width == 0 || plane->height == 0 || plane->width > 8192 || plane->height > 8192 ||
+		    (plane->bytesPerRow & 63) || (at & 63) || (pitch[p] & 63) || w * 4 > plane->bytesPerRow || w * 4 > pitch[p] ||
+		    !s->holds(plane->offset + (uint64_t) (plane->height - 1) * plane->bytesPerRow, (uint64_t) w * 4) ||
+		    dst[p] < v->regionPhys || dst[p] + (uint64_t) pitch[p] * plane->height > v->regionPhys + v->regionSize) {
+			return false;
+		}
+	}
+	for (unsigned p = 0; p < 2; p++) {
+		const struct minisurf_plane * plane = &s->planes[p];
+		uint32_t w = (plane->width * (p == 0 ? 1u : 2u) + 3) / 4;
+
+		/* (a video is decoded by the processors: what they wrote, in memory for the GPU to read) */
+		hakios_gpu_to_memory(s->pixels() + plane->offset, (uint64_t) plane->bytesPerRow * plane->height);
+		pm4Blit(st, gpu + plane->offset, plane->bytesPerRow, w, plane->height, 0, 0, w, plane->height,
+		    gPresent.video.address + (dst[p] - v->regionPhys), pitch[p], 0, 0, w, plane->height);
+	}
+	return true;
+}
+
+/*
  * A rectangle of the GPU's copy onto the panel, unscaled, by rows of two (see above): rows Y.. of the copy (pitch CP) at
  * the same place on the panel (pitch PP, not a multiple of 64 bytes, twice it is).
  */
@@ -980,9 +1064,9 @@ presentSurface(MiniIOSurface * s, uint64_t now)
 
 uint32_t
 MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned count, uint64_t panelPhys, uint32_t panelRowBytes,
-    uint32_t panelWidth, uint32_t panelHeight)
+    uint32_t panelWidth, uint32_t panelHeight, const struct MiniIOSurfacePresentVideo * video)
 {
-	uint64_t began = mach_absolute_time(), sources[4];
+	uint64_t began = mach_absolute_time(), sources[4], videoSource = 0;
 	uint32_t fence = 0, words;
 	static uint32_t said;
 
@@ -1016,6 +1100,16 @@ MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned c
 			IOLockUnlock(gGPULock);
 			return 0;
 		}
+	}
+	/* fb_video: the video's surface in the GPU's address space too (frames that go to a buffer of fb_flip's only) */
+	if (video != NULL && (video->surface == NULL || (panelRowBytes & 63) ||
+	    (videoSource = presentSurface(video->surface, began)) == 0)) {
+		if (said++ < 8) {
+			IOLog("HakiosGPU: fb_video: surface %u cannot be read by the GPU: the frame is drawn by the processor\n",
+			    video->surface != NULL ? video->surface->sid : 0);
+		}
+		IOLockUnlock(gGPULock);
+		return 0;
 	}
 	/* the slot: the GPU done with what was in it before */
 	unsigned slot = gPresent.next % PRESENT_SLOTS;
@@ -1067,6 +1161,21 @@ MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned c
 		pm4Blit(&st, sources[i], s->info.bytesPerRow, s->info.width, s->info.height, l->sx, l->sy, l->sw, l->sh, target,
 		    targetPitch, l->dx, l->dy, l->dw, l->dh);
 	}
+	/* fb_video: the test's hole over the video, and the video's planes for the display controller */
+	if (video != NULL) {
+		if (video->hole && video->hw != 0 && video->hh != 0 && video->hx + video->hw <= panelWidth &&
+		    video->hy + video->hh <= panelHeight) {
+			pm4Clear(&st, target, targetPitch, video->hx, video->hy, video->hw, video->hh);
+		}
+		if (!presentVideoPlanes(&st, video, videoSource)) {
+			if (said++ < 8) {
+				IOLog("HakiosGPU: fb_video: the planes of surface %u cannot be copied by the 2D engine: the frame is "
+				    "drawn by the processor\n", video->surface->sid);
+			}
+			IOLockUnlock(gGPULock);
+			return 0;
+		}
+	}
 	pm4BlitBarrier(&st);
 	/* ... and from the copy onto the panel, each layer's rectangle, by rows of two */
 	if (staged) {
@@ -1092,9 +1201,11 @@ MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned c
 	}
 	gPresent.slotFence[slot] = fence;
 	gPresent.next++;
-	for (unsigned i = 0; i < count; i++) {
+	for (unsigned i = 0; i < count + (video != NULL ? 1u : 0u); i++) {
+		MiniIOSurface * shown = i < count ? layers[i].surface : video->surface;
+
 		for (unsigned k = 0; k < PRESENT_MAPS; k++) {
-			if (gPresent.maps[k].surface == layers[i].surface) {
+			if (gPresent.maps[k].surface == shown) {
 				gPresent.maps[k].fence = fence;
 			}
 		}

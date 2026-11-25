@@ -231,8 +231,24 @@ struct MiniIOSurfacePresentLayer {
 	uint32_t        sx, sy, sw, sh;
 	uint32_t        dx, dy, dw, dh;
 };
+/*
+ * fb_video (MiniIOMobileFramebuffer.cpp): a two-plane YCbCr layer ('420v', '420f') shown by the display controller, its
+ * planes copied as they are by the same submission into memory the controller can read (physically one piece, which a
+ * surface's is not): the luma plane to LUMAPHYS, rows LUMAPITCH apart, the chroma plane to CHROMAPHYS (CHROMAPITCH),
+ * both in the REGIONSIZE bytes at REGIONPHYS (all of the controller's video memory, entered into the GPU's address space
+ * once). With HOLE, the rectangle HX, HY, HW, HH of the frame is made transparent black after the layers are put there
+ * (the test's stand-in for the hole CoreAnimation leaves over a video).
+ */
+struct MiniIOSurfacePresentVideo {
+	MiniIOSurface * surface;
+	uint64_t        regionPhys, regionSize;
+	uint64_t        lumaPhys, chromaPhys;
+	uint32_t        lumaPitch, chromaPitch;
+	bool            hole;
+	uint32_t        hx, hy, hw, hh;
+};
 uint32_t        MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned count, uint64_t panelPhys,
-    uint32_t panelRowBytes, uint32_t panelWidth, uint32_t panelHeight);
+    uint32_t panelRowBytes, uint32_t panelWidth, uint32_t panelHeight, const struct MiniIOSurfacePresentVideo * video);
 /* Whether the GPU is done with that submission, waiting so long at most. */
 bool            MiniIOSurfacePresentDone(uint32_t fence, uint64_t milliseconds);
 /* What the presents cost since this was last asked: how many, us each to hand over, us of the GPU's each (timed of them), surfaces entered. */

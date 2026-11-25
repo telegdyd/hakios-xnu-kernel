@@ -296,23 +296,64 @@ enum { kRefusedNoPanel, kRefusedBlack, kRefusedOffPanel, kRefusedNotGPUDrawn, kR
  * interface's counters, tear check and auto-refresh. Reads only.
  */
 extern "C" bool hakios_display_flip_data(uint64_t * mdss, uint64_t * intf, uint64_t * splash_size);
-#define MDSS_WINDOW_FIRST       0x04000                 /* what is mapped of it: the pipes and the CTLs */
-#define MDSS_WINDOW_END         0x2c000
+#define MDSS_WINDOW_FIRST       0x01000                 /* what is mapped of it: the top's interrupts, the pipes, CTLs, mixers */
+#define MDSS_WINDOW_END         0x47000
+#define MDP_INTR_EN             0x01010                 /* (Linux's dpu_hw_interrupts.c, MDP_SSPP_TOP0) */
+#define MDP_INTR_STATUS         0x01014
+#define MDP_INTR_CLEAR          0x01018
+#define MDP_INTR_INTF1_UNDERRUN (1u << 26)
 #define SSPP_SRC_SIZE           0x00
 #define SSPP_SRC_XY             0x08
 #define SSPP_OUT_SIZE           0x0c
 #define SSPP_OUT_XY             0x10
 #define SSPP_SRC0_ADDR          0x14
+#define SSPP_SRC1_ADDR          0x18
+#define SSPP_SRC2_ADDR          0x1c
+#define SSPP_SRC3_ADDR          0x20
 #define SSPP_SRC_YSTRIDE0       0x24
+#define SSPP_SRC_YSTRIDE1       0x28
 #define SSPP_SRC_FORMAT         0x30
 #define SSPP_SRC_UNPACK         0x34
 #define SSPP_SRC_OP_MODE        0x38
+#define SSPP_UBWC_ERROR_STATUS  0x138
+#define SSPP_PE_C0_LR           0x100                   /* pixel extension: LR, TB, REQ_PIXELS of C0, C1C2 (+0x10), C3 (+0x20) */
+/* fb_video: what a VIG pipe's fetch is paced by, copied from the pipe the boot loader set up (dpu_hw_sspp.c) */
+static const uint16_t kSSPPQoS[] = { 0x048, 0x060, 0x064, 0x068, 0x06c, 0x074, 0x078, 0x130, 0x134, 0x150 };
+/* ... and its scaler (QSEED3 lite, version 0x3001: the live DT's qcom,sde-qseed-scalar-version) and 10-bit CSC */
+#define VIG_SCALER              0xa00                   /* qcom,sde-vig-qseed-off; dpu_hw_util.c's QSEED3_* below */
+#define QSEED3_HW_VERSION       0x00
+#define QSEED3_OP_MODE          0x04
+#define QSEED3_PHASE_STEP_Y_H   0x10
+#define QSEED3_PHASE_STEP_Y_V   0x14
+#define QSEED3_PHASE_STEP_UV_H  0x18
+#define QSEED3_PHASE_STEP_UV_V  0x1c
+#define QSEED3_PRELOAD          0x20
+#define QSEED3_SRC_SIZE_Y_RGB_A 0x40
+#define QSEED3_SRC_SIZE_UV      0x44
+#define QSEED3_DST_SIZE         0x48
+#define QSEED3_PHASE_INIT_Y_H   0x90                    /* .. Y_V 0x94, UV_H 0x98, UV_V 0x9c */
+#define VIG_CSC10               0x1a00                  /* qcom,sde-vig-csc-off: the op mode, then the matrix from +4 */
+#define CSC10_EN                (1u << 0)
+#define CSC10_SRC_YUV           (1u << 1)
+/* the display's mixers (qcom,sde-mixer-off: LM0..LM4; CTL_LAYER0 + 4 * n is LMn's) and their blend stages */
+#define LM_BASE(n)              (0x45000 + 0x1000 * (n))
+#define LM_OP_MODE              0x00
+#define LM_BLEND_OP(stage)      (0x20 + 0x18 * ((stage) - 1)) /* qcom,sde-mixer-blend-op-off, stage 1 (DPU_STAGE_0) on */
+#define LM_BLEND_CONST(stage)   (LM_BLEND_OP(stage) + 4)
+#define LM_BLEND_OPAQUE         0x100                   /* DPU_BLEND_FG_ALPHA_FG_CONST | DPU_BLEND_BG_ALPHA_BG_CONST */
+#define LM_BLEND_PREMULTIPLIED  0x600                   /* FG_ALPHA_FG_CONST | BG_ALPHA_FG_PIXEL | BG_INV_ALPHA */
+#define LM_BLEND_CONST_FG       0x00ff0000u             /* combined alpha: the foreground's 255, the background's 0 */
+#define LM_FLUSH(n)             (6 + (n))               /* LM0..LM4's bits in CTL_FLUSH (dpu_hw_ctl.c) */
 #define CTL_LAYER0              0x00                    /* LM0..LM4 at 0x00..0x10, LM5 at 0x24 */
 #define CTL_TOP                 0x14
 #define CTL_FLUSH               0x18
 #define CTL_START               0x1c
 #define CTL_INTF_ACTIVE         0xf4
 #define CTL_FETCH_PIPE_ACTIVE   0xfc
+#define CTL_MIX_SHIFT_VIG2      6                       /* a pipe's stage (stage + 1, 3 bits) in CTL_LAYER: VIG0 0, VIG1 3, */
+#define CTL_MIX_SHIFT_VIG3      26                      /* ... VIG2 6, VIG3 26 (dpu_hw_ctl.c setup_blendstage) */
+#define CTL_FETCH_VIG2          (1u << 18)              /* ... and in CTL_FETCH_PIPE_ACTIVE: VIG0 16 .. VIG3 19 */
+#define CTL_FETCH_VIG3          (1u << 19)
 #define INTF_TIMING_ENGINE_EN   0x000
 #define INTF_FRAME_COUNT        0x0ac
 #define INTF_LINE_COUNT         0x0b0
@@ -415,6 +456,23 @@ sysctl_fb_dpu SYSCTL_HANDLER_ARGS
 		    mdssRead(b + CTL_FLUSH), mdssRead(b + CTL_START), mdssRead(b + CTL_INTF_ACTIVE),
 		    mdssRead(b + CTL_FETCH_PIPE_ACTIVE));
 	}
+	for (unsigned m = 0; m < 2; m++) {
+		uint32_t b = LM_BASE(m);
+		SAY("LM%u op %#x out %#x blend", m, mdssRead(b + LM_OP_MODE), mdssRead(b + 0x04));
+		for (unsigned stage = 1; stage <= 5; stage++) {
+			SAY(" %u:%#x/%#x", stage, mdssRead(b + LM_BLEND_OP(stage)), mdssRead(b + LM_BLEND_CONST(stage)));
+		}
+		SAY("\n");
+	}
+	for (unsigned p = 2; p < 4; p++) {
+		uint32_t b = kDPUPipes[p].offset;
+		SAY("%s scaler version %#x op %#x steps %#x %#x src %#x dst %#x; csc op %#x; addr1 %#x\n", kDPUPipes[p].name,
+		    mdssRead(b + VIG_SCALER + QSEED3_HW_VERSION), mdssRead(b + VIG_SCALER + QSEED3_OP_MODE),
+		    mdssRead(b + VIG_SCALER + QSEED3_PHASE_STEP_Y_H), mdssRead(b + VIG_SCALER + QSEED3_PHASE_STEP_Y_V),
+		    mdssRead(b + VIG_SCALER + QSEED3_SRC_SIZE_Y_RGB_A), mdssRead(b + VIG_SCALER + QSEED3_DST_SIZE),
+		    mdssRead(b + VIG_CSC10), mdssRead(b + SSPP_SRC1_ADDR));
+	}
+	SAY("MDP interrupts enabled %#x status %#x (INTF_1 underrun bit 26)\n", mdssRead(MDP_INTR_EN), mdssRead(MDP_INTR_STATUS));
 	SAY("INTF timing %#x status %#x tearcheck %#x vsync %#x height %#x start %#x rdptr %#x autorefresh %#x\n",
 	    intfRead(INTF_TIMING_ENGINE_EN), intfRead(INTF_STATUS), intfRead(INTF_TEAR_TEAR_CHECK_EN),
 	    intfRead(INTF_TEAR_SYNC_CONFIG_VSYNC), intfRead(INTF_TEAR_SYNC_CONFIG_HEIGHT), intfRead(INTF_TEAR_START_POS),
@@ -459,6 +517,70 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, fb_dpu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLA
  * auto-refresh a flush alone was taken at the frame's start, every one of the timed ones.
  */
 static TUNABLE_WRITEABLE(uint32_t, gFlip, "fb_flip", 1);
+/*
+ * Boot-arg fb_video=0: a video's layer (two planes, '420v' or '420f') drawn by the processors as before (fb_yuv). By
+ * default, with fb_flip, it is shown by the display controller, as an iPhone's display does: a VIG pipe (two, VIG2 and
+ * VIG3, when it crosses from the left mixer's half into the right's, as the boot loader's VIG0 and VIG1 do) converts it
+ * to RGB (its 10-bit CSC, BT.601 video or full range), scales it (QSEED3 lite, bilinear) and the mixers put it under
+ * the frame, which is blended over it by its alpha (premultiplied: CoreAnimation leaves a transparent hole for the
+ * video). The controller reads memory of one piece and a surface's is not: its two planes are copied as they are by the
+ * GPU, in the submission that puts the frame into its buffer, into video memory of that buffer's own after fb_flip's
+ * two (the rest of the boot loader's display memory). The pipes are set and the mixers changed with the flip that
+ * shows the frame, in the same flush. A video the controller cannot take (off the panel, a frame not covering it, too
+ * large for the memory) goes to the processors as before.
+ */
+static TUNABLE_WRITEABLE(uint32_t, gVideo, "fb_video", 1);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_video, CTLFLAG_RW | CTLFLAG_LOCKED, &gVideo, 0,
+    "fb_video: video layers shown by the display controller");
+static uint32_t gVideoState, gVideoFrames;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_video_state, CTLFLAG_RD | CTLFLAG_LOCKED, &gVideoState, 0,
+    "fb_video: 0 not tried, 1 ready, 2 no room, 3 the mixers not as expected");
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_video_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &gVideoFrames, 0,
+    "fb_video: frames shown with a video on the display controller");
+/*
+ * sysctl kern.hakios.fb_video_test=SURFACE (root; 0 to stop): a two-plane surface of a test's own shown as a video
+ * under every frame the GPU puts into an fb_flip buffer, 960 x 540 at 60, 800 of the panel (across the middle), with
+ * the GPU cutting the frame's hole over it as CoreAnimation would (userland's video_test makes the surface and moves
+ * its picture).
+ */
+static uint32_t gVideoTest;
+static MiniIOSurface * gVideoTestSurface;
+#define VIDEO_TEST_X            60
+#define VIDEO_TEST_Y            800
+#define VIDEO_TEST_W            960
+#define VIDEO_TEST_H            540
+static int
+sysctl_fb_video_test SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	uint32_t value = gVideoTest;
+	int error = sysctl_handle_int(oidp, &value, 0, req);
+
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (suser(kauth_cred_get(), NULL) != 0) {
+		return EPERM;
+	}
+	MiniIOSurface * s = value != 0 ? MiniIOSurfaceCopy(value) : NULL;
+
+	if (value != 0 && (s == NULL || s->info.planeCount != 2)) {
+		if (s != NULL) {
+			MiniIOSurfaceDrop(s);
+		}
+		return EINVAL;
+	}
+	MiniIOSurface * was = __atomic_exchange_n(&gVideoTestSurface, s, __ATOMIC_ACQ_REL);
+
+	gVideoTest = value;
+	if (was != NULL) {
+		IOSleep(100);           /* (the presenter may be using it: it holds its own reference only while it is) */
+		MiniIOSurfaceDrop(was);
+	}
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, fb_video_test, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_fb_video_test,
+    "I", "fb_video: a test's two-plane surface shown as a video under every frame (root; 0 off)");
 SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_flip, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlip, 0, "fb_flip: frames shown by flipping between two buffers");
 #define FLIP_SPLASH_KEEP        0x4000                  /* the end of the firmware's display memory: its DSI command buffer */
 #define FLIP_CTL                0                       /* CTL0, which drives the panel's interface (kern.hakios.fb_dpu) */
@@ -687,6 +809,22 @@ public:
 	uint8_t *       fFlipBase[2];
 	uint32_t        fStatFlips, fStatFlipsHome, fStatFlipNotFull, fStatFlipWaited;
 	uint64_t        fStatFlipWait;
+	/* fb_video */
+	struct VideoFrame {
+		bool            valid;
+		bool            full;                   /* '420f' (else '420v', video range) */
+		uint32_t        sx, sy, sw, sh;         /* of the luma plane */
+		uint32_t        dx, dy, dw, dh;         /* on the panel */
+		uint32_t        lumaPitch, chromaPitch;
+		uint32_t        chromaOffset;           /* from the buffer's start */
+	}               fVideoNext;             /* the frame of the next flip's, put into the target's video buffer */
+	uint64_t        fVideoRegionPhys, fVideoRegionSize, fVideoPhys[2], fVideoBufferSize;
+	bool            fVideoOn;               /* the controller shows a video now */
+	unsigned        fVideoLMs;              /* the mixers CTL0 drives (the boot loader's: 2) */
+	uint32_t        fVideoUIStage;          /* the frame's stage in them (the boot loader's VIG0's) */
+	uint32_t        fVideoHomeLayer[5], fVideoHomeFetch, fVideoHomeLMOp[5], fVideoHomeBlend[5][2];
+	uint32_t        fVideoPipesOn;          /* 1: VIG2, 2: VIG3 */
+	uint32_t        fStatVideoFrames, fStatVideoRefused, fStatVideoUnderruns;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
 	/* settings user space gives and may read back; nothing here applies them to the panel */
 	uint8_t         fGamma[kFBGammaSize];
@@ -774,6 +912,10 @@ public:
 	void flipTo(int buffer);
 	void flipOff(const char * why);
 	void flipHome(void);
+	bool videoSetUp(void);
+	bool videoTake(MiniIOSurface * s, const int32_t * src, int64_t qx0, int64_t qy0, int64_t qx1, int64_t qy1, int target,
+	    struct MiniIOSurfacePresentVideo * v);
+	uint32_t videoProgram(int buffer);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -1968,6 +2110,14 @@ IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, 
 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
 	unsigned count = 0;
 	uint32_t fence;
+	/* fb_video: the frame's video layer (at most one), for the display controller */
+	MiniIOSurface * video = NULL, * held = NULL;
+	int32_t videoSrc[4] = { 0, 0, 0, 0 };
+	int64_t vq[4] = { 0, 0, 0, 0 };
+	struct MiniIOSurfacePresentVideo v;
+	bool test = false;
+
+	fVideoNext.valid = false;
 
 	if (fPanelPhys == 0) {
 		fStatRefused[kRefusedNoPanel]++;
@@ -1986,8 +2136,27 @@ IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, 
 			continue;
 		}
 		if (s != NULL && s->info.planeCount == 2 && gYUV != 0) {
-			fStatRefused[kRefusedVideo]++;
-			return false;            /* (a video's two planes: drawYUV() by the processors) */
+			int32_t vs[4], vd[4];
+
+			memcpy(vs, swap + SWAP_SOURCE(layer), sizeof(vs));
+			memcpy(vd, swap + SWAP_DEST(layer), sizeof(vd));
+			if (vd[2] <= 0 || vd[3] <= 0) {
+				vd[0] = vd[1] = 0;
+				vd[2] = (int32_t) fWidth;
+				vd[3] = (int32_t) fHeight;
+			}
+			/* (a second video, or none for the controller: drawYUV() by the processors) */
+			if (!gVideo || *target < 0 || video != NULL) {
+				fStatRefused[kRefusedVideo]++;
+				return false;
+			}
+			video = s;
+			memcpy(videoSrc, vs, sizeof(vs));
+			vq[0] = (int64_t) vd[0] * fPanelWidth / fWidth;
+			vq[1] = (int64_t) vd[1] * fPanelHeight / fHeight;
+			vq[2] = ((int64_t) vd[0] + vd[2]) * fPanelWidth / fWidth;
+			vq[3] = ((int64_t) vd[1] + vd[3]) * fPanelHeight / fHeight;
+			continue;
 		}
 		if (s == NULL || s->info.bytesPerElement != 4 || s->info.planeCount != 0) {
 			continue;                       /* (nothing drawn for it by the processors either) */
@@ -2053,14 +2222,53 @@ IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, 
 		*target = -1;
 		fStatFlipNotFull++;
 	}
+	/* fb_video_test: the test's surface as the video, under a hole of the frame's (when the frame has none of its own) */
+	if (video == NULL && gVideoTest != 0 && gVideo && *target >= 0 && (held = MiniIOSurfaceCopy(gVideoTest)) != NULL) {
+		video = held;
+		test = true;
+		vq[0] = VIDEO_TEST_X;
+		vq[1] = VIDEO_TEST_Y;
+		vq[2] = VIDEO_TEST_X + VIDEO_TEST_W;
+		vq[3] = VIDEO_TEST_Y + VIDEO_TEST_H;
+	}
+	if (video != NULL && (*target < 0 || !videoTake(video, videoSrc, vq[0], vq[1], vq[2], vq[3], *target, &v))) {
+		if (fStatVideoRefused++ < 4) {
+			IOLog("MiniIOMobileFramebuffer: fb_video: surface %u (%ux%u, %u planes) from %d,%d %dx%d onto %lld,%lld .. "
+			    "%lld,%lld of the panel is not one the controller takes%s: the processors draw it\n", video->sid,
+			    video->info.width, video->info.height, video->info.planeCount, videoSrc[0], videoSrc[1], videoSrc[2],
+			    videoSrc[3], vq[0], vq[1], vq[2], vq[3], *target < 0 ? " (the frame not in a buffer of fb_flip's)" : "");
+		}
+		fVideoNext.valid = false;
+		if (held != NULL) {
+			MiniIOSurfaceDrop(held);
+			held = NULL;
+		}
+		if (!test) {
+			fStatRefused[kRefusedVideo]++;
+			return false;
+		}
+		video = NULL;
+	}
+	if (video != NULL && test) {
+		v.hole = true;
+		v.hx = VIDEO_TEST_X;
+		v.hy = VIDEO_TEST_Y;
+		v.hw = VIDEO_TEST_W;
+		v.hh = VIDEO_TEST_H;
+	}
 	uint64_t phys = *target >= 0 ? fFlipPhys[*target] : fPanelPhys;
 	uint32_t rowBytes = *target >= 0 ? fFlipRowBytes : fRowBytes;
 
-	fence = MiniIOSurfacePresent(layers, count, phys, rowBytes, fPanelWidth, fPanelHeight);
+	fence = MiniIOSurfacePresent(layers, count, phys, rowBytes, fPanelWidth, fPanelHeight, video != NULL ? &v : NULL);
+	if (held != NULL) {
+		MiniIOSurfaceDrop(held);        /* (the present holds it while the GPU reads it) */
+	}
 	if (fence == 0) {
+		fVideoNext.valid = false;
 		fStatRefused[kRefusedByGPU]++;
 		return false;
 	}
+	fStatVideoFrames += video != NULL;
 	gLastPresent = fence;
 	fGPUBase = *target >= 0 ? fFlipBase[*target] : fBase;
 	fGPURowBytes = rowBytes;
@@ -2197,6 +2405,293 @@ IOMobileFramebuffer::flipSetUp(void)
 	return true;
 }
 
+
+/*
+ * fb_video: the controller's video memory (the rest of the boot loader's display memory after fb_flip's two buffers, one
+ * half for each), and the mixers as the boot loader left them: CTL0's mixers with VIG0 (and VIG1) at one stage above
+ * the first, VIG2 and VIG3 unused. Once, when the first video comes.
+ */
+bool
+IOMobileFramebuffer::videoSetUp(void)
+{
+	uint32_t ctl = kDPUCTLs[FLIP_CTL];
+	uint64_t flipSize = round_page_64((uint64_t) fFlipRowBytes * fPanelHeight);
+	uint64_t start = (fFlipPhys[1] + flipSize + 0xffff) & ~0xffffULL;
+	uint64_t end = (fPanelPhys + gSplashSize - FLIP_SPLASH_KEEP) & ~0xfffULL;
+	uint32_t stage = 0;
+
+	if (gVideoState != 0) {
+		return gVideoState == 1;
+	}
+	if (end <= start || end - start < 4 * 1024 * 1024) {
+		IOLog("MiniIOMobileFramebuffer: fb_video: no room for video memory after fb_flip's buffers (%#llx to %#llx): off\n",
+		    start, end);
+		gVideoState = 2;
+		return false;
+	}
+	fVideoRegionPhys = start;
+	fVideoRegionSize = end - start;
+	fVideoBufferSize = (fVideoRegionSize / 2) & ~0xfffULL;
+	fVideoPhys[0] = start;
+	fVideoPhys[1] = start + fVideoBufferSize;
+	fVideoLMs = 0;
+	for (unsigned m = 0; m < 5; m++) {
+		uint32_t layer = mdssRead(ctl + CTL_LAYER0 + 4 * m);
+
+		fVideoHomeLayer[m] = layer;
+		if ((layer & 7) == 0) {
+			continue;
+		}
+		if (m != fVideoLMs || (stage != 0 && stage != (layer & 7) - 1) || ((layer >> CTL_MIX_SHIFT_VIG2) & 7) != 0 ||
+		    ((layer >> CTL_MIX_SHIFT_VIG3) & 7) != 0) {
+			stage = 0;
+			break;
+		}
+		stage = (layer & 7) - 1;
+		fVideoHomeLMOp[m] = mdssRead(LM_BASE(m) + LM_OP_MODE);
+		fVideoHomeBlend[m][0] = mdssRead(LM_BASE(m) + LM_BLEND_OP(stage));
+		fVideoHomeBlend[m][1] = mdssRead(LM_BASE(m) + LM_BLEND_CONST(stage));
+		fVideoLMs++;
+	}
+	fVideoHomeFetch = mdssRead(ctl + CTL_FETCH_PIPE_ACTIVE);
+	fVideoUIStage = stage;
+	if (fVideoLMs == 0 || fVideoLMs > 2 || stage < 2 || (fVideoHomeFetch & (CTL_FETCH_VIG2 | CTL_FETCH_VIG3)) != 0 ||
+	    mdssRead(kDPUPipes[2].offset + SSPP_SRC0_ADDR) != 0 || mdssRead(kDPUPipes[3].offset + SSPP_SRC0_ADDR) != 0) {
+		IOLog("MiniIOMobileFramebuffer: fb_video: the mixers are not as expected (CTL%u layers %#x %#x, fetch %#x, the "
+		    "frame's stage %u, VIG2 %#x VIG3 %#x): off\n", FLIP_CTL, fVideoHomeLayer[0], fVideoHomeLayer[1], fVideoHomeFetch,
+		    stage, mdssRead(kDPUPipes[2].offset + SSPP_SRC0_ADDR), mdssRead(kDPUPipes[3].offset + SSPP_SRC0_ADDR));
+		gVideoState = 3;
+		return false;
+	}
+	gVideoState = 1;
+	IOLog("MiniIOMobileFramebuffer: fb_video: videos by VIG2/VIG3 under the frame (stage %u of %u mixers, op %#x, blend "
+	    "%#x/%#x), from video memory %#llx and %#llx (%llu bytes each); scaler version %#x\n", stage, fVideoLMs,
+	    fVideoHomeLMOp[0], fVideoHomeBlend[0][0], fVideoHomeBlend[0][1], fVideoPhys[0], fVideoPhys[1], fVideoBufferSize,
+	    mdssRead(kDPUPipes[2].offset + VIG_SCALER + QSEED3_HW_VERSION));
+	return true;
+}
+
+/*
+ * A video layer for the controller, into fVideoNext and V (for MiniIOSurfacePresent()), the rectangle SRC (of the luma
+ * plane, display numbers: 0 x 0 the whole) onto QX0, QY0 .. QX1, QY1 of the panel. False: not one it can take.
+ */
+bool
+IOMobileFramebuffer::videoTake(MiniIOSurface * s, const int32_t * src, int64_t qx0, int64_t qy0, int64_t qx1, int64_t qy1,
+    int target, struct MiniIOSurfacePresentVideo * v)
+{
+	const struct minisurf_plane * luma = &s->planes[0], * chroma = &s->planes[1];
+	struct VideoFrame f;
+	int64_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
+
+	bzero(&f, sizeof(f));
+	if (target < 0 || target > 1 || !videoSetUp() || s->info.planeCount != 2 ||
+	    (s->info.pixelFormat != FOURCC('4', '2', '0', 'v') && s->info.pixelFormat != FOURCC('4', '2', '0', 'f')) ||
+	    luma->width < 2 || luma->height < 2 || chroma->width != (luma->width + 1) / 2 || chroma->height != (luma->height + 1) / 2) {
+		return false;
+	}
+	if (sw <= 0 || sh <= 0) {
+		sx = sy = 0;
+		sw = luma->width;
+		sh = luma->height;
+	}
+	/* (4:2:0: a rectangle of whole chroma samples) */
+	sw += sx & 1;
+	sh += sy & 1;
+	sx &= ~1LL;
+	sy &= ~1LL;
+	sw &= ~1LL;
+	sh &= ~1LL;
+	if (sx < 0 || sy < 0 || sw < 2 || sh < 2 || sx + sw > luma->width || sy + sh > luma->height || qx0 < 0 || qy0 < 0 ||
+	    qx1 > fPanelWidth || qy1 > fPanelHeight || qx1 - qx0 < 2 || qy1 - qy0 < 2 ||
+	    sw > 4 * (qx1 - qx0) || sh > 4 * (qy1 - qy0) || sw > 4096 || sh > 4096) {
+		return false;
+	}
+	f.lumaPitch = (luma->width + 63) & ~63u;
+	f.chromaPitch = (chroma->width * 2 + 63) & ~63u;
+	f.chromaOffset = (uint32_t) round_page_64((uint64_t) f.lumaPitch * luma->height);
+	if ((uint64_t) f.chromaOffset + (uint64_t) f.chromaPitch * chroma->height > fVideoBufferSize) {
+		return false;
+	}
+	f.valid = true;
+	f.full = s->info.pixelFormat == FOURCC('4', '2', '0', 'f');
+	f.sx = (uint32_t) sx;
+	f.sy = (uint32_t) sy;
+	f.sw = (uint32_t) sw;
+	f.sh = (uint32_t) sh;
+	f.dx = (uint32_t) qx0;
+	f.dy = (uint32_t) qy0;
+	f.dw = (uint32_t) (qx1 - qx0);
+	f.dh = (uint32_t) (qy1 - qy0);
+	bzero(v, sizeof(*v));
+	v->surface = s;
+	v->regionPhys = fVideoRegionPhys;
+	v->regionSize = fVideoRegionSize;
+	v->lumaPhys = fVideoPhys[target];
+	v->chromaPhys = fVideoPhys[target] + f.chromaOffset;
+	v->lumaPitch = f.lumaPitch;
+	v->chromaPitch = f.chromaPitch;
+	fVideoNext = f;
+	return true;
+}
+
+/* the 10-bit CSC's matrix, clamps and biases (dpu_hw_util.c dpu_hw_csc_setup; Linux's dpu_csc10_YUV2RGB_601L for '420v') */
+static void
+videoCSC(uint32_t pipe, bool full)
+{
+	static const int32_t kVideo[9] = { 0x12a00, 0, 0x19880, 0x12a00, -0x6480, -0xd000, 0x12a00, 0x20480, 0 };
+	static const int32_t kFull[9] = { 0x10000, 0, 0x166e9, 0x10000, -0x581a, -0xb6d2, 0x10000, 0x1c5a2, 0 };
+	static const uint32_t kVideoPre[6] = { 0x40, 0x3ac, 0x40, 0x3c0, 0x40, 0x3c0 };
+	static const uint32_t kFullPre[6] = { 0, 0x3ff, 0, 0x3ff, 0, 0x3ff };
+	const int32_t * m = full ? kFull : kVideo;
+	const uint32_t * pre = full ? kFullPre : kVideoPre;
+	uint32_t b = pipe + VIG_CSC10 + 4;
+
+#define S49(v) ((uint32_t) ((v) >> 7) & 0x1fff)
+	mdssWrite(b + 0x00, S49(m[0]) | S49(m[1]) << 16);
+	mdssWrite(b + 0x04, S49(m[2]) | S49(m[3]) << 16);
+	mdssWrite(b + 0x08, S49(m[4]) | S49(m[5]) << 16);
+	mdssWrite(b + 0x0c, S49(m[6]) | S49(m[7]) << 16);
+	mdssWrite(b + 0x10, S49(m[8]));
+#undef S49
+	for (unsigned i = 0; i < 3; i++) {
+		mdssWrite(b + 0x14 + 4 * i, pre[2 * i] << 16 | pre[2 * i + 1]);            /* pre clamp */
+		mdssWrite(b + 0x20 + 4 * i, 0x3ffu);                                      /* post clamp 0 .. 1023 */
+		mdssWrite(b + 0x2c + 4 * i, i == 0 ? (full ? 0 : 0xffc0u) : 0xfe00u);   /* pre bias: -16 (video), -128 */
+		mdssWrite(b + 0x38 + 4 * i, 0);                                           /* post bias */
+	}
+	mdssWrite(pipe + VIG_CSC10, mdssRead(pipe + VIG_CSC10) | CSC10_EN | CSC10_SRC_YUV);
+}
+
+/*
+ * For flipTo(): the video pipes and the mixers as the frame shown from BUFFER wants them (fVideoNext, or no video), to
+ * be taken with its flush. Returns the flush bits that adds.
+ */
+uint32_t
+IOMobileFramebuffer::videoProgram(int buffer)
+{
+	static const unsigned kPipes[2] = { 2, 3 };     /* kDPUPipes: VIG2, VIG3 */
+	uint32_t ctl = kDPUCTLs[FLIP_CTL], flush = 0, used = 0;
+	const struct VideoFrame * f = &fVideoNext;
+
+	if (gVideoState != 1 || (!fVideoOn && (buffer < 0 || !f->valid))) {
+		return 0;
+	}
+	if (buffer >= 0 && f->valid) {
+		/* the pieces: the left mixer's half and the right's, a pipe each, as the boot loader's VIG0 and VIG1 */
+		uint32_t seam = fVideoLMs == 2 ? fPanelWidth / 2 : fPanelWidth;
+		uint32_t edges[3] = { f->dx, f->dx + f->dw, f->dx + f->dw };
+		unsigned pieces = 1;
+
+		if (f->dx < seam && f->dx + f->dw > seam) {
+			edges[1] = seam;
+			pieces = 2;
+		}
+		for (unsigned k = 0; k < pieces; k++) {
+			uint32_t pipe = kDPUPipes[kPipes[k]].offset;
+			uint32_t ax = edges[k], bx = edges[k + 1], ow = bx - ax;
+			uint32_t x0 = f->sx + (uint32_t) ((uint64_t) (ax - f->dx) * f->sw / f->dw);
+			uint32_t x1 = f->sx + (uint32_t) (((uint64_t) (bx - f->dx) * f->sw + f->dw - 1) / f->dw);
+			uint64_t luma = fVideoPhys[buffer], chroma = luma + f->chromaOffset;
+
+			x0 &= ~1u;
+			x1 = (x1 + 1) & ~1u;
+			x1 = x1 < f->sx + f->sw ? x1 : f->sx + f->sw;
+			uint32_t sw = x1 - x0, sh = f->sh;
+
+			if (sw < 2 || ow < 1) {
+				continue;
+			}
+			if (!(fVideoPipesOn & (1u << k))) {
+				/* (its fetch paced as the boot loader's pipe's) */
+				for (unsigned q = 0; q < sizeof(kSSPPQoS) / sizeof(kSSPPQoS[0]); q++) {
+					mdssWrite(pipe + kSSPPQoS[q], mdssRead(kDPUPipes[0].offset + kSSPPQoS[q]));
+				}
+			}
+			mdssWrite(pipe + SSPP_SRC_SIZE, sh << 16 | sw);
+			mdssWrite(pipe + SSPP_SRC_XY, f->sy << 16 | x0);
+			mdssWrite(pipe + SSPP_OUT_SIZE, f->dh << 16 | ow);
+			mdssWrite(pipe + SSPP_OUT_XY, f->dy << 16 | ax);
+			mdssWrite(pipe + SSPP_SRC0_ADDR, (uint32_t) luma);
+			mdssWrite(pipe + SSPP_SRC1_ADDR, (uint32_t) chroma);
+			mdssWrite(pipe + SSPP_SRC2_ADDR, 0);
+			mdssWrite(pipe + SSPP_SRC3_ADDR, 0);
+			mdssWrite(pipe + SSPP_SRC_YSTRIDE0, f->chromaPitch << 16 | f->lumaPitch);
+			mdssWrite(pipe + SSPP_SRC_YSTRIDE1, 0);
+			/* NV12 (dpu_formats.c, setup_format): 4:2:0, pseudo-planar, 8 bits, Cb then Cr, two a fetch, YUV */
+			mdssWrite(pipe + SSPP_SRC_FORMAT, 3u << 23 | 2u << 19 | 0x3f | 1u << 12 | 1u << 17 | 1u << 9 | 1u << 15);
+			mdssWrite(pipe + SSPP_SRC_UNPACK, 2u << 8 | 1u);
+			mdssWrite(pipe + SSPP_SRC_OP_MODE, 0x80000000u);        /* PE_OVERRIDE: the pixel extension below */
+			mdssWrite(pipe + SSPP_UBWC_ERROR_STATUS, 1u << 31);
+			/* pixel extension: none; what the scaler is fed, of luma, chroma (half each way) and alpha */
+			for (unsigned c = 0; c < 3; c++) {
+				uint32_t w = c == 1 ? sw / 2 : sw, h = c == 1 ? sh / 2 : sh;
+
+				mdssWrite(pipe + SSPP_PE_C0_LR + 0x10 * c, 0);
+				mdssWrite(pipe + SSPP_PE_C0_LR + 0x10 * c + 4, 0);
+				mdssWrite(pipe + SSPP_PE_C0_LR + 0x10 * c + 8, h << 16 | w);
+			}
+			/* the scaler (dpu_plane.c _dpu_plane_setup_scaler3, dpu_hw_setup_scaler3): bilinear, chroma at half */
+			uint32_t stepX = (uint32_t) (((uint64_t) sw << 21) / ow), stepY = (uint32_t) (((uint64_t) sh << 21) / f->dh);
+			uint32_t sc = pipe + VIG_SCALER;
+
+			mdssWrite(sc + QSEED3_PHASE_INIT_Y_H, 0);
+			mdssWrite(sc + QSEED3_PHASE_INIT_Y_H + 4, 0);
+			mdssWrite(sc + QSEED3_PHASE_INIT_Y_H + 8, 0);
+			mdssWrite(sc + QSEED3_PHASE_INIT_Y_H + 12, 0);
+			mdssWrite(sc + QSEED3_PHASE_STEP_Y_H, stepX & 0xffffff);
+			mdssWrite(sc + QSEED3_PHASE_STEP_Y_V, stepY & 0xffffff);
+			mdssWrite(sc + QSEED3_PHASE_STEP_UV_H, (stepX / 2) & 0xffffff);
+			mdssWrite(sc + QSEED3_PHASE_STEP_UV_V, (stepY / 2) & 0xffffff);
+			mdssWrite(sc + QSEED3_PRELOAD, 4u | 2u << 8 | 4u << 16 | 2u << 24);
+			mdssWrite(sc + QSEED3_SRC_SIZE_Y_RGB_A, sh << 16 | sw);
+			mdssWrite(sc + QSEED3_SRC_SIZE_UV, (sh / 2) << 16 | sw / 2);
+			mdssWrite(sc + QSEED3_DST_SIZE, f->dh << 16 | ow);
+			mdssWrite(sc + QSEED3_OP_MODE, 1u | 3u << 16 | 1u << 12 | 3u << 24 | 1u << 31 | 1u << 14);
+			videoCSC(pipe, f->full);
+			used |= 1u << k;
+			flush |= 1u << kDPUPipes[kPipes[k]].flush;
+		}
+	}
+	/* the mixers: the pipes used at the first stage, the frame over them by its alpha; or as the boot loader had them */
+	for (unsigned m = 0; m < fVideoLMs; m++) {
+		uint32_t b = LM_BASE(m), layer = fVideoHomeLayer[m];
+
+		layer |= (used & 1) ? 2u << CTL_MIX_SHIFT_VIG2 : 0;
+		layer |= (used & 2) ? 2u << CTL_MIX_SHIFT_VIG3 : 0;
+		mdssWrite(ctl + CTL_LAYER0 + 4 * m, layer);
+		if (used != 0) {
+			mdssWrite(b + LM_BLEND_OP(1), LM_BLEND_OPAQUE);
+			mdssWrite(b + LM_BLEND_CONST(1), LM_BLEND_CONST_FG);
+			mdssWrite(b + LM_BLEND_OP(fVideoUIStage), LM_BLEND_PREMULTIPLIED);
+			mdssWrite(b + LM_BLEND_CONST(fVideoUIStage), LM_BLEND_CONST_FG);
+			mdssWrite(b + LM_OP_MODE, fVideoHomeLMOp[m] | 1u << 1);
+		} else {
+			mdssWrite(b + LM_BLEND_OP(fVideoUIStage), fVideoHomeBlend[m][0]);
+			mdssWrite(b + LM_BLEND_CONST(fVideoUIStage), fVideoHomeBlend[m][1]);
+			mdssWrite(b + LM_OP_MODE, fVideoHomeLMOp[m]);
+		}
+		flush |= 1u << LM_FLUSH(m);
+	}
+	mdssWrite(ctl + CTL_FETCH_PIPE_ACTIVE, fVideoHomeFetch | ((used & 1) ? CTL_FETCH_VIG2 : 0) | ((used & 2) ? CTL_FETCH_VIG3 : 0));
+	/* (a pipe no longer used: flushed too, so that it is out of the mixers with them) */
+	for (unsigned k = 0; k < 2; k++) {
+		if ((fVideoPipesOn & (1u << k)) && !(used & (1u << k))) {
+			flush |= 1u << kDPUPipes[kPipes[k]].flush;
+		}
+	}
+	if (used != 0 && !fVideoOn) {
+		IOLog("MiniIOMobileFramebuffer: fb_video: on: %ux%u at %u,%u of the luma onto %ux%u at %u,%u by %s ('420%c')\n",
+		    f->sw, f->sh, f->sx, f->sy, f->dw, f->dh, f->dx, f->dy, used == 3 ? "VIG2 and VIG3" : used == 1 ? "VIG2" : "VIG3",
+		    f->full ? 'f' : 'v');
+	} else if (used == 0 && fVideoOn) {
+		IOLog("MiniIOMobileFramebuffer: fb_video: off (%u frames with one)\n", gVideoFrames);
+	}
+	fVideoOn = used != 0;
+	fVideoPipesOn = used;
+	gVideoFrames += used != 0;
+	return flush;
+}
+
 /* Whether the last flush has been taken, waiting so long at most. */
 bool
 IOMobileFramebuffer::flipTaken(uint32_t milliseconds)
@@ -2237,8 +2732,10 @@ IOMobileFramebuffer::flipTo(int buffer)
 		mdssWrite(fFlipPipe[i] + SSPP_SRC0_ADDR, (uint32_t) phys);
 		mdssWrite(fFlipPipe[i] + SSPP_SRC_YSTRIDE0, (fFlipHomeStride[i] & 0xffff0000u) | stride);
 	}
+	uint32_t videoFlush = videoProgram(buffer);    /* (fb_video: the video of this frame, or none, with the same flush) */
+
 	__asm__ volatile ("dsb sy" ::: "memory");
-	mdssWrite(ctl + CTL_FLUSH, fFlipFlush);
+	mdssWrite(ctl + CTL_FLUSH, fFlipFlush | videoFlush);
 	fFlipWritten = mach_absolute_time();
 	fFlipWrittenLine = flipLine();
 	fFlipShown = buffer;
@@ -2297,6 +2794,10 @@ IOMobileFramebuffer::flipHome(void)
 	bool taken;
 
 	if (fFlipShown < 0 || fFlipShown > 1 || fBase == NULL) {
+		if (fVideoOn) {
+			fVideoNext.valid = false;
+			mdssWrite(ctl + CTL_FLUSH, videoProgram(-1));
+		}
 		snprintf(line, sizeof(line), "fb_flip: at the end the controller is on the panel's memory already (%u flips)\n",
 		    fFlipCount);
 		loader_log_line(line);
@@ -2311,8 +2812,11 @@ IOMobileFramebuffer::flipHome(void)
 		mdssWrite(fFlipPipe[i] + SSPP_SRC0_ADDR, (uint32_t) fPanelPhys);
 		mdssWrite(fFlipPipe[i] + SSPP_SRC_YSTRIDE0, fFlipHomeStride[i]);
 	}
+	fVideoNext.valid = false;
+	uint32_t videoFlush = videoProgram(-1);         /* (fb_video: the mixers as the boot loader had them) */
+
 	__asm__ volatile ("dsb sy" ::: "memory");
-	mdssWrite(ctl + CTL_FLUSH, fFlipFlush);
+	mdssWrite(ctl + CTL_FLUSH, fFlipFlush | videoFlush);
 	nanoseconds_to_absolutetime((uint64_t) FLIP_TAKEN_MS * NSEC_PER_MSEC, &until);
 	until += mach_absolute_time();
 	while ((mdssRead(ctl + CTL_FLUSH) & fFlipFlush) != 0 && mach_absolute_time() < until) {
@@ -2711,6 +3215,18 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				    fStatFlipWaited ? micros(fStatFlipWait) / fStatFlipWaited : 0, fFlipShown);
 				fStatFlips = fStatFlipsHome = fStatFlipNotFull = fStatFlipWaited = 0;
 				fStatFlipWait = 0;
+			}
+			/* fb_video: frames with a video on the controller, and whether the panel's interface ran short meanwhile */
+			if (gVideoState == 1 && (fStatVideoFrames != 0 || fVideoOn)) {
+				bool under = (mdssRead(MDP_INTR_STATUS) & MDP_INTR_INTF1_UNDERRUN) != 0;
+
+				fStatVideoUnderruns += under;
+				mdssWrite(MDP_INTR_CLEAR, MDP_INTR_INTF1_UNDERRUN);
+				IOLog("MiniIOMobileFramebuffer: fb_video: %u frames with a video by the display controller, %u not taken "
+				    "(the processors drew them); interface underrun %s (%u times seen)\n", fStatVideoFrames,
+				    fStatVideoRefused, under ? "seen" : "not seen", fStatVideoUnderruns);
+				fStatVideoFrames = 0;
+				fStatVideoRefused = 0;
 			}
 		}
 		if (surfaces[0] != NULL) {

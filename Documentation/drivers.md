@@ -33,7 +33,7 @@ needs its feature in the board's `features`.
 
 | File | Stands in for | Portability |
 | --- | --- | --- |
-| `iokit/Kernel/MiniIOMobileFramebuffer.cpp` | The display driver family: swaps, vsync, scaling to the panel, software dimming, the Metal plug-in gate (`metal=1`); frames put on the panel by an A7XX's 2D engine (`fb_gpu`, BoardGPU.cpp) and shown by flipping the display controller between two buffers (`fb_flip`). | any; `fb_scan` timing is **data** (`display-scan`, `display { }` intf1); the flip is **data** for an SM8450-layout DPU (`display-flip`: soc `display { }` mdss and intf1, board `display { }` splash-size) |
+| `iokit/Kernel/MiniIOMobileFramebuffer.cpp` | The display driver family: swaps, vsync, scaling to the panel, software dimming, the Metal plug-in gate (`metal=1`); frames put on the panel by an A7XX's 2D engine (`fb_gpu`, BoardGPU.cpp) and shown by flipping the display controller between two buffers (`fb_flip`); video layers (two planes) shown by the display controller's VIG pipes under the frame (`fb_video`). | any; `fb_scan` timing is **data** (`display-scan`, `display { }` intf1); the flip is **data** for an SM8450-layout DPU (`display-flip`: soc `display { }` mdss and intf1, board `display { }` splash-size) |
 | `iokit/Kernel/MiniIOSurface.cpp` | IOSurface. | any |
 | `iokit/Kernel/MiniAppleKeyStore.cpp` | AppleKeyStore: a device without a passcode. | any |
 | `iokit/Kernel/MiniIONetworkStack.cpp`, `BoardWLAN.cpp` | The registry entries by which Darwin finds network interfaces. | any |

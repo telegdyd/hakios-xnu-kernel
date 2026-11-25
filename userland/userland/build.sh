@@ -217,6 +217,8 @@ if [ -d $DARWIN_FW/rootfs/usr/lib ]; then
 		$DYN -o obj/hello_dyn src/hello_dyn.c
 		$DYN -framework CoreFoundation -o obj/svc_test src/svc_test.c
 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/surf_test src/surf_test.c
+		# a video layer for the display controller without a player (src/video_test.c, fb_video)
+		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/video_test src/video_test.c
 		# an IOSurface of ours imported as a texture of the GPU, written through one view
 		# and read through the other (src/drawable_test.c): the check that tells a texture
 		# over the surface's own pages from a texture over a copy of them. It goes through
@@ -402,7 +404,7 @@ if [ -d $DARWIN_FW/rootfs/usr/lib ]; then
 		fi
 	fi
 	# (drawable_test is built in the same block as surf_test, so it is copied with it)
-	cp obj/hello_dyn obj/svc_test obj/surf_test obj/drawable_test obj/rwtouch obj/mg_test obj/sensors_probe root/bin/
+	cp obj/hello_dyn obj/svc_test obj/surf_test obj/video_test obj/drawable_test obj/rwtouch obj/mg_test obj/sensors_probe root/bin/
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/thermald ] && cp obj/thermald root/bin/
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
