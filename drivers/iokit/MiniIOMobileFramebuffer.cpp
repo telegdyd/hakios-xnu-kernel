@@ -57,12 +57,24 @@ enum {
 	kFBMethodGetID                  = 7,
 	kFBMethodGetDisplaySize         = 8,
 	kFBMethodRequestPowerChange     = 12,
+	kFBMethodSetDebugFlags          = 15,   /* Darwin 26 on (IOMobileFramebuffer.framework's kern_*) */
+	kFBMethodSetGammaTable          = 17,
+	kFBMethodIsMainDisplay          = 18,
 	kFBMethodSwapSignal             = 20,
+	kFBMethodSetDisplayDevice       = 22,
 	kFBMethodGetDigitalOutState     = 25,
+	kFBMethodGetGammaTable          = 27,
 	kFBMethodGetDotPitch            = 28,
 	kFBMethodGetDisplayArea         = 29,
+	kFBMethodVideoPowerSavings      = 33,
+	kFBMethodSetBrightnessCorrection = 50,
+	kFBMethodSetColorRemapMode      = 51,
 	kFBMethodSwapCancel             = 52,
+	kFBMethodSetMatrix              = 55,
 	kFBMethodGetColorRemapMode      = 57,
+	kFBMethodSetParameter           = 68,
+	kFBMethodSetContrast            = 84,
+	kFBMethodOpenedByName           = 88,   /* sent by IOMobileFramebufferOpenByName */
 	kFBMethodNotifications          = 72,
 	kFBMethodChangeFrameInfo        = 73,
 	kFBMethodSupportedFrameInfo     = 74,
@@ -84,6 +96,8 @@ enum {
 #define SWAP26_SIZE             0x588                   /* Darwin 26's request ... */
 #define SWAP26_SHIFT            0x48                    /* ... with these fields that much further on */
 #define SWAP_LAYERS             4
+
+#define kFBGammaSize            3084                    /* SetGammaTable / GetGammaTable: 3 x 257 words */
 
 #define kFBNotifyVSync          5
 #define kFBNotifyTypes          8
@@ -674,6 +688,10 @@ public:
 	uint32_t        fStatFlips, fStatFlipsHome, fStatFlipNotFull, fStatFlipWaited;
 	uint64_t        fStatFlipWait;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
+	/* settings user space gives and may read back; nothing here applies them to the panel */
+	uint8_t         fGamma[kFBGammaSize];
+	bool            fGammaSet;
+	uint32_t        fDebugFlags, fColorRemapMode;
 	MiniIOSurface * fDefaultSurface;
 	uint32_t        fSwapID;
 	uint32_t        fSwapsShown;
@@ -3156,6 +3174,86 @@ IOMobileFramebufferUserClient::method(uint32_t selector, IOExternalMethodArgumen
 		}
 		out[0] = mach_absolute_time();
 		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodIsMainDisplay:                    /* out: 1 = the main display; the only one here */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = 1;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodSetDebugFlags:                    /* in: bits to clear, bits to set; out: the flags now */
+		if (args->scalarInputCount < 2 || args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		fOwner->fDebugFlags = (fOwner->fDebugFlags & ~(uint32_t) in[0]) | (uint32_t) in[1];
+		out[0] = fOwner->fDebugFlags;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodSetGammaTable:                    /* kept for GetGammaTable; the panel is not changed */
+		if (args->structureInput == NULL || args->structureInputSize != kFBGammaSize) {
+			return kIOReturnBadArgument;
+		}
+		memcpy(fOwner->fGamma, args->structureInput, kFBGammaSize);
+		fOwner->fGammaSet = true;
+		return kIOReturnSuccess;
+
+	case kFBMethodGetGammaTable:                    /* the last one set, zeros before that */
+		if (args->structureOutput == NULL || args->structureOutputSize != kFBGammaSize) {
+			return kIOReturnBadArgument;
+		}
+		if (fOwner->fGammaSet) {
+			memcpy(args->structureOutput, fOwner->fGamma, kFBGammaSize);
+		} else {
+			bzero(args->structureOutput, kFBGammaSize);
+		}
+		return kIOReturnSuccess;
+
+	case kFBMethodGetDisplayArea:                   /* out: 8 bytes, width and height */
+		if (args->structureOutput == NULL || args->structureOutputSize < 8) {
+			return kIOReturnBadArgument;
+		} else {
+			uint32_t area[2] = { fOwner->fWidth, fOwner->fHeight };
+
+			bzero(args->structureOutput, args->structureOutputSize);
+			memcpy(args->structureOutput, area, sizeof(area));
+		}
+		return kIOReturnSuccess;
+
+	case kFBMethodGetDigitalOutState:               /* out: no digital output connected */
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = 0;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	case kFBMethodSetColorRemapMode:
+		if (args->scalarInputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		fOwner->fColorRemapMode = (uint32_t) in[0];
+		return kIOReturnSuccess;
+
+	case kFBMethodGetColorRemapMode:
+		if (args->scalarOutputCount < 1) {
+			return kIOReturnBadArgument;
+		}
+		out[0] = fOwner->fColorRemapMode;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
+
+	/* settings for the panel's own colour, brightness and power hardware, which is not driven here: accepted */
+	case kFBMethodSetDisplayDevice:
+	case kFBMethodVideoPowerSavings:
+	case kFBMethodSetBrightnessCorrection:
+	case kFBMethodSetMatrix:
+	case kFBMethodSetParameter:
+	case kFBMethodSetContrast:
+	case kFBMethodOpenedByName:
 		return kIOReturnSuccess;
 
 	default:
