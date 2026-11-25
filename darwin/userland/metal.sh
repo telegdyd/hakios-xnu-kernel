@@ -13,6 +13,9 @@ RN=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 source "$RN/userland/env.sh"
 M=$IOS_REPO/components/metal/plugin
 export IOS_ARCH=arm64e
+# (linked by ld64.lld, env.sh: everything built as arm64 and the bundle's header named arm64e by pac_strip, as the
+# other libraries are; an arm64e driver and Mesa archive would not link into it)
+[ "${DARWIN_LLD:-0}" = 1 ] && IOS_ARCH=arm64
 # (every time: it copies the front end in again and ninja rebuilds what changed, so an edit of components/metal/plugin/tools/mesa/air
 # is in this plug-in)
 mkdir -p "$OBJ"

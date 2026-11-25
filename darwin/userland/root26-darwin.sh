@@ -193,6 +193,16 @@ if [ -n "$BOARD" ] && [ -d "$IOS_REPO/firmware/$BOARD/fw" ]; then
 	fi
 	PLAIN=(--plain fw)
 	echo "  firmware of $BOARD: $(find "$T/fw" -type f | wc -l) files"
+	# a board's other firmware directories, where its board.dts names one as a section's firmware (gpu { firmware =
+	# "fw-gpu"; }: the OnePlus 10 Pro's A730 files), beside fw/ and as plain
+	for dir in "$IOS_REPO/firmware/$BOARD"/fw-*/; do
+		[ -d "$dir" ] || continue
+		name=$(basename "$dir")
+		rm -rf "${T:?}/$name"
+		cp -r "$dir" "$T/$name"
+		PLAIN+=(--plain "$name")
+		echo "  firmware of $BOARD: $name, $(find "$T/$name" -type f | wc -l) files"
+	done
 else
 	echo "root26-darwin.sh: no phone's firmware in the image (board: ${BOARD:-none}; firmware/BOARD/fw/): no GPU, no Wi-Fi" >&2
 fi
