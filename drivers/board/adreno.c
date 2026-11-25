@@ -4411,13 +4411,15 @@ static bool(*const steps[])(void) = {
 /*
  * The SoC's temperature sensors report by themselves, in a block that is always on (dt: tsens1,
  * whose readings are at 0xc265000; Linux's tsens-v2.c): a status word a sensor, the last reading
- * in its low 12 bits, signed, in tenths of a degree, and bit 21 when there is one. Sensors 1 and
- * 2 sit at the GPU (dt: gpuss-0, gpuss-1). Read, never written: once a minute while the GPU is
+ * in its low 12 bits, signed, in tenths of a degree, and bit 21 when there is one. The GPU's two
+ * (dt: gpuss-0, gpuss-1) are the SoC's adreno { tsens-sensors }: 1 and 2 of tsens1 on the SC7280,
+ * 14 and 15 of tsens0 (0xc263000) on the SM8450. Read, never written: once a minute while the GPU is
  * kept, for the line beside the kernel's line about memory (osfmk/arm64/loader_return.c). A
  * sensor caught between two readings has none for a moment and is asked again; one that still
  * has none is put down as -273.0.
  */
-static struct block tsens = { "tsens1", 0, 0x200 };                     /* soc: adreno { } tsens; 0: none to read */
+static struct block tsens = { "tsens", 0, 0x200 };                      /* soc: adreno { } tsens; 0: none to read */
+static uint8_t tsens_sensor[2] = { 1, 2 };                              /* soc: adreno { } tsens-sensors */
 #define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
 #define TSENS_VALID             (1u << 21)
 
@@ -4433,7 +4435,7 @@ hakios_adreno_minute(void)
 	for (unsigned i = 0; i < 2; i++) {
 		tenths[i] = -2730;
 		for (unsigned again = 0; again < 16 && tenths[i] == -2730; again++) {
-			uint32_t status = rd(tsens.base + TSENS_STATUS(1 + i));
+			uint32_t status = rd(tsens.base + TSENS_STATUS(tsens_sensor[i]));
 
 			if (status & TSENS_VALID) {
 				tenths[i] = (int32_t)(status << 20) >> 20;
@@ -4775,6 +4777,10 @@ blocks_of_board(void)
 	smmu.phys = board->adreno.smmu;
 	pdc.phys = board->adreno.pdc;
 	tsens.phys = board->adreno.tsens;
+	if (board->adreno.tsens_sensors[0] != 0 || board->adreno.tsens_sensors[1] != 0) {
+		tsens_sensor[0] = board->adreno.tsens_sensors[0];
+		tsens_sensor[1] = board->adreno.tsens_sensors[1];
+	}
 	return true;
 }
 

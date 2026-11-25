@@ -99,6 +99,7 @@ SOC_SCHEMA = {
     'usb': {'dwc3': (int, True), 'interrupt': (int, False), 'hsphy': (int, False), 'clkref': (int, False)},
     'adreno': {'gpu': (int, True), 'gmu': (int, True), 'gpucc': (int, True), 'cx_misc': (int, True), 'rscc': (int, True),
                'smmu': (int, True), 'pdc': (int, True), 'qfprom': (int, True), 'tsens': (int, False),
+               'tsens_sensors': ([int], False),
                'smmu_size': (int, False), 'clock_layout': (GPU_CLOCK_LAYOUTS, False),
                'zap_memory': (int, False), 'interrupt': (int, False)},
     'pins': {'tlmm': (int, True), 'pdc': (int, False)},
@@ -656,6 +657,12 @@ def load_soc(path, problems):
         problems.add(shown(path), str(error))
         return None
     check_file(path, data, SOC_SCHEMA, problems)
+    adreno = data.get('adreno')
+    if isinstance(adreno, dict) and isinstance(adreno.get('tsens_sensors'), list):
+        if 'tsens' not in adreno:
+            problems.add(f'{shown(path)} [adreno]', 'tsens-sensors: the sensors of a tsens, which is not given')
+        if len(adreno['tsens_sensors']) != 2 or not all(0 <= s < 16 for s in adreno['tsens_sensors']):
+            problems.add(f'{shown(path)} [adreno]', "tsens-sensors: the GPU's two sensors in its TSENS controller (0 to 15)")
     lpass = data.get('lpass')
     if isinstance(lpass, dict) and isinstance(lpass.get('swr_tx_pins'), list) and isinstance(lpass.get('swr_tx_slew'), list):
         pins, slew = lpass['swr_tx_pins'], lpass['swr_tx_slew']
@@ -1110,6 +1117,8 @@ def table_text(socs, boards):
                            f'.clock_layout = HAKIOS_GPU_CLOCKS_{adreno.get("clock_layout", "sc7280").upper()},')
             if 'interrupt' in adreno:
                 out.append(f'\t\t\t.interrupt = {adreno["interrupt"]},')
+            if 'tsens_sensors' in adreno:
+                out.append(f'\t\t\t.tsens_sensors = {{ {", ".join(str(s) for s in adreno["tsens_sensors"])} }},')
             if 'zap_memory' in adreno:
                 out.append(f'\t\t\t.zap_memory = {adreno["zap_memory"]:#x}ull,')
             out.append('\t\t},')

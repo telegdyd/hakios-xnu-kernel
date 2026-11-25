@@ -782,6 +782,24 @@ class Generate(Sandbox):
                          '.pdc = 0x0b290000, .qfprom = 0x00780000, .tsens = 0x00000000,'):
             self.assertIn(expected, text)
 
+    def test_the_gpus_sensors_are_soc_data(self):
+        # SM8450: the GPU's sensors are 14 and 15 of TSENS0, not 1 and 2 of TSENS1 as on the SC7280
+        path = self.dir / 'devices/phone/board.dts'
+        self.soc('\tthermal {', GPU_SOC + '\tthermal {')
+        path.write_text(path.read_text().replace('"cpufreq-epss"', '"cpufreq-epss", "gpu-a660"') + GPU)
+        self.soc('qfprom = <0x780000>;', 'qfprom = <0x780000>;\n\t\ttsens = <0xc263000>;\n\t\ttsens-sensors = <14 15>;')
+        self.assertEqual(self.problems(), '')
+        text = boards.table_text(*boards.load())
+        self.assertIn('.tsens = 0x0c263000,', text)
+        self.assertIn('.tsens_sensors = { 14, 15 },', text)
+        for new, reason in (('<14>', "the GPU's two sensors"), ('<14 16>', "the GPU's two sensors")):
+            with self.subTest(sensors=new):
+                self.soc('tsens-sensors = <14 15>;', f'tsens-sensors = {new};')
+                self.assertIn(reason, self.problems())
+                self.soc(f'tsens-sensors = {new};', 'tsens-sensors = <14 15>;')
+        self.soc('\t\ttsens = <0xc263000>;\n', '')
+        self.assertIn('the sensors of a tsens, which is not given', self.problems())
+
     def test_the_table_carries_rpmh(self):
         self.soc('\tthermal {', '\trpmh {\n\t\tcmd-db = <0x80860000>;\n\t\tcmd-db-size = <0x20000>;\n\t\trsc = <0x18220000>;\n\t\ttcs-offset = <0xd00>;\n\t};\n\tthermal {')
         self.board('"cpufreq-epss"', '"cpufreq-epss", "ddr-rpmh"')
