@@ -1944,18 +1944,28 @@ IOSurfaceRootUserClient::methodCopyValue(IOExternalMethodArguments * args, const
 
 /*
  * Colour space, transfer function and the like: a fixed structure kept in the shared page.
- * The request: the structure, its size, a mask of the fields that changed, the surface number.
+ * The request: the structure, its size, a mask of the fields that changed, the surface number. Darwin 16.5's is 0x88
+ * bytes (a 0x70-byte structure; the size, mask and number at 0x70, 0x78 and 0x80; kept at 0x30 of the shared page).
+ * Darwin 26's is 0xa0 (IOSurfaceSetBulkAttachments2): 0x84 bytes of structure with 22 fields, the size, mask and
+ * number at 0x88, 0x90 and 0x98, kept at 0x34 (MiniIOSurface.h). Read with the old layout, its size and mask were
+ * structure bytes and its number was not a surface's: every one was refused, and colour tags such as the alpha
+ * mode -- a CAMetalLayer that is not premultiplied -- never reached the window server.
  */
 IOReturn
 IOSurfaceRootUserClient::methodSetBulkAttachments(const uint8_t * in, size_t inSize)
 {
 	static const struct {
 		uint8_t from, to;
-	} fields[15] = {
+	} fields[22] = {
 		{ 0x00, 0x20 }, { 0x20, 0x30 }, { 0x30, 0x38 }, { 0x38, 0x39 }, { 0x39, 0x3a }, { 0x3a, 0x3b }, { 0x3b, 0x3c },
 		{ 0x3c, 0x3d }, { 0x3d, 0x3e }, { 0x3e, 0x3f }, { 0x3f, 0x40 }, { 0x40, 0x58 }, { 0x58, 0x5c }, { 0x5c, 0x64 },
 		{ 0x64, 0x65 },
+		/* Darwin 26 */
+		{ 0x68, 0x70 }, { 0x70, 0x74 }, { 0x65, 0x66 }, { 0x66, 0x67 }, { 0x74, 0x80 }, { 0x80, 0x82 }, { 0x82, 0x84 },
 	};
+	const bool darwin26 = inSize >= 0xa0;
+	const size_t trailer = darwin26 ? 0x88 : 0x70, room = darwin26 ? MINISURF_ATTACHMENTS26_SIZE : 0x70;
+	const unsigned count = darwin26 ? 22 : 15;
 	uint64_t size, mask;
 	uint32_t sid;
 	struct minisurf_client_ref * ref;
@@ -1964,18 +1974,20 @@ IOSurfaceRootUserClient::methodSetBulkAttachments(const uint8_t * in, size_t inS
 	if (inSize < 0x88) {
 		return kIOReturnBadArgument;
 	}
-	memcpy(&size, in + 0x70, sizeof(size));
-	memcpy(&mask, in + 0x78, sizeof(mask));
-	memcpy(&sid, in + 0x80, sizeof(sid));
-	if (size > 0x70) {
+	memcpy(&size, in + trailer, sizeof(size));
+	memcpy(&mask, in + trailer + 8, sizeof(mask));
+	memcpy(&sid, in + trailer + 0x10, sizeof(sid));
+	if (size > room) {
 		return kIOReturnBadArgument;
 	}
 	IOLockLock(gSurfaceLock);
 	ref = findRef(sid, false);
 	if (ref != NULL) {
-		uint8_t * attachments = ref->surface->shared()->attachments;
+		uint8_t * attachments = darwin26 ? (uint8_t *) ref->surface->shared() + MINISURF_ATTACHMENTS26_OFFSET :
+		    ref->surface->shared()->attachments;
 
-		for (unsigned i = 0; i < 15; i++) {
+		static_assert(MINISURF_ATTACHMENTS26_OFFSET + MINISURF_ATTACHMENTS26_SIZE <= MINISURF_AUX_OFFSET, "attachments");
+		for (unsigned i = 0; i < count; i++) {
 			if ((mask & (1ULL << i)) && fields[i].to <= size) {
 				memcpy(attachments + fields[i].from, in + fields[i].from, fields[i].to - fields[i].from);
 			}

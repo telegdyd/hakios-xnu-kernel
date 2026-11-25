@@ -88,8 +88,16 @@ struct minisurf_shared {
 	uint8_t  displayable;                   /* 0x2d */
 	uint8_t  sysMemOnly;                    /* 0x2e */
 	uint8_t  reserved2f;
-	uint8_t  attachments[0x70];             /* 0x30 the "bulk attachments" */
+	uint8_t  attachments[0x70];             /* 0x30 the "bulk attachments" (Darwin 16.5) */
 };
+
+/*
+ * Darwin 26's bulk attachments (IOSurface.framework: IOSurfaceGetBulkAttachments copies them from offset 0x34 of the
+ * shared page, IOSurfaceSetBulkAttachments2 takes at most 0x84 bytes): the 15 fields of Darwin 16.5 at the same
+ * offsets, and 7 more -- bytes at 0x65 and 0x66, then 0x68-0x70, 0x70-0x74, 0x74-0x80, 0x80-0x82 and 0x82-0x84.
+ */
+#define MINISURF_ATTACHMENTS26_OFFSET   0x34
+#define MINISURF_ATTACHMENTS26_SIZE     0x84
 
 struct minisurf_aux {
 	uint64_t timestamps[4];
