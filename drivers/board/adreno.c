@@ -4849,7 +4849,8 @@ hakios_adreno_minute(void)
  * Without the feature, the 3D core runs at the board's default speed for the whole run. With it, a worker of
  * BoardGPU.cpp (every 50 ms, 250 ms while the GPU idles at the slowest; under the GPU's lock, as everything here)
  * asks the GMU for the speed the load wants, by the policy of adreno_dcvs.h, and never above what the GPU's two
- * sensors allow; a submission after 200 ms without one asks for the fastest allowed before the core sees it.
+ * sensors allow, nor above what board/thermal.c's hold on the processors allows (adreno_soc_cap(): the SoC hot from
+ * whatever heats it, the GPU slower as well); a submission after 200 ms without one asks for the fastest allowed before the core sees it.
  * The load is the GMU's busy counter, which counts 19.2 MHz ticks while the GPU is busy whatever its speed
  * (Linux v6.12 a6xx_gpu.c: hw_init and a6xx_gpu_busy, a6xx_gmu.xml). The bus vote that goes with each speed is the
  * board's gpu { } speed-bus (an index into the GMU's table of bus votes, step 17); without it, none is changed.
@@ -4859,7 +4860,9 @@ hakios_adreno_minute(void)
  *   kern.hakios.gpu_speed         the speed asked for now, from 1; written, a fixed one (and gpu_dcvs off)
  *   kern.hakios.gpu_dcvs          1 the speed follows the load, 0 it does not
  *   kern.hakios.gpu_max_speed     the fastest the load may ask for (the sensors' cap comes on top)
- *   kern.hakios.gpu_dcvs_state    a line: speed, cap, load, temperatures, votes, time spent at each speed
+ *   kern.hakios.gpu_dcvs_state    a line: speed, cap, load, temperatures, votes, time spent at each speed; the SoC
+ *                                 limiter's cap and step, the test temperature
+ *   kern.hakios.gpu_temp_test     (root) millidegrees both sensors read as, to test the cap; 0 the sensors
  *
  * From the OnePlus 10 Pro's port (negroni-dev's hakios.adreno.c, GPU-POWER-PLAN.md task 2).
  */
@@ -4884,6 +4887,12 @@ static bool busy_valid;
 static unsigned busy_pct;
 static int32_t dcvs_mc[2];
 static uint32_t dcvs_temps_valid;
+static unsigned dcvs_soc;               /* the cap the SoC's thermal limiter puts on it (adreno_soc_cap()) */
+static uint32_t dcvs_soc_step, dcvs_soc_most;
+static int32_t gpu_temp_test;           /* kern.hakios.gpu_temp_test: millidegrees read for both sensors (0: the sensors) */
+
+/* board/thermal.c, when it is in the kernel (QCOM_THERMAL): how far it holds the processors back, of how far it can */
+extern uint32_t hakios_thermal_step(uint32_t *of) __attribute__((weak));
 
 static uint64_t
 dcvs_ns(void)
@@ -4902,6 +4911,11 @@ gpu_temperatures(int32_t mc[2])
 
 	if (tsens.phys == 0) {
 		return 0;
+	}
+	if (gpu_temp_test != 0) {
+		/* (root's test of the cap: both sensors read as this; the SoC's limiter still reads the real ones) */
+		mc[0] = mc[1] = gpu_temp_test;
+		return 3;
 	}
 	need(&tsens);
 	for (unsigned i = 0; i < 2; i++) {
@@ -4985,7 +4999,24 @@ gpu_vote(unsigned level)
 static unsigned
 dcvs_ceiling(void)
 {
-	return dcvs_cap < dcvs_limit ? dcvs_cap : dcvs_limit;
+	unsigned ceiling = dcvs_cap < dcvs_limit ? dcvs_cap : dcvs_limit;
+
+	return dcvs_soc >= 1 && dcvs_soc < ceiling ? dcvs_soc : ceiling;
+}
+
+/* The SoC limiter's cap, from where board/thermal.c holds the processors now; said when it changes. */
+static void
+dcvs_soc_look(void)
+{
+	unsigned previous = dcvs_soc;
+
+	dcvs_soc_most = 0;
+	dcvs_soc_step = hakios_thermal_step != NULL ? hakios_thermal_step(&dcvs_soc_most) : 0;
+	dcvs_soc = adreno_soc_cap(dcvs_top, dcvs_soc_step, dcvs_soc_most);
+	if (dcvs_soc != previous && previous != 0) {
+		printf("adreno: gpu-dcvs: the SoC's limiter holds the processors back %u of %u: at most %u MHz\n",
+		    dcvs_soc_step, dcvs_soc_most, gpu_profile->speeds[dcvs_soc].khz / 1000);
+	}
 }
 
 static void
@@ -5016,7 +5047,7 @@ gpu_dcvs_start(void)
 		return false;
 	}
 	dcvs_top = gpu_profile->speed_count - 1;
-	dcvs_cap = dcvs_limit = dcvs_top;
+	dcvs_cap = dcvs_limit = dcvs_soc = dcvs_top;
 	dcvs_manual = core_speed >= 1 && core_speed <= dcvs_top ? core_speed : 1;
 	/* gpu_dcvs=0: the speed stays the board's default, under the sensors' cap (gpu-dcvs; on without it) */
 	if (PE_parse_boot_argn("gpu_dcvs", &off, sizeof(off)) && off == 0) {
@@ -5028,10 +5059,12 @@ gpu_dcvs_start(void)
 	}
 	dcvs_running = true;
 	gpu_dcvs_counters_start();
-	printf("adreno: gpu-dcvs: %u to %u MHz %s, at most what the GPU's sensors allow (%s); bus votes %s\n",
+	printf("adreno: gpu-dcvs: %u to %u MHz %s, at most what the GPU's sensors allow (%s) and the SoC's limiter (%s); "
+	    "bus votes %s\n",
 	    gpu_profile->speeds[1].khz / 1000, gpu_profile->speeds[dcvs_top].khz / 1000,
 	    dcvs_auto ? "by the GPU's load" : "fixed (gpu_dcvs=0)",
 	    tsens.phys != 0 ? "one speed less from 75 degrees, the slowest from 85" : "NONE: the slowest",
+	    hakios_thermal_step != NULL ? "as far down as the processors" : "not in this kernel",
 	    dcvs_has_bus ? "with each speed" : "left alone");
 	return true;
 }
@@ -5057,6 +5090,7 @@ gpu_dcvs_tick(void)
 	dcvs_mc[0] = mc[0];
 	dcvs_mc[1] = mc[1];
 	dcvs_cap = adreno_thermal_cap(dcvs_cap, dcvs_top, dcvs_temps_valid, mc[0], mc[1]);
+	dcvs_soc_look();
 	if (dcvs_cap != previous_cap) {
 		printf("adreno: gpu-dcvs: the GPU's sensors read %d and %d millidegrees (valid %u): at most %u MHz\n",
 		    mc[0], mc[1], dcvs_temps_valid, gpu_profile->speeds[dcvs_cap].khz / 1000);
@@ -5171,6 +5205,42 @@ hakios_gpu_dcvs_line(char *line, size_t size)
 	    busy_valid ? (int)busy_pct : -1, dcvs_mc[0], dcvs_mc[1], dcvs_temps_valid, dcvs_votes, dcvs_failed,
 	    dcvs_rejected, dcvs_ms_at[1] / 1000000, dcvs_ms_at[2] / 1000000, dcvs_ms_at[3] / 1000000,
 	    dcvs_ms_at[4] / 1000000, dcvs_ms_at[5] / 1000000);
+	{
+		size_t at = strlen(line);
+
+		/* (the line's newline replaced: the SoC limiter's cap and the sensors' test reading after it) */
+		if (at > 0 && line[at - 1] == '\n') {
+			at--;
+		}
+		snprintf(line + at, size - at, " soc %u step %u of %u test %d\n", dcvs_soc, dcvs_soc_step, dcvs_soc_most,
+		    gpu_temp_test);
+	}
+}
+
+/*
+ * kern.hakios.gpu_temp_test (root; for testing the cap): millidegrees both GPU sensors are read as from now on, from
+ * 1 to 125000; 0, the sensors again. The worker's next look (50 ms) caps the speed by it; board/thermal.c still reads
+ * the real sensors. With the GPU's lock held.
+ */
+int
+hakios_gpu_temp_test(int millidegrees)
+{
+	if (millidegrees < 0 || millidegrees > 125000) {
+		return EINVAL;
+	}
+	if (!dcvs_running) {
+		return ENXIO;
+	}
+	gpu_temp_test = millidegrees;
+	printf("adreno: gpu-dcvs: kern.hakios.gpu_temp_test=%d: %s\n", millidegrees,
+	    millidegrees ? "both sensors read as this" : "the sensors again");
+	return 0;
+}
+
+int
+hakios_gpu_temp_test_value(void)
+{
+	return gpu_temp_test;
 }
 
 /* ---- beside the steps: the core's power collapse between frames (board feature gpu-ifpc) -------------------- */
@@ -5427,6 +5497,7 @@ gpu_runtime_resume(void)
 		dcvs_mc[0] = mc[0];
 		dcvs_mc[1] = mc[1];
 		dcvs_cap = adreno_thermal_cap(dcvs_cap, dcvs_top, dcvs_temps_valid, mc[0], mc[1]);
+		dcvs_soc_look();
 		cap = dcvs_ceiling();
 		target = dcvs_auto ? cap : (dcvs_manual < cap ? dcvs_manual : cap);
 		gpu_vote(target);

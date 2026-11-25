@@ -26,6 +26,25 @@ main(void)
 	assert(adreno_thermal_cap(5, 5, 3, 76000, 0) == 4);
 	assert(adreno_thermal_cap(1, 1, 3, 30000, 30000) == 1);
 
+	/* the SoC's limiter: nothing held back the top, all of it the slowest, in between to the nearest speed */
+	assert(adreno_soc_cap(3, 0, 10) == 3);
+	assert(adreno_soc_cap(3, 0, 0) == 3);
+	assert(adreno_soc_cap(3, 5, 0) == 3);
+	assert(adreno_soc_cap(3, 2, 10) == 3);
+	assert(adreno_soc_cap(3, 3, 10) == 2);
+	assert(adreno_soc_cap(3, 7, 10) == 2);
+	assert(adreno_soc_cap(3, 8, 10) == 1);
+	assert(adreno_soc_cap(3, 10, 10) == 1);
+	assert(adreno_soc_cap(3, 12, 10) == 1);
+	assert(adreno_soc_cap(3, 4, 17) == 3);    /* (the phone: 17 rows; a run at 64-69 C held back 1 to 4) */
+	assert(adreno_soc_cap(3, 5, 17) == 2);
+	assert(adreno_soc_cap(3, 13, 17) == 1);
+	assert(adreno_soc_cap(5, 1, 8) == 4);    /* (half a speed: rounded up) */
+	assert(adreno_soc_cap(5, 7, 8) == 1);
+	assert(adreno_soc_cap(5, 6, 8) == 2);
+	assert(adreno_soc_cap(1, 3, 8) == 1);
+	assert(adreno_soc_cap(0, 0, 8) == 1);
+
 	/* with the busy counter */
 	assert(adreno_dcvs_target(3, 3, 3, true, 0, false, false, 199999999, &last) == 3);
 	assert(adreno_dcvs_target(3, 3, 3, true, 0, false, false, 200000000, &last) == 2);

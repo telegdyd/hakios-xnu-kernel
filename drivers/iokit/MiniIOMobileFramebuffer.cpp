@@ -36,6 +36,7 @@
 extern "C" {
 #include <console/video_console.h>
 extern struct vc_info vinfo;            /* the boot framebuffer, as the text console knows it */
+void loader_log_line(const char *line); /* osfmk/arm64/loader_return.c: the log the loader is handed */
 }
 
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -754,6 +755,7 @@ public:
 	bool flipTaken(uint32_t milliseconds);
 	void flipTo(int buffer);
 	void flipOff(const char * why);
+	void flipHome(void);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -786,6 +788,7 @@ public:
 OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
 
 static IOMobileFramebuffer * gLightFramebuffer;      /* (backend soft) whom a new light is shown by */
+static IOMobileFramebuffer * gFlipFramebuffer;       /* fb_flip ready: hakios_fb_quiesce() brings its controller home */
 
 static void
 setNumber(OSDictionary * dict, const char * key, uint64_t value)
@@ -2170,6 +2173,7 @@ IOMobileFramebuffer::flipSetUp(void)
 		fFlipBase[i] = (uint8_t *) fFlipMap[i]->getVirtualAddress();
 	}
 	gFlipState = 1;
+	gFlipFramebuffer = this;
 	IOLog("MiniIOMobileFramebuffer: fb_flip: frames into %#llx and %#llx (rows of %u bytes) in turn; %u pipes, CTL%u flush "
 	    "bits %#x\n", fFlipPhys[0], fFlipPhys[1], fFlipRowBytes, fFlipPipeCount, FLIP_CTL, fFlipFlush);
 	return true;
@@ -2256,6 +2260,55 @@ IOMobileFramebuffer::flipOff(const char * why)
 	gFlipState = 6;
 	flipTo(-1);
 	fFlipPending = false;
+}
+
+/*
+ * At the run's end and on a panic's way out (hakios_fb_quiesce(), one processor, its interrupts off): the frame being
+ * shown copied into the panel's own memory and the controller pointed back there, so what is drawn there next -- the
+ * loader's screen, a panic's -- is seen, over the last frame rather than over one two frames old. No log, no lock: the
+ * presenter is not running any more.
+ */
+void
+IOMobileFramebuffer::flipHome(void)
+{
+	uint32_t ctl = kDPUCTLs[FLIP_CTL];
+	const uint8_t * from;
+	uint64_t until;
+	char line[160];
+	int was = fFlipShown;
+	bool taken;
+
+	if (fFlipShown < 0 || fFlipShown > 1 || fBase == NULL) {
+		snprintf(line, sizeof(line), "fb_flip: at the end the controller is on the panel's memory already (%u flips)\n",
+		    fFlipCount);
+		loader_log_line(line);
+		return;
+	}
+	from = fFlipBase[fFlipShown];
+	for (uint32_t y = 0; y < fPanelHeight; y++) {
+		memcpy(fBase + (size_t) y * fRowBytes, from + (size_t) y * fFlipRowBytes, (size_t) fPanelWidth * 4);
+	}
+	flush_dcache64((addr64_t) (uintptr_t) fBase, fRowBytes * fPanelHeight, FALSE);
+	for (unsigned i = 0; i < fFlipPipeCount; i++) {
+		mdssWrite(fFlipPipe[i] + SSPP_SRC0_ADDR, (uint32_t) fPanelPhys);
+		mdssWrite(fFlipPipe[i] + SSPP_SRC_YSTRIDE0, fFlipHomeStride[i]);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	mdssWrite(ctl + CTL_FLUSH, fFlipFlush);
+	nanoseconds_to_absolutetime((uint64_t) FLIP_TAKEN_MS * NSEC_PER_MSEC, &until);
+	until += mach_absolute_time();
+	while ((mdssRead(ctl + CTL_FLUSH) & fFlipFlush) != 0 && mach_absolute_time() < until) {
+	}
+	taken = (mdssRead(ctl + CTL_FLUSH) & fFlipFlush) == 0;
+	snprintf(line, sizeof(line), "fb_flip: at the end the controller back from buffer %d to the panel's memory %#llx: flush "
+	    "%s, pipe source %#x (%u flips)\n", was, fPanelPhys, taken ? "taken" : "NOT taken",
+	    mdssRead(fFlipPipe[0] + SSPP_SRC0_ADDR), fFlipCount);
+	loader_log_line(line);
+	fFlipShown = -1;
+	fFlipPending = false;
+	gScreenBase = NULL;
+	gScreenRowBytes = fRowBytes;
+	gFlip = 0;
 }
 
 /* Before the processors write the panel: the GPU done with what it was given to write there (it would write over them). */
@@ -3355,6 +3408,29 @@ MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t hei
 	for (uint32_t y = 0; y < rows; y++) {
 		memcpy((void *) (vinfo.v_baseaddr + (size_t) y * vinfo.v_rowbytes), pixels + (size_t) y * rowBytes,
 		    (size_t) columns * 4);
+	}
+	/*
+	 * fb_flip: the controller may be on one of its buffers, not the panel's memory: the picture into that one too, so it
+	 * is seen (until the window server's next frame, as on the panel's memory)
+	 */
+	{
+		uint8_t * shown = (uint8_t *) gScreenBase;
+		uint32_t stride = gScreenRowBytes;
+
+		if (shown != NULL && stride >= columns * 4) {
+			for (uint32_t y = 0; y < rows; y++) {
+				memcpy(shown + (size_t) y * stride, pixels + (size_t) y * rowBytes, (size_t) columns * 4);
+			}
+		}
+	}
+}
+
+/* At the run's end, and on a panic's way out (osfmk/arm64/loader_return.c): fb_flip's controller back home. */
+extern "C" void
+hakios_fb_quiesce(void)
+{
+	if (gFlipFramebuffer != NULL) {
+		gFlipFramebuffer->flipHome();
 	}
 }
 

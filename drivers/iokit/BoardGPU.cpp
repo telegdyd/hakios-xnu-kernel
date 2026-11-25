@@ -74,6 +74,8 @@ void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t
 void hakios_gpu_report(const char * why);
 bool hakios_gpu_recover(void);
 int hakios_gpu_hang_test(int kind);
+int hakios_gpu_temp_test(int millidegrees);
+int hakios_gpu_temp_test_value(void);
 void hakios_gpu_recover_line(char * line, size_t size);
 void hakios_gpu_stop(void);
 bool hakios_gpu_power_start(void);
@@ -633,6 +635,32 @@ hangSysctl(struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, st
 }
 SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_hang, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, hangSysctl, "I",
     "gpu_recover: written 1 or 2, a submission the A730 never finishes (to test the recovery; root)");
+
+/* gpu-dcvs's cap by the GPU's sensors, tested (board/adreno.c hakios_gpu_temp_test(); root): millidegrees, 0 the sensors */
+static int
+tempTestSysctl(struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	int value = 0, error;
+
+	if (gGPULock != NULL) {
+		IOLockLock(gGPULock);
+		value = hakios_gpu_temp_test_value();
+		IOLockUnlock(gGPULock);
+	}
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (gGPULock == NULL) {
+		return ENXIO;
+	}
+	IOLockLock(gGPULock);
+	error = hakios_gpu_temp_test(value);
+	IOLockUnlock(gGPULock);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_temp_test, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, tempTestSysctl, "I",
+    "gpu-dcvs: millidegrees both GPU sensors read as, to test the cap (0: the sensors; root)");
 
 static inline uint32_t
 pm4Parity(uint32_t v)

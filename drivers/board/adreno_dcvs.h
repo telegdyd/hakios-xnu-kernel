@@ -36,6 +36,29 @@ adreno_thermal_cap(unsigned previous, unsigned top, unsigned valid, int32_t t0, 
 }
 
 /*
+ * The fastest speed the SoC's thermal limiter allows (board/thermal.c, hakios_thermal_step(): `step` of `most`, how far
+ * it holds the processors back for the hottest of all the SoC's sensors): the top while it holds nothing back, the
+ * slowest when it holds back all it can, and in between as far down the GPU's speeds as it is down its own rows, to
+ * the nearest speed: a row or two of the processors' many costs the GPU nothing (the phone sits between thermal's
+ * clear and trip most of a run, held back a row or so, and the GPU at one speed less lost its fastest for all of
+ * it). A phone hot from its processors draws less with its GPU too.
+ */
+static inline unsigned
+adreno_soc_cap(unsigned top, uint32_t step, uint32_t most)
+{
+	uint32_t down;
+
+	if (top <= 1 || most == 0 || step == 0) {
+		return top < 1 ? 1 : top;
+	}
+	if (step >= most) {
+		return 1;
+	}
+	down = (step * (top - 1) + most / 2) / most;
+	return down >= top ? 1 : top - down;
+}
+
+/*
  * The speed wanted now, from `level`, the speed it runs at. With the GMU's busy counter (`busy_valid`): from 60 %
  * busy the fastest, from 20 % one below it (or the fastest, from there); without it, work still queued for the
  * fastest and a submission in the last 200 ms for one below. Otherwise one speed down every 200 ms. Never above

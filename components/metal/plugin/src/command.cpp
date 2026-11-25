@@ -585,7 +585,7 @@ bool CommandBuffer::copy(const Buffer& from, uint64_t fromOffset, const Buffer& 
         if (!piece(render::kTableBytes, &table, &why)) {
             return fail(std::string("no memory for the copy's table: ") + why);
         }
-        pm4::Stream added(queue_.gpu().chipId());
+        pm4::Stream added(stream_.chipId());   // (the chip this buffer was made for: asked again, a stopped GPU answers 0)
         render::encodeBytes(added, from.gpuAddress() + fromOffset, to.gpuAddress() + toOffset, length, table.gpuAddress(), table.contents());
         appendStream(stream_, added);
         use(from, false);
@@ -715,7 +715,12 @@ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave
         uint32_t perFiber = 512;
         while (perFiber < bytes) perFiber *= 2;
         const uint64_t perSp = (uint64_t(perFiber) * kFibersPerSp + 4095) & ~uint64_t(4095);
-        std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * chipInfo(gpu_.chipId())->numCcu, why);
+        const auto* info = chipInfo(gpu_.chipId());
+        if (info == nullptr) {   // (a stopped GPU answers 0: no table for it)
+            *why = "the GPU did not say which chip it is (stopped?)";
+            return nullptr;
+        }
+        std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * info->numCcu, why);
         if (b == nullptr) return nullptr;
         private_[l].push_back(std::move(b));
         privatePerFiber_[l] = perFiber;

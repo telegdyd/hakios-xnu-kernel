@@ -3007,7 +3007,7 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
 bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
                          const render::Options& requested) {
     // (the A730 draws in sysmem only until GMEM has its own ladder step: render::encodeDraw refuses a tile there)
-    const bool a730 = queue_.gpu().chipId() == kChipA730.id;
+    const bool a730 = stream_.chipId() == kChipA730.id;   // (not asked of the kernel each draw: once the GPU is stopped it answers 0, and an A730 draw went the A6xx way into a GMEM plan its stream refuses)
     render::Options options = requested;
     // Rewriting equal state can trigger work on gen7 (early preambles among it). The A6xx shadow does not model
     // those side effects: A730 probe 9r corrupts its joined draws with deduplication, and is exact without it.
@@ -3453,7 +3453,7 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
     if (!piece(render::kTableBytes, &table, &why)) {
         return fail(std::string("no memory for the copy's table: ") + why);
     }
-    pm4::Stream added(queue_.gpu().chipId());
+    pm4::Stream added(stream_.chipId());   // (the chip this buffer was made for: asked again, a stopped GPU answers 0)
     if (!render::encodeBlit(added, src, srcLevel, s, dst, dstLevel, d, linear, table.gpuAddress(), table.contents(), &why, options)) {
         return refuseWork(why);
     }
@@ -3691,7 +3691,7 @@ bool CommandBuffer::clear(const RenderPass& pass, const render::Options& options
     if (!piece(render::kTableBytes, &table, &why)) {
         return fail(std::string("no memory for the pass's table: ") + why);
     }
-    pm4::Stream added(queue_.gpu().chipId());
+    pm4::Stream added(stream_.chipId());   // (the chip this buffer was made for: asked again, a stopped GPU answers 0)
     if (!render::encodeClear(added, pass, table.gpuAddress(), table.contents(), &why, options)) {
         return refuseWork(why);
     }

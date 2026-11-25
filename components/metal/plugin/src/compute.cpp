@@ -699,7 +699,7 @@ bool CommandBuffer::dispatchAny(const Kernel& k, const uint32_t* groups, const B
         }
         b = &withScratch;
     }
-    pm4::Stream added(queue_.gpu().chipId());
+    pm4::Stream added(stream_.chipId());   // (the chip this buffer was made for: asked again, a stopped GPU answers 0)
     const bool encoded = args != nullptr ? compute::encodeIndirect(added, k, args->gpuAddress() + offset, loc, *b, immediates, program, table.gpuAddress(),
                                                                    table.contents(), &why, options)
                                          : compute::encode(added, k, groups, loc, *b, immediates, program, table.gpuAddress(), table.contents(), &why, options);
