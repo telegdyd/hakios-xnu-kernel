@@ -92,7 +92,7 @@ SOC_SCHEMA = {
     'clocks': {'gcc': (int, True), 'gcc_disp_ahb_cbcr': (int, False), 'dispcc': (int, False),
                'dispcc_mdss_gdscr': (int, False), 'dispcc_mdss_ahb_cbcr': (int, False),
                'dispcc_mdss_pclk0_cbcr': (int, False), 'dispcc_mdss_mdp_cbcr': (int, False)},
-    'display': {'dsi0': (int, True), 'intf1': (int, False)},
+    'display': {'dsi0': (int, True), 'intf1': (int, False), 'mdss': (int, False)},
     'thermal': {'tsens': ([int], True)},
     'spmi': {'core': (int, True), 'cnfg': (int, True), 'observer': (int, True), 'channels': (int, False),
              'ee': (int, False), 'channel_map': (int, False), 'bus': (int, False)},
@@ -179,6 +179,7 @@ BOARD_SCHEMA = {
     'camera': {'pmic_pins': ([int], True), 'pmic_reset': (int, True), 'sensors': ([CAMERA_SENSOR], True), 'test_sensor': (str, False),
                'darwin_sensor': (str, False), 'darwin_front': (str, False)},
     'screen': {'statusbar_leading_shift': (int, True)},
+    'display': {'splash_size': (int, True)},
     'wifi': {'radio_model': (int, True), 'early_pool_mb': (int, False), 'dsp_memory': (int, False),
              'board_data': (str, False), 'regdb': (str, False),
              'dsp_memory_size': (int, False), 'pins': ([int], False), 'supplies': ([str], False)},
@@ -194,7 +195,7 @@ KEY_WITH_UNDERSCORE = re.compile(r'(?<![\w.])(' + '|'.join(sorted(
     {key for schema in (SOC_SCHEMA, BOARD_SCHEMA) for section, keys in schema.items() for key in list(keys) + [section]
      if '_' in key} | {key for key in CAMERA_SENSOR if '_' in key}, key=len, reverse=True)) + r')(?![\w(=])')
 # what a feature needs of the SoC file: a board cannot list a feature its SoC has no addresses for
-FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virtio': ('virtio',), 'cpufreq-scmi': ('scmi_perf',), 'cpufreq-epss': ('cpufreq',), 'display-scan': ('display',), 'buttons-pmic': ('spmi',),
+FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virtio': ('virtio',), 'cpufreq-scmi': ('scmi_perf',), 'cpufreq-epss': ('cpufreq',), 'display-scan': ('display',), 'display-flip': ('display',), 'buttons-pmic': ('spmi',),
                  'torch-pm8350c': ('spmi',), 'ddr-rpmh': ('rpmh',),
                  'camera-sm7325': ('spmi', 'pins', 'clocks', 'rpmh', 'smmu', 'camera'),
                  'gpu-a660': ('adreno', 'clocks', 'rpmh'), 'gpu-a730': ('adreno', 'clocks', 'rpmh'),
@@ -220,6 +221,7 @@ FEATURE_BOOTARGS = {
     'buttons-pmic': 'buttons=1',
     'adsp': 'adsp=1',
     'display-scan': 'fb_scan=1, the default',
+    'display-flip': 'fb_flip=1, the default, with the GPU putting frames on the panel (gpu=1; fb_gpu=1, the default)',
     'gpu-a660': 'gpu=1',
     'gpu-a730': 'gpu=1 or adreno=22; gpu_irq=1 for completion interrupts',
     'virtio': 'virtio_net=1, virtio_input=1',
@@ -240,7 +242,7 @@ FEATURE_BOOTARGS = {
 # features that are a driver of one part as one phone has it wired, by the first word of their names
 PART_DRIVERS = ('bluetooth', 'touch', 'speaker', 'haptic', 'imu', 'torch', 'camera', 'wifi', 'mic', 'modem')
 # ... and of the board's own file
-FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'gpu-a660': 'gpu', 'gpu-a730': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
+FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'display-flip': 'display', 'gpu-a660': 'gpu', 'gpu-a730': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
                           'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
                           'touch-ft3658u': 'touch', 'touch-ft5x06': 'touch_i2c', 'touch-s3908': 'touch_i2c', 'camera-sm7325': 'camera', 'imu-lsm6dso': 'imu',
                           'imu-bmi160': 'imu'}
@@ -396,6 +398,8 @@ def feature_needs(feature, board, soc):
     smmu = soc.get('smmu')
     if feature in STREAM_OF and isinstance(smmu, dict) and STREAM_OF[feature] not in smmu:
         needs.append(f'{STREAM_OF[feature]} in [smmu] of {soc_file}')
+    if feature == 'display-flip' and isinstance(display, dict) and ('intf1' not in display or 'mdss' not in display):
+        needs.append(f'intf1 and mdss in [display] of {soc_file}')
     if feature == 'display-scan' and isinstance(display, dict) and ('intf1' not in display or 'clocks' not in soc):
         needs.append(f'intf1 in [display] and [clocks] in {soc_file}')
     if feature == 'display-scan' and clocks_missing(soc):
@@ -422,6 +426,8 @@ def feature_requirements(feature):
     if feature == 'display-scan':
         of_soc['display'].append('intf1')
         of_soc['clocks'] = list(DISPLAY_CLOCKS)
+    if feature == 'display-flip':
+        of_soc['display'] += ['intf1', 'mdss']
     if feature in ('gpu-a660', 'gpu-a730'):
         of_soc['clocks'].append('gcc_disp_ahb_cbcr')
     of_board = {}
@@ -1050,8 +1056,10 @@ def table_text(socs, boards):
                 out.append(f'\t\t\t.dispcc_mdss_pclk0_cbcr = {clocks.get("dispcc_mdss_pclk0_cbcr", 0):#x}, '
                            f'.dispcc_mdss_mdp_cbcr = {clocks.get("dispcc_mdss_mdp_cbcr", 0):#x},')
             out.append('\t\t},')
-        if 'intf1' in soc.get('display', {}):
-            out.append(f'\t\t.display = {{ .intf = {soc["display"]["intf1"]:#010x} }},')
+        shown = soc.get('display', {})
+        if 'intf1' in shown or 'mdss' in shown or 'display' in board:
+            out.append(f'\t\t.display = {{ .intf = {shown.get("intf1", 0):#010x}, .mdss = {shown.get("mdss", 0):#010x}, '
+                       f'.splash_size = {board.get("display", {}).get("splash_size", 0):#x} }},')
         kind = {'dcs': 'HAKIOS_BACKLIGHT_DCS', 'soft': 'HAKIOS_BACKLIGHT_SOFT'}.get(light.get('type'), 'HAKIOS_BACKLIGHT_NONE')
         if dcs:
             out += [

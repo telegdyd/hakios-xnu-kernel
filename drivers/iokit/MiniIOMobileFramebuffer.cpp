@@ -239,6 +239,228 @@ micros(uint64_t absolute)
 	return ns / 1000;
 }
 
+/*
+ * Boot-arg fb_gpu=0: frames put on the panel by the processors, as before. By default, where the GPU is kept (gpu=1) and is
+ * an A7XX, the GPU's 2D engine puts them there (MiniIOSurfacePresent(), BoardGPU.cpp): a submission of the kernel's own,
+ * after whatever drew the frame, scaling it bilinear onto the panel. The processors' part is a few hundred words of
+ * commands, and no processor reads a surface the GPU may be drawing into (shownReading). A frame the GPU cannot take (a
+ * surface of a program's own memory, a layer partly off the panel, a surface no GPU has drawn into, a video's two planes,
+ * no GPU) is drawn by the processors after the GPU is done with what it was given of the panel. The OnePlus 10 Pro's
+ * GPU-PRESENT-PLAN.md step 1.
+ */
+static TUNABLE(uint32_t, gGPUPresent, "fb_gpu", 1);
+static uint32_t gLastPresent;           /* the last frame's fence when the GPU put it on the panel (0: the processors did) */
+static uint64_t gPanelPhys;
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, fb_panel_phys, CTLFLAG_RD | CTLFLAG_LOCKED, &gPanelPhys, "fb_gpu: the panel's memory");
+/*
+ * ... and whether it is the picture the processors would have drawn: the 60th frame the GPU puts on the panel, and every
+ * 1800th after it (half a minute at 60 a second), is waited for, and 256 of its pixels on the panel are compared with
+ * what drawLayer()'s bilinear makes of the surface there ("fb_gpu: check"). A frame whose surface was drawn into again
+ * meanwhile is not counted.
+ */
+#define GPU_CHECK_FIRST         60
+#define GPU_CHECK_EVERY         1800
+/* sysctl kern.hakios.fb_gpu_check=N: the next N frames the GPU puts on the panel are checked as well */
+static uint32_t gCheckNext;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_gpu_check, CTLFLAG_RW | CTLFLAG_LOCKED, &gCheckNext, 0,
+    "fb_gpu: so many of the next frames checked against the processors' bilinear");
+extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+extern "C" vm_offset_t ml_vtophys(vm_offset_t vaddr);
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+/* why frames went to the processors under fb_gpu, counted for the 5-second line */
+enum { kRefusedNoPanel, kRefusedBlack, kRefusedOffPanel, kRefusedNotGPUDrawn, kRefusedNothing, kRefusedByGPU, kRefusedVideo,
+       kRefusedKinds };
+
+/*
+ * The display controller, for fb_flip (the board's feature display-flip: its SoC file's display { } mdss and intf1, its
+ * own display { } splash-size; drivers/board/board.c). The offsets in the MDSS are an SM8450's (waipio: Linux's
+ * dpu_hw_catalog sm8450, the OnePlus 10 Pro's live DT qcom,sde-sspp-off/ctl-off); another DPU's are somebody else's
+ * registers, which is why it is a feature a board lists. sysctl kern.hakios.fb_dpu reads its state each time it is asked:
+ * each source pipe's address, size, crop, stride and format, each CTL's layers, flush and interfaces, and the panel
+ * interface's counters, tear check and auto-refresh. Reads only.
+ */
+extern "C" bool hakios_display_flip_data(uint64_t * mdss, uint64_t * intf, uint64_t * splash_size);
+#define MDSS_WINDOW_FIRST       0x04000                 /* what is mapped of it: the pipes and the CTLs */
+#define MDSS_WINDOW_END         0x2c000
+#define SSPP_SRC_SIZE           0x00
+#define SSPP_SRC_XY             0x08
+#define SSPP_OUT_SIZE           0x0c
+#define SSPP_OUT_XY             0x10
+#define SSPP_SRC0_ADDR          0x14
+#define SSPP_SRC_YSTRIDE0       0x24
+#define SSPP_SRC_FORMAT         0x30
+#define SSPP_SRC_UNPACK         0x34
+#define SSPP_SRC_OP_MODE        0x38
+#define CTL_LAYER0              0x00                    /* LM0..LM4 at 0x00..0x10, LM5 at 0x24 */
+#define CTL_TOP                 0x14
+#define CTL_FLUSH               0x18
+#define CTL_START               0x1c
+#define CTL_INTF_ACTIVE         0xf4
+#define CTL_FETCH_PIPE_ACTIVE   0xfc
+#define INTF_TIMING_ENGINE_EN   0x000
+#define INTF_FRAME_COUNT        0x0ac
+#define INTF_LINE_COUNT         0x0b0
+#define INTF_STATUS             0x26c
+#define INTF_TEAR_TEAR_CHECK_EN 0x284
+#define INTF_TEAR_SYNC_CONFIG_VSYNC 0x288
+#define INTF_TEAR_SYNC_CONFIG_HEIGHT 0x28c
+#define INTF_TEAR_INT_COUNT_VAL 0x298                   /* frame count << 16 | line */
+#define INTF_TEAR_START_POS     0x2a0
+#define INTF_TEAR_RD_PTR_IRQ    0x2a4
+#define INTF_TEAR_LINE_COUNT    0x2b0
+#define INTF_TEAR_AUTOREFRESH_CONFIG 0x2b4              /* bit 31 on, [15:0] frames per refresh */
+static const struct {
+	const char *    name;
+	uint32_t        offset;
+	uint8_t         flush;                          /* its bit in CTL_FLUSH (Linux's sde_hw_ctl.c sspp table) */
+} kDPUPipes[] = {
+	{ "VIG0", 0x05000, 0 }, { "VIG1", 0x07000, 1 }, { "VIG2", 0x09000, 2 }, { "VIG3", 0x0b000, 18 },
+	{ "DMA0", 0x25000, 11 }, { "DMA1", 0x27000, 12 }, { "DMA2", 0x29000, 24 }, { "DMA3", 0x2b000, 25 },
+};
+static const uint32_t kDPUCTLs[] = { 0x16000, 0x17000, 0x18000, 0x19000, 0x1a000, 0x1b000 };
+static vm_offset_t gMDSS;                       /* where MDSS_WINDOW_FIRST is mapped (0: not yet) */
+static vm_offset_t gIntf;                       /* ... and the panel's interface */
+static uint64_t gSplashSize;                    /* the firmware's display memory, from the panel's on */
+
+static inline uint32_t
+mdssRead(uint32_t offset)
+{
+	return *(volatile uint32_t *)(gMDSS + offset - MDSS_WINDOW_FIRST);
+}
+
+static inline void
+mdssWrite(uint32_t offset, uint32_t value)
+{
+	*(volatile uint32_t *)(gMDSS + offset - MDSS_WINDOW_FIRST) = value;
+}
+
+static inline uint32_t
+intfRead(uint32_t offset)
+{
+	return *(volatile uint32_t *)(gIntf + offset);
+}
+
+/* the registers mapped, once (false: the board has not the feature display-flip) */
+static bool
+mdssMapped(void)
+{
+	uint64_t mdss, intf, splash;
+
+	if (gMDSS != 0) {
+		return true;
+	}
+	if (!hakios_display_flip_data(&mdss, &intf, &splash) || (mdss & 0x3fffULL) != 0) {
+		return false;
+	}
+	vm_offset_t window = ml_io_map((vm_offset_t) mdss + MDSS_WINDOW_FIRST, MDSS_WINDOW_END - MDSS_WINDOW_FIRST);
+	vm_offset_t panel = ml_io_map((vm_offset_t) (intf & ~0x3fffULL), 0x4000) + (vm_offset_t) (intf & 0x3fffULL);
+
+	if (window == 0 || panel == 0) {
+		return false;
+	}
+	gSplashSize = splash;
+	gIntf = panel;
+	/* (mapped by another caller meanwhile: this mapping stays unused; rare, and small) */
+	__sync_bool_compare_and_swap(&gMDSS, 0, window);
+	return true;
+}
+
+static int
+sysctl_fb_dpu SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	const size_t size = 4096;
+	char *text;
+	size_t used = 0;
+	uint32_t frames, lines[12], tears[12];
+	int error;
+
+	if (!mdssMapped()) {
+		return SYSCTL_OUT(req, "no display-flip on this board\n", 31);
+	}
+	text = (char *) IOMalloc(size);
+	if (text == NULL) {
+		return ENOMEM;
+	}
+#define SAY(...) (used += (size_t) snprintf(text + used, used < size ? size - used : 0, __VA_ARGS__), used = used < size ? used : size)
+	for (unsigned p = 0; p < sizeof(kDPUPipes) / sizeof(kDPUPipes[0]); p++) {
+		uint32_t b = kDPUPipes[p].offset;
+		SAY("%s addr %#x size %#x xy %#x out %#x at %#x stride %#x format %#x unpack %#x op %#x (flush bit %u)\n",
+		    kDPUPipes[p].name, mdssRead(b + SSPP_SRC0_ADDR), mdssRead(b + SSPP_SRC_SIZE), mdssRead(b + SSPP_SRC_XY),
+		    mdssRead(b + SSPP_OUT_SIZE), mdssRead(b + SSPP_OUT_XY), mdssRead(b + SSPP_SRC_YSTRIDE0),
+		    mdssRead(b + SSPP_SRC_FORMAT), mdssRead(b + SSPP_SRC_UNPACK), mdssRead(b + SSPP_SRC_OP_MODE),
+		    kDPUPipes[p].flush);
+	}
+	for (unsigned c = 0; c < sizeof(kDPUCTLs) / sizeof(kDPUCTLs[0]); c++) {
+		uint32_t b = kDPUCTLs[c];
+		SAY("CTL%u layers %#x %#x %#x %#x %#x %#x top %#x flush %#x start %#x intf %#x fetch %#x\n", c,
+		    mdssRead(b + CTL_LAYER0), mdssRead(b + CTL_LAYER0 + 4), mdssRead(b + CTL_LAYER0 + 8),
+		    mdssRead(b + CTL_LAYER0 + 12), mdssRead(b + CTL_LAYER0 + 16), mdssRead(b + 0x24), mdssRead(b + CTL_TOP),
+		    mdssRead(b + CTL_FLUSH), mdssRead(b + CTL_START), mdssRead(b + CTL_INTF_ACTIVE),
+		    mdssRead(b + CTL_FETCH_PIPE_ACTIVE));
+	}
+	SAY("INTF timing %#x status %#x tearcheck %#x vsync %#x height %#x start %#x rdptr %#x autorefresh %#x\n",
+	    intfRead(INTF_TIMING_ENGINE_EN), intfRead(INTF_STATUS), intfRead(INTF_TEAR_TEAR_CHECK_EN),
+	    intfRead(INTF_TEAR_SYNC_CONFIG_VSYNC), intfRead(INTF_TEAR_SYNC_CONFIG_HEIGHT), intfRead(INTF_TEAR_START_POS),
+	    intfRead(INTF_TEAR_RD_PTR_IRQ), intfRead(INTF_TEAR_AUTOREFRESH_CONFIG));
+	/* the counters, every 700 us for about one refresh at 120 Hz; then how many frames in 100 ms */
+	for (unsigned s = 0; s < 12; s++) {
+		lines[s] = intfRead(INTF_LINE_COUNT);
+		tears[s] = intfRead(INTF_TEAR_INT_COUNT_VAL);
+		IODelay(700);
+	}
+	SAY("INTF line_count");
+	for (unsigned s = 0; s < 12; s++) {
+		SAY(" %u", lines[s]);
+	}
+	SAY("\nINTF tear frame:line");
+	for (unsigned s = 0; s < 12; s++) {
+		SAY(" %u:%u", tears[s] >> 16, tears[s] & 0xffff);
+	}
+	frames = intfRead(INTF_FRAME_COUNT);
+	uint32_t tear = intfRead(INTF_TEAR_INT_COUNT_VAL) >> 16;
+	IOSleep(100);
+	SAY("\nINTF in 100 ms: frame_count +%u, tear frames +%u, tear line_count %u\n", intfRead(INTF_FRAME_COUNT) - frames,
+	    ((intfRead(INTF_TEAR_INT_COUNT_VAL) >> 16) - tear) & 0xffff, intfRead(INTF_TEAR_LINE_COUNT));
+#undef SAY
+	error = SYSCTL_OUT(req, text, used);
+	IOFree(text, size);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, fb_dpu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_fb_dpu, "A",
+    "display-flip: the display controller's state, read now");
+
+/*
+ * Boot-arg fb_flip=0 (or sysctl kern.hakios.fb_flip=0 at any time; 1 back): frames copied into the panel's own memory,
+ * the one buffer the display controller reads. By default, on a board with display-flip and with fb_gpu, frames go into
+ * two buffers of the panel's size after the panel's own memory, in turn, and the display controller is pointed at the
+ * one written once the GPU is done with it (each of its pipes' source address and stride, then CTL0's flush): it takes
+ * the new address when it starts its next frame, so it never reads a buffer being written, and their rows (a multiple of
+ * 64 bytes) the 2D engine writes as they are, with no copy of the GPU's own. The buffer it showed is written again only
+ * once the flush is seen taken. A frame the GPU cannot take, or that does not cover the whole panel, goes into the
+ * panel's own memory as before, and the controller back to it. If a flush is not taken in 100 ms, the controller goes
+ * back to the panel's memory and fb_flip is off. The OnePlus 10 Pro's GPU-PRESENT-PLAN.md step 4: under the firmware's
+ * auto-refresh a flush alone was taken at the frame's start, every one of the timed ones.
+ */
+static TUNABLE_WRITEABLE(uint32_t, gFlip, "fb_flip", 1);
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_flip, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlip, 0, "fb_flip: frames shown by flipping between two buffers");
+#define FLIP_SPLASH_KEEP        0x4000                  /* the end of the firmware's display memory: its DSI command buffer */
+#define FLIP_CTL                0                       /* CTL0, which drives the panel's interface (kern.hakios.fb_dpu) */
+#define FLIP_TAKEN_MS           100
+#define FLIP_TIMED              16                      /* the first so many flips are timed to when they are taken */
+static uint32_t gFlipState;
+static const uint8_t * volatile gScreenBase;   /* the fb_flip buffer the controller reads (NULL: the panel's own memory) */
+static volatile uint32_t gScreenRowBytes;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_flip_state, CTLFLAG_RD | CTLFLAG_LOCKED, &gFlipState, 0,
+    "fb_flip: 0 not tried, 1 ready, 2 no display-flip, 3 the controller not as expected, 4 no room, 5 not mapped, 6 a flush not taken");
+/* the scan position: the tear check's read pointer, from INTF_TEAR_START_POS at the TE on */
+static inline uint32_t
+flipLine(void)
+{
+	return intfRead(INTF_TEAR_INT_COUNT_VAL) & 0xffff;
+}
+
 static inline uint32_t
 refreshHz(void)
 {
@@ -432,6 +654,24 @@ public:
 	uint8_t *       fBackBuffer;            /* RAM backbuffer for tear-free double buffering */
 	IOBufferMemoryDescriptor * fBackBufferDescriptor;
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
+	uint64_t        fPanelPhys;             /* ... its physical address (fb_gpu; 0: not one piece) */
+	/* fb_gpu: the last frame the GPU put on the panel, for the check; what was done how, for the 5-second line */
+	uint8_t *       fGPUBase;               /* where it went (the panel or an fb_flip buffer) */
+	uint32_t        fGPURowBytes;
+	struct MiniIOSurfacePresentLayer fGPUFirst;     /* its first layer, and how many it had */
+	uint32_t        fGPUDrawn, fGPULayers, fGPUFrames;
+	uint32_t        fStatGPUFrames, fStatCPUFrames, fStatRefused[kRefusedKinds];
+	/* fb_flip */
+	bool            fFlipTried, fFlipPending;
+	int             fFlipShown;             /* the buffer the controller reads (-1: the panel's own memory) */
+	unsigned        fFlipPipeCount;
+	uint32_t        fFlipPipe[2], fFlipHomeStride[2], fFlipFlush, fFlipRowBytes, fFlipWrittenLine, fFlipCount;
+	uint64_t        fFlipPhys[2], fFlipWritten;
+	IOMemoryDescriptor * fFlipMemory[2];
+	IOMemoryMap *   fFlipMap[2];
+	uint8_t *       fFlipBase[2];
+	uint32_t        fStatFlips, fStatFlipsHome, fStatFlipNotFull, fStatFlipWaited;
+	uint64_t        fStatFlipWait;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
 	MiniIOSurface * fDefaultSurface;
 	uint32_t        fSwapID;
@@ -507,6 +747,13 @@ public:
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
 	void show(const uint8_t * swap, MiniIOSurface ** surfaces);
+	bool showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, int * target);
+	void checkOnGPU(void);
+	void panelForProcessor(void);
+	bool flipSetUp(void);
+	bool flipTaken(uint32_t milliseconds);
+	void flipTo(int buffer);
+	void flipOff(const char * why);
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
@@ -731,6 +978,23 @@ IOMobileFramebuffer::start(IOService * provider)
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
+	fFlipShown = -1;
+	/*
+	 * fb_gpu: where the panel's memory is. Not taken on trust from the console's v_physaddr: the mapping is asked, at its
+	 * first byte and its last, which must be as far apart as in the kernel's view -- one piece of memory, as the boot
+	 * loader's framebuffer is.
+	 */
+	{
+		uint64_t last = (uint64_t) fRowBytes * fPanelHeight - 1;
+		uint64_t first = ml_vtophys((vm_offset_t) fBase), end = ml_vtophys((vm_offset_t) fBase + last);
+
+		fPanelPhys = first != 0 && end == first + last ? first : 0;
+		gPanelPhys = first;
+		if (gGPUPresent && fPanelPhys == 0) {
+			IOLog("MiniIOMobileFramebuffer: fb_gpu: the panel's memory is not one piece (%#llx, and %#llx at its end): "
+			    "frames by the processors\n", first, end);
+		}
+	}
 	uint32_t width = kFBDefaultWidth, height = kFBDefaultHeight, ownScale = kFBDefaultScale;
 	{
 		IORegistryEntry * chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
@@ -775,8 +1039,8 @@ IOMobileFramebuffer::start(IOService * provider)
 	fColumnWeight = IONewZero(uint16_t, fPanelWidth);
 	fDiff = gDiff != 0;
 	fDiffLeft = fDiffTop = ~0u;
-	printf("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row)\n", fWidth, fHeight,
-	    fPanelWidth, fPanelHeight, fRowBytes);
+	printf("MiniIOMobileFramebuffer: display %ux%u on a panel of %ux%u (%u bytes per row) at %#llx%s\n", fWidth, fHeight,
+	    fPanelWidth, fPanelHeight, fRowBytes, fPanelPhys, gGPUPresent ? "; frames to it by the GPU where it can (fb_gpu)" : "");
 	/* (the frame: rows of 4 bytes a pixel, padded to 64 bytes as IOSurface pads them, and a little to spare) */
 	fScanLead = usToAbs(gScanLeadUs >= 1000 && gScanLeadUs <= 8000 ? gScanLeadUs : 2000);
 	if (gScan) {
@@ -1657,6 +1921,353 @@ IOMobileFramebuffer::presenter(void)
 	}
 }
 
+/*
+ * Are the first `rows` rows of a surface, `columns` 32-bit pixels of each, inside the memory it has? Its stride and size
+ * come from whoever made it: checked in 64 bits, so that nothing wraps.
+ */
+static bool
+surfaceHolds(const MiniIOSurface * s, uint64_t rows, uint64_t columns)
+{
+	if (rows == 0 || columns == 0) {
+		return true;
+	}
+	return (uint64_t) s->info.offset + (rows - 1) * s->info.bytesPerRow + columns * 4 <= s->info.allocSize;
+}
+
+/*
+ * fb_gpu: the frame's layers onto the panel by the GPU, all of them or none (then the processors draw it, show()). The
+ * rectangles are drawLayer()'s; a layer partly off the panel is not cut here, the processors draw that frame. A surface
+ * no submission has named (drawn == 0) is one the processor drew: what it wrote may be in its cache yet, not in memory.
+ */
+bool
+IOMobileFramebuffer::showOnGPU(const uint8_t * swap, MiniIOSurface ** surfaces, int * target)
+{
+	bool full = false;
+	struct MiniIOSurfacePresentLayer layers[SWAP_LAYERS];
+	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
+	unsigned count = 0;
+	uint32_t fence;
+
+	if (fPanelPhys == 0) {
+		fStatRefused[kRefusedNoPanel]++;
+		return false;
+	}
+	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
+		uint32_t sid = swapWord(swap, SWAP_SURFACE(layer));
+		MiniIOSurface * s = surfaces[layer];
+		int32_t src[4], dst[4];
+
+		if (sid == 0) {
+			if (layer == 0 && (set & 1)) {
+				fStatRefused[kRefusedBlack]++;
+				return false;           /* (the screen made black: the processors' bzero()) */
+			}
+			continue;
+		}
+		if (s != NULL && s->info.planeCount == 2 && gYUV != 0) {
+			fStatRefused[kRefusedVideo]++;
+			return false;            /* (a video's two planes: drawYUV() by the processors) */
+		}
+		if (s == NULL || s->info.bytesPerElement != 4 || s->info.planeCount != 0) {
+			continue;                       /* (nothing drawn for it by the processors either) */
+		}
+		memcpy(src, swap + SWAP_SOURCE(layer), sizeof(src));
+		memcpy(dst, swap + SWAP_DEST(layer), sizeof(dst));
+		int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
+		int32_t dx = dst[0], dy = dst[1], dw = dst[2], dh = dst[3];
+
+		if (sw <= 0 || sh <= 0) {
+			sx = sy = 0;
+			sw = (int32_t) s->info.width;
+			sh = (int32_t) s->info.height;
+		}
+		if (dw <= 0 || dh <= 0) {
+			dx = dy = 0;
+			dw = (int32_t) fWidth;
+			dh = (int32_t) fHeight;
+		}
+		if (sx < 0 || sy < 0 || (uint32_t) (sx + sw) > s->info.width || (uint32_t) (sy + sh) > s->info.height ||
+		    !surfaceHolds(s, (uint32_t) (sy + sh), (uint32_t) (sx + sw))) {
+			continue;
+		}
+		int64_t qx0 = (int64_t) dx * fPanelWidth / fWidth;
+		int64_t qy0 = (int64_t) dy * fPanelHeight / fHeight;
+		int64_t qx1 = ((int64_t) dx + dw) * fPanelWidth / fWidth;
+		int64_t qy1 = ((int64_t) dy + dh) * fPanelHeight / fHeight;
+
+		if (qx1 <= qx0 || qy1 <= qy0 || qx1 <= 0 || qy1 <= 0 || qx0 >= fPanelWidth || qy0 >= fPanelHeight) {
+			continue;                       /* (nothing of it on the panel) */
+		}
+		if (qx0 < 0 || qy0 < 0 || qx1 > fPanelWidth || qy1 > fPanelHeight) {
+			fStatRefused[kRefusedOffPanel]++;
+			return false;
+		}
+		if (s->drawn == 0) {
+			fStatRefused[kRefusedNotGPUDrawn]++;
+			return false;
+		}
+		if (!fGraphics) {
+			fGraphics = true;
+			PE_initialize_console(NULL, kPEGraphicsMode);
+			PE_initialize_console(NULL, kPEReleaseScreen);
+		}
+		layers[count].surface = s;
+		layers[count].sx = (uint32_t) sx;
+		layers[count].sy = (uint32_t) sy;
+		layers[count].sw = (uint32_t) sw;
+		layers[count].sh = (uint32_t) sh;
+		layers[count].dx = (uint32_t) qx0;
+		layers[count].dy = (uint32_t) qy0;
+		layers[count].dw = (uint32_t) (qx1 - qx0);
+		layers[count].dh = (uint32_t) (qy1 - qy0);
+		full = full || (qx0 == 0 && qy0 == 0 && qx1 == fPanelWidth && qy1 == fPanelHeight);
+		count++;
+	}
+	if (count == 0) {
+		fStatRefused[kRefusedNothing]++;
+		return false;
+	}
+	/* (fb_flip: a frame into a buffer of its own only when it covers all of it; what was there is two frames old) */
+	if (*target >= 0 && !full) {
+		*target = -1;
+		fStatFlipNotFull++;
+	}
+	uint64_t phys = *target >= 0 ? fFlipPhys[*target] : fPanelPhys;
+	uint32_t rowBytes = *target >= 0 ? fFlipRowBytes : fRowBytes;
+
+	fence = MiniIOSurfacePresent(layers, count, phys, rowBytes, fPanelWidth, fPanelHeight);
+	if (fence == 0) {
+		fStatRefused[kRefusedByGPU]++;
+		return false;
+	}
+	gLastPresent = fence;
+	fGPUBase = *target >= 0 ? fFlipBase[*target] : fBase;
+	fGPURowBytes = rowBytes;
+	fGPUFirst = layers[0];
+	fGPUDrawn = layers[0].surface->drawn;
+	fGPULayers = count;
+	fGPUFrames++;
+	return true;
+}
+
+/* fb_gpu: the panel's pixels the GPU wrote against drawLayer()'s bilinear of the same surface (see GPU_CHECK_FIRST). */
+void
+IOMobileFramebuffer::checkOnGPU(void)
+{
+	const struct MiniIOSurfacePresentLayer * l = &fGPUFirst;
+	MiniIOSurface * s = l->surface;
+	uint32_t drawn = fGPUDrawn, close = 0, near = 0, far = 0, worst = 0, wx = 0, wy = 0, expect = 0, got = 0;
+
+	if (fGPULayers != 1 || !MiniIOSurfacePresentDone(gLastPresent, 100)) {
+		IOLog("MiniIOMobileFramebuffer: fb_gpu: check: frame %u not checked (%u layers, or the GPU not done)\n", fGPUFrames,
+		    fGPULayers);
+		return;
+	}
+	for (uint32_t i = 0; i < 256; i++) {
+		/* a 16 x 16 grid over the rectangle, each point moved a little so that they do not all fall on one phase */
+		uint32_t x = l->dx + (uint32_t) ((uint64_t) l->dw * (i % 16) / 16) + (i * 7) % 13;
+		uint32_t y = l->dy + (uint32_t) ((uint64_t) l->dh * (i / 16) / 16) + (i * 11) % 17;
+
+		x = x < l->dx + l->dw ? x : l->dx + l->dw - 1;
+		y = y < l->dy + l->dh ? y : l->dy + l->dh - 1;
+		int64_t ax = sample_at(x - l->dx, l->sw, l->dw), ay = sample_at(y - l->dy, l->sh, l->dh);
+		uint32_t c0 = (uint32_t) (ax >> 8), r0 = (uint32_t) (ay >> 8);
+		uint32_t c1 = c0 + 1 < l->sw ? c0 + 1 : c0, r1 = r0 + 1 < l->sh ? r0 + 1 : r0;
+		const uint8_t * upper = s->pixels() + (size_t) (l->sy + r0) * s->info.bytesPerRow + (size_t) l->sx * 4;
+		const uint8_t * lower = s->pixels() + (size_t) (l->sy + r1) * s->info.bytesPerRow + (size_t) l->sx * 4;
+		uint32_t * panel = (uint32_t *) (fGPUBase + (size_t) y * fGPURowBytes) + x;
+
+		/* (what the processor's cache may hold of either is older than memory, where the GPU read and wrote) */
+		flush_dcache64((addr64_t) (uintptr_t) (upper + c0 * 4), 8, FALSE);
+		flush_dcache64((addr64_t) (uintptr_t) (lower + c0 * 4), 8, FALSE);
+		flush_dcache64((addr64_t) (uintptr_t) panel, 4, FALSE);
+		uint32_t top = blend(((const uint32_t *) upper)[c0], ((const uint32_t *) upper)[c1], (uint32_t) (ax & 255));
+		uint32_t bottom = blend(((const uint32_t *) lower)[c0], ((const uint32_t *) lower)[c1], (uint32_t) (ax & 255));
+		uint32_t want = blend(top, bottom, (uint32_t) (ay & 255)), have = *(volatile uint32_t *) panel, diff = 0;
+
+		for (unsigned shift = 0; shift < 32; shift += 8) {
+			int32_t d = (int32_t) (want >> shift & 0xff) - (int32_t) (have >> shift & 0xff);
+
+			diff = (uint32_t) (d < 0 ? -d : d) > diff ? (uint32_t) (d < 0 ? -d : d) : diff;
+		}
+		close += diff <= 4;
+		near += diff > 4 && diff <= 32;
+		far += diff > 32;
+		if (diff > worst) {
+			worst = diff;
+			wx = x;
+			wy = y;
+			expect = want;
+			got = have;
+		}
+	}
+	if (s->drawn != drawn) {
+		IOLog("MiniIOMobileFramebuffer: fb_gpu: check: frame %u: its surface was drawn into again meanwhile: not counted\n",
+		    fGPUFrames);
+		return;
+	}
+	IOLog("MiniIOMobileFramebuffer: fb_gpu: check: frame %u (surface %u, %ux%u at %u,%u onto %ux%u at %u,%u): of 256 "
+	    "pixels %u within 4 of the processors' bilinear, %u within 32, %u further; the worst %u at %u,%u (%#x, the "
+	    "processors' %#x)\n", fGPUFrames, s->sid, l->sw, l->sh, l->sx, l->sy, l->dw, l->dh, l->dx, l->dy, close, near, far,
+	    worst, wx, wy, got, expect);
+}
+
+/*
+ * fb_flip: the controller as the boot loader left it (kern.hakios.fb_dpu: VIG0 and VIG1 fetch the panel's memory, its
+ * left and right half, for CTL0 and INTF_1), and two buffers after the panel's memory in the boot loader's display memory.
+ */
+bool
+IOMobileFramebuffer::flipSetUp(void)
+{
+	uint32_t ctl = kDPUCTLs[FLIP_CTL];
+	uint64_t size, first;
+
+	fFlipTried = true;
+	fFlipShown = -1;
+	if (!mdssMapped()) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: the board has not the feature display-flip: off\n");
+		gFlipState = 2;
+		return false;
+	}
+	fFlipFlush = 1u << 17;
+	for (unsigned p = 0; p < sizeof(kDPUPipes) / sizeof(kDPUPipes[0]); p++) {
+		uint32_t b = kDPUPipes[p].offset;
+
+		if (mdssRead(b + SSPP_SRC0_ADDR) != (uint32_t) fPanelPhys || fFlipPipeCount == 2) {
+			continue;
+		}
+		fFlipHomeStride[fFlipPipeCount] = mdssRead(b + SSPP_SRC_YSTRIDE0);
+		fFlipPipe[fFlipPipeCount++] = b;
+		fFlipFlush |= 1u << kDPUPipes[p].flush;
+	}
+	if (fFlipPipeCount == 0 || (fPanelPhys >> 32) != 0 || (fFlipHomeStride[0] & 0xffff) != fRowBytes ||
+	    !(mdssRead(ctl + CTL_INTF_ACTIVE) & 2) || mdssRead(ctl + CTL_FLUSH) != 0 ||
+	    !(intfRead(INTF_TEAR_AUTOREFRESH_CONFIG) & 0x80000000u)) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: the controller is not as expected (%u pipes at %#llx, stride %#x; CTL%u "
+		    "interfaces %#x flush %#x; auto-refresh %#x): off\n", fFlipPipeCount, fPanelPhys, fFlipHomeStride[0], FLIP_CTL,
+		    mdssRead(ctl + CTL_INTF_ACTIVE), mdssRead(ctl + CTL_FLUSH), intfRead(INTF_TEAR_AUTOREFRESH_CONFIG));
+		gFlipState = 3;
+		return false;
+	}
+	fFlipRowBytes = (fPanelWidth * 4 + 63) & ~63u;
+	size = round_page_64((uint64_t) fFlipRowBytes * fPanelHeight);
+	first = (fPanelPhys + (uint64_t) fRowBytes * fPanelHeight + 0xfffff) & ~0xfffffULL;
+	if (first + 2 * size > fPanelPhys + gSplashSize - FLIP_SPLASH_KEEP) {
+		IOLog("MiniIOMobileFramebuffer: fb_flip: no room for two buffers of %llu bytes after the panel's memory: off\n", size);
+		gFlipState = 4;
+		return false;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		fFlipPhys[i] = first + i * size;
+		fFlipMemory[i] = IOMemoryDescriptor::withAddressRange(fFlipPhys[i], size, kIODirectionInOut | kIOMemoryMapperNone, NULL);
+		fFlipMap[i] = fFlipMemory[i] != NULL ? fFlipMemory[i]->createMappingInTask(kernel_task, 0,
+		    kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
+		if (fFlipMap[i] == NULL) {
+			IOLog("MiniIOMobileFramebuffer: fb_flip: the buffer at %#llx cannot be mapped: off\n", fFlipPhys[i]);
+			gFlipState = 5;
+			return false;
+		}
+		fFlipBase[i] = (uint8_t *) fFlipMap[i]->getVirtualAddress();
+	}
+	gFlipState = 1;
+	IOLog("MiniIOMobileFramebuffer: fb_flip: frames into %#llx and %#llx (rows of %u bytes) in turn; %u pipes, CTL%u flush "
+	    "bits %#x\n", fFlipPhys[0], fFlipPhys[1], fFlipRowBytes, fFlipPipeCount, FLIP_CTL, fFlipFlush);
+	return true;
+}
+
+/* Whether the last flush has been taken, waiting so long at most. */
+bool
+IOMobileFramebuffer::flipTaken(uint32_t milliseconds)
+{
+	uint32_t ctl = kDPUCTLs[FLIP_CTL];
+	uint64_t began = mach_absolute_time(), until;
+	bool waited = false;
+
+	if (!fFlipPending) {
+		return true;
+	}
+	nanoseconds_to_absolutetime((uint64_t) milliseconds * NSEC_PER_MSEC, &until);
+	until += began;
+	while ((mdssRead(ctl + CTL_FLUSH) & fFlipFlush) != 0) {
+		if (mach_absolute_time() >= until) {
+			return false;
+		}
+		waited = true;
+		IODelay(20);
+	}
+	if (waited) {
+		fStatFlipWaited++;
+		fStatFlipWait += mach_absolute_time() - began;
+	}
+	fFlipPending = false;
+	return true;
+}
+
+/* The controller pointed at a buffer (-1: the panel's own memory), taken when it starts its next frame. */
+void
+IOMobileFramebuffer::flipTo(int buffer)
+{
+	uint32_t ctl = kDPUCTLs[FLIP_CTL];
+	uint64_t phys = buffer >= 0 ? fFlipPhys[buffer] : fPanelPhys;
+	uint32_t stride = buffer >= 0 ? fFlipRowBytes : fRowBytes;
+
+	for (unsigned i = 0; i < fFlipPipeCount; i++) {
+		mdssWrite(fFlipPipe[i] + SSPP_SRC0_ADDR, (uint32_t) phys);
+		mdssWrite(fFlipPipe[i] + SSPP_SRC_YSTRIDE0, (fFlipHomeStride[i] & 0xffff0000u) | stride);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	mdssWrite(ctl + CTL_FLUSH, fFlipFlush);
+	fFlipWritten = mach_absolute_time();
+	fFlipWrittenLine = flipLine();
+	fFlipShown = buffer;
+	gScreenRowBytes = stride;
+	gScreenBase = buffer >= 0 ? fFlipBase[buffer] : NULL;
+	fFlipPending = true;
+	fFlipCount++;
+	fStatFlips++;
+	fStatFlipsHome += buffer < 0;
+	if (fFlipCount <= FLIP_TIMED) {
+		/* the first ones: when the flush is taken, and where the scan is then (a frame's start: at INTF_TEAR_START_POS) */
+		uint64_t took, until;
+		uint32_t line;
+		bool taken;
+
+		nanoseconds_to_absolutetime((uint64_t) FLIP_TAKEN_MS * NSEC_PER_MSEC, &until);
+		until += fFlipWritten;
+		while ((mdssRead(ctl + CTL_FLUSH) & fFlipFlush) != 0 && mach_absolute_time() < until) {
+		}
+		took = mach_absolute_time();
+		line = flipLine();
+		taken = (mdssRead(ctl + CTL_FLUSH) & fFlipFlush) == 0;
+		IOLog("MiniIOMobileFramebuffer: fb_flip: flip %u to %d (%#llx): written at line %u, %s after %llu us at line %u "
+		    "(start %u)\n", fFlipCount, buffer, phys, fFlipWrittenLine, taken ? "taken" : "NOT taken",
+		    micros(took - fFlipWritten), line, intfRead(INTF_TEAR_START_POS));
+		fFlipPending = !taken;
+	}
+}
+
+/* fb_flip off: the controller back at the panel's own memory. */
+void
+IOMobileFramebuffer::flipOff(const char * why)
+{
+	IOLog("MiniIOMobileFramebuffer: fb_flip: off: %s (CTL%u flush %#x, line %u, %u flips)\n", why, FLIP_CTL,
+	    mdssRead(kDPUCTLs[FLIP_CTL] + CTL_FLUSH), flipLine(), fFlipCount);
+	gFlip = 0;
+	gFlipState = 6;
+	flipTo(-1);
+	fFlipPending = false;
+}
+
+/* Before the processors write the panel: the GPU done with what it was given to write there (it would write over them). */
+void
+IOMobileFramebuffer::panelForProcessor(void)
+{
+	if (gLastPresent != 0) {
+		MiniIOSurfacePresentDone(gLastPresent, 100);
+		gLastPresent = 0;
+	}
+}
+
 /* A swap's surfaces onto the panel, once the GPU is done with them. */
 void
 IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
@@ -1750,6 +2361,28 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	shown = began;
 	/*
+	 * fb_gpu: the frame into the GPU's ring, behind what drew it; fb_flip: into the buffer the controller does not read,
+	 * once it has left it. A frame the GPU does not take is drawn by the processors below, into the panel's own memory.
+	 */
+	int target = -1;
+	bool onGPU = false;
+
+	if (gGPUPresent && gFlip && fPanelPhys != 0 && (fFlipTried ? gFlipState == 1 : flipSetUp())) {
+		if (fFlipPending && !flipTaken(FLIP_TAKEN_MS)) {
+			flipOff("a flush not taken in 100 ms");
+		} else {
+			target = fFlipShown == 0 ? 1 : 0;
+		}
+	}
+	if (gGPUPresent) {
+		onGPU = showOnGPU(swap, surfaces, &target);
+	}
+	if (!onGPU) {
+		panelForProcessor();
+	}
+	fStatGPUFrames += onGPU;
+	fStatCPUFrames += !onGPU;
+	/*
 	 * The panel's readout this frame is for: the first that begins a lead after now. The lead grows
 	 * by half a millisecond after a frame with a stripe written too late for it, and shrinks by a
 	 * tenth of one after 60 frames in a row in time (a video panel: after 10): as little delay as
@@ -1759,7 +2392,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	 */
 	fScanTarget = 0;
 	fScanLate = 0;
-	if (gPanel.ok && fGraphics) {
+	if (gPanel.ok && fGraphics && !onGPU) {
 		scanObserve();
 		if (gPanel.ok) {
 			uint64_t target = scanNextStart(began + fScanLead);
@@ -1795,7 +2428,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fOver = false;
 	/* fb_yuv: the video layers first, under the rest (see gYUV) */
-	for (unsigned layer = 0; gYUV != 0 && layer < SWAP_LAYERS; layer++) {
+	for (unsigned layer = 0; gYUV != 0 && !onGPU && layer < SWAP_LAYERS; layer++) {
 		MiniIOSurface * s = surfaces[layer];
 		int32_t src[4], dst[4];
 
@@ -1825,7 +2458,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 		if (sid == 0) {
 			/* the bottom layer taken away: nothing is shown, the screen is black */
-			if (layer == 0 && (set & 1) && fGraphics && !fOver) {        /* (fb_yuv: not over the video drawn) */
+			if (layer == 0 && (set & 1) && fGraphics && !fOver && !onGPU) { /* (fb_yuv: not over the video drawn) */
 				/*
 				 * Plain aligned stores, not bzero: the panel's memory is device memory under the phone's
 				 * hypervisor, and bzero's DC ZVA and unaligned stores fault there ("Unaligned kernel data
@@ -1891,16 +2524,20 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				PE_initialize_console(NULL, kPEGraphicsMode);
 				PE_initialize_console(NULL, kPEReleaseScreen);
 			}
-			OSIncrementAtomic((volatile SInt32 *) &s->shownReading);
-			drawLayer(s, src, dst);
-			OSDecrementAtomic((volatile SInt32 *) &s->shownReading);
+			if (!onGPU) {
+				OSIncrementAtomic((volatile SInt32 *) &s->shownReading);
+				drawLayer(s, src, dst);
+				OSDecrementAtomic((volatile SInt32 *) &s->shownReading);
+			}
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
 		}
 	}
 	composed = mach_absolute_time();
-	copyBackBuffer();
+	if (!onGPU) {
+		copyBackBuffer();
+	}
 	if (fScanTarget != 0) {
 		uint64_t up = usToAbs(500), down = usToAbs(100), floor = usToAbs(1000), ceiling = usToAbs(8000);
 
@@ -1924,9 +2561,28 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	fSwapsWaiting--;
 	IOLockWakeup(fSwapLock, &fSwapsWaiting, true);
 	IOLockUnlock(fSwapLock);
+	/*
+	 * (fb_gpu: the frame is in the GPU's ring, and whatever the window server draws next is behind it there.) fb_flip: the
+	 * controller pointed at the buffer once the GPU is done with it, or back at the panel's own memory after the
+	 * processors drew there; after the swap is handed on, so the next frame is drawn meanwhile.
+	 */
+	if (onGPU && fFlipTried && target != fFlipShown) {
+		if (MiniIOSurfacePresentDone(gLastPresent, FLIP_TAKEN_MS)) {
+			flipTo(target);
+		} else {
+			flipOff("the GPU not done with a frame in 100 ms");
+		}
+	} else if (!onGPU && fFlipTried && fFlipShown >= 0) {
+		flipTo(-1);
+	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
 		record(recorded);
+	}
+	if (onGPU && (fGPUFrames == GPU_CHECK_FIRST || (fGPUFrames > GPU_CHECK_FIRST &&
+	    (fGPUFrames - GPU_CHECK_FIRST) % GPU_CHECK_EVERY == 0) || gCheckNext != 0)) {
+		gCheckNext -= gCheckNext != 0;
+		checkOnGPU();
 	}
 	fSwapsShown++;
 	if (gTouchLat) {
@@ -1963,6 +2619,29 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		    fStatHeld, fStatLost, fStatSwapsLate);
 		IOLog("MiniIOMobileFramebuffer: %u swaps came before the GPU work of their surface, %u of them shown without it\n",
 		    fStatStale, fStatStaleShown);
+		/* fb_gpu: who put the frames on the panel, what the GPU's part cost, and why a frame was not its */
+		{
+			uint32_t presents, timed, mapped;
+			uint64_t submitting, gpu;
+
+			MiniIOSurfacePresentCost(&presents, &submitting, &gpu, &timed, &mapped);
+			IOLog("MiniIOMobileFramebuffer: present: %u frames by the processors; %u by the GPU, %llu us each to hand over, "
+			    "%llu us of the GPU's (%u timed); %u surfaces entered into its address space; not by the GPU: %u no panel "
+			    "address, %u black, %u off the panel, %u drawn by a processor, %u nothing to draw, %u a video, %u refused "
+			    "by it\n", fStatCPUFrames, fStatGPUFrames, submitting, gpu, timed, mapped, fStatRefused[kRefusedNoPanel],
+			    fStatRefused[kRefusedBlack], fStatRefused[kRefusedOffPanel], fStatRefused[kRefusedNotGPUDrawn],
+			    fStatRefused[kRefusedNothing], fStatRefused[kRefusedVideo], fStatRefused[kRefusedByGPU]);
+			fStatCPUFrames = fStatGPUFrames = 0;
+			bzero(fStatRefused, sizeof(fStatRefused));
+			if (fFlipTried && (gFlipState == 1 || fStatFlips != 0)) {
+				IOLog("MiniIOMobileFramebuffer: fb_flip: %u flips (%u back to the panel's memory), %u frames not covering the "
+				    "panel; %u waited for the last flush to be taken, %llu us each; shown now %d\n", fStatFlips,
+				    fStatFlipsHome, fStatFlipNotFull, fStatFlipWaited,
+				    fStatFlipWaited ? micros(fStatFlipWait) / fStatFlipWaited : 0, fFlipShown);
+				fStatFlips = fStatFlipsHome = fStatFlipNotFull = fStatFlipWaited = 0;
+				fStatFlipWait = 0;
+			}
+		}
 		if (surfaces[0] != NULL) {
 			IOLog("MiniIOMobileFramebuffer: the last swap's surface %u: its last GPU submission %u (0: none ever named it)\n",
 			    surfaces[0]->sid, surfaces[0]->drawn);
@@ -2670,6 +3349,9 @@ MiniIOMobileFramebufferShow(const uint8_t * pixels, uint32_t width, uint32_t hei
 		PE_initialize_console(NULL, kPEGraphicsMode);
 		PE_initialize_console(NULL, kPEReleaseScreen);
 	}
+	if (gLastPresent != 0) {
+		MiniIOSurfacePresentDone(gLastPresent, 100);    /* (fb_gpu: the GPU is not to write over it) */
+	}
 	for (uint32_t y = 0; y < rows; y++) {
 		memcpy((void *) (vinfo.v_baseaddr + (size_t) y * vinfo.v_rowbytes), pixels + (size_t) y * rowBytes,
 		    (size_t) columns * 4);
@@ -2690,7 +3372,8 @@ MiniIOMobileFramebufferPanel(uint32_t * width, uint32_t * height)
  * kern.hakios.screen: what the panel shows, for root alone (userland/src/screencap.c makes a PNG of it). A header of
  * 24 bytes -- "HKSCREEN", then width, height, bytes a row and 0 for BGRA, little-endian words -- and the rows packed,
  * 4 bytes a pixel, read from the boot framebuffer the panel scans out (what MiniIOMobileFramebufferShow() and the
- * swaps copy into). Not one instant: rows a frame is copied over while they are read may be of the next frame.
+ * swaps copy into), or, while fb_flip has the controller on one of its buffers, from that one. Not one instant: rows a
+ * frame is copied over while they are read may be of the next frame.
  */
 struct screen_header {
 	char magic[8];
@@ -2718,9 +3401,11 @@ screenSysctl(struct sysctl_oid * oidp __unused, void * arg1 __unused, int arg2 _
 		req->oldidx = sizeof(h) + (size_t) h.rowBytes * h.height;
 		return 0;
 	}
+	const uint8_t * base = gScreenBase != NULL ? gScreenBase : (const uint8_t *) vinfo.v_baseaddr;
+	size_t rowBytes = gScreenBase != NULL ? gScreenRowBytes : vinfo.v_rowbytes;
 	int error = SYSCTL_OUT(req, &h, sizeof(h));
 	for (uint32_t y = 0; error == 0 && y < h.height; y++) {
-		error = SYSCTL_OUT(req, (const void *) (vinfo.v_baseaddr + (size_t) y * vinfo.v_rowbytes), h.rowBytes);
+		error = SYSCTL_OUT(req, (const void *) (base + (size_t) y * rowBytes), h.rowBytes);
 	}
 	return error;
 }

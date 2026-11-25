@@ -220,6 +220,23 @@ extern "C" void MiniIOSurfaceVolatile(uint32_t * idle, uint64_t * idleBytes, uin
 void            MiniIOSurfaceClearKept(void);
 /* Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels (BoardGPU.cpp). */
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
+/*
+ * fb_gpu (BoardGPU.cpp): layers of a frame onto memory frames are shown from (the panel's, or one of fb_flip's buffers) by
+ * the GPU's 2D engine, scaled bilinear, in its ring after what was drawn into the surfaces: a rectangle SW x SH at SX, SY
+ * of the surface onto DW x DH at DX, DY of PANELPHYS (rows PANELROWBYTES apart, PANELWIDTH x PANELHEIGHT). Returns the
+ * submission (0: not taken, the processors draw the frame).
+ */
+struct MiniIOSurfacePresentLayer {
+	MiniIOSurface * surface;
+	uint32_t        sx, sy, sw, sh;
+	uint32_t        dx, dy, dw, dh;
+};
+uint32_t        MiniIOSurfacePresent(const struct MiniIOSurfacePresentLayer * layers, unsigned count, uint64_t panelPhys,
+    uint32_t panelRowBytes, uint32_t panelWidth, uint32_t panelHeight);
+/* Whether the GPU is done with that submission, waiting so long at most. */
+bool            MiniIOSurfacePresentDone(uint32_t fence, uint64_t milliseconds);
+/* What the presents cost since this was last asked: how many, us each to hand over, us of the GPU's each (timed of them), surfaces entered. */
+void            MiniIOSurfacePresentCost(uint32_t * presents, uint64_t * submitting, uint64_t * gpu, uint32_t * timed, uint32_t * mapped);
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */

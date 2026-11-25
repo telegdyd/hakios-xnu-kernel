@@ -69,6 +69,26 @@ hakios_board_has(uint32_t feature)
 	return board != NULL && (board->features & feature) != 0;
 }
 
+/*
+ * For the display driver (iokit/MiniIOMobileFramebuffer.cpp, fb_flip), which does not see this file's table: where the
+ * display subsystem and the panel's interface are, and how much of the firmware's display memory there is from the
+ * panel's on. False on a board without the feature display-flip.
+ */
+bool
+hakios_display_flip_data(uint64_t *mdss, uint64_t *intf, uint64_t *splash_size)
+{
+	const struct hakios_board *board = hakios_board();
+
+	if (board == NULL || !(board->features & HAKIOS_HAS_DISPLAY_FLIP) || board->display.mdss == 0 ||
+	    board->display.intf == 0 || board->display.splash_size == 0) {
+		return false;
+	}
+	*mdss = board->display.mdss;
+	*intf = board->display.intf;
+	*splash_size = board->display.splash_size;
+	return true;
+}
+
 unsigned
 hakios_board_cpu_groups(void)
 {

@@ -35,6 +35,7 @@ the two the same. What each key means is in `arch/arm64/boot/dts/_template/soc.d
 | `touch-ft5x06` | `pins { }` | `touch-i2c { }`: `sda`, `scl`, `interrupt`, `reset`, `address`, `contacts`, `coordinates` | `touchscreen=-1 looks; touchscreen=1` |
 | `touch-s3908` | `pins { }` | `touch-i2c { }`: `sda`, `scl`, `interrupt`, `reset`, `address`, `contacts`, `coordinates` | `touchscreen=-1 looks; touchscreen=1` |
 | `gpu-a730` | `adreno { }`; `clocks { }`: `gcc-disp-ahb-cbcr`; `rpmh { }` | `gpu { }`: `model`, `chip-id`, `firmware`, `gmem-kb`, `primitive-fifo`, `hang-cycles`, `speed-fuse`, `gaming-fuse`, `highest-bank-bit`, `gcc-debug-gpucc`, `speeds-khz`, `speed-levels`, `default-speed` | `gpu=1 or adreno=22; gpu_irq=1 for completion interrupts` |
+| `display-flip` | `display { }`: `intf1`, `mdss` | `display { }`: `splash-size` | `fb_flip=1, the default, with the GPU putting frames on the panel (gpu=1; fb_gpu=1, the default)` |
 
 The brightness (`backlight { }`), the thermal floors (`thermal { }`), the PMIC's clock (`rtc { }`, which
 needs `spmi { }` in the SoC file) and the partition that may be written (`storage { }`) are not

@@ -44,6 +44,10 @@ enum {
 	                                         * the next is the board's gpu { } (board/adreno.c, gpu=1) */
 	HAKIOS_HAS_GPU_A730     = 1u << 23,     /* an Adreno 730 (gen7) behind a GMU: the same driver, board data and
 	                                         * steps, with gen7's own parts; steps 1 to 10 so far (board/adreno.c) */
+	HAKIOS_HAS_DISPLAY_FLIP = 1u << 24,     /* frames shown by pointing the display controller's pipes at one of two
+	                                         * buffers in turn while the GPU draws into the other (an SM8450-layout
+	                                         * DPU under the firmware's auto-refresh; iokit/MiniIOMobileFramebuffer.cpp,
+	                                         * fb_flip) */
 	/*
 	 * Drivers of one part, wired the way one phone has it (the pins, the bus, the chip): a board lists
 	 * one only if it has that part wired that way. Asked for on any other board, the driver says so and
@@ -118,6 +122,8 @@ struct hakios_board {
 	/* the display controller (soc: display { }) */
 	struct {
 		uint32_t intf;                  /* the interface the panel hangs on (INTF_*): its timing and counters */
+		uint32_t mdss;                  /* the display subsystem's registers (its "mdss_mdp" reg): display-flip */
+		uint32_t splash_size;           /* board: the firmware's display memory from the panel's on (cont_splash_region) */
 	} display;
 
 	/* the panel's light (board: backlight { }; soc: display { }) */
@@ -448,6 +454,9 @@ const struct hakios_board *hakios_board(void);
 
 /* Has this board the feature (one HAKIOS_HAS_*)? Never, on a board that is not known. */
 bool hakios_board_has(uint32_t feature);
+
+/* display-flip's data (MDSS, the panel's interface, the firmware's display memory); false without the feature */
+bool hakios_display_flip_data(uint64_t *mdss, uint64_t *intf, uint64_t *splash_size);
 
 /*
  * The groups of cores with a clock of their own (soc: cpufreq { } domain_cores): how many there are, and
