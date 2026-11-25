@@ -56,6 +56,8 @@ enum {
 	kSurfaceMethodBindAccel         = 12,
 	kSurfaceMethodInit              = 13,
 	kSurfaceMethodLog               = 19,
+	kSurfaceMethodSetSurfaceNotify  = 17,   /* async: the notifier's port, 3 references; in 24 bytes: callback, refcon, 0 */
+	kSurfaceMethodRemoveSurfaceNotify = 18, /* in 24 bytes: 0, the notifier, 0 */
 	kSurfaceMethodSetPurgeable      = 20,
 	kSurfaceMethodSetOwnership      = 21,
 	kSurfaceMethodSetTiled          = 22,
@@ -2206,6 +2208,23 @@ IOSurfaceRootUserClient::method(uint32_t selector, IOExternalMethodArguments * a
 
 	case kSurfaceMethodQueryTransactionList:
 		return methodQueryTransactionList(args);
+
+	case kSurfaceMethodSetSurfaceNotify:
+		/*
+		 * IOSurfaceNotifierCreate: a port for the kext's notifications about surfaces. Nothing here sends any, so the
+		 * notifier is taken and its reference let go of at once (externalMethod); it is told nothing, which is true.
+		 */
+		if (args->asyncWakePort == MACH_PORT_NULL || args->structureInputSize != 24) {
+			return kIOReturnBadArgument;
+		}
+		return kIOReturnSuccess;
+
+	case kSurfaceMethodRemoveSurfaceNotify:
+		/* IOSurfaceNotifierInvalidate: nothing kept for it (above) */
+		if (args->structureInputSize != 24) {
+			return kIOReturnBadArgument;
+		}
+		return kIOReturnSuccess;
 
 	case kSurfaceMethodCommPageAddress:
 		/*
