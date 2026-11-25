@@ -109,6 +109,18 @@ echo "== APFS images (tools/apfs/mkapfs.py) read back by the kernel's reader, an
 
 echo "== qmi (drivers/board/qmi.c under the sanitizers)"
 "$HERE/qmi/run.sh" 2>&1 | grep -v "said once" || failed=1
+echo "== qrtr (drivers/board/qrtr.c, the router under the QMI helpers, under the sanitizers)"
+"$HERE/qrtr/run.sh" || failed=1
+echo "== wifi_pci (drivers/board/wifi_pci.c: the PCIe radio's words, firmware names and stages, under the sanitizers)"
+"$HERE/wifi_pci/run.sh" || failed=1
+echo "== mhi (kernel/lx/src/lx_mhi.c against a fake MHI chip, under the sanitizers)"
+"$HERE/mhi/run.sh" || failed=1
+echo "== lx_pci (kernel/lx/src/lx_pci.c against a fake endpoint, under the sanitizers)"
+"$HERE/lx_pci/run.sh" || failed=1
+echo "== wpa, sae, owe (kernel/lx/src/lx_wpa.c, lx_sae*.c, lx_owe.c: the handshakes against Python's reference access points)"
+"$HERE/wpa/run.sh" || failed=1
+"$HERE/sae/run.sh" || failed=1
+"$HERE/owe/run.sh" || failed=1
 
 run backlight_test -I"$SRC" "$HERE/backlight_test.c"
 run thermal_test -I"$SRC" "$HERE/thermal_test.c"
@@ -171,7 +183,7 @@ done
 # drivers' tests are, with the maths library: the cameras' picture processor of Darwin's capture device
 # (components/camera/src/camera_isp.c) as libhakios-media builds it, and the WPA2 handshake of the Wi-Fi driver's object
 # (kernel/lx/src/lx_wpa.c), which needs nothing of the kernel's outside it
-for test in camera_isp_test lx_wpa_test; do
+for test in camera_isp_test; do
 	echo "== $test (host${SANITIZE[0]:+, sanitizers})"
 	if "$CC" -std=gnu11 -Wall -Wextra -Werror -O2 -pthread "${SANITIZE[@]}" "$HERE/$test.c" -o "$WORK/$test" -lm; then
 		scenarios "" "$WORK/$test"

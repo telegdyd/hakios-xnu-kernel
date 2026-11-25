@@ -1,0 +1,6 @@
+--- a/sys/compat/linuxkpi/common/include/linux/jiffies.h
++++ b/sys/compat/linuxkpi/common/include/linux/jiffies.h
+@@ -39,1 +39,2 @@
+-extern unsigned long jiffies;	/* defined in sys/kern/subr_ticks.S */
++unsigned long lx_jiffies(void);
++#define jiffies (lx_jiffies())

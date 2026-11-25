@@ -85,7 +85,7 @@ CPUFREQ_EXTENT = {'epss': 0x324, 'osm': 0x924}
 SOC_SCHEMA = {
     '': {'name': (str, True), 'description': (str, True)},
     'platform': {'io_base': (U64, False), 'io_size': (U64, False), 'gic_dist': (U64, True), 'gic_redist': (U64, True),
-                 'gic_redist_size': (U64, False), 'gic_redist_stride': (U64, False), 'uart': (U64, False),
+                 'gic_redist_size': (U64, False), 'gic_redist_stride': (U64, False), 'gic_its': (U64, False), 'uart': (U64, False),
                  'ufs': (U64, False),
                  'cores': (int, True), 'core_shift': (int, True), 'small_cores': (int, False),
                  'psci': (('smc', 'hvc'), True), 'timeout_scale': (int, False)},
@@ -98,6 +98,7 @@ SOC_SCHEMA = {
              'intr': (int, False), 'interrupt_pdc': ([int], False),
              'ee': (int, False), 'channel_map': (int, False), 'bus': (int, False)},
     'usb': {'dwc3': (int, True), 'interrupt': (int, False), 'hsphy': (int, False), 'clkref': (int, False)},
+    'pcie': {'parf': (int, True), 'phy': (int, True), 'dbi': (int, True), 'config': (int, True), 'bar': (int, True)},
     'adreno': {'gpu': (int, True), 'gmu': (int, True), 'gpucc': (int, True), 'cx_misc': (int, True), 'rscc': (int, True),
                'smmu': (int, True), 'pdc': (int, True), 'qfprom': (int, True), 'tsens': (int, False),
                'tsens_sensors': ([int], False),
@@ -215,7 +216,7 @@ FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virt
                  'touch-s3908': ('pins',),
                  'speaker-aw88261': ('pins', 'clocks', 'rpmh', 'smmu'), 'haptic-aw86927': ('pins',),
                  'imu-lsm6dso': ('pins',), 'imu-bmi160': ('pins',),
-                 'adsp': ('rpmh', 'ipc'), 'wifi-wcn6750': ('rpmh', 'pins', 'spmi', 'ipc', 'smmu'), 'mic-wcd938x': ('pins', 'lpass')}
+                 'adsp': ('rpmh', 'ipc'), 'wifi-wcn6750': ('rpmh', 'pins', 'spmi', 'ipc', 'smmu'), 'wifi-qca6490': ('rpmh', 'pins', 'smmu', 'clocks', 'pcie'), 'mic-wcd938x': ('pins', 'lpass')}
 # ... and the stream of the SMMU that a part's DMA comes in on: [stream ID, mask], from the device tree's iommus
 STREAM_OF = {'speaker-aw88261': 'audio_stream', 'wifi-wcn6750': 'wifi_stream', 'camera-sm7325': 'camera_stream'}
 WRITES_TO_PMIC = ('bluetooth-wcn-uart', 'torch-pm8350c', 'camera-sm7325')    # ... these through the arbiter's channels as well
@@ -251,6 +252,7 @@ FEATURE_BOOTARGS = {
     'torch-pm8350c': 'torch=1 looks; torch=3 is the light for Darwin',
     'camera-sm7325': 'cam=N',
     'wifi-wcn6750': 'wifi=1',
+    'wifi-qca6490': 'wifi=1; wifi_join=1 with wifi_ssid and wifi_psk joins at the start',
     'mic-wcd938x': 'mic=N with adsp=1',
     'modem-sm7325': 'modem=1',
 }
@@ -430,6 +432,8 @@ def feature_needs(feature, board, soc):
     radio = board.get('wifi')
     if feature == 'wifi-wcn6750' and not (isinstance(radio, dict) and 'dsp_memory' in radio and 'dsp_memory_size' in radio):
         needs.append('dsp_memory and dsp_memory_size in [wifi] of the board file')
+    if feature == 'wifi-qca6490' and not (isinstance(radio, dict) and radio.get('radio_model') == 1):
+        needs.append('radio_model 1 (a radio on PCIe) in [wifi] of the board file')
     light = board.get('backlight')
     if feature == 'display-scan' and isinstance(light, dict) and light.get('panel_mode') == 'video':
         needs.append('a command-mode panel ([backlight] says video)')
@@ -465,6 +469,8 @@ def feature_requirements(feature):
         of_board[section] = [key for key, (_, needed) in BOARD_SCHEMA[section].items() if needed] + list(TOUCH_NEEDS.get(feature, ()))
     if feature == 'wifi-wcn6750':
         of_board['wifi'] = ['radio_model', 'dsp_memory', 'dsp_memory_size']
+    if feature == 'wifi-qca6490':
+        of_board['wifi'] = ['radio_model']
     return of_soc, of_board
 
 
@@ -1169,6 +1175,13 @@ def table_text(socs, boards):
         if usb:
             out.append(f'\t\t.usb = {{ .dwc3 = {usb["dwc3"]:#010x}, .interrupt = {usb.get("interrupt", 0)}, '
                        f'.hsphy = {usb.get("hsphy", 0):#010x}, .clkref = {usb.get("clkref", 0):#010x} }},')
+        pcie = soc.get('pcie')
+        if pcie:
+            out.append('\t\t.pcie = { ' + ', '.join(f'.{key} = {pcie[key]:#010x}' for key in ('parf', 'phy', 'dbi', 'config', 'bar')) + ' },')
+        platform = soc.get('platform')
+        if platform:
+            out.append('\t\t.gic = { ' + ', '.join(f'.{field} = {platform.get(key, 0):#x}' for field, key in (('dist', 'gic_dist'), ('redist', 'gic_redist'),
+                       ('redist_size', 'gic_redist_size'), ('redist_stride', 'gic_redist_stride'), ('its', 'gic_its'))) + ' },')
         adreno = soc.get('adreno')
         if adreno:
             out += ['\t\t.adreno = {',

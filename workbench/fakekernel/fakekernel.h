@@ -113,6 +113,9 @@ typedef int boolean_t;
 #define VM_KERN_MEMORY_IOKIT            1
 #define VM_KERN_MEMORY_DIAG             2
 extern void *kernel_map;
+/* page numbers, as kmem_alloc_contig() limits them: 16 KiB pages on arm64 */
+typedef uint32_t ppnum_t;
+#define atop(x)                         ((uint64_t)(x) >> 14)
 int kmem_alloc_contig(void *map, vm_offset_t *address, vm_size_t size, vm_offset_t mask, int max_pnum, int pnum_mask,
     int flags, int tag);
 int kmem_alloc(void *map, vm_offset_t *address, vm_size_t size, int flags, int tag);
@@ -195,6 +198,16 @@ int fake_sysctl_out(struct sysctl_req *req, const void *data, size_t size);
 #define SYSCTL_INT(parent, nbr, name, access, ptr, val, descr) FAKE_OID(parent, name, 2, (void *)(ptr), val, NULL, access)
 #define SYSCTL_QUAD(parent, nbr, name, access, ptr, descr) FAKE_OID(parent, name, 3, (void *)(ptr), 0, NULL, access)
 #define SYSCTL_DECL(name) extern int fake_unused_decl_##name
+/* a string read as it is (SYSCTL_STRING), and an int handled whole (sysctl_handle_int) */
+#define SYSCTL_STRING(parent, nbr, name, access, ptr, len, descr) FAKE_OID(parent, name, 4, (void *)(ptr), len, NULL, access)
+static inline int
+sysctl_handle_int(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
+{
+	int changed = 0;
+
+	(void)oidp; (void)arg2;
+	return sysctl_io_number(req, *(int *)arg1, sizeof(int), arg1, &changed);
+}
 
 /*
  * Character devices (sys/conf.h, sys/uio.h, miscfs/devfs/devfs.h): a driver's /dev node is kept by its
@@ -353,6 +366,18 @@ void *mbuf_data(mbuf_t m);
 void mbuf_freem(mbuf_t m);
 typedef uint64_t user_addr_t;
 #define USER_ADDR_NULL                  ((user_addr_t)0)
+/* what a frame asks of the link (board/lx.c): its service class, and the checksums it leaves to the link (here: none) */
+typedef enum { MBUF_SC_BE = 0, MBUF_SC_BK_SYS, MBUF_SC_BK, MBUF_SC_RD, MBUF_SC_OAM, MBUF_SC_AV, MBUF_SC_RV, MBUF_SC_VI, MBUF_SC_SIG,
+	MBUF_SC_VO, MBUF_SC_CTL } mbuf_svc_class_t;
+static inline mbuf_svc_class_t mbuf_get_service_class(mbuf_t m) { (void)m; return MBUF_SC_BE; }
+typedef uint32_t mbuf_csum_request_flags_t;
+#define MBUF_CSUM_REQ_IP        0x0001
+#define MBUF_CSUM_REQ_TCP       0x0002
+#define MBUF_CSUM_REQ_UDP       0x0004
+#define MBUF_CSUM_REQ_TCPIPV6   0x0020
+#define MBUF_CSUM_REQ_UDPIPV6   0x0040
+static inline int mbuf_get_csum_requested(mbuf_t m, mbuf_csum_request_flags_t *request, uint32_t *value)
+{ (void)m; *request = 0; if (value) *value = 0; return 0; }
 #ifndef EAUTH
 #define EAUTH                           80
 #endif

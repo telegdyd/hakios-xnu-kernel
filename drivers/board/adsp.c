@@ -1648,7 +1648,7 @@ struct glink_packet {
  * carries APR, the audio services' own protocol (below; Android's apr_tal_rpmsg.c asks for no
  * particular intents: what the DSP sends there is a few hundred bytes, up to a few kilobytes).
  */
-enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNELS };
+enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNEL_PCIE, CHANNELS };
 
 struct glink_channel {
 	const char *name;
@@ -1689,9 +1689,105 @@ static struct {
 		[CHANNEL_APR] = { .name = "apr_audio_svc", .ours = 2, .intents = { { 0x200, 8 }, { 0x1000, 4 }, { 0x2000, 2 } } },
 		/* the battery manager's (battmgr below): answers of a few dozen bytes, a name of 128 */
 		[CHANNEL_PMIC] = { .name = "PMIC_RTR_ADSP_APPS", .ours = 3, .intents = { { 0x200, 6 }, { 0x1000, 2 }, { 0, 0 } } },
+		/* PCIe DRV (the vendor's pci-msm.c "pcie_drv" rpmsg): the DSP keeps RC0's link in L1ss for us while the processors
+		 * sleep (board/pcie.c, the Wi-Fi's link sleep); a DSP that does not offer it leaves it closed */
+		[CHANNEL_PCIE] = { .name = "pcie_drv", .ours = 4, .intents = { { 0x40, 4 }, { 0, 0 }, { 0, 0 } } },
 	},
 };
 
+/*
+ * PCIe DRV (pci-msm.c msm_pcie_drv_send_rpmsg): a 24-byte header (version 1.0, msg_id 0xc command, seq, payload 16,
+ * dev_id = RC index) and four words (command, dev_id, argument, 0); the DSP answers msg_id 0xa with our seq as its
+ * reply_seq and a status word, 0 for done. One command at a time, up to 1 s for its answer.
+ */
+struct __attribute__((packed)) pcie_drv_header {
+	uint16_t major, minor, msg_id, seq, reply_seq, payload_size;
+	uint32_t dev_id;
+	uint8_t reserved[8];
+};
+static struct {
+	volatile uint32_t acks;
+	volatile uint16_t reply_seq;
+	volatile uint32_t status;
+	uint16_t seq;
+	uint32_t sent, timeouts, refused, odd;
+} pcie_drv;
+static LCK_GRP_DECLARE(pcie_drv_group, "hakios-pcie-drv");
+static LCK_MTX_DECLARE(pcie_drv_lock, &pcie_drv_group);
+static void
+pcie_drv_input(const uint8_t *data, uint32_t length)
+{
+	struct pcie_drv_header h;
+	uint32_t status;
+
+	if (length < sizeof(h) + 4) { pcie_drv.odd++; return; }
+	memcpy(&h, data, sizeof(h));
+	if (h.msg_id != 0xa || h.payload_size != 4) { pcie_drv.odd++; return; }
+	memcpy(&status, data + sizeof(h), 4);
+	pcie_drv.status = status;
+	pcie_drv.reply_seq = h.reply_seq;
+	os_atomic_inc(&pcie_drv.acks, release);
+	thread_wakeup((event_t)&pcie_drv.acks);
+}
+static int glink_send(struct glink_channel *channel, const void *data, uint32_t length);
+int hakios_adsp_pcie_drv(uint32_t command, uint32_t argument);
+int
+hakios_adsp_pcie_drv(uint32_t command, uint32_t argument)
+{
+	struct __attribute__((packed)) { struct pcie_drv_header h; uint32_t word[4]; } m;
+	uint32_t before;
+	uint64_t start_ms;
+	int error = 0;
+
+	lck_mtx_lock(&pcie_drv_lock);
+	if (!glink.up || !glink.channel[CHANNEL_PCIE].open) {
+		lck_mtx_unlock(&pcie_drv_lock);
+		return ENXIO;
+	}
+	bzero(&m, sizeof(m));
+	m.h.major = 1; m.h.minor = 0; m.h.msg_id = 0xc; m.h.seq = pcie_drv.seq++; m.h.payload_size = 16; m.h.dev_id = 0;
+	if (pcie_drv.seq == 0xffff) pcie_drv.seq = 0;
+	m.word[0] = command; m.word[1] = 0; m.word[2] = argument;
+	before = os_atomic_load(&pcie_drv.acks, acquire);
+	if (glink_send(&glink.channel[CHANNEL_PCIE], &m, sizeof(m)) != 0) {
+		lck_mtx_unlock(&pcie_drv_lock);
+		return EIO;
+	}
+	pcie_drv.sent++;
+	/* (up to a second for the answer, as battmgr waits for its own) */
+	start_ms = now_us() / 1000;
+	while (os_atomic_load(&pcie_drv.acks, acquire) == before) {
+		uint64_t elapsed = now_us() / 1000 - start_ms;
+
+		if (elapsed >= 1000) {
+			error = ETIMEDOUT;
+			break;
+		}
+		assert_wait_timeout((event_t)&pcie_drv.acks, THREAD_UNINT, (uint32_t)(1000 - elapsed), NSEC_PER_MSEC);
+		if (os_atomic_load(&pcie_drv.acks, acquire) != before) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+			break;
+		}
+		thread_block(THREAD_CONTINUE_NULL);
+	}
+	if (error) pcie_drv.timeouts++;
+	else if (pcie_drv.reply_seq != m.h.seq || pcie_drv.status != 0) { pcie_drv.refused++; error = EIO; }
+	lck_mtx_unlock(&pcie_drv_lock);
+	return error;
+}
+static int
+sysctl_pcie_drv SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	char text[200];
+	snprintf(text, sizeof(text), "channel %s; sent %u acks %u timeouts %u refused %u odd %u last status %u",
+	    glink.channel[CHANNEL_PCIE].open ? "open" : "NOT OPEN", pcie_drv.sent, pcie_drv.acks, pcie_drv.timeouts, pcie_drv.refused,
+	    pcie_drv.odd, pcie_drv.status);
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, pcie_drv, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_pcie_drv, "A",
+    "the audio DSP's PCIe DRV channel: commands and answers");
 static struct glink_channel *
 glink_theirs(uint32_t theirs)
 {
@@ -3370,6 +3466,8 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 				qrtr_input(packet->data, packet->length);
 			} else if (from == CHANNEL_PMIC) {
 				battmgr_input(packet->data, packet->length);
+			} else if (from == CHANNEL_PCIE) {
+				pcie_drv_input(packet->data, packet->length);
 			} else if (gpr) {
 				gpr_input(packet->data, packet->length);
 			} else {

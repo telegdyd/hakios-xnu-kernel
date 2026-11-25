@@ -2,8 +2,10 @@
 #ifndef _LX_H_
 #define _LX_H_
 
-int	lx_base_init(void);		/* lx_base.c: the thread that counts the ticks and runs the timers */
+int	lx_base_init(void);		/* lx_base.c: the thread that waits for and runs timer deadlines */
+void	lx_timer_poll(void);		/* due monitor statistics, on the PCI worker's existing wakes */
 int	lx_pool_init(void);		/* lx_base.c: the memory the radio reads and writes; 0, or an errno */
+int	lx_pool_window(unsigned long long *base, unsigned long *size);	/* lx_base.c: the pool's first radio address and its size; 0, or ENODEV before lx_pool_init */
 long	lx_stub(const char *name);	/* lx_base.c: what a function that is not there yet does */
 void	lx_tell(const char *format, ...) __printflike(1, 2);	/* lx_base.c: a line that is always said (printf: may be kept back) */
 void	lx_memory_say(void);		/* lx_base.c: what the layer holds of memory */
@@ -13,8 +15,16 @@ int	lx_station_scan(void);		/* lx_80211.c: an interface in station mode, a scan,
 int	lx_station_join(void);		/* lx_80211.c: join the network the kernel was given; 0 when frames can pass */
 void	lx_station_say(void);		/* lx_80211.c: what has passed since */
 void	lx_station_leave(void);		/* lx_80211.c: leave it, and the interface down */
-int	lx_station_send(const unsigned char *frame, unsigned long length);	/* lx_80211.c: an Ethernet frame for the network */
+int	lx_station_send(const unsigned char *frame, unsigned long length, unsigned flags);	/* lx_80211.c: an Ethernet frame for the network (lx_transmit's flags) */
 int	lx_station_offer(void);	/* lx_80211.c: the station given to the kernel to ask (sys/board/sta.h); 0, or an errno */
 void	lx_station_withdraw(void);	/* lx_80211.c: ... and taken back */
+int lx_pci_runtime_power(bool on); /* station caller serialized; keeps the boundary registered */
+void lx_mhi_diagnostic(void);
+void lx_mhi_idle_start(void);
+bool lx_mhi_bar_access(unsigned off, bool write);
+
+unsigned	lx_mhi_serial(void);		/* lx_mhi.c: the chip's serial number over BHI, once the first image is sent; 0 if not known */
+int	lx_firmware_by_board(const void **data, unsigned long *size);	/* lx_bus.c: board.bin by the QMI board id (PCIe path, no wifi_board); 0, or ENOENT */
+const char	*lx_mac_source(void);		/* lx_bus.c: where the radio's address came from, in words (lx_policy.h); "" before it is known */
 
 #endif

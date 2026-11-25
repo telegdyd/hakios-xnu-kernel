@@ -6,7 +6,7 @@
  * ioctls still: SIOCGA80211 and SIOCSA80211 on any socket, with a struct apple80211req that
  * names the interface, a request type, a value, and a buffer in the caller's memory
  * (IO80211.framework: Apple80211Get/Set and their kin all end there). XNU hands an interface
- * ioctl it does not know to the interface, so they arrive in drivers/net/hakios_net.c, which
+ * ioctl it does not know to the interface, so they arrive in board/net.c, which
  * passes them here when its link is a radio.
  *
  * What is asked is answered from the station boundary (sys/board/sta.h): the radio's power,
@@ -30,6 +30,87 @@
  * when the station has joined or failed, event 9 says so, and ASSOCIATE_RESULT (21) gives the
  * outcome as one of Apple80211's result numbers, which the framework turns into its errors:
  * 1 success, 21 "invalid PMK" (a wrong passphrase), 9 a timeout, 2 anything else.
+ *
+ * How a refusal reads: Apple80211GetWithIOCTL (IO80211.framework 16.5) turns both EOPNOTSUPP (102) and ENXIO (6)
+ * into the same "unsupported" error (-3903), so either is a Broadcom driver's "not here"; none of the refusals
+ * below is retried by wifid (counted over every saved run). ENXIO is kept for "no network joined".
+ *
+ * The request map (P3a): every request seen on the phone (device-info/.../wifi-runs, all runs to 2026-11-13),
+ * plus the ones answered without being seen. Layouts: [F] read in IO80211.framework 16.5 (GetWithIOCTL's case for
+ * the type), [H] apple80211_var.h, [O] observed on the phone. Who: w wifid, c configd.
+ *
+ *   type                       who  answer                                                         layout
+ *   GET  1 SSID                w c  the name joined; ENXIO when not joined                         [H]
+ *   GET  2 AUTH_TYPE           w c  {1, 1 open, 8 WPA2-PSK, 0}; ENXIO                               [H]
+ *   GET  4 CHANNEL             w    the channel joined; ENXIO                                       [H]
+ *   GET  5 POWERSAVE           w    value 0: off (the station has no power save yet)                [F] value
+ *   GET  6 PROTMODE            w    {1, 0 off, 0 threshold}                                          [F] 12 bytes
+ *   GET  8 RATE                w    value: Mbit/s the link was set up for (not measured); ENXIO      [F] value
+ *   GET  9 BSSID               w c  the access point joined; ENXIO                                   [H]
+ *   GET 11 SCAN_RESULT         w    one network of the last scan a request; EIO after the last       [O]
+ *   GET 12 CARD_CAPABILITIES   w c  the capability bits                                              [O]
+ *   GET 13 STATE               w    INIT/SCAN/AUTH/RUN from the station's phase                      [H]
+ *   GET 14 PHY_MODE            w    {1, supported a/b/g/n/ac, active: the link's (0 not joined)}     [F] 12 bytes
+ *   GET 15 OP_MODE             w    value 1: a station                                               [H]
+ *   GET 16 RSSI                w    the network joined, dBm; ENXIO                                   [F] 52 bytes
+ *   GET 17 NOISE               w    -95 dBm (ath11k's own noise floor); ENXIO                         [F] RSSI's layout
+ *   GET 18 INT_MIT             w    value 0: off                                                     [F] value
+ *   GET 19 POWER               w    {1, 1 radio, on/off}                                             [O]
+ *   GET 21 ASSOCIATE_RESULT    w    value: 0 running, 1/21/9/2 at the end                            [O]
+ *   GET 27, 254 channels       w    the radio's channels; ENXIO before it is up                      [O]
+ *   GET 29 DEAUTH              w    {1, reason of the last loss (0: none), the access point}         [F] 16 bytes
+ *   GET 43, 44 names           -    the driver's name (not seen asked)                               [H]
+ *   GET 51 COUNTRY_CODE        w    the country in force; ENXIO while there is none                  [O]
+ *   GET 57 MCS                 w    value: the link's highest MCS (not measured); ENXIO if none      [F] value
+ *   GET 96, 97 VIRTUAL_IF_*    w    EOPNOTSUPP: no virtual interfaces (asked once at open)           [F]
+ *   GET 103 CURRENT_NETWORK    w    the network joined as a scan result; ENXIO                       [O]
+ *   GET 106 RSSI_BOUNDS        w    {1, -90, -40, -80}                                                [O]
+ *   GET 115 POWER_DEBUG_INFO   w    EOPNOTSUPP: 1288 bytes of the chip's power counters, none here   [F]
+ *   GET 207 CHANNELS_INFO      w    the channels' rows; ENXIO before the radio is up                 [O]
+ *   GET 346 BEACON_INFO        w    EOPNOTSUPP: 1032 bytes of beacon statistics, none kept           [F]
+ *   GET 353 NSS                w    value: the link's spatial streams; ENXIO                          [F] value
+ *   GET 386 LQM_SUMMARY        w    EOPNOTSUPP: 4000 bytes of link-quality counters, none kept       [F]
+ *   GET 387 COLOCATED_..._ID   c    EOPNOTSUPP: no 6 GHz co-located networks                         [F] 37 bytes
+ *   GET 390 BEACON_SCAN_CACHE  w    the last scan's networks, one a request, EIO after the last;     [F] scan result,
+ *                                   read in a loop like 11 (its own place in the list)               a loop
+ *   GET 423 COUNTRY_BAND_SUP.  w    EOPNOTSUPP (not in GetWithIOCTL; layout unknown)
+ *   SET 10 SCAN_REQ            w    a scan                                                           [O]
+ *   SET 19 POWER               w    the radio on or off                                              [O]
+ *   SET 20 ASSOCIATE           w    a join                                                           [O]
+ *   SET 22 DISASSOCIATE        w    leave                                                            [O]
+ *   SET 25 HOST_AP_MODE        w    EOPNOTSUPP: no access point mode (P8)
+ *   SET 51 COUNTRY_CODE        w    the radio into that country                                      [O]
+ *   SET 365 DISPLAY_STATE      w    taken: the station has no power save to change                   value
+ *   SET 383 SET_PROPERTY       w    taken: hints (ExternelPowerState, HeartBeat, IPConfigurationBusy,
+ *                                   WiFiPrimary, IPV4Params, POWER_PROFILE, FastlaneProfileState,
+ *                                   MIMOPowerSaveParams, ApInfoParams, IsMovingNetwork, RoamParams, ...)
+ *                                   for firmware tuning this driver does not do; the key is logged
+ *   SET 422 6G_MODE            w    EOPNOTSUPP: no 6 GHz
+ *
+ * Not seen yet, refused (EOPNOTSUPP) until a run shows them: 7 TXPOWER, 28 LOCALE, 47 BACKGROUND_SCAN,
+ * 49/79 STATS, 80 ROAM_THRESH, 86 SCAN_REQ_MULTIPLE, 87 BTCOEX_MODE, 90 SCANCACHE_CLEAR, 94/95
+ * VIRTUAL_IF_CREATE/DELETE, 107 ROAM, 382 ABORT_SCAN.
+ *
+ * The events (P3b), each sent when the station side sees the thing, not when asked. Numbers from IO80211's own
+ * table (convertApple80211EventToString); data as its reader (_eventRead and the _dispatch... it calls) takes it:
+ *
+ *   event                        when                                                      data
+ *   1  POWER_CHANGED             the radio on or off                                       none
+ *   2  SSID_CHANGED,             joined, left, lost (before LINK_CHANGED)                  none
+ *   3  BSSID_CHANGED
+ *   4  LINK_CHANGED              joined: up, the signal; left: down; lost: down,           32 bytes
+ *                                involuntary, the 802.11 reason (the AP's, else 4)
+ *   9  ASSOC_DONE                a join is over (ASSOCIATE_RESULT has how)                 none
+ *   10 SCAN_DONE                 a scan is over                                            none
+ *   11 COUNTRY_CODE_CHANGED      a country request left another country in force           none
+ *   34 DEAUTH_RECEIVED,          the access point sent us a deauthentication /             8: {0, reason}
+ *   72 DISASSOC_RECEIVED         disassociation (before LINK_CHANGED)
+ *   39 RSSI_CHANGED              joined, measured once a second: sent at once after the     180 bytes (the
+ *                                join, then when it crosses GET 106's threshold, moves     link-quality layout)
+ *                                3 dB, or 5 s went by without one
+ *
+ * Not sent: 17 LINK_QUALITY (wifid does not listen for it; RSSI_CHANGED is iOS 16's link quality), 31 BGSCAN_NET_
+ * DISCOVERED (there is no background scan: 47 is refused, and wifid scans itself), 5/6 MIC_ERROR (I7).
  */
 #include <kern/kalloc.h>
 #include <kern/locks.h>
@@ -59,7 +140,7 @@ struct apple80211req {
 	user_addr_t req_data __attribute__((aligned(8)));
 };
 
-/* (as far as they have come by: the names help reading the log) */
+/* (as far as they have come by: the names help reading the log; the newer ones from IO80211's kIoctlNameTable) */
 static const char *
 type_name(int32_t type)
 {
@@ -77,7 +158,11 @@ type_name(int32_t type)
 		{ 50, "ASSOCIATION_STATUS" }, { 51, "COUNTRY_CODE" }, { 54, "RADIO_INFO" }, { 57, "MCS" }, { 66, "MCS_INDEX_SET" },
 		{ 79, "STA_STATS" }, { 80, "ROAM_THRESH" }, { 85, "IE" }, { 86, "SCAN_REQ_MULTIPLE" }, { 87, "BTCOEX_MODE" },
 		{ 90, "SCANCACHE_CLEAR" }, { 94, "VIRTUAL_IF_CREATE" }, { 95, "VIRTUAL_IF_DELETE" }, { 103, "CURRENT_NETWORK" },
-		{ 106, "RSSI_BOUNDS" }, { 107, "ROAM" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" },
+		{ 96, "VIRTUAL_IF_ROLE" }, { 97, "VIRTUAL_IF_PARENT" }, { 106, "RSSI_BOUNDS" }, { 107, "ROAM" },
+		{ 115, "POWER_DEBUG_INFO" }, { 207, "CHANNELS_INFO" }, { 254, "HW_SUPPORTED_CHANNELS" }, { 267, "SUPPRESS_SCANS" },
+		{ 346, "BEACON_INFO" }, { 353, "NSS" }, { 365, "DISPLAY_STATE" }, { 382, "ABORT_SCAN" }, { 383, "SET_PROPERTY" },
+		{ 386, "LQM_SUMMARY" }, { 387, "COLOCATED_NETWORK_SCOPE_ID" }, { 390, "BEACON_SCAN_CACHE_REQ" },
+		{ 419, "LTE_RESTRICTED_CHANNELS" }, { 422, "6G_MODE" }, { 423, "COUNTRY_BAND_SUPPORT" },
 	};
 
 	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -232,15 +317,58 @@ _Static_assert(sizeof(struct apple80211_scan_result) == 1164 && offsetof(struct 
     offsetof(struct apple80211_scan_result, age_ms) == 0x84 && offsetof(struct apple80211_scan_result, elements) == 0x8c,
     "a scan's result as Darwin 16.5 has it");
 
-/* Apple80211's events (APPLE80211_M_...) */
-enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
-       EVENT_SCAN_DONE = 10 };
+/* DEAUTH_RECEIVED (34) and DISASSOC_RECEIVED (72): exactly 8 bytes, or the framework drops the event */
+struct apple80211_door {
+	uint32_t status;                        /* 0: an indication (nothing of ours failed) */
+	uint32_t reason;                        /* the 802.11 reason code in the frame */
+};
 
-static const char interface_name[16] = "en0";   /* (drivers/net/hakios_net.c makes one interface, and that is its name) */
+/*
+ * RSSI_CHANGED (39): at least 180 bytes, which the framework turns into its link-quality dictionary
+ * (_dispatchlqmChangedEvent). Each group is read only when its byte before says it is there; the counters
+ * after `cca` are always read (zero here: the driver keeps none yet), the rest of the 180 bytes is unused here.
+ */
+struct apple80211_lqm {
+	uint8_t has_rssi, unused_0[3];
+	int32_t rssi;                           /* "RSSI", dBm */
+	uint8_t has_chains;
+	int8_t chain[2];                        /* "PER_CORE_RSSI" (0x80: none) */
+	uint8_t has_snr;
+	int16_t snr;                            /* "SNR", dB */
+	uint8_t has_noise, unused_1;
+	int16_t noise;                          /* "NOISE", dBm */
+	uint8_t has_cca, cca;                   /* "CCA", % */
+	uint32_t tx_fail, tx_retrans, tx_frames, rx_retry, rx_frames, rx_beacons, rx_beacons_due;
+	uint8_t has_beacons, has_fw, unused_2[2];
+	uint32_t fw_fail, fw_retrans, fw_frames, tx_rate, tx_fallback_rate, rx_rate;
+	uint8_t rest[180 - 0x4c];
+};
+
+_Static_assert(sizeof(struct apple80211_door) == 8, "the deauthentication event as Darwin userland 16.5 reads it");
+_Static_assert(sizeof(struct apple80211_lqm) == 180 && offsetof(struct apple80211_lqm, snr) == 0xc &&
+    offsetof(struct apple80211_lqm, noise) == 0x10 && offsetof(struct apple80211_lqm, tx_fail) == 0x14 &&
+    offsetof(struct apple80211_lqm, rx_beacons) == 0x28 && offsetof(struct apple80211_lqm, has_beacons) == 0x30 &&
+    offsetof(struct apple80211_lqm, fw_fail) == 0x34 && offsetof(struct apple80211_lqm, tx_rate) == 0x40 &&
+    offsetof(struct apple80211_lqm, rx_rate) == 0x48, "the link-quality event as Darwin userland 16.5 reads it");
+
+/* Apple80211's events (APPLE80211_M_..., numbers from IO80211's eventArray: tools/apple80211-test/events.py) */
+enum { EVENT_POWER_CHANGED = 1, EVENT_SSID_CHANGED = 2, EVENT_BSSID_CHANGED = 3, EVENT_LINK_CHANGED = 4, EVENT_ASSOC_DONE = 9,
+       EVENT_SCAN_DONE = 10, EVENT_COUNTRY_CODE_CHANGED = 11, EVENT_DEAUTH_RECEIVED = 34, EVENT_RSSI_CHANGED = 39,
+       EVENT_DISASSOC_RECEIVED = 72 };
+
+/* GET 106's bounds; an RSSI_CHANGED is sent when the signal crosses RSSI_THRESHOLD, moves RSSI_STEP dB from the last one
+ * sent, or RSSI_QUIET samples (seconds) have gone by without one */
+#define RSSI_THRESHOLD          (-80)
+#define RSSI_STEP               3
+#define RSSI_QUIET              5
+#define REASON_INACTIVITY       4               /* 802.11 reason "disassociated due to inactivity": as mac80211 says a loss */
+
+static const char interface_name[16] = "en0";   /* (board/net.c makes one interface, and that is its name) */
 
 static LCK_GRP_DECLARE(apple80211_lock_group, "hakios-apple80211");
 static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
 static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
+static unsigned cache_next;                     /* ... and a BEACON_SCAN_CACHE_REQ (390) request */
 static uint32_t join_result;                    /* of the last join Darwin asked for: 0 while it runs, then Apple80211's number */
 
 /* ---- channels ---------------------------------------------------------------------------------------- */
@@ -269,6 +397,161 @@ channel_fill(struct apple80211_channel *channel, unsigned frequency, unsigned fl
 	channel->channel = channel_number(frequency);
 	channel->flags = CHANNEL_20MHZ | (frequency < 4000 ? CHANNEL_2GHZ : CHANNEL_5GHZ) | (flags & HAKIOS_STA_CHANNEL_PASSIVE ?
 	    0 : CHANNEL_ACTIVE) | (flags & HAKIOS_STA_CHANNEL_RADAR ? CHANNEL_DFS : 0);
+}
+
+/* ---- the link joined, as its elements and ours make it ------------------------------------------------ */
+
+/* PHY modes (APPLE80211_MODE_*) */
+#define MODE_11A                0x2u
+#define MODE_11B                0x4u
+#define MODE_11G                0x8u
+#define MODE_11N                0x10u
+#define MODE_11AC               0x80u
+#define MODE_11AX               0x100u
+#define MODES_OURS              (MODE_11A | MODE_11B | MODE_11G | MODE_11N | MODE_11AC | MODE_11AX)
+
+#define NOISE_FLOOR             (-95)           /* dBm: ath11k's ATH11K_DEFAULT_NOISE_FLOOR; the firmware reports none */
+
+struct joined_link {
+	unsigned mode;                          /* one MODE_ */
+	unsigned streams;                       /* 1 or 2 */
+	unsigned width;                         /* MHz */
+	int mcs;                                /* highest index the link was set up for; -1: legacy rates only */
+	unsigned rate;                          /* Mbit/s: the highest the link was set up for, long guard interval */
+};
+
+static const uint8_t *
+bss_element(const struct hakios_sta_bss *bss, unsigned id)
+{
+	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
+	    at += 2 + bss->elements[at + 1]) {
+		if (bss->elements[at] == id) {
+			return &bss->elements[at];
+		}
+	}
+	return NULL;
+}
+
+/* An extension element (255) of that number (35: HE capabilities). */
+static const uint8_t *
+bss_extension(const struct hakios_sta_bss *bss, unsigned number)
+{
+	for (unsigned at = 0; at + 3 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
+	    at += 2 + bss->elements[at + 1]) {
+		if (bss->elements[at] == 255 && bss->elements[at + 1] >= 1 && bss->elements[at + 2] == number) {
+			return &bss->elements[at];
+		}
+	}
+	return NULL;
+}
+
+/*
+ * What the station set the link up with, from the access point's elements and the rules of kernel/lx/src/lx_80211.c
+ * (station_width, the peer's streams): HT when it has HT capabilities, VHT on 5 GHz when it also has VHT, HE (both
+ * bands) when it has HE capabilities; two streams when its HT MCS set has the second; 160 MHz when its VHT operation
+ * says 160 (CCFS1 8 channels from CCFS0, or the old width 2), 80 when it says 80 (5 GHz), else 40 when its HT
+ * operation allows a second 20, else 20 (wifi_wide is on by default; the channels' own limits are not checked
+ * here). The rate is the top of the 802.11 rate tables for that, not a measurement.
+ */
+static void
+link_of(const struct hakios_sta_bss *bss, struct joined_link *link)
+{
+	/* tenths of Mbit/s, one stream, long guard interval (VHT 0.8 us), MCS 0-9; 20, 40, 80, 160 MHz */
+	static const uint16_t rates[4][10] = {
+		{ 65, 130, 195, 260, 390, 520, 585, 650, 780, 867 },
+		{ 135, 270, 405, 540, 810, 1080, 1215, 1350, 1620, 1800 },
+		{ 293, 585, 878, 1170, 1755, 2340, 2633, 2925, 3510, 3900 },
+		{ 585, 1170, 1755, 2340, 3510, 4680, 5265, 5850, 7020, 7800 },
+	};
+	/* HE, 0.8 us guard interval, MCS 0-11 (802.11ax-2021 Tables 27-55 ff.) */
+	static const uint16_t he_rates[4][12] = {
+		{ 86, 172, 258, 344, 516, 688, 774, 860, 1032, 1147, 1290, 1434 },
+		{ 172, 344, 516, 688, 1032, 1376, 1549, 1721, 2065, 2294, 2581, 2868 },
+		{ 360, 721, 1081, 1441, 2162, 2882, 3243, 3603, 4324, 4804, 5404, 6005 },
+		{ 721, 1441, 2162, 2882, 4324, 5765, 6485, 7206, 8647, 9608, 10809, 12010 },
+	};
+	const uint8_t *ht = bss_element(bss, 45), *ht_op = bss_element(bss, 61);
+	const uint8_t *vht = bss_element(bss, 191), *vht_op = bss_element(bss, 192), *he = bss_extension(bss, 35);
+	unsigned table;
+	bool low = bss->frequency < 4000;
+	unsigned best = 0;
+
+	bzero(link, sizeof(*link));
+	link->streams = 1;
+	link->width = 20;
+	link->mcs = -1;
+	for (unsigned at = 0; at + 2 <= bss->elements_length && at + 2 + bss->elements[at + 1] <= bss->elements_length;
+	    at += 2 + bss->elements[at + 1]) {
+		for (unsigned i = 0; (bss->elements[at] == 1 || bss->elements[at] == 50) && i < bss->elements[at + 1]; i++) {
+			unsigned rate = (bss->elements[at + 2 + i] & 0x7f) / 2;
+
+			best = rate <= 54 && rate > best ? rate : best;
+		}
+	}
+	link->mode = !low ? MODE_11A : best > 11 ? MODE_11G : MODE_11B;
+	link->rate = best;
+	if (ht == NULL || ht[1] < 26) {
+		return;
+	}
+	link->mode = MODE_11N;
+	link->streams = ht[2 + 3 + 1] != 0 ? 2 : 1;     /* (capabilities 2, A-MPDU 1, then the RX MCS bitmask) */
+	link->mcs = 7;
+	if (ht_op != NULL && ht_op[1] >= 22 && (ht_op[3] & 4) != 0) {
+		if (!low && vht != NULL && vht[1] >= 12 && vht_op != NULL && vht_op[1] >= 3 && (vht_op[2] == 1 || vht_op[2] == 2)) {
+			link->width = vht_op[2] == 2 || (vht_op[4] != 0 && (vht_op[4] == vht_op[3] + 8 || vht_op[3] == vht_op[4] + 8)) ?
+			    160 : 80;
+		} else if ((ht_op[3] & 3) == 1 || (ht_op[3] & 3) == 3) {
+			link->width = 40;
+		}
+	}
+	if (!low && vht != NULL && vht[1] >= 12) {
+		/* its RX MCS map (after 4 bytes of capabilities), two bits a stream: 0 up to 7, 1 up to 8, 2 up to 9 */
+		unsigned map = vht[2 + 4] | vht[2 + 5] << 8, most = 9;
+
+		link->mode = MODE_11AC;
+		for (unsigned s = 0; s < link->streams; s++) {
+			unsigned m = (map >> (2 * s)) & 3;
+
+			if (m == 3) {
+				link->streams = s == 0 ? 1 : s;
+				break;
+			}
+			most = MIN(most, 7 + m);
+		}
+		link->mcs = (int)(link->width == 20 && most == 9 ? 8 : most);  /* (VHT MCS 9 is not defined at 20 MHz, 1-2 streams) */
+	}
+	table = link->width == 160 ? 3 : link->width == 80 ? 2 : link->width == 40 ? 1 : 0;
+	if (he != NULL && he[1] >= 1 + 17 + 4) {
+		/*
+		 * its RX HE-MCS map for <= 80 MHz (after the extension number, 6 MAC and 11 PHY bytes), or for 160 MHz when
+		 * the link is 160 and the element has that map: two bits a stream, 0 up to 7, 1 up to 9, 2 up to 11
+		 */
+		unsigned at = 2 + 1 + 17 + (link->width == 160 && (he[2 + 1 + 6] & 0x08) && he[1] >= 1 + 17 + 8 ? 4 : 0);
+		unsigned map = he[at] | he[at + 1] << 8, most = 11;
+
+		link->mode = MODE_11AX;
+		for (unsigned s = 0; s < link->streams; s++) {
+			unsigned m = (map >> (2 * s)) & 3;
+
+			if (m == 3) {
+				link->streams = s == 0 ? 1 : s;
+				break;
+			}
+			most = MIN(most, 7 + 2 * m);
+		}
+		link->mcs = (int)most;
+		link->rate = he_rates[table][link->mcs] * link->streams / 10;
+		return;
+	}
+	link->rate = rates[table][link->mcs] * link->streams / 10;
+}
+
+/* Why a network was lost, as an 802.11 reason: the access point's own if it sent one, else inactivity. */
+static uint32_t
+loss_reason(const struct hakios_sta_state *state)
+{
+	return (state->loss == HAKIOS_STA_LOSS_DEAUTH || state->loss == HAKIOS_STA_LOSS_DISASSOC) && state->reason != 0 ?
+	       state->reason : REASON_INACTIVITY;
 }
 
 /* ---- what the caller is given back ------------------------------------------------------------------- */
@@ -351,7 +634,7 @@ get(struct apple80211req *request)
 	switch (request->req_type) {
 	case 43:
 	case 44: {                              /* the driver's and the hardware's name: the text alone, in 256 bytes */
-		static const char name[256] = "hakios: ath11k for the WCN6750";
+		static const char name[256] = "hakios: ath11k";        /* (WCN6750 on redwood, QCA6490 on negroni) */
 
 		return give(request, name, sizeof(name));
 	}
@@ -359,13 +642,17 @@ get(struct apple80211req *request)
 		/*
 		 * What the card can do, a bit each (apple80211_var.h: APPLE80211_CAP_*): the 13 bytes are the
 		 * bits alone, from the first (the framework hands in a buffer that begins after the old
-		 * header's version word). AES, AES-CCM, power management, short slot and preamble, WPA2, WME,
+		 * header's version word). TKIP with Michael MIC (for the WPA2 group key), AES, AES-CCM,
+		 * power management, short slot and preamble, WPA2, WME,
 		 * short guard interval at 20 MHz. Read wrong, the framework sees no WPA2 and builds no join
 		 * for a WPA2 network ("Unable to join"). Not 52 (protected management frames) nor 75 (SAE): the
 		 * station does neither, and with them Darwin would build joins of the kinds set_join() refuses.
 		 */
 		uint8_t bits[13] = { 0 };
-		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
+		/* APPLE80211_CAP_TKIP=1, TKIPMIC=12, WPA2=14 (apple80211_var.h).
+		 * Without TKIP, wifid can reject a TKIP-group RSN before ASSOCIATE,
+		 * even though the station can now install that group key. */
+		static const uint8_t has[] = { 1, 2, 3, 6, 9, 10, 12, 14, 17, 19 };
 
 		for (unsigned i = 0; i < sizeof(has); i++) {
 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
@@ -401,6 +688,41 @@ get(struct apple80211req *request)
 			answer.threshold = threshold;
 		}
 		return give(request, &answer, sizeof(answer));
+	}
+	case 5:                                 /* power save: off (APPLE80211_POWERSAVE_MODE_DISABLED); none yet */
+	case 18:                                /* interference mitigation: off */
+		request->req_val = 0;
+		return 0;
+	case 6: {                               /* protection (RTS/CTS for older stations): off, no threshold */
+		static const uint32_t answer[3] = { 1, 0, 0 };
+
+		return give(request, answer, sizeof(answer));
+	}
+	case 390: {
+		/*
+		 * The beacon cache: IO80211 asks again and again, one network in a scan's result form each time
+		 * (elements_length set to the room), until a request fails. Its own place in the last scan's list;
+		 * after the failure that ends a pass the next pass starts from the first again.
+		 */
+		struct hakios_sta_bss *bss = kalloc_data(sizeof(*bss), Z_WAITOK);
+		unsigned index;
+		bool there;
+
+		if (bss == NULL) {
+			return ENOMEM;
+		}
+		lck_mtx_lock(&apple80211_lock);
+		index = cache_next++;
+		lck_mtx_unlock(&apple80211_lock);
+		there = hakios_sta_heard(index, bss);
+		if (!there) {
+			lck_mtx_lock(&apple80211_lock);
+			cache_next = 0;
+			lck_mtx_unlock(&apple80211_lock);
+		}
+		error = there ? give_network(request, bss) : EIO;
+		kfree_data(bss, sizeof(*bss));
+		return error;
 	}
 	case 27:
 	case 254: {                             /* the channels the radio may tune to */
@@ -441,6 +763,11 @@ get(struct apple80211req *request)
 		error = give(request, answer, sizeof(*answer));
 		kfree_data(answer, sizeof(*answer));
 		return error;
+	}
+	case 51: {                              /* the country the radio is in: its two letters and a zero */
+		char code[3] = { 0 };
+
+		return hakios_sta_country(code) ? give(request, code, sizeof(code)) : ENXIO;
 	}
 	case 21:                                /* how the last join went (0: not over yet) */
 		lck_mtx_lock(&apple80211_lock);
@@ -514,12 +841,69 @@ get(struct apple80211req *request)
 	case 103:                               /* all of it, as a scan's result */
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give_network(request, &state->bss);
 		break;
-	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
+	case 2: {                               /* the negotiated Personal AKM */
 		struct {
 			uint32_t version, lower, upper, extended;
 		} answer = { .version = 1, .lower = 1, .upper = 8 };
+		/* APPLE80211_AUTHTYPE_WPA3_SAE = 1 << 12 (Apple80211 ABI).
+		 * Lower remains the open/auth family; SAE is the upper RSN AKM. */
+		if (state->security == HAKIOS_STA_WPA3_SAE) answer.upper = 1u << 12;
+		/* Enhanced Open remains passwordless in the Apple interface. */
+		if (state->security == HAKIOS_STA_OWE) answer.upper = 0;
 
 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 14: {                              /* the PHY modes: those the radio has, and the link's (0: none) */
+		struct joined_link link;
+		uint32_t answer[3] = { 1, MODES_OURS, 0 };
+
+		if (state->phase == HAKIOS_STA_JOINED) {
+			link_of(&state->bss, &link);
+			answer[2] = link.mode;
+		}
+		error = give(request, answer, sizeof(answer));
+		break;
+	}
+	case 17: {                              /* the noise, in RSSI's layout */
+		struct {
+			uint32_t version, radios, unit;
+			int32_t each[4], all, each_ext[4], all_ext;
+		} answer = { .version = 1, .radios = 1, .each = { NOISE_FLOOR }, .all = NOISE_FLOOR, .each_ext = { NOISE_FLOOR },
+			     .all_ext = NOISE_FLOOR };
+
+		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+		break;
+	}
+	case 8:                                 /* the rate, Mbit/s */
+	case 57:                                /* the MCS: HT counts the streams into the index (0-15), VHT does not */
+	case 353: {                             /* the spatial streams */
+		struct joined_link link;
+
+		if (state->phase != HAKIOS_STA_JOINED) {
+			error = ENXIO;
+			break;
+		}
+		link_of(&state->bss, &link);
+		if (request->req_type == 57 && link.mcs < 0) {
+			error = ENXIO;          /* (legacy rates only: no MCS) */
+			break;
+		}
+		request->req_val = (int32_t)(request->req_type == 8 ? link.rate : request->req_type == 353 ? link.streams :
+		    (unsigned)link.mcs + (link.mode == MODE_11N ? 8 * (link.streams - 1) : 0));
+		break;
+	}
+	case 29: {                              /* why the last network was lost: an 802.11 reason, and from whom */
+		struct {
+			uint32_t version, reason;
+			uint8_t address[6], unused[2];
+		} answer = { .version = 1 };
+
+		if (state->phase != HAKIOS_STA_JOINED && state->last_error != 0) {
+			answer.reason = loss_reason(state);     /* (as the link event said it) */
+			memcpy(answer.address, state->bss.bssid, sizeof(answer.address));
+		}
+		error = give(request, &answer, sizeof(answer));
 		break;
 	}
 	default:
@@ -629,14 +1013,17 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
 	memcpy(what->ssid, asked->ssid, asked->ssid_length);
 	memcpy(what->bssid, asked->bssid, sizeof(what->bssid));
 	if (asked->key_length == 0) {
+		if (asked->auth_upper & (1u << 12)) { error = EINVAL; goto out; }
 		what->security = HAKIOS_STA_OPEN;
-	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 8 && asked->key_length <= 63) {
+	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 1 && asked->key_length <= 63) {
 		what->security = HAKIOS_STA_WPA2_PSK;
 		what->passphrase_length = (uint8_t)asked->key_length;
 		memcpy(what->passphrase, asked->key, asked->key_length);
+		if ((asked->auth_upper & (1u << 12)) && !(asked->auth_upper & 8)) what->security = HAKIOS_STA_WPA3_SAE;
 	} else if (asked->key_cipher == CIPHER_PMK && asked->key_length == sizeof(what->pmk)) {
 		what->security = HAKIOS_STA_WPA2_PSK;
 		memcpy(what->pmk, asked->key, sizeof(what->pmk));
+		if (asked->auth_upper & (1u << 12)) { error = EINVAL; goto out; } /* SAE cannot use a WPA2 PSK */
 	} else {
 		hakios_say("apple80211: A JOIN WITH A KEY OF KIND %u (%u bytes) IS REFUSED: the station takes a passphrase of 8 to 63 "
 		    "bytes (kind 10) or its key of 32 (kind 6), nothing else (WEP is not done)\n", asked->key_cipher, asked->key_length);
@@ -681,6 +1068,40 @@ set(const struct apple80211req *request, char *said, size_t said_size)
 	}
 	case 10:
 		return set_scan(request, said, said_size);
+	case 365:                               /* the display is on or off (the value): a hint for power save, which */
+		snprintf(said, said_size, " (the display: %s)", request->req_val ? "on" : "off");
+		return 0;                       /* the station has none; taken, nothing to do */
+	case 383: {                             /* Apple80211SetProperty: { key: value } as an XML property list, after a */
+		char data[384];                 /* version and its length; hints for firmware tuning: taken, the key said */
+		const char *key, *end;          /* (after the XML header and DOCTYPE, ~175 bytes) */
+
+		if (request->req_len >= 8 + 16 && copyin(request->req_data + 8, data, MIN(sizeof(data) - 1, request->req_len - 8)) == 0) {
+			data[sizeof(data) - 1] = 0;
+			if ((key = strnstr(data, "<key>", sizeof(data))) != NULL && (end = strnstr(key, "</key>", sizeof(data) -
+			    (size_t)(key - data))) != NULL) {
+				snprintf(said, said_size, " (a property: %.*s)", (int)MIN(end - key - 5, 60), key + 5);
+			}
+		}
+		return 0;
+	}
+	case 51: {                              /* the country (wifid: from the beacons' country elements); a version, then */
+		struct {                        /* the letters (APPLE80211_MAX_CC_LEN 3) */
+			uint32_t version;
+			char code[4];
+		} asked;
+		int error;
+
+		if (request->req_len < 6 || request->req_len > sizeof(asked)) {
+			return EINVAL;
+		}
+		bzero(&asked, sizeof(asked));
+		if ((error = copyin(request->req_data, &asked, request->req_len)) != 0) {
+			return error;
+		}
+		snprintf(said, said_size, " (the country: version %u, \"%c%c\")", asked.version, asked.code[0] >= ' ' && asked.code[0] < 127 ?
+		    asked.code[0] : '?', asked.code[1] >= ' ' && asked.code[1] < 127 ? asked.code[1] : '?');
+		return hakios_sta_ask_country(asked.code);
+	}
 	default:
 		return EOPNOTSUPP;
 	}
@@ -705,18 +1126,71 @@ post(uint32_t code, const void *data, uint32_t length)
 	kev_post_msg(&message);
 }
 
-/* What the station side says has happened (drivers/wifi/hakios_sta.c calls this, on its thread or the station's). */
+/* the signal of the network joined, as last told (RSSI_CHANGED) */
+static struct {
+	bool up;                                /* joined, as the link event last said */
+	bool told;                              /* an RSSI_CHANGED has been sent since */
+	int dbm;                                /* ... with this */
+	unsigned quiet;                         /* samples since */
+} signal_told;
+
+/* An RSSI_CHANGED, if the signal has moved enough since the last: true when it is to be sent. */
+static bool
+signal_moved(int dbm)
+{
+	bool send;
+
+	lck_mtx_lock(&apple80211_lock);
+	send = signal_told.up && (!signal_told.told || (dbm < RSSI_THRESHOLD) != (signal_told.dbm < RSSI_THRESHOLD) ||
+	    dbm >= signal_told.dbm + RSSI_STEP || dbm <= signal_told.dbm - RSSI_STEP || signal_told.quiet + 1 >= RSSI_QUIET);
+	if (send) {
+		signal_told.told = true;
+		signal_told.dbm = dbm;
+		signal_told.quiet = 0;
+	} else if (signal_told.up) {
+		signal_told.quiet++;
+	}
+	lck_mtx_unlock(&apple80211_lock);
+	return send;
+}
+
+static void
+post_signal(int dbm)
+{
+	struct apple80211_lqm lqm = { .has_rssi = 1, .rssi = dbm, .chain = { (int8_t)0x80, (int8_t)0x80 }, .has_snr = 1,
+		                      .snr = (int16_t)(dbm > NOISE_FLOOR ? dbm - NOISE_FLOOR : 0), .has_noise = 1,
+		                      .noise = NOISE_FLOOR };
+
+	post(EVENT_RSSI_CHANGED, &lqm, sizeof(lqm));
+}
+
+/* What the station side says has happened (board/sta.c calls this, on its thread or the station's). */
 void
 hakios_apple80211_event(enum hakios_sta_event event, int status)
 {
-	static unsigned said;
+	static const char *const what[] = { "power", "a scan is over", "a join is over", "the link", "the signal", "the country" };
+	static unsigned said, signals_said;
 
-	if (said < 200) {
-		said++;
-		printf("apple80211: the station says: %s, %d\n", event == HAKIOS_STA_POWER ? "power" : event == HAKIOS_STA_SCAN_DONE ?
-		    "a scan is over" : event == HAKIOS_STA_JOIN_DONE ? "a join is over" : "the link", status);
+	/* (a signal comes every second: the first few, and from then on each one sent, below) */
+	if (event == HAKIOS_STA_SIGNAL ? signals_said++ < 20 : said++ < 200) {
+		printf("apple80211: the station says: %s, %d\n", (unsigned)event < sizeof(what) / sizeof(what[0]) ? what[event] : "?",
+		    status);
 	}
 	switch (event) {
+	case HAKIOS_STA_SIGNAL:
+		if (signal_moved(status)) {
+			static unsigned sent;
+
+			if (sent < 400) {
+				sent++;
+				printf("apple80211: RSSI_CHANGED %d dBm\n", status);
+			}
+			post_signal(status);
+		}
+		break;
+	case HAKIOS_STA_COUNTRY:
+		post(EVENT_COUNTRY_CODE_CHANGED, NULL, 0);
+		break;
 	case HAKIOS_STA_POWER:
 		post(EVENT_POWER_CHANGED, NULL, 0);
 		break;
@@ -741,18 +1215,49 @@ hakios_apple80211_event(enum hakios_sta_event event, int status)
 		post(EVENT_ASSOC_DONE, NULL, 0);
 		break;
 	case HAKIOS_STA_LINK: {
-		struct apple80211_link_changed link = { .down = status != 1, .involuntary = status != 1 && status != 0,
-			                                .reason = status != 1 && status != 0 ? 4 : 0 };      /* (4: gone, not asked) */
+		/*
+		 * Up: with the signal it is joined at. Down when asked: no reason. Lost: involuntary, with the 802.11 reason --
+		 * the access point's, after a DEAUTH_RECEIVED or DISASSOC_RECEIVED with it, or inactivity (its beacons stopped).
+		 */
+		bool lost = status != 1 && status != 0;
+		struct apple80211_link_changed link = { .down = status != 1, .involuntary = lost, .reason = lost ? REASON_INACTIVITY :
+			                                0 };
 		struct hakios_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
+		struct apple80211_door door = { 0 };
+		uint32_t door_event = 0;
 
 		if (state != NULL) {
 			hakios_sta_state(state);
-			link.rssi = status == 1 ? state->bss.rssi : 0;
+			if (status == 1) {
+				link.rssi = state->bss.rssi;
+				link.snr = (uint16_t)(state->bss.rssi > NOISE_FLOOR ? state->bss.rssi - NOISE_FLOOR : 0);
+				link.noise = (uint16_t)(int16_t)NOISE_FLOOR;
+			} else if (lost) {
+				link.reason = loss_reason(state);
+				door.reason = state->reason;
+				door_event = state->loss == HAKIOS_STA_LOSS_DEAUTH ? EVENT_DEAUTH_RECEIVED : state->loss ==
+				    HAKIOS_STA_LOSS_DISASSOC ? EVENT_DISASSOC_RECEIVED : 0;
+			}
 			kfree_data(state, sizeof(*state));
+		}
+		lck_mtx_lock(&apple80211_lock);
+		signal_told.up = status == 1;
+		signal_told.told = false;
+		signal_told.quiet = 0;
+		lck_mtx_unlock(&apple80211_lock);
+		if (door_event != 0) {
+			post(door_event, &door, sizeof(door));
+		}
+		if (lost) {
+			printf("apple80211: the network is lost: %s, reason %u\n", door_event == EVENT_DEAUTH_RECEIVED ?
+			    "deauthenticated" : door_event == EVENT_DISASSOC_RECEIVED ? "disassociated" : "gone", link.reason);
 		}
 		post(EVENT_SSID_CHANGED, NULL, 0);
 		post(EVENT_BSSID_CHANGED, NULL, 0);
 		post(EVENT_LINK_CHANGED, &link, sizeof(link));
+		if (status == 1 && signal_moved(link.rssi)) {
+			post_signal(link.rssi);         /* (the first measure of the link, at once) */
+		}
 		break;
 	}
 	}
@@ -772,9 +1277,11 @@ static struct {
 } kinds[96];
 static unsigned kind_count;
 
-static void
+/* true: the first of its kind, or the first answer of a kind refused so far, or the first refusal of one answered */
+static bool
 note(const struct apple80211req *request, bool is_set, int error)
 {
+	bool first = false;
 	unsigned i;
 
 	lck_mtx_lock(&apple80211_lock);
@@ -784,11 +1291,14 @@ note(const struct apple80211req *request, bool is_set, int error)
 		if (i == kind_count) {
 			kinds[kind_count++] = (typeof(kinds[0])) { .type = request->req_type, .set = is_set };
 		}
+		first = kinds[i].times == 0 || (error == 0 && kinds[i].answered == 0) ||
+		    (error != 0 && kinds[i].last_error == 0);
 		kinds[i].times++;
 		kinds[i].answered += error == 0;
 		kinds[i].last_error = error != 0 ? error : kinds[i].last_error;
 	}
 	lck_mtx_unlock(&apple80211_lock);
+	return first;
 }
 
 void
@@ -836,9 +1346,10 @@ hakios_apple80211_ioctl(u_long command, void *data)
 	 * what it heard anybody may read.
 	 */
 	error = !is_set ? get(request) : suser(kauth_cred_get(), NULL) != 0 ? EPERM : set(request, what, sizeof(what));
-	note(request, is_set, error);
-	/* (a request that is repeated for ever is said a few hundred times) */
-	if (said < 800) {
+	/* (a request that is repeated for ever is said a few hundred times; after that only what is new of a kind, joins,
+	 * leaves and the country) */
+	if (note(request, is_set, error) || said < 800 || (is_set && (request->req_type == 20 || request->req_type == 22 ||
+	    request->req_type == 51))) {
 		said++;
 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==

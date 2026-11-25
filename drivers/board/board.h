@@ -79,6 +79,9 @@ enum {
 	HAKIOS_HAS_CAMERA_SM7325   = 1u << 10,  /* cameras on an SM7325's camera blocks, powered by a PM8008, wired as
 	                                         * the board's camera { } says (board/camera.c) */
 	HAKIOS_HAS_WIFI_WCN6750    = 1u << 11,  /* a WCN6750 radio on the SoC's own Wi-Fi DSP (board/wifi.c) */
+	HAKIOS_HAS_WIFI_QCA6490    = 1u << 31,  /* a QCA6490 (Linux: WCN6855) radio on the SM8450's first PCIe controller, its
+	                                         * enable pins and supplies as the OnePlus 10 Pro has them (board/wifi_pci.c,
+	                                         * board/pcie.c; MHI and ath11k's PCI path in kernel/lx) */
 	HAKIOS_HAS_MIC_WCD938X     = 1u << 12,  /* the microphones on a WCD938x codec, through the audio DSP (board/mic.c) */
 	HAKIOS_HAS_BLUETOOTH_WCN_UART = 1u << 17, /* Qualcomm Bluetooth over a GENI UART (board/bt_uart.c) */
 	HAKIOS_HAS_MODEM_SM7325    = 1u << 18,  /* an SM7325's modem, its packet engine and the SIM as this phone has them
@@ -205,6 +208,20 @@ struct hakios_board {
 		uint32_t hsphy;                 /* the high-speed PHY (usb_phyguard=1); 0: no guard */
 		uint32_t clkref;                /* the GCC register that enables the PHY's reference clock (usb_phyguard=1) */
 	} usb;
+
+	/* the first PCIe controller (soc: pcie { }), for a radio on PCIe (board/pcie.c, the board's wifi-qca6490). 0: none named */
+	struct {
+		uint32_t parf;                  /* the controller's PARF registers (the pcie node's reg "parf") */
+		uint32_t phy;                   /* its PHY (the qcom,pcie-phy node's reg) */
+		uint32_t dbi, config;           /* its DBI (reg "dm_core") and the window of its configuration space (reg "conf") */
+		uint32_t bar;                   /* where the endpoint's first BAR is put in the memory window (aligned to its size) */
+	} pcie;
+
+	/* the GIC as the SoC file's platform { } names it, for its ITS (board/its.c). 0: not said */
+	struct {
+		uint64_t dist, redist, redist_size, redist_stride;
+		uint64_t its;                   /* the ITS (the arm,gic-v3-its node's reg); 0: none, message-signalled interrupts polled */
+	} gic;
 
 	/* the SoC's own pins (soc: pins { }) */
 	struct {
@@ -414,7 +431,7 @@ struct hakios_board {
 
 	/* the Wi-Fi radio (board: wifi { }), for the driver's layer under it (board/lx.c) */
 	struct {
-		uint32_t radio_model;           /* which radio: 0 a WCN6750 on the SoC's own bus, 1 a WCN6855 on PCIe */
+		uint32_t radio_model;           /* which radio: 0 a WCN6750 on the SoC's own bus, 1 a WCN6855/QCA6490 on PCIe */
 		uint32_t early_pool_mb;         /* memory in one piece kept for the radio's driver from early on; 0: none */
 		uint32_t dsp_memory, dsp_memory_size;   /* the Wi-Fi DSP's reserved memory, for a radio on the SoC's own DSP */
 		int16_t pin[3];                 /* the radio's enable, Bluetooth's reset and its sw-ctrl; -1: not said */

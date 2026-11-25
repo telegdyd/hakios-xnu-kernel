@@ -4,7 +4,7 @@
  * arrive at the keys their frames are ciphered with (IEEE 802.11-2020, 12.7; RSN, AKM "PSK",
  * key descriptor version 2: HMAC-SHA1 and the AES key wrap). lx_wpa.c is the arithmetic and
  * nothing else -- no radio, no kernel --, so that it runs on the machine the kernel is built on
- * (workbench/lx_wpa_test.c) as it runs in the kernel.
+ * (tools/wpa-test) as it runs in the kernel.
  */
 #ifndef _LX_WPA_H_
 #define _LX_WPA_H_
@@ -14,25 +14,33 @@ void lx_wpa_pmk(const unsigned char *passphrase, unsigned passphrase_length, con
     unsigned char pmk[32]);
 
 struct lx_wpa {
-	unsigned char pmk[32];			/* (wiped once message 3 has proven the keys: no handshake comes after it) */
+	unsigned char pmk[32];
 	unsigned char own[6], peer[6];		/* the station's address and the access point's */
 	unsigned char own_nonce[32];		/* 32 bytes nobody can guess, fresh for every handshake */
 	const unsigned char *rsn;		/* the station's RSN element as its association request had it ... */
 	unsigned rsn_length;			/* ... which goes into message 2 */
-	unsigned group_cipher;			/* what the access point ciphers frames to everybody with: 4 CCMP, 2 TKIP */
-	const unsigned char *target_rsn;	/* the access point's RSN element as its beacons have it ... */
-	unsigned target_rsn_length;		/* ... which its message 3 must repeat */
+	unsigned group_cipher;			/* negotiated RSN suite type: 2 TKIP or 4 CCMP (0: legacy CCMP caller) */
+	unsigned pmf;				/* negotiated MFPC, BIP-CMAC-128 only */
+	unsigned owe, owe_ready;         /* OWE: SHA256 PTK, HMAC-SHA256 MIC, descriptor 0; PMK publication gate */
+	unsigned sae;                    /* AKM 00:0f:ac:8: SHA256 PTK, AKM-defined (0) AES-CMAC MIC */
+	const unsigned char *ap_rsn;		/* AP's advertised RSN: message 3 must authenticate the same negotiation */
+	unsigned ap_rsn_length;
+	const unsigned char *ap_rsnxe;   /* SAE H2E indication must be authenticated in message 3 */
+	unsigned ap_rsnxe_length;
+	struct {
+		unsigned valid;
+		unsigned char key[16], ipn[6]; /* little-endian integrity packet number; slots 4 and 5 */
+	} igtk[2];
+	unsigned char management_pn[6];		/* unicast management RX CCMP PN, separate from data */
+	unsigned group_updated;			/* this accepted key message carried a GTK */
 	/* from here on: lx_wpa.c's */
-	unsigned char peer_nonce[32];		/* the access point's nonce of the keys proven */
+	unsigned char peer_nonce[32];
 	unsigned char kck[16], kek[16];		/* the keys the handshake's own messages are signed and ciphered with */
 	unsigned char replay[8];		/* the counter of the last message accepted */
-	int answered;				/* a message 1 has been answered */
-	int have_keys, replay_known;		/* message 3 has proven the keys; a signed message has been accepted */
+	int have_keys, replay_known;
 	/* what comes out of it */
 	unsigned char pairwise[16];		/* the key for frames between the two ("TK", CCMP) */
-	unsigned char group[32];		/* the key the access point sends to everybody with ("GTK": 16 bytes for CCMP,
-						 * 32 for TKIP -- its key, then the Michael keys to receive and to send with,
-						 * already the station's way round) ... */
+	unsigned char group[32];		/* the key the access point sends to everybody with ("GTK") ... */
 	unsigned group_length, group_index;	/* ... its length, and its number (1 to 3) */
 	unsigned char group_counter[8];		/* ... and the packet number its frames have got to ("RSC") */
 };
@@ -43,15 +51,21 @@ struct lx_wpa {
  */
 #define LX_WPA_REPLY_MOST	256
 enum {
-	LX_WPA_REFUSED = -2,		/* message 3, signed, but the access point is not what its beacons said: leave (*why) */
 	LX_WPA_BAD = -1,		/* not a message that can be answered: *why says what was wrong with it */
 	LX_WPA_NOTHING = 0,		/* not for us to answer (not a key message) */
 	LX_WPA_ANSWER = 1,		/* message 1: send the reply (message 2) */
 	LX_WPA_KEYS = 2,		/* message 3: send the reply (message 4), then both keys are to be used */
 	LX_WPA_GROUP = 3,		/* a new group key later on: send the reply, then use the new group key */
-	LX_WPA_AGAIN = 4,		/* a message 3 or group message with nothing new: send the reply, nothing else */
 };
 int lx_wpa_message(struct lx_wpa *wpa, const unsigned char *message, unsigned length, unsigned char *reply,
     unsigned *reply_length, const char **why);
+
+/* Is a plaintext management frame robust? Protected unicast is classified after its IV is removed. */
+int lx_wpa_robust(const unsigned char *frame, unsigned length);
+/* Verify a group MMIE in software or a firmware-decrypted unicast frame and its PN.
+ * On success remove the crypto header/trailer in place. Never trust stripped PNs unless the driver validated them.
+ * Caller checks transmitter, BSSID and destination first; serializes this with key messages. */
+int lx_wpa_pmf_rx(struct lx_wpa *wpa, unsigned char *frame, unsigned *length,
+    int decrypted, int iv_stripped, int mic_stripped, int pn_validated);
 
 #endif

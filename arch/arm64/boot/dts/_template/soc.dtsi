@@ -75,6 +75,16 @@
 		//                              // CLKREF_EN of GCC's USB); optional, for usb_phyguard=1 only
 	};
 
+	// The first PCIe controller, for the feature "wifi-qca6490" (a radio on it): the pcie node's regs, and where the
+	// endpoint's first BAR goes in its memory window (its "ranges"), aligned to the BAR's size.
+	pcie {
+		parf = <0x01c00000>;            // reg "parf"
+		phy = <0x01c06000>;             // the qcom,pcie-phy node's reg
+		dbi = <0x60000000>;             // reg "dm_core"
+		config = <0x60100000>;          // reg "conf"
+		bar = <0x60400000>;             // in the memory window: BAR0
+	};
+
 	// The SMMU between the SoC's devices and memory, for the part drivers that give a device its addresses
 	// (the speakers' audio path, the cameras, Wi-Fi). The GPU's own is in adreno { }.
 	smmu {
@@ -232,6 +242,8 @@
 		gic-redist = <0x17A60000>;      // ... its second
 		gic-redist-size = <0x100000>;   // optional: the redistributors' region; 1 MB (eight cores) if left out
 		gic-redist-stride = <0x20000>;  // optional: the distance between redistributors; as the GIC says if left out
+		gic-its = <0x17A40000>;         // optional: the arm,gic-v3-its node's reg, for a PCIe radio's interrupts
+		//                              // ("wifi-qca6490"); left out, they are polled
 		uart = <0x09000000>;            // optional: a PL011 for the kernel's serial console (the emulator has one)
 		cores = <8>;                    // the cpu@ nodes
 		core-shift = <8>;               // where the core's number is in its reg: 8 for 0x000, 0x100 ..., 0 for 0, 1 ...

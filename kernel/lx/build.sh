@@ -39,6 +39,7 @@ set -e
 VERSION=7.0.14
 SHA256=de9999b784d2293f00d39c62d8f92a08ab8a54bc4e80ffd250a0c09cb07a0f98
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
+SELF=$(readlink -f "$0")		# (an object older than this script, whose flags it holds, is made again: after the cd below too)
 # shellcheck source=../env.sh
 source "$ROOT/kernel/env.sh"
 B=$XNUDEPS/build/ath11k
@@ -116,7 +117,14 @@ if [ ! -d gen ]; then
 fi
 
 # --- compile: the driver's files that are built so far, and ours
-DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p"
+DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p wow"
+# The bus: a WCN6855/QCA6490 on PCIe (a board's wifi { radio-model = <1>; }: ath11k's pci, pcic and mhi with our lx_pci.c
+# and lx_mhi.c) or a WCN6750 on the SoC's own bus (radio-model 0). The PCI object has the AHB path too, chosen at run time by
+# the board's radio model, so it is the default; ATH11K_PCI=0 makes the AHB-only object. A change of the bus compiles
+# everything again (obj/.pci below).
+ATH11K_PCI=${ATH11K_PCI:-1}
+case "$ATH11K_PCI" in 0|1) ;; *) echo "ATH11K_PCI must be 0 or 1" >&2; exit 1 ;; esac
+[ "$ATH11K_PCI" = 0 ] || DRIVER="$DRIVER pci pcic mhi"
 export IPHONEOS_DEPLOYMENT_TARGET=16.5
 CC="clang -target arm64-apple-darwin"
 LD=$XNUDEPS/host/bin/ld64
@@ -126,25 +134,48 @@ CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fn
 	-I$W/include -Igen -I$S -I$S/contrib/ck/include
 	-I$S/compat/linuxkpi/common/include -I$S/compat/linuxkpi/dummy/include
 	-include $S/compat/linuxkpi/common/include/linux/kconfig.h -DLINUXKPI_VERSION=70000"
-DFLAGS="-Isrc/ath11k -Isrc -include $W/include/lx_prelude.h -DCONFIG_ATH11K_AHB -DCONFIG_ATH11K_DEBUG
-	-DKBUILD_MODNAME=\"ath11k\""
+# CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS: ath11k_reg_notifier() hands the firmware the country Darwin asks for (lx_80211.c,
+# boundary_country); without it the notifier only says "Country Setting is not allowed".
+DFLAGS="-Igen/ath11k -Isrc -include $W/include/lx_prelude.h -DCONFIG_ATH11K_AHB -DCONFIG_ATH11K_DEBUG
+	-DCONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS -DCONFIG_PM -DKBUILD_MODNAME=\"ath11k\""
 # two headers are the kernel's: what it offers this object (kernel/lx/include/lx_os.h), and its QMI
 # helpers (kernel/lx/include/linux/soc/qcom/qmi.h)
 for h in lx qmi; do
 	[ -f "$XNU_SRC/bsd/sys/board/$h.h" ] || { echo "lx/build.sh: the kernel tree has no bsd/sys/board/$h.h (kernel/build.sh first)" >&2; exit 1; }
 done
+[ "$ATH11K_PCI" = 0 ] || DFLAGS="$DFLAGS -DCONFIG_ATH11K_PCI"
 DFLAGS="$DFLAGS -DLX_HAKIOS_LX_H=\"$XNU_SRC/bsd/sys/board/lx.h\" -DLX_HAKIOS_QMI_H=\"$XNU_SRC/bsd/sys/board/qmi.h\""
+# the pool's window (C3) from the kernel's own header, where there is one, in place of lx_mhi.c's checked copy
+[ "$ATH11K_PCI" = 0 ] || [ ! -f "$XNU_SRC/bsd/sys/board/smmu_ctx.h" ] || DFLAGS="$DFLAGS -DLX_HAKIOS_SMMU_H=\"$XNU_SRC/bsd/sys/board/smmu_ctx.h\""
 mkdir -p obj out
+# A field named jiffies conflicts with the clock accessor macro. Compile copies
+# with that member renamed, leaving the pinned upstream files unchanged.
+python3 "$W/ath11k-clock-source.py" src/ath11k gen/ath11k
+if [ "$(cat obj/.pci 2>/dev/null)" != "$ATH11K_PCI" ]; then
+ rm -f obj/*.o obj/*.o.d
+ echo "$ATH11K_PCI" > obj/.pci
+fi
 rm -f obj/*.err
 compile() {		# compile SOURCE OBJECT [FLAGS]: only when the object is older than anything it was made of
 	local src=$1 obj=$2
 	shift 2
-	if [ -f "$obj" ] && [ -f "$obj.d" ] && [ -z "$(find $(sed -e 's/^[^:]*://' -e 's/\\$//' "$obj.d") "$0" -newer "$obj" 2>/dev/null | head -1)" ]; then
+	if [ -f "$obj" ] && [ -f "$obj.d" ] && [ -z "$(find $(sed -e 's/^[^:]*://' -e 's/\\$//' "$obj.d") "$SELF" -newer "$obj" 2>/dev/null | head -1)" ]; then
 		return
 	fi
 	$CC $CFLAGS "$@" -MMD -MF "$obj.d" -c "$src" -o "$obj" 2> "$obj.err" || rm -f "$obj"
 }
-for f in $DRIVER; do compile src/ath11k/$f.c obj/ath11k_$f.o $DFLAGS & done
+# A wrapper exports init/exit of the unchanged upstream translation unit. Linux
+# module init sections are not run by XNU; lx_bus dispatches explicitly.
+cat > gen/ath11k_pci_entry.c <<'EOF'
+#include "pci.c"
+int lx_pci_driver_init(void) { return ath11k_pci_init(); }
+void lx_pci_driver_exit(void) { ath11k_pci_exit(); }
+EOF
+for f in $DRIVER; do
+ source=gen/ath11k/$f.c
+ [ "$f" != pci ] || source=gen/ath11k_pci_entry.c
+ compile "$source" obj/ath11k_$f.o $DFLAGS &
+done
 for f in "$W"/src/*.c; do [ -f "$f" ] && compile "$f" obj/lx_$(basename "$f" .c).o $DFLAGS -I$W/src & done
 wait
 bad=
@@ -179,8 +210,9 @@ for s in $(cat out/undefined.txt); do
 done
 [ -z "$missing" ] || exit 1
 $CC -c out/stubs.s -o out/stubs.o
-# four names are shown: where the kernel enters (lx_prepare(), lx_start(), lx_stop() and lx_transmit() of board/lx.h)
-printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n' > out/exported.txt
+# five names are shown: where the kernel enters (lx_prepare(), lx_start(), lx_stop() and lx_transmit() of board/lx.h),
+# and lx_thread_release(), the clean-up of a kernel thread that called into the driver, when it ends
+printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n_lx_thread_release\n' > out/exported.txt
 $LD -r -arch arm64 -exported_symbols_list out/exported.txt out/all.o out/stubs.o -o out/ath11k.o 2> out/ld.err ||
 	{ cat out/ld.err; exit 1; }
 rm -f out/all.o

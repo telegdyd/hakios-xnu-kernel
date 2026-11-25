@@ -31,6 +31,9 @@ int hakios_sta_ask_leave(void) { leaves++; return 0; }
 static bool join_by_darwin = true;         /* (whether the join told over is one Darwin asked for) */
 bool hakios_sta_join_by_darwin(void) { return join_by_darwin; }
 void hakios_sta_state(struct hakios_sta_state *out) { *out = state; }
+/* (the country: none in force, and a request for one refused, as a radio without a regulatory domain of its own) */
+int hakios_sta_ask_country(const char *code) { (void)code; return ENOTSUP; }
+bool hakios_sta_country(char *code) { (void)code; return false; }
 
 bool
 hakios_sta_heard(unsigned index, struct hakios_sta_bss *bss)
@@ -273,7 +276,8 @@ join(void)
 	CHECK(printed_has("a name of 4 bytes, any access point"), "lengths only: %s", printed);
 
 	assoc.key_length = 7;
-	CHECK(request(true, 20, &assoc, sizeof(assoc), NULL) == EINVAL, "a passphrase of 7 bytes");
+	/* (taken: WPA3's SAE allows a password shorter than WPA2's 8; a network of WPA2 alone refuses it at the station) */
+	CHECK(request(true, 20, &assoc, sizeof(assoc), NULL) == 0 && asked_join.passphrase_length == 7, "a passphrase of 7 bytes");
 	assoc.key_length = 64;
 	CHECK(request(true, 20, &assoc, sizeof(assoc), NULL) == EINVAL, "and of 64");
 	assoc.key_length = 8;
@@ -290,7 +294,7 @@ join(void)
 	assoc.ssid_length = 32;
 	memset(assoc.ssid, 'n', 32);
 	CHECK(request(true, 20, &assoc, sizeof(assoc), NULL) == 0 && asked_join.ssid_length == 32, "a name of 32 bytes, the longest");
-	joins--;                                /* (not one of the four below) */
+	joins--;                                /* (not one of the five counted) */
 	memcpy(assoc.ssid, "home", 4);
 	assoc.ssid_length = 0;
 	CHECK(request(true, 20, &assoc, sizeof(assoc), NULL) == EINVAL, "no name");
@@ -300,7 +304,7 @@ join(void)
 	assoc.key_length = 32;
 	CHECK(request(true, 20, &assoc, sizeof(assoc), NULL) == 0 && asked_join.passphrase_length == 0 &&
 	    asked_join.security == HAKIOS_STA_WPA2_PSK, "the key itself");
-	CHECK(joins == 4, "nothing refused reached the station (four taken): %u", joins);
+	CHECK(joins == 5, "nothing refused reached the station (five taken): %u", joins);
 
 	/* how it went, in Apple80211's numbers */
 	static const struct { int status; int32_t result; } outcomes[] = { { 0, 1 }, { EAUTH, 21 }, { ETIMEDOUT, 9 }, { EIO, 2 } };
@@ -327,9 +331,19 @@ link_changes(void)
 		unsigned before = fake_events;
 
 		hakios_apple80211_event(HAKIOS_STA_LINK, cases[i].status);
-		CHECK(fake_events == before + 3 && fake_event_codes[before % 16] == EVENT_SSID_CHANGED &&
+		CHECK(fake_events == before + 3 + (cases[i].status == 1) && fake_event_codes[before % 16] == EVENT_SSID_CHANGED &&
 		    fake_event_codes[(before + 1) % 16] == EVENT_BSSID_CHANGED && fake_event_codes[(before + 2) % 16] == EVENT_LINK_CHANGED,
 		    "%d: the name, the access point, then the link (%u events)", cases[i].status, fake_events - before);
+		if (cases[i].status == 1) {
+			/* (up: the link's first signal follows at once, an RSSI_CHANGED, which is then the last event) */
+			struct apple80211_lqm lqm;
+
+			CHECK(fake_event_codes[(before + 3) % 16] == EVENT_RSSI_CHANGED && fake_last_event_length == 16 + sizeof(lqm),
+			    "up: the signal said after the link (%u bytes)", fake_last_event_length);
+			memcpy(&lqm, fake_last_event_data + 16, sizeof(lqm));
+			CHECK(lqm.has_rssi && lqm.rssi == cases[i].rssi, "up: the signal is the station's: %d", lqm.rssi);
+			continue;
+		}
 		/* (the interface's name first, then the link's) */
 		CHECK(fake_last_event_length == 16 + sizeof(link), "%d: the name and the link carried: %u bytes", cases[i].status,
 		    fake_last_event_length);

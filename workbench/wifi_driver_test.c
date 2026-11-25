@@ -184,6 +184,14 @@ bool hakios_wlfw_exchange(uint32_t s __unused) { return false; }
 bool hakios_wlfw_registers(uint64_t *address __unused, uint32_t *size __unused, bool *mission __unused) { return false; }
 void hakios_wlfw_stop(uint32_t s __unused) { }
 void loader_return(void) { }
+/* the PCIe radio's path (board/wifi_pci.c), which a board without wifi-qca6490 never takes */
+bool hakios_wifi_pci_init(void) { return false; }
+bool hakios_wifi_pci_selected(void) { return false; }
+bool hakios_wifi_pci_stop(void) { return false; }
+bool hakios_wifi_pci_quiesce(void) { return false; }
+int hakios_wifi_pci_firmware(const char *name __unused, const uint8_t **data __unused, uint64_t *size __unused) { return ENOENT; }
+bool hakios_wifi_pci_network(uint8_t *n __unused, unsigned *nl __unused, uint8_t *p __unused, unsigned *pl __unused) { return false; }
+int hakios_wifi_mac_parse(const char *text __unused, uint8_t *bytes __unused) { return EINVAL; }
 
 #pragma GCC diagnostic ignored "-Wformat"
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
@@ -195,6 +203,8 @@ void loader_return(void) { }
 #define get wifi_get
 #include "board/wifi.c"
 #undef get
+/* the QRTR router the GLINK link is under (board/qrtr.c) */
+#include "board/qrtr.c"
 #undef printf
 
 static int failures;

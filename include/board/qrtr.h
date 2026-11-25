@@ -16,6 +16,29 @@
 
 struct hakios_qrtr_port;
 
+/* C6: one chip link, supplied by GLINK or MHI IPCR. Whole QRTR v1 packets
+ * including the little-endian 32-byte header and 4-byte payload padding;
+ * length <= 32+8192. Callbacks run in thread context and may sleep.
+ * send borrows bytes for the call only: copy before returning if asynchronous.
+ * 0 or positive errno. Do not reenter receive inline from send.
+ */
+struct hakios_qrtr_link {
+	int (*send)(void *ctx, const void *packet, unsigned long len);
+	void *ctx;
+	const char *name;
+};
+/* up borrows the immutable link and its storage until down returns. One active
+ * link; EBUSY for another, same link is idempotent. Publish before HELLO.
+ * receive borrows packet for this call; reject malformed/inactive link with
+ * EINVAL/ENOTCONN. 0 on accepted packet. Transport serializes receives.
+ * down rejects new traffic, drains callbacks/sends, removes servers, notifies
+ * ports, and returns with no future link callback. NULL/inactive is a no-op.
+ * No caller holds a transport lock across these calls. QMI ops stay unchanged.
+ */
+int hakios_qrtr_link_up(const struct hakios_qrtr_link *link);
+int hakios_qrtr_receive(const struct hakios_qrtr_link *link, const void *packet, unsigned long len);
+void hakios_qrtr_link_down(const struct hakios_qrtr_link *link);
+
 /*
  * A datagram for the port has arrived from (node, port). The data is the caller's again on return.
  */

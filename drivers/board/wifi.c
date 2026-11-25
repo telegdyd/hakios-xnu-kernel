@@ -172,6 +172,7 @@
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_kern_xnu.h>  /* xnu-12377: the KMA flags and kmem_alloc moved to the internal header */
+#include <sys/sysctl.h>
 
 #include "kernel.h"
 #include "scm.h"
@@ -179,6 +180,19 @@
 #include "cache.h"
 #include "board.h"
 #include "time.h"
+
+/*
+ * the board's wifi-qca6490, the OnePlus 10 Pro: the radio is a PCIe chip, and none of the steps below (the DSP, SMEM, GLINK) applies. Its
+ * start, its stop and the panic's way back are board/wifi_pci.c's; the steps of this file are redwood's and
+ * stay what they were. Without the board's wifi-qca6490 nothing of that is looked at.
+ */
+extern bool hakios_wifi_pci_init(void);                 /* the board lists wifi-qca6490: the PCIe path took over (true) */
+extern bool hakios_wifi_pci_selected(void);
+extern bool hakios_wifi_pci_stop(void);
+extern bool hakios_wifi_pci_quiesce(void);
+extern int hakios_wifi_pci_firmware(const char *name, const uint8_t **data, uint64_t *size);
+extern bool hakios_wifi_pci_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);
+extern int hakios_wifi_mac_parse(const char *text, uint8_t *bytes);
 
 static LCK_GRP_DECLARE(wifi_lock_group, "hakios-wifi");
 
@@ -222,7 +236,9 @@ say_line(const char *line, bool aloud)
 		return;
 	}
 	lck_mtx_lock(&say_lock);
-	if (quiet && !aloud) {
+	if (quiet) {
+		/* every line kept, the said ones too: kern.hakios.wifi_kept is then the whole story (run58: the join's
+		 * milestones, said aloud, were not in it, and the kept scan lines looked like the station had stopped) */
 		for (const char *c = line; *c != 0; c++) {
 			kept[kept_at] = *c;
 			if (++kept_at == sizeof(kept)) {
@@ -230,7 +246,8 @@ say_line(const char *line, bool aloud)
 				kept_wrapped = true;
 			}
 		}
-	} else {
+	}
+	if (!quiet || aloud) {
 		for (const char *c = line; *c != 0; c++) {
 			loader_log_putc(*c);
 		}
@@ -282,6 +299,28 @@ hakios_wifi_tell(const char *format, ...)
 }
 #define tell hakios_wifi_tell
 
+/* kern.hakios.wifi_kept: all the lines kept (not said) since the radio came up, as far as the buffer goes back (run58: an
+ * 8 KB tail of scan lines no longer reached the moment the network was lost) */
+static int
+sysctl_wifi_kept SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	static char out[sizeof(kept) + 1];
+	uint32_t length, show, start;
+
+	lck_mtx_lock(&say_lock);
+	length = kept_wrapped ? sizeof(kept) : kept_at;
+	show = length;
+	start = kept_wrapped ? (kept_at + sizeof(kept) - show) % sizeof(kept) : kept_at - show;
+	for (uint32_t i = 0; i < show; i++) out[i] = kept[(start + i) % sizeof(kept)];
+	out[show] = 0;
+	lck_mtx_unlock(&say_lock);
+	return SYSCTL_OUT(req, out, show + 1);
+}
+SYSCTL_DECL(_kern_hakios);
+SYSCTL_PROC(_kern_hakios, OID_AUTO, wifi_kept, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_wifi_kept, "A",
+    "the Wi-Fi lines kept since the radio came up (the buffer's worth)");
+
 /* The last of what was kept, into the log after all: the radio has not come up. */
 static void
 say_kept(void)
@@ -330,6 +369,20 @@ static bool whole;                      /* wifi=1: all of it, by itself (see the
 static volatile bool whole_runs;        /* ... and the thread that does it is at work */
 static volatile bool ending;            /* the run ends (hakios_wifi_stop()): no step more is taken, nor the driver kept */
 
+/* For the PCIe path (board/wifi_pci.c): wifi=1 there says things the same way, and stands for the same options. */
+void
+hakios_wifi_whole_mode(bool loud)
+{
+	whole = true;
+	quiet = !loud;
+}
+
+void
+hakios_wifi_say_kept(void)
+{
+	say_kept();
+}
+
 /*
  * A number given to the kernel when it was started; with wifi=1 the ones that stands for are as if
  * given, unless given otherwise (wifi_irq=0: the rings looked at as before).
@@ -341,7 +394,7 @@ hakios_wifi_option(const char *name)
 		const char *name;
 		uint32_t value;
 	} stands_for[] = { { "wifi_lx", 2 }, { "wifi_smmu", 2 }, { "wifi_station", 1 }, { "wifi_keep", 1 }, { "wifi_irq", 1 },
-			   { "wifi_ba", 1 }, { "wifi_wide", 1 } };
+			   { "wifi_ba", 1 }, { "wifi_wide", 1 }, { "wifi_pcie_off", 1 } };
 	uint32_t value = 0;
 
 	if (strcmp(name, "wifi_quiet") == 0) {
@@ -349,6 +402,9 @@ hakios_wifi_option(const char *name)
 	}
 	if (strcmp(name, "wifi_ending") == 0) {
 		return ending;                  /* (for the driver's start: it is cut short, see hakios_wifi_stop()) */
+	}
+	if (strcmp(name, "wifi_keep") == 0 && hakios_wifi_pci_selected()) {
+		return 1;                       /* (lx_start() leaves the driver up: board/wifi_pci.c scans, joins, and then keeps or stops) */
 	}
 	if (PE_parse_boot_argn(name, &value, sizeof(value))) {
 		return value;
@@ -2461,318 +2517,22 @@ glink_send(const void *data, uint32_t length)
 /* ---- QRTR -------------------------------------------------------------------------------------------- */
 
 /*
- * What the channel carries (Linux: net/qrtr/af_qrtr.c, ns.c, smd.c): datagrams from a port of a
- * node to a port of a node, one in each GLINK message, behind a header of eight words. A node's
- * services announce themselves to the other nodes through a port that all have, the control
- * port: when a link comes up each side says hello, and is told the other's services one by one
- * ("new server": a service, an instance, a node, a port), and later their going. We are node 1
- * (Linux's default, and what this phone's Android is); the DSP says who it is in what it sends.
- * The interface for the rest of the kernel is sys/board/qrtr.h: the four calls at the end of
- * this section, handed to the QMI helpers (drivers/modem/hakios_qmi.c), which is what speaks to the
- * services.
+ * The router is board/qrtr.c (the interface for the rest of the kernel is sys/board/qrtr.h); what is
+ * here is GLINK's channel as the one link under it (C6), and what the steps of this file ask of it.
+ * The router's lines (wifi: qrtr: ...) are said with hakios_wifi_say(), as ours are.
  */
-#define HAKIOS_QRTR_MAX        8192            /* the most a datagram holds, either way */
-#include "qrtr_frame.h"             /* the header in either version, its constants, and where the datagram is */
-#define QRTR_FIRST_PORT         0x4000u         /* where Linux begins numbering ports that ask for no number */
+extern void hakios_qrtr_poll(void);
+extern void hakios_qrtr_stats(uint32_t *peer, uint32_t *hellos, uint32_t *in, uint32_t *out, uint32_t *services);
+extern const struct hakios_qrtr_ops hakios_qrtr_router_ops;
 
-struct hakios_qrtr_port {
-	uint32_t number;                        /* 0: free */
-	hakios_qrtr_receive_t receive;
-	hakios_qrtr_server_t server;
-	void *context;
-	struct {
-		uint32_t service, instance;     /* the instance as on the wire: version | instance << 8; 0: any */
-		bool asked;
-		bool fresh;                     /* not yet told of the services that were there before it */
-	} lookups[4];
-};
-
-static LCK_MTX_DECLARE(qrtr_lock, &wifi_lock_group);    /* the tables below */
-static LCK_MTX_DECLARE(qrtr_calling, &wifi_lock_group); /* held by the link's thread around a callback */
-static struct hakios_qrtr_port qrtr_ports[16];
-static struct {
-	uint32_t service, instance, node, port;
-	bool there;
-} qrtr_servers[64];
-static uint32_t qrtr_peer;                      /* the DSP's node; 0: it has not said */
-static uint32_t qrtr_next_port = QRTR_FIRST_PORT, qrtr_in, qrtr_out, qrtr_hellos;
-static thread_t link_thread_is;
-
-/* One datagram out, of any type. */
+/* One packet of the router's, whole, to the DSP. Called without any lock of ours held. */
 static int
-qrtr_out_packet(uint32_t type, uint32_t from_port, uint32_t to_node, uint32_t to_port, const void *data, uint32_t length)
+glink_qrtr_send(__unused void *context, const void *packet, unsigned long length)
 {
-	uint32_t padded = (length + 3) & ~3u;
-	struct qrtr_header *packet;
-	int error;
-
-	if (length == 0 || length > HAKIOS_QRTR_MAX) {
-		return EMSGSIZE;
-	}
-	packet = kalloc_data(sizeof(*packet) + padded, Z_WAITOK | Z_ZERO);
-	if (packet == NULL) {
-		return ENOMEM;
-	}
-	packet->version = 1;
-	packet->type = type;
-	packet->from_node = QRTR_US;
-	packet->from_port = from_port;
-	packet->size = length;
-	packet->to_node = to_node;
-	packet->to_port = to_port;
-	memcpy(packet + 1, data, length);
-	error = glink_send(packet, (uint32_t)sizeof(*packet) + padded);
-	kfree_data(packet, sizeof(*packet) + padded);
-	qrtr_out += error == 0;
-	return error;
+	return glink_send(packet, (uint32_t)length);
 }
 
-static bool
-qrtr_matches(uint32_t service, uint32_t instance, unsigned server)
-{
-	return qrtr_servers[server].there && qrtr_servers[server].service == service &&
-	       (instance == 0 || qrtr_servers[server].instance == instance);
-}
-
-/* Everybody who looked a service up is told that it has come, or gone. From the link's thread. */
-static void
-qrtr_tell(uint32_t service, uint32_t instance, uint32_t node, uint32_t port, bool arrived)
-{
-	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
-		for (unsigned l = 0; l < 4; l++) {
-			hakios_qrtr_server_t server = NULL;
-			void *context;
-
-			lck_mtx_lock(&qrtr_lock);
-			if (qrtr_ports[p].number != 0 && qrtr_ports[p].lookups[l].asked && !qrtr_ports[p].lookups[l].fresh &&
-			    qrtr_ports[p].lookups[l].service == service &&
-			    (qrtr_ports[p].lookups[l].instance == 0 || qrtr_ports[p].lookups[l].instance == instance)) {
-				server = qrtr_ports[p].server;
-			}
-			context = qrtr_ports[p].context;
-			lck_mtx_unlock(&qrtr_lock);
-			if (server != NULL) {
-				server(context, arrived, service, instance & 0xff, instance >> 8, node, port);
-			}
-		}
-	}
-}
-
-/* The control port's part: Linux's name service, without services of our own to tell of. */
-static void
-qrtr_control(const struct qrtr_header *header, const struct qrtr_control *control)
-{
-	struct qrtr_control hello = { .command = QRTR_HELLO };
-	int found = -1, error;
-
-	switch (control->command) {
-	case QRTR_HELLO:
-		if (qrtr_hellos++ != 0) {
-			break;                                  /* (answered once: two that answer every hello never end) */
-		}
-		error = qrtr_out_packet(QRTR_HELLO, QRTR_CONTROL, header->from_node, QRTR_CONTROL, &hello, sizeof(hello));
-		printf("wifi: qrtr: HELLO FROM NODE %u; ours to it: %s\n", header->from_node, error == 0 ? "SENT" : "NOT SENT");
-		break;
-	case QRTR_NEW_SERVER:
-		lck_mtx_lock(&qrtr_lock);
-		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
-			if (qrtr_servers[i].there && qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]) {
-				found = (int)i;
-				break;
-			}
-			if (!qrtr_servers[i].there && found < 0) {
-				found = (int)i;
-			}
-		}
-		if (found >= 0) {
-			qrtr_servers[found].there = true;
-			qrtr_servers[found].service = control->words[0];
-			qrtr_servers[found].instance = control->words[1];
-			qrtr_servers[found].node = control->words[2];
-			qrtr_servers[found].port = control->words[3];
-		}
-		lck_mtx_unlock(&qrtr_lock);
-		printf("wifi: qrtr: a service: %u (%#x), version %u, instance %u, at node %u port %u\n", control->words[0],
-		    control->words[0], control->words[1] & 0xff, control->words[1] >> 8, control->words[2], control->words[3]);
-		qrtr_tell(control->words[0], control->words[1], control->words[2], control->words[3], true);
-		break;
-	case QRTR_DEL_SERVER:
-	case QRTR_BYE:
-		for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
-			bool gone;
-
-			lck_mtx_lock(&qrtr_lock);
-			gone = qrtr_servers[i].there && (control->command == QRTR_BYE ? qrtr_servers[i].node == header->from_node :
-			    qrtr_servers[i].node == control->words[2] && qrtr_servers[i].port == control->words[3]);
-			qrtr_servers[i].there = qrtr_servers[i].there && !gone;
-			lck_mtx_unlock(&qrtr_lock);
-			if (gone) {
-				printf("wifi: qrtr: service %u at node %u port %u has gone\n", qrtr_servers[i].service, qrtr_servers[i].node,
-				    qrtr_servers[i].port);
-				qrtr_tell(qrtr_servers[i].service, qrtr_servers[i].instance, qrtr_servers[i].node, qrtr_servers[i].port, false);
-			}
-		}
-		break;
-	default:
-		break;                                  /* (a client's going, and what else there is: nothing here wants it) */
-	}
-}
-
-/* A message from the channel: one datagram. From the link's thread. */
-static void
-qrtr_input(const uint8_t *data, uint32_t length)
-{
-	struct qrtr_header header;
-	hakios_qrtr_receive_t receive = NULL;
-	void *context = NULL;
-	uint32_t at;
-
-	switch (qrtr_frame(data, length, &header, &at)) {
-	case QRTR_FRAME_NO_DATAGRAM:
-		printf("wifi: qrtr: %u bytes that are no datagram (they begin %#x)\n", length, length ? data[0] : 0);
-		return;
-	case QRTR_FRAME_SIZE_WRONG:
-		printf("wifi: qrtr: a datagram of %u bytes in a message of %u: dropped\n", header.size, length);
-		return;
-	case QRTR_FRAME_OK:
-		break;
-	}
-	qrtr_in++;
-	if (qrtr_peer == 0) {
-		qrtr_peer = header.from_node;
-	}
-	if (header.type == QRTR_RESUME_TX) {
-		return;                                 /* (we never ask for one: GLINK's intents hold us back already) */
-	}
-	if (header.confirm) {
-		/* the sender counts what it has sent to this port, and waits for this before it sends many more */
-		struct qrtr_control resume = { .command = QRTR_RESUME_TX, .words = { header.to_node, header.to_port } };
-
-		qrtr_out_packet(QRTR_RESUME_TX, header.to_port, header.from_node, header.from_port, &resume, sizeof(resume));
-	}
-	if (header.to_port == QRTR_CONTROL) {
-		struct qrtr_control control = { 0 };
-
-		memcpy(&control, data + at, header.size < sizeof(control) ? header.size : sizeof(control));
-		qrtr_control(&header, &control);
-		return;
-	}
-	lck_mtx_lock(&qrtr_lock);
-	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
-		if (qrtr_ports[p].number == header.to_port && header.type == QRTR_DATA) {
-			receive = qrtr_ports[p].receive;
-			context = qrtr_ports[p].context;
-		}
-	}
-	lck_mtx_unlock(&qrtr_lock);
-	if (receive != NULL) {
-		receive(context, header.from_node, header.from_port, data + at, header.size);
-	}
-}
-
-/* Lookups made since the last look are told of the services that were there before them. From the link's thread. */
-static void
-qrtr_fresh(void)
-{
-	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]); p++) {
-		for (unsigned l = 0; l < 4; l++) {
-			hakios_qrtr_server_t server;
-			uint32_t service, instance;
-			void *context;
-
-			lck_mtx_lock(&qrtr_lock);
-			if (qrtr_ports[p].number == 0 || !qrtr_ports[p].lookups[l].fresh) {
-				lck_mtx_unlock(&qrtr_lock);
-				continue;
-			}
-			qrtr_ports[p].lookups[l].fresh = false;
-			server = qrtr_ports[p].server;
-			service = qrtr_ports[p].lookups[l].service;
-			instance = qrtr_ports[p].lookups[l].instance;
-			context = qrtr_ports[p].context;
-			lck_mtx_unlock(&qrtr_lock);
-			for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]) && server != NULL; i++) {
-				if (qrtr_matches(service, instance, i)) {
-					server(context, true, qrtr_servers[i].service, qrtr_servers[i].instance & 0xff,
-					    qrtr_servers[i].instance >> 8, qrtr_servers[i].node, qrtr_servers[i].port);
-				}
-			}
-		}
-	}
-}
-
-static struct hakios_qrtr_port *
-qrtr_open(hakios_qrtr_receive_t receive, hakios_qrtr_server_t server, void *context)
-{
-	struct hakios_qrtr_port *port = NULL;
-
-	lck_mtx_lock(&qrtr_lock);
-	for (unsigned p = 0; p < sizeof(qrtr_ports) / sizeof(qrtr_ports[0]) && port == NULL; p++) {
-		if (qrtr_ports[p].number == 0) {
-			port = &qrtr_ports[p];
-			bzero(port, sizeof(*port));
-			port->number = qrtr_next_port++;
-			port->receive = receive;
-			port->server = server;
-			port->context = context;
-		}
-	}
-	lck_mtx_unlock(&qrtr_lock);
-	return port;
-}
-
-static int
-qrtr_send(struct hakios_qrtr_port *port, uint32_t node, uint32_t to, const void *data, size_t length)
-{
-	if (port == NULL || port->number == 0 || length > HAKIOS_QRTR_MAX) {
-		return EINVAL;
-	}
-	return qrtr_out_packet(QRTR_DATA, port->number, node, to, data, (uint32_t)length);
-}
-
-static int
-qrtr_lookup(struct hakios_qrtr_port *port, uint32_t service, uint32_t version, uint32_t instance)
-{
-	int error = ENOSPC;
-
-	lck_mtx_lock(&qrtr_lock);
-	for (unsigned l = 0; l < 4 && error != 0 && port != NULL && port->number != 0; l++) {
-		if (!port->lookups[l].asked) {
-			port->lookups[l].service = service;
-			port->lookups[l].instance = instance != 0 ? (version & 0xff) | instance << 8 : 0;
-			port->lookups[l].asked = true;
-			port->lookups[l].fresh = true;
-			error = 0;
-		}
-	}
-	lck_mtx_unlock(&qrtr_lock);
-	return error;
-}
-
-static void
-qrtr_close(struct hakios_qrtr_port *port)
-{
-	struct qrtr_control gone = { .command = QRTR_DEL_CLIENT, .words = { QRTR_US, port ? port->number : 0 } };
-	bool outside = current_thread() != link_thread_is;
-
-	if (port == NULL || port->number == 0) {
-		return;
-	}
-	if (outside) {
-		lck_mtx_lock(&qrtr_calling);            /* (a callback of the port's that is running ends first) */
-	}
-	lck_mtx_lock(&qrtr_lock);
-	port->number = 0;
-	lck_mtx_unlock(&qrtr_lock);
-	if (outside) {
-		lck_mtx_unlock(&qrtr_calling);
-	}
-	if (qrtr_peer != 0) {
-		qrtr_out_packet(QRTR_DEL_CLIENT, gone.words[1], qrtr_peer, QRTR_CONTROL, &gone, sizeof(gone));
-	}
-}
-
-static const struct hakios_qrtr_ops qrtr_ops = { .open = qrtr_open, .send = qrtr_send, .lookup = qrtr_lookup, .close = qrtr_close };
+static const struct hakios_qrtr_link glink_qrtr_link = { .send = glink_qrtr_send, .ctx = NULL, .name = "glink" };
 
 /* ---- the link's thread -------------------------------------------------------------------------------- */
 
@@ -2825,17 +2585,11 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 			if (packet == NULL) {
 				break;
 			}
-			lck_mtx_lock(&qrtr_calling);
-			qrtr_input(packet->data, packet->length);
-			lck_mtx_unlock(&qrtr_calling);
+			hakios_qrtr_receive(&glink_qrtr_link, packet->data, packet->length);
 			kfree_data(packet, sizeof(*packet) + packet->length);
 		}
-		lck_mtx_lock(&qrtr_calling);
-		qrtr_fresh();
-		lck_mtx_unlock(&qrtr_calling);
+		hakios_qrtr_poll();
 	}
-	/* This thread's handle is no longer one once it ends: a new thread at the same address must not be taken for it (qrtr_close()). */
-	link_thread_is = NULL;
 	link_runs = false;
 	thread_terminate(current_thread());
 }
@@ -2845,6 +2599,7 @@ static void
 link_stop(void)
 {
 	struct glink_packet *packet;
+	uint32_t peer, hellos, in, out, services;
 
 	/* (first: a send that waits for an intent of the DSP's returns at once, and the thread finds nothing more to read) */
 	link_wanted = false;
@@ -2861,9 +2616,10 @@ link_stop(void)
 		for (unsigned ms = 0; ms < 6000 && link_runs; ms++) {
 			sleep_ms(1);
 		}
-		printf("wifi: link: %s; GLINK said %u and heard %u messages, QRTR sent %u and received %u datagrams; its doorbells "
-		    "heard: GLINK %u, SMP2P %u\n", link_runs ? "THE THREAD DOES NOT END" : "down", glink.said, glink.heard, qrtr_out,
-		    qrtr_in, doorbell.glink, doorbell.smp2p);
+		hakios_qrtr_stats(&peer, &hellos, &in, &out, &services);
+		printf("wifi: link: %s; GLINK said %u and heard %u messages, QRTR sent %u and received %u datagrams; doorbells heard: "
+		    "GLINK %u, SMP2P %u\n", link_runs ? "THE THREAD DOES NOT END" : "down", glink.said, glink.heard, out, in,
+		    doorbell.glink, doorbell.smp2p);
 	}
 	lck_mtx_lock(&glink_lock);
 	while ((packet = glink.first) != NULL) {
@@ -2872,10 +2628,7 @@ link_stop(void)
 	}
 	glink.last = NULL;
 	lck_mtx_unlock(&glink_lock);
-	lck_mtx_lock(&qrtr_lock);
-	bzero(qrtr_servers, sizeof(qrtr_servers));
-	qrtr_peer = 0;
-	lck_mtx_unlock(&qrtr_lock);
+	hakios_qrtr_link_down(&glink_qrtr_link);        /* (after GLINK is down: sends still waiting come back at once) */
 }
 
 /* ---- step 12: GLINK's queues, looked at --------------------------------------------------------------- */
@@ -2939,17 +2692,20 @@ step_link(void)
 	bzero(glink.their_intents, sizeof(glink.their_intents));
 	glink.trace = 60;
 	glink.up = true;
-	qrtr_hellos = qrtr_in = qrtr_out = 0;
 	doorbell.since = began = now_us();
 	glink_say(GLINK_VERSION, GLINK_VERSION_1, glink.features, NULL, 0);
 	lck_mtx_unlock(&glink_lock);
+	if (hakios_qrtr_link_up(&glink_qrtr_link) != 0) {       /* (before the first message can be heard: it is the router's link from here on) */
+		printf("wifi: %u: no router link\n", step);
+		return false;
+	}
 	link_wanted = link_runs = true;
 	if (kernel_thread_start(link_thread, NULL, &thread) != KERN_SUCCESS) {
 		link_wanted = link_runs = false;
+		hakios_qrtr_link_down(&glink_qrtr_link);
 		printf("wifi: %u: no thread\n", step);
 		return false;
 	}
-	link_thread_is = thread;
 	thread_deallocate(thread);
 	for (unsigned ms = 0; ms < 5000 && !glink.open && !glink.broken; ms++) {
 		sleep_ms(1);
@@ -3237,7 +2993,7 @@ static bool
 step_qrtr(void)
 {
 	struct hakios_qrtr_port *port;
-	uint32_t ask = 0, seconds = 3, services = 0;
+	uint32_t ask = 0, seconds = 3, services = 0, peer, hellos, in, out;
 
 	if (!glink.open) {
 		return false;
@@ -3245,19 +3001,17 @@ step_qrtr(void)
 	PE_parse_boot_argn("wifi_listen", &seconds, sizeof(seconds));
 	announce("listen for QRTR on the channel: the DSP's hello is answered with ours, its services are written down; and a "
 	    "port of ours looks the Wi-Fi firmware's service up, as the radio's driver will");
-	port = qrtr_open(wlfw_receive, wlfw_service, NULL);
-	if (port == NULL || qrtr_lookup(port, SERVICE_WLFW, 1, 0) != 0) {
+	port = hakios_qrtr_router_ops.open(wlfw_receive, wlfw_service, NULL);
+	if (port == NULL || hakios_qrtr_router_ops.lookup(port, SERVICE_WLFW, 1, 0) != 0) {
 		printf("wifi: %u: no port\n", step);
 		return false;
 	}
 	for (unsigned ms = 0; ms < seconds * 1000 && !(wlfw_port != 0 && ms >= 500); ms++) {
 		sleep_ms(1);
 	}
-	for (unsigned i = 0; i < sizeof(qrtr_servers) / sizeof(qrtr_servers[0]); i++) {
-		services += qrtr_servers[i].there;
-	}
+	hakios_qrtr_stats(&peer, &hellos, &in, &out, &services);
 	printf("wifi: %u: QRTR: the DSP is node %u; hellos from it %u; datagrams received %u, sent %u; services it has told of: "
-	    "%u; the Wi-Fi firmware's service: %s\n", step, qrtr_peer, qrtr_hellos, qrtr_in, qrtr_out, services, wlfw_port != 0 ?
+	    "%u; the Wi-Fi firmware's service: %s\n", step, peer, hellos, in, out, services, wlfw_port != 0 ?
 	    "THERE" : "NOT THERE");
 	if (wlfw_port != 0 && PE_parse_boot_argn("wifi_ask", &ask, sizeof(ask)) && ask) {
 		/*
@@ -3271,7 +3025,7 @@ step_qrtr(void)
 		announce("ask the Wi-Fi firmware's service for its capabilities (QMI message 0x24, seven bytes) and wait a second "
 		    "for an answer");
 		wlfw_answer = 0;
-		error = qrtr_send(port, wlfw_node, wlfw_port, question, sizeof(question));
+		error = hakios_qrtr_router_ops.send(port, wlfw_node, wlfw_port, question, sizeof(question));
 		for (unsigned ms = 0; ms < 1000 && error == 0 && wlfw_answer == 0; ms++) {
 			sleep_ms(1);
 		}
@@ -3286,8 +3040,9 @@ step_qrtr(void)
 			printf("wifi: %u: THE SERVICE ANSWERS: %u bytes, beginning%s\n", step, wlfw_answer, text);
 		}
 	}
-	qrtr_close(port);
-	return qrtr_hellos != 0 && qrtr_out != 0;
+	hakios_qrtr_router_ops.close(port);
+	hakios_qrtr_stats(&peer, &hellos, &in, &out, &services);
+	return hellos != 0 && out != 0;
 }
 
 /* ---- beside the steps: the radio's stream in the SMMU (boot-arg wifi_smmu=1) ------------------------------ */
@@ -3780,7 +3535,11 @@ hakios_wifi_driver_file(const char *name, uint64_t *size)
 {
 	const char *const files[][2] = { { "board.bin", hakios_board()->wifi.board_data }, { "regdb.bin", hakios_board()->wifi.regdb } };
 	const char *last = strrchr(name, '/');
+	const uint8_t *data = NULL;
 
+	if (hakios_wifi_pci_selected()) {
+		return hakios_wifi_pci_firmware(name, &data, size) == 0 ? data : NULL;
+	}
 	last = last == NULL ? name : last + 1;
 	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
 		if (strcmp(last, files[i][0]) == 0) {
@@ -3802,32 +3561,13 @@ hakios_wifi_radio_address(uint8_t *address)
 {
 	char text[32] = "";
 	uint8_t bytes[6];
-	unsigned count = 0, digits = 0, value = 0;
 	bool good;
 
 	if (!PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || text[0] == 0) {
 		printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac)\n", step);
 		return false;
 	}
-	good = true;
-	for (const char *c = text;; c++) {
-		int digit = *c >= '0' && *c <= '9' ? *c - '0' : *c >= 'a' && *c <= 'f' ? *c - 'a' + 10 : *c >= 'A' && *c <= 'F' ?
-		    *c - 'A' + 10 : -1;
-
-		if (digit >= 0 && digits < 2) {
-			value = value << 4 | (unsigned)digit;
-			digits++;
-		} else if ((*c == ':' || *c == 0) && digits != 0 && count < 6) {
-			bytes[count++] = (uint8_t)value;
-			digits = value = 0;
-		} else {
-			good = false;
-		}
-		if (*c == 0 || !good) {
-			break;
-		}
-	}
-	good = good && count == 6 && !(bytes[0] & 1) && (bytes[0] | bytes[1] | bytes[2] | bytes[3] | bytes[4] | bytes[5]) != 0;
+	good = hakios_wifi_mac_parse(text, bytes) == 0;        /* (six bytes, no group address, not zero: board/wifi_pci.c) */
 	printf("wifi: %u: the driver asks for the radio's address: one was given, %lu characters, %s\n", step,
 	    (unsigned long)strlen(text), good ? "six bytes: it is the radio's for this run" : "WHICH IS NOT A STATION'S ADDRESS: "
 	    "not used");
@@ -3851,6 +3591,9 @@ hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, u
 	unsigned lengths[2] = { 0, 0 }, sizes[2] = { *name_length, *passphrase_length };
 	uint8_t *where[2] = { name, passphrase };
 
+	if (hakios_wifi_pci_network(name, name_length, passphrase, passphrase_length)) {
+		return true;                    /* (wifi_ssid and wifi_psk were given: they come before the file) */
+	}
 	if (file == NULL) {
 		printf("wifi: %u: which network to join: none was given (fw/network of the small image)\n", step);
 		return false;
@@ -3905,6 +3648,9 @@ hakios_wifi_stop(void)
 		sleep_ms(10);
 	}
 	hakios_apple80211_summary();
+	if (hakios_wifi_pci_stop()) {
+		return;                                 /* (the board's wifi-qca6490: the radio is a PCIe chip; there is no DSP of ours to stop) */
+	}
 	lck_mtx_lock(&dsp_lock);
 	if (dsp_started && !dirty) {
 		bool down = dsp_shutdown("the run is about to end");
@@ -3929,6 +3675,9 @@ void
 hakios_wifi_quiesce(void)
 {
 	hakios_apple80211_summary();           /* (also when the run is ended from the phone: five fingers) */
+	if (hakios_wifi_pci_quiesce()) {
+		return;                         /* (the PCIe radio: WLAN_EN low and the rails off, with no lock and no allocation) */
+	}
 	if (!dsp_started && !dirty) {
 		/* (with wifi=1 the radio is shown its memory before the DSP is started: a run that ends before that, or whose
 		 * bring-up gave up before it, leaves the mapping -- and the next kernel would find a match for the radio's stream
@@ -4076,6 +3825,9 @@ hakios_wifi_init(void)
 	uint64_t size = 0;
 	thread_t thread;
 
+	if (hakios_wifi_pci_init()) {
+		return;                         /* the board lists wifi-qca6490: the OnePlus 10 Pro's PCIe radio (board/wifi_pci.c), not these steps */
+	}
 	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {
 		return;
@@ -4110,7 +3862,7 @@ hakios_wifi_init(void)
 	ipcc.phys = hakios_board()->ipc.ipcc;
 	smem_lock.phys = hakios_board()->ipc.smem_lock;
 	rsc.phys = hakios_board()->rpmh.rsc;
-	hakios_qmi_set_transport(&qrtr_ops);
+	hakios_qmi_set_transport(&hakios_qrtr_router_ops);
 	if (last_step == 0) {
 		if (image_file("wpss.mdt", &size) == NULL) {
 			printf("wifi: wifi=1, but the radio's firmware is not in the small image (fw-wifi/, see the README): no Wi-Fi\n");

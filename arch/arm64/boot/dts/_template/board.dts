@@ -39,7 +39,7 @@
 	// and these, each a driver of one part wired the way one phone has it -- list one only if your phone
 	// has that part on the same pins and bus (drivers/board/board.h, Documentation/drivers.md):
 	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-s3908, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,
-	// camera-sm7325, wifi-wcn6750, mic-wcd938x, modem-sm7325, bluetooth-wcn-uart
+	// camera-sm7325, wifi-wcn6750, wifi-qca6490, mic-wcd938x, modem-sm7325, bluetooth-wcn-uart
 	// Documentation/features.md has what each needs written down first; tools/boards.py status NAME says it for
 	// this board.
 	features = <>;
@@ -300,7 +300,8 @@
 	// The Wi-Fi radio, for the driver's layer in the kernel (board/lx.c). Left out: a WCN6750, no pool.
 	// wifi {
 		// radio-model = <1>;           // 0: a WCN6750 on the SoC's own bus (feature "wifi-wcn6750");
-		//                              // 1: a WCN6855 on PCIe (its driver is being brought over)
+		//                              // 1: a WCN6855/QCA6490 on PCIe (feature "wifi-qca6490": the SM8450's PCIe0,
+		//                              // its pins and supplies as the OnePlus 10 Pro has them, board/pcie.c)
 		// early-pool-mb = <80>;        // memory in one piece kept for the radio's driver before user space
 		//                              // fragments RAM (ath11k on PCIe wants 80 MiB); left out: none
 		// dsp-memory = <0x9ae00000>;   // for "wifi-wcn6750": the Wi-Fi DSP's reserved memory, which the node with

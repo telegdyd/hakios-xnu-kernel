@@ -4,7 +4,7 @@
  * The network interface Darwin uses here is made in bsd/dev/board/net.c with the kernel's own
  * interface KPI: Ethernet as far as the rest of the kernel and user space can tell. What carries
  * the frames is a "link", a driver of its own that knows nothing about interfaces: QEMU's virtio
- * network device today (drivers/net/hakios_virtio_net.c), the phone's radio or frames carried over
+ * network device today (board/virtio_net.c), the phone's radio or frames carried over
  * the boot loader's USB channel tomorrow. This is all the two know of each other.
  *
  * A link driver
@@ -23,6 +23,7 @@
 
 #ifdef KERNEL
 #include <sys/kpi_mbuf.h>
+#include <net/kpi_interface.h>
 
 #define HAKIOS_NET_FRAME_MAX   1514
 #define HAKIOS_NET_UNITS       3       /* en0: the radio (or virtio); en1: the modem's packets (board/cell.c); en2: the USB cable (board/usb_net.c) */
@@ -34,6 +35,11 @@ struct hakios_net_link {
 	bool            wireless;       /* the interface is told to be Wi-Fi (its "subfamily"), which is how the
 	                                 * network stack and configd tell a radio from a cable */
 	bool            up;             /* frames can pass from the start (else: wait for hakios_net_link_state()) */
+	/*
+	 * HAKIOS_NET_CSUM_TX, or 0: the link fills in the IPv4 header and TCP/UDP checksums (v4 and v6) of the frames
+	 * whose mbuf_get_csum_requested() asks for it; the stack leaves them (with the pseudo-header's sum in place).
+	 */
+	uint32_t        offload;
 	/*
 	 * Send one frame: a chain of mbufs, `length` bytes in all, the Ethernet header first. The
 	 * packet stays the caller's: copy it (mbuf_copydata()). Returns false if it had to be dropped.
@@ -54,6 +60,9 @@ bool hakios_net_attach(const struct hakios_net_link *link);
 /* A frame has arrived (on en0 / on en<unit>). Copied; the buffer is the caller's again on return. */
 void hakios_net_input(const uint8_t *frame, size_t length);
 void hakios_net_input_unit(unsigned unit, const uint8_t *frame, size_t length);
+/* ... whose IPv4 header and TCP/UDP checksums the link's hardware has checked and found good (the stack skips them) */
+void hakios_net_input_checked(unsigned unit, const uint8_t *frame, size_t length, bool checked);
+#define HAKIOS_NET_CSUM_TX      (IFNET_CSUM_IP | IFNET_CSUM_TCP | IFNET_CSUM_UDP | IFNET_CSUM_TCPIPV6 | IFNET_CSUM_UDPIPV6)
 /* Frames can pass now / can no longer pass (on en0 / on en<unit>). */
 void hakios_net_link_state(bool up);
 void hakios_net_link_state_unit(unsigned unit, bool up);

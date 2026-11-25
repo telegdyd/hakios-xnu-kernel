@@ -14,6 +14,9 @@
 #define _SYS_HAKIOS_LX_H_
 
 #include "sta.h"
+#include "pcie.h"
+#include "qrtr.h"
+#include "wifi.h"
 
 /* ---- memory ---- */
 void	*lx_os_alloc(unsigned long size);			/* zeroed; NULL when there is none */
@@ -26,6 +29,35 @@ void	 lx_os_free(void *memory, unsigned long size);
  */
 void	*lx_os_radio_memory(unsigned long size, unsigned long long *address);
 void	*lx_os_map_registers(unsigned long long physical, unsigned long size);	/* never unmapped */
+
+/* ---- PCI bus (C4); same types, return values and lifetime as C2 ----
+ * Declared in wave 0; hardware bodies belong to integration (WP6).
+ */
+int lx_os_pcie_up(unsigned rc, struct hakios_pcie_link *link);
+void lx_os_pcie_down(unsigned rc);
+int lx_os_pcie_cfg_read(unsigned rc, unsigned bdf, unsigned off, unsigned size, unsigned *value);
+int lx_os_pcie_cfg_write(unsigned rc, unsigned bdf, unsigned off, unsigned size, unsigned value);
+int lx_os_pcie_try_read32(const volatile void *va, unsigned *value);
+int lx_os_pcie_try_write32(volatile void *va, unsigned value);
+/* Reserve ONE contiguous, zeroed, DMA-coherent pool, mapped at 0xa0000000
+ * through SID 0x1c01. size is page-aligned, <=64 MiB. 0 or positive errno;
+ * failure sets *va=NULL, *iova=0. Repeating the same request returns the same
+ * pool; a different size while active returns EBUSY. lx owns suballocation,
+ * never calls lx_os_free on it. Kernel owns teardown after DMA has stopped.
+ * In diagnostic bypass mode reject inaccessible (>32-bit) physical memory.
+ */
+int lx_os_dma_pool(unsigned long size, void **va, unsigned long long *iova);
+struct hakios_qrtr_link;
+/* NULL detaches; otherwise installs borrowed C6 link via link_up (0/errno).
+ * Detach synchronously drains callbacks, before the lx link storage is freed.
+ * RX calls hakios_qrtr_receive via lx_os_qrtr_receive, avoiding an extra kernel
+ * symbol family in the standalone object's imports. WP6 supplies both bodies.
+ */
+int lx_os_qrtr_link(const struct hakios_qrtr_link *link);
+int lx_os_qrtr_receive(const struct hakios_qrtr_link *link, const void *packet, unsigned long len);
+/* Same C1 wire format; name/number from sys/board/wifi.h's table. */
+void lx_os_stage(unsigned n, const char *name, int ok, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
 
 /* ---- saying things ---- */
 void	 lx_os_print(const char *text);				/* for whoever looks for a fault: may be kept back */
@@ -54,6 +86,11 @@ void	 lx_os_random(void *buffer, unsigned long size);	/* bytes nobody can guess 
 unsigned lx_os_option(const char *name);
 /* Physical radio model: 0 WCN6750/AHB, 1 WCN6855 HW2.0/PCIe. */
 unsigned lx_os_radio_model(void);
+void lx_os_mhi_power(unsigned state, unsigned wake, unsigned pending, unsigned m0, unsigned m2, unsigned errors, unsigned blocked);
+void lx_os_thread_slots(unsigned used, unsigned high);
+void lx_thread_release(void);
+/* 1 while the display is off (the layer's clocks then tick less often: STANDBY-PLAN.md), else 0 */
+int	 lx_os_screen_off(void);
 /* a file the driver asks for by the name Linux has for it, in place: 0, or an errno (ENOENT) */
 int	 lx_os_firmware(const char *name, const void **data, unsigned long *size);
 /* the processor that runs the radio's firmware: started, and up when this returns; 0 or an errno */
@@ -69,7 +106,14 @@ int	 lx_os_network(unsigned char *name, unsigned *name_length, unsigned char *pa
 /* ---- frames: the radio as what carries the machine's network interface ---- */
 void	 lx_os_net_attach(const unsigned char *address);	/* there is a radio, and this is its address */
 void	 lx_os_net_link(int up);				/* frames can pass now (a network is joined) / no longer */
-void	 lx_os_net_input(const unsigned char *frame, unsigned long length);	/* an Ethernet frame has arrived */
+/* an Ethernet frame has arrived; checked: the radio found its IPv4 header and TCP/UDP checksums good */
+void	 lx_os_net_input(const unsigned char *frame, unsigned long length, int checked);
+/*
+ * lx_transmit()'s flags: the frame's 802.11 traffic identifier (0-7, its WMM class) and whether the radio is
+ * to fill in its IPv4 header and TCP/UDP checksums (the stack left them, with the pseudo-header's sum in place).
+ */
+#define LX_TX_TID(flags)	((flags) & 7u)
+#define LX_TX_CSUM		0x100u
 
 /*
  * ---- the radio's interrupts (wifi_irq=1). The radio raises one by writing a number to an address
@@ -85,6 +129,17 @@ void	 lx_os_irq_disable(unsigned vector);			/* returns when its function is not 
 void	 lx_os_irq_detach_all(void);				/* returns when no function is running */
 unsigned long long lx_os_irq_count(unsigned vector);		/* how many have arrived */
 
+/*
+ * ---- the PCIe radio's MSIs as LPIs of the GIC's ITS (radio model 1; wifi_its=0: lx_pci.c's RAM mailbox and 1 ms poll).
+ * lx_os_pci_msi(): where the radio writes (an IOVA of its SMMU context, the ITS's doorbell) and what: vector v is data + v.
+ * 0, -1 with wifi_its=0, or a (Darwin) errno: then the mailbox. lx_os_pci_msi_wait(): sleeps until a vector fires or the time is up; the vectors that
+ * fired since the last call (a bit each), 0 after the time. Nothing of the driver runs in an interrupt.
+ */
+int	 lx_os_pci_msi(unsigned vectors, unsigned long long *address, unsigned *data);
+unsigned lx_os_pci_msi_wait(unsigned milliseconds);
+void	 lx_os_pci_msi_off(void);					/* no more; returns when no interrupt of it is being taken */
+unsigned long long lx_os_pci_msi_count(unsigned vector);	/* how many have arrived */
+
 /* ---- the station: scanning and joining, for whoever asks the kernel (board/sta.h) ---- */
 void	 lx_os_station(const struct hakios_sta_ops *ops);	/* here it is, to be asked; NULL: no longer (returns when no call is under way) */
 void	 lx_os_station_lost(int error);				/* the network joined is gone by itself */
@@ -98,8 +153,27 @@ void	 lx_os_station_lost(int error);				/* the network joined is gone by itself 
  * is not up).
  */
 int	 lx_start(void);
+int lx_os_pcie_down_status(void);
+void lx_os_runtime_state(int phase, int error);
+void lx_os_qrtr_diagnostic(void);
+int lx_os_pcie_pm_start(void);
+void lx_os_pcie_pm_sample(void);
+/* doze (lx_80211.c): C2's link sleep/wake, WAKE# (cb in interrupt context), the words, a counts line, en0's IPv4 */
+int lx_os_pcie_sleep(_Bool fast_mhi);
+int lx_os_pcie_wake(void);
+int lx_os_pcie_wake_irq(void (*cb)(void));
+void lx_os_pcie_wake_arm(int on);
+int lx_os_pcie_wake_line(void);
+unsigned lx_os_pcie_sleep_mode(void);
+void lx_os_doze_config(unsigned *on, unsigned *idle_ms, unsigned *ps);
+bool lx_os_rx_filter_asked(unsigned *mode);
+void lx_os_doze_stats(const char *text);
+unsigned lx_os_doze_patterns(void);
+void lx_os_doze_event(const void *event);
+unsigned lx_os_doze_kick_mode(void);
+int lx_os_wifi_ipv4(unsigned *be_addr);
 void	 lx_stop(void);
-int	 lx_transmit(const unsigned char *frame, unsigned long length);
+int	 lx_transmit(const unsigned char *frame, unsigned long length, unsigned flags);
 /* before lx_start(), if the kernel wants it early: take the memory the radio will be shown. 0, or an errno. */
 int	 lx_prepare(void);
 

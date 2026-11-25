@@ -225,7 +225,7 @@ config ADRENO_A6XX
 	  (board/adreno.c, the board's "gpu-a660", gpu=1).
 
 config WIFI_WCN6750
-	bool "WCN6750 Wi-Fi on the SoC's Wi-Fi DSP"
+	bool "Wi-Fi: a WCN6750 on the SoC's Wi-Fi DSP, or a QCA6490 on PCIe"
 	default y
 	select QCOM_SCM
 	select QCOM_SMMU
@@ -236,7 +236,9 @@ config WIFI_WCN6750
 	help
 	  The Wi-Fi DSP started through TrustZone, the radio's firmware and calibration given through QMI, Linux's ath11k
 	  driver (kernel/lx) behind a station boundary, Apple80211's requests answered (board/wifi.c, the board's
-	  "wifi-wcn6750", wifi=1).
+	  "wifi-wcn6750", wifi=1). A QCA6490 on the SM8450's first PCIe controller instead: its link, its SMMU context,
+	  MHI and ath11k's PCI path, the GIC's ITS for its interrupts (board/wifi_pci.c, board/pcie.c, board/its.c, the
+	  board's "wifi-qca6490", wifi=1).
 
 config AUDIO_DSP
 	bool "The audio DSP: sound, the microphones, the battery's details"

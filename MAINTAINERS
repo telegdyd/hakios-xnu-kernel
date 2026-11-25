@@ -436,6 +436,13 @@ F:	drivers/board/wlfw.c
 F:	drivers/board/lx.c
 F:	drivers/board/sta.c
 F:	drivers/board/apple80211.c
+F:	drivers/board/wifi_pci.c
+F:	drivers/board/wifi_stage.c
+F:	drivers/board/pcie.c
+F:	drivers/board/pcie_pm.h
+F:	drivers/board/qrtr.c
+F:	drivers/board/its.c
+F:	drivers/board/smmu_ctx.c
 F:	drivers/board/net.c
 F:	drivers/board/usb_net.c
 F:	drivers/iokit/BoardWLAN.cpp
@@ -443,14 +450,31 @@ F:	drivers/iokit/MiniIONetworkStack.cpp
 F:	include/board/lx.h
 F:	include/board/net.h
 F:	include/board/sta.h
+F:	include/board/pcie.h
+F:	include/board/wifi.h
+F:	include/board/its.h
+F:	include/board/smmu_ctx.h
+F:	include/board/mmio_try.h
+F:	include/board/qrtr.h
 F:	kernel/lx/src/lx_80211.c
 F:	kernel/lx/src/lx_wpa.c
 F:	kernel/lx/src/lx_wpa.h
+F:	kernel/lx/src/lx_pci.c
+F:	kernel/lx/src/lx_mhi.c
+F:	kernel/lx/src/lx_sae.c
+F:	kernel/lx/src/lx_owe.c
+F:	kernel/lx/src/lx_policy.h
 T:	workbench/wifi_driver_test.c
 T:	workbench/apple80211_test.c
 T:	workbench/station_test.c
 T:	workbench/lx_test.c
 T:	workbench/lx_base_test.c
-T:	workbench/lx_wpa_test.c
+T:	workbench/wpa/
+T:	workbench/sae/
+T:	workbench/owe/
+T:	workbench/qrtr/
+T:	workbench/wifi_pci/
+T:	workbench/mhi/
+T:	workbench/lx_pci/
 D:	Documentation/drivers.md
-K:	wifi-wcn6750; wifi=
+K:	wifi-wcn6750, wifi-qca6490; wifi=
