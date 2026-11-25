@@ -132,6 +132,15 @@ static uint32_t speed_bin;              /* which of the GPUs of this kind the fu
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
 static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
+static uint32_t power_quiescing;        /* panic path: never takes the GPU lock, stops runtime transitions */
+static uint32_t slumber_config, slumber_on;
+static bool slumber_asleep, slumber_resuming, slumber_failed;
+static uint64_t slumber_idle_ns, slumber_suspends, slumber_resumes;
+static uint64_t slumber_suspend_us, slumber_resume_us;
+static bool slumber_stream1, slumber_irq;
+static bool gpu_runtime_suspend(void);
+static bool gpu_runtime_resume(void);
+static void gpu_slumber_stop(void);
 
 /*
  * gpu-ifpc (the core's power collapse between frames; "inter-frame power collapse" below, after the ring): set up
@@ -588,7 +597,9 @@ step_cx_power(void)
 		printf("adreno: %u: CX does not come on\n", step);
 		return false;
 	}
-	printf("adreno: %u: CX is on\n", step);
+	if (!quiet) {
+		printf("adreno: %u: CX is on\n", step);
+	}
 	if (rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON) {
 		/*
 		 * The 3D core kept its power while the rest of the block lost it: an ending that went
@@ -1833,7 +1844,7 @@ step_gmu_firmware(void)
 						wrong++;
 					}
 				}
-				if (pass == 1) {
+				if (pass == 1 && !quiet) {
 					printf("adreno: %u: %#x bytes at the GMU's %#x, through its registers\n", step, block.size,
 					    block.address);
 				}
@@ -1850,7 +1861,9 @@ step_gmu_firmware(void)
 				    (uint64_t)block.address + block.size <= gmu_blocks[i].address + gmu_blocks[i].size) {
 					memcpy((void *)(gmu_blocks[i].memory + (block.address - gmu_blocks[i].address)), data, block.size);
 					to_memory(gmu_blocks[i].memory, gmu_blocks[i].size);
-					printf("adreno: %u: %#x bytes at the GMU's %#x, in memory\n", step, block.size, block.address);
+					if (!quiet) {
+						printf("adreno: %u: %#x bytes at the GMU's %#x, in memory\n", step, block.size, block.address);
+					}
 					break;
 				}
 			}
@@ -1861,8 +1874,10 @@ step_gmu_firmware(void)
 		printf("adreno: %u: %u words of the GMU's own memory do not read back as written\n", step, wrong);
 		return false;
 	}
-	printf("adreno: %u: THE GMU'S FIRMWARE IS LOADED; its versions, read back from the GMU: core %#x, power %#x, HFI %#x\n",
-	    step, rd(gmu.base + GMU_DTCM_VERSIONS), rd(gmu.base + GMU_DTCM_VERSIONS + 8), rd(gmu.base + GMU_DTCM_VERSIONS + 16));
+	if (!quiet) {
+		printf("adreno: %u: THE GMU'S FIRMWARE IS LOADED; its versions, read back from the GMU: core %#x, power %#x, HFI %#x\n",
+		    step, rd(gmu.base + GMU_DTCM_VERSIONS), rd(gmu.base + GMU_DTCM_VERSIONS + 8), rd(gmu.base + GMU_DTCM_VERSIONS + 16));
+	}
 	return true;
 }
 
@@ -1924,7 +1939,9 @@ step_gmu_start(void)
 	if (!cx_ready() || !gmu_space_is_on) {
 		return false;
 	}
-	hfi = (volatile struct hfi_table *)block_uncached(&gmu_hfi);
+	if (hfi == NULL) {
+		hfi = (volatile struct hfi_table *)block_uncached(&gmu_hfi);
+	}
 	if (hfi == NULL) {
 		printf("adreno: %u: the page for the messages is not in one piece\n", step);
 		return false;
@@ -1956,6 +1973,9 @@ step_gmu_start(void)
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 2);
 		if (!wait_for(&gmu, GMU_RSCC_CONTROL_ACK, 2, 2, 100) || !wait_for(&rscc, RSCC_SEQ_BUSY_DRV0, ~0u, 0, 100)) {
 			printf("adreno: %u: the GMU's RPMh channel does not wake\n", step);
+			if (slumber_resuming) {
+				return false;
+			}
 		}
 		get(&gmu, "rscc_control_ack", GMU_RSCC_CONTROL_ACK);
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
@@ -2020,7 +2040,9 @@ step_gmu_start(void)
 		gmu_post_mortem();
 		return false;
 	}
-	printf("adreno: %u: THE GMU'S FIRMWARE RUNS\n", step);
+	if (!quiet) {
+		printf("adreno: %u: THE GMU'S FIRMWARE RUNS\n", step);
+	}
 	return true;
 }
 
@@ -2101,7 +2123,9 @@ step_gmu_queues(void)
 	get(&gmu, "hfi_ctrl_status", GMU_HFI_CTRL_STATUS);
 	get(&gmu, "hfi_version_info", GMU_HFI_VERSION_INFO);
 	gmu_talks = true;
-	printf("adreno: %u: THE GMU'S MESSAGE QUEUES ARE UP\n", step);
+	if (!quiet) {
+		printf("adreno: %u: THE GMU'S MESSAGE QUEUES ARE UP\n", step);
+	}
 	return !space_faulted(&gmu_space);
 }
 
@@ -2362,23 +2386,27 @@ gpu_ifpc_boot(void)
 	uint32_t wanted = 1;
 	uint32_t feature[4] = { 0, 9, 1, 0x1680 };
 
-	ifpc_config = ifpc_on = 0;
-	if (!adreno_gen7() || !hakios_board_has(HAKIOS_HAS_GPU_IFPC)) {
+	if (!slumber_resuming) {
+		ifpc_config = ifpc_on = 0;
+		if (!adreno_gen7() || !hakios_board_has(HAKIOS_HAS_GPU_IFPC)) {
+			return true;
+		}
+		PE_parse_boot_argn("gpu_ifpc", &wanted, sizeof(wanted));
+		if (!gpu_keep_asked || !wanted) {
+			printf("adreno: %u: gpu-ifpc: %s: the core is not collapsed between frames\n", step,
+			    !gpu_keep_asked ? "the GPU is not to be kept" : "gpu_ifpc=0");
+			return true;
+		}
+		ifpc_config = 1;
+		ifpc_on = 1;
+	} else if (!ifpc_config) {
 		return true;
 	}
-	PE_parse_boot_argn("gpu_ifpc", &wanted, sizeof(wanted));
-	if (!gpu_keep_asked || !wanted) {
-		printf("adreno: %u: gpu-ifpc: %s: the core is not collapsed between frames\n", step,
-		    !gpu_keep_asked ? "the GPU is not to be kept" : "gpu_ifpc=0");
-		return true;
-	}
-	ifpc_config = 1;
 	gpu_gx_ref(true);
 	if (!hfi_send("the feature IFPC", HFI_FEATURE_CTRL, feature, 4)) {
 		ifpc_failed = 1;
 		return false;
 	}
-	ifpc_on = 1;
 	return true;
 }
 
@@ -2438,8 +2466,10 @@ step_core_power(void)
 	    !rail_vote(adreno_gen7() ? 64 : 48, cx, cx_levels, mx, mx_levels, &perf.gmu[1].vote)) {
 		return false;
 	}
-	printf("adreno: %u: votes: 3D core %#x %#x %#x %#x, GMU %#x %#x\n", step, perf.gpu[0].vote, perf.gpu[1].vote,
-	    perf.gpu[2].vote, perf.gpu[3].vote, perf.gmu[0].vote, perf.gmu[1].vote);
+	if (!quiet) {
+		printf("adreno: %u: votes: 3D core %#x %#x %#x %#x, GMU %#x %#x\n", step, perf.gpu[0].vote, perf.gpu[1].vote,
+		    perf.gpu[2].vote, perf.gpu[3].vote, perf.gmu[0].vote, perf.gmu[1].vote);
+	}
 
 	bw.levels = 1;
 	bw.ddr_commands = 3;
@@ -2461,8 +2491,10 @@ step_core_power(void)
 		bw.cnoc_data[1][0] = 0x60000001;
 	}
 	core_bus_levels = bw.levels;
-	printf("adreno: %u: RPMh's bus resources: SH0 %#x, MC0 %#x, ACV %#x, CN0 %#x (Linux has 0x50004, 0x50000, 0x50088, "
-	    "0x5006c)\n", step, bw.ddr_address[0], bw.ddr_address[1], bw.ddr_address[2], bw.cnoc_address[0]);
+	if (!quiet) {
+		printf("adreno: %u: RPMh's bus resources: SH0 %#x, MC0 %#x, ACV %#x, CN0 %#x (Linux has 0x50004, 0x50000, 0x50088, "
+		    "0x5006c)\n", step, bw.ddr_address[0], bw.ddr_address[1], bw.ddr_address[2], bw.cnoc_address[0]);
+	}
 	if (bw.ddr_address[0] == 0 || bw.ddr_address[1] == 0 || bw.ddr_address[2] == 0 ||
 	    (bw.cnoc_commands != 0 && bw.cnoc_address[0] == 0)) {
 		return false;
@@ -2473,7 +2505,10 @@ step_core_power(void)
 	}
 	core_khz = speeds[vote[2]].khz;
 	core_speed = vote[2];
-	printf("adreno: %u: the speed wanted: %u MHz\n", step, core_khz / 1000);
+	core_bus = HFI_NO_INDEX;
+	if (!quiet) {
+		printf("adreno: %u: the speed wanted: %u MHz\n", step, core_khz / 1000);
+	}
 	announce("send the GMU its tables (speeds and supply levels, bus votes), \"start\", and the speed wanted; "
 	    "from here on it casts votes in RPMh by itself");
 	if (!hfi_send("the table of speeds", HFI_PERF_TABLE, &perf.header, sizeof(perf) / 4) ||
@@ -2519,7 +2554,9 @@ step_core_power(void)
 	get(&gpu, "rbbm_int_0_status", RBBM_INT_0_STATUS);
 	get(&gpu, "rbbm_clock_cntl", RBBM_CLOCK_CNTL);
 	get(&gpu, "cp_rb_base", CP_RB_BASE);
-	printf("adreno: %u: THE 3D CORE HAS POWER AND ANSWERS\n", step);
+	if (!quiet) {
+		printf("adreno: %u: THE 3D CORE HAS POWER AND ANSWERS\n", step);
+	}
 	return !space_faulted(&gmu_space);
 }
 
@@ -2817,7 +2854,9 @@ ring_run(const char *what)
 {
 	uint32_t taken = ~0u, status = ~0u;
 
-	printf("adreno: %u: about to have the 3D core %s: the ring up to word %u\n", step, what, ring_at);
+	if (!quiet) {
+		printf("adreno: %u: about to have the 3D core %s: the ring up to word %u\n", step, what, ring_at);
+	}
 	snprintf(last_write, sizeof(last_write), "step %u had the 3D core %s", step, what);
 	hold(true);
 	if (!ring_send()) {
@@ -2829,7 +2868,9 @@ ring_run(const char *what)
 		status = rd(gpu.base + RBBM_STATUS);
 	}
 	if (taken == ring_at && !(status & ~1u) && rd(gpu.base + CP_HW_FAULT) == 0 && !space_faulted(&core_space)) {
-		printf("adreno: %u: the 3D core has done it (ring read up to %u, status %#x)\n", step, taken, status);
+		if (!quiet) {
+			printf("adreno: %u: the 3D core has done it (ring read up to %u, status %#x)\n", step, taken, status);
+		}
 		return true;
 	}
 	printf("adreno: %u: the 3D core does not get through: ring read up to %u of %u, status %#x, interrupts %#x, "
@@ -3164,10 +3205,12 @@ step_core_start(void)
 	core_runs = true;
 	put(&gpu, "cp_sqe_cntl", CP_SQE_CNTL, 1);
 	sleep_ms(20);
-	printf("adreno: %u: alive after it; status %#x, interrupts %#x, command processor: fault %#x, interrupts %#x, "
-	    "protection %#x, ring read up to %u\n", step, rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_INT_0_STATUS),
-	    rd(gpu.base + CP_HW_FAULT), rd(gpu.base + CP_INTERRUPT_STATUS), rd(gpu.base + CP_PROTECT_STATUS),
-	    rd(gpu.base + CP_RB_RPTR));
+	if (!quiet) {
+		printf("adreno: %u: alive after it; status %#x, interrupts %#x, command processor: fault %#x, interrupts %#x, "
+		    "protection %#x, ring read up to %u\n", step, rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_INT_0_STATUS),
+		    rd(gpu.base + CP_HW_FAULT), rd(gpu.base + CP_INTERRUPT_STATUS), rd(gpu.base + CP_PROTECT_STATUS),
+		    rd(gpu.base + CP_RB_RPTR));
+	}
 	get(&smmu, "sgfsr", SMMU_SGFSR);
 	get(&smmu, "sgfsynr0", SMMU_SGFSR + 8);
 	get(&smmu, "sgfsynr1", SMMU_SGFSR + 12);
@@ -3212,7 +3255,9 @@ step_core_start(void)
 	if (!ring_run("initialize its command processor")) {
 		return false;
 	}
-	printf("adreno: %u: THE 3D CORE TAKES COMMANDS\n", step);
+	if (!quiet) {
+		printf("adreno: %u: THE 3D CORE TAKES COMMANDS\n", step);
+	}
 	return true;
 }
 
@@ -3240,8 +3285,10 @@ step_core_commands(void)
 		return false;
 	}
 	to_memory(core_scratch.memory, 64);
-	printf("adreno: %u: the page reads %#x: %s\n", step, scratch[0], scratch[0] == 0x600dc0de ?
-	    "THE 3D CORE WRITES OUR MEMORY ON COMMAND" : "not what it was told to write");
+	if (!quiet || scratch[0] != 0x600dc0de) {
+		printf("adreno: %u: the page reads %#x: %s\n", step, scratch[0], scratch[0] == 0x600dc0de ?
+		    "THE 3D CORE WRITES OUR MEMORY ON COMMAND" : "not what it was told to write");
+	}
 	return scratch[0] == 0x600dc0de;
 }
 
@@ -3526,24 +3573,29 @@ core_bus_halt(bool for_good)
 
 static bool core_stuck;                 /* the 3D core has not finished what it was given, and is not waited for */
 
-static void
-gpu_block_stop(void)
+static bool
+gpu_block_suspend(bool runtime)
 {
 	/* A730 PREPARE_SLUMBER needs a valid performance entry and DDR index. */
 	uint32_t slumber[3] = { 0, adreno_gen7() ? 2u : 0u, adreno_gen7() ? 1u : 0u };
 	bool power_off = cx_ours;               /* (also where a step failed before the GMU had its memory: steps 5 to 12) */
+	bool ok = true;
 
 	step = 0;
 	newest_step = ~0u;
 	if (core_runs && core_is_on) {
 		/* (what the core looks like when it is given back: a GMU that then does not answer may have its reasons here) */
-		printf("adreno: %u: the 3D core before it is stopped: status %#x, interrupts %#x, ring read up to %u of %u; the GMU "
-		    "sees it busy: %#x\n", step, rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_INT_0_STATUS),
-		    rd(gpu.base + CP_RB_RPTR), ring_at, rd(gmu.base + GMU_AO_GPU_CX_BUSY_STATUS));
+		if (!runtime) {
+			printf("adreno: %u: the 3D core before it is stopped: status %#x, interrupts %#x, ring read up to %u of %u; the GMU "
+			    "sees it busy: %#x\n", step, rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_INT_0_STATUS),
+			    rd(gpu.base + CP_RB_RPTR), ring_at, rd(gmu.base + GMU_AO_GPU_CX_BUSY_STATUS));
+		}
 		core_bus_halt(core_stuck);
-		printf("adreno: %u: the GPU block's bus has been halted%s (rbbm_gbif_halt_ack %#x, gbif halt_ack %#x)\n", step,
-		    core_stuck ? ", the 3D core's side too, and stays so" : " and let go again", rd(gpu.base + RBBM_GBIF_HALT_ACK),
-		    rd(gbif.base + GBIF_HALT_ACK));
+		if (!runtime) {
+			printf("adreno: %u: the GPU block's bus has been halted%s (rbbm_gbif_halt_ack %#x, gbif halt_ack %#x)\n", step,
+			    core_stuck ? ", the 3D core's side too, and stays so" : " and let go again", rd(gpu.base + RBBM_GBIF_HALT_ACK),
+			    rd(gbif.base + GBIF_HALT_ACK));
+		}
 	}
 	if (core_is_on) {
 		put(&gmu, "host2gmu_intr_set", GMU_HOST2GMU_INTR_SET, 1u << 31);
@@ -3565,12 +3617,16 @@ gpu_block_stop(void)
 		if (gmu_talks && (!wait_for(&gmu, GMU_RPMH_POWER_STATE, 0xf, 3, 100) || !wait_for(&gmu, GMU_GX_STATUS, 3, 3, 100))) {
 			printf("adreno: %u: gpu-ifpc: the GMU does not go down to its idle state (power state %#x, gx status %#x)\n",
 			    step, rd(gmu.base + GMU_RPMH_POWER_STATE), rd(gmu.base + GMU_GX_STATUS));
+			ok = false;
 		}
 	}
 	if (gmu_talks) {
-		hfi_send("\"slumber\"", HFI_PREPARE_SLUMBER, slumber, 3);
+		if (!hfi_send("\"slumber\"", HFI_PREPARE_SLUMBER, slumber, 3)) {
+			ok = false;
+		}
 		if (!wait_for(&gmu, GMU_AO_GPU_CX_BUSY_STATUS, 1u << 23, 0, 100)) {
 			get(&gmu, "ao_gpu_cx_busy_status", GMU_AO_GPU_CX_BUSY_STATUS);
+			ok = false;
 		}
 		get(&gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK_STATUS);
 		get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
@@ -3582,8 +3638,8 @@ gpu_block_stop(void)
 		gx_off();                               /* (a GMU that has slumbered has done it itself) */
 		core_runs = false;                      /* (no register of the 3D core is to be reached from here on) */
 	}
-	if (zap_is_loaded) {
-		/* the next kernel loads its own: see step_zap_load() */
+	if (zap_is_loaded && !runtime) {
+		/* the next kernel loads its own: see step_zap_load(); runtime slumber keeps it authenticated */
 		printf("adreno: %u: the zap shader: %s\n", step, zap_unload() ? "TrustZone has given it up" :
 		    "TRUSTZONE DOES NOT GIVE IT UP; the next kernel will find it there");
 		zap_is_loaded = false;
@@ -3593,6 +3649,7 @@ gpu_block_stop(void)
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 1);
 		if (!wait_for(&rscc, RSCC_RSC_STATUS0_DRV0, RSCC_ASLEEP, RSCC_ASLEEP, 100)) {
 			printf("adreno: %u: the GMU's RPMh channel does not go to sleep\n", step);
+			ok = false;
 		}
 		get(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0);
 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
@@ -3650,6 +3707,14 @@ gpu_block_stop(void)
 		}
 		bzero(&gcc_ours, sizeof(gcc_ours));
 	}
+	core_runs = false;
+	return ok && cx_off && !(rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON);
+}
+
+static void
+gpu_block_stop(void)
+{
+	(void)gpu_block_suspend(false);
 }
 
 /*
@@ -3662,6 +3727,7 @@ static void gpu_irq_quiesce(void);
 void
 hakios_adreno_quiesce(void)
 {
+	__atomic_store_n(&power_quiescing, 1, __ATOMIC_RELEASE);
 	gpu_irq_quiesce();
 	if (cx_off) {
 		return;
@@ -3966,7 +4032,9 @@ gpu_irq_start(void)
 	gpu_irq_intid = intid;
 	wr(gpu.base + GPU_IRQ_MASK, GPU_IRQ_COMPLETION);
 	__asm__ volatile ("dsb sy" ::: "memory");
-	printf("adreno: GPU completion IRQ armed on GIC INTID %u\n", intid);
+	if (!quiet) {
+		printf("adreno: GPU completion IRQ armed on GIC INTID %u\n", intid);
+	}
 #else
 	printf("adreno: GPU completion IRQ needs GICv3; polling retained\n");
 #endif
@@ -4020,6 +4088,17 @@ hakios_gpu_stop(void)
 
 		gpu_kept = false;                       /* (nothing more is taken) */
 		quiet = false;
+		if (slumber_asleep || cx_off) {
+			gpu_slumber_stop();
+			gpu_dcvs_stop();
+			if (zap_is_loaded) {
+				printf("adreno: 0: the zap shader: %s\n", zap_unload() ? "TrustZone has given it up" :
+				    "TRUSTZONE DOES NOT GIVE IT UP; the next kernel will find it there");
+				zap_is_loaded = false;
+			}
+			printf("adreno: the run is about to end: the GPU was already asleep\n");
+			return;
+		}
 		/*
 		 * What the core has been given, it finishes first: told to slumber in the middle of a
 		 * frame, the GMU may not answer. Half a second at the most; then its bus is halted
@@ -4030,6 +4109,7 @@ hakios_gpu_stop(void)
 			waited++;
 		}
 		core_stuck = !hakios_gpu_done(gpu_fence);
+		gpu_slumber_stop();
 		gpu_ifpc_stop();                        /* (before the counters are turned off with gpu-dcvs) */
 		gpu_dcvs_stop();
 		/* (gpu-ifpc: the core up for the rest, which reads and halts it; one that does not come back is not reached) */
@@ -4257,8 +4337,8 @@ hakios_gpu_unmap(uint64_t address, uint64_t size)
 		space_map(&core_space, address + offset, 0, 0);
 	}
 	space_commit(&core_space);
-	if (!gpu_kept) {
-		return true;            /* (the GPU given back: its SMMU context is off, and its registers not to be touched) */
+	if (!gpu_kept || !core_space_is_on) {
+		return true;            /* (the GPU given back or asleep: its SMMU context is off, and resume flushes TLBs) */
 	}
 	wr(smmu.base + context + SMMU_CB_TLBIASID, core_space.context);
 	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
@@ -4450,9 +4530,13 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	 * caller holds the lock hakios_gpu_stop() is called under, so what it sees here stays so until it lets go; a
 	 * submission that looked before taking the lock -- BoardGPU.cpp's externalMethod -- is turned away here.)
 	 */
-	if (!gpu_kept || ifpc_failed) {
+	if (!gpu_kept || ifpc_failed || slumber_failed || __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
 		return 0;
 	}
+	if (slumber_asleep && !gpu_runtime_resume()) {
+		return 0;
+	}
+	slumber_idle_ns = 0;
 
 	for (int i = 0; i < 20000; i++) {
 		room = (ring_read_position() + RING_WORDS - ring_at - 1) % RING_WORDS;
@@ -4506,6 +4590,10 @@ hakios_gpu_report(const char *why)
 
 	if (!gpu_kept) {
 		printf("adreno: gpu: %s: the GPU has been given back: nothing of it is read\n", why);
+		return;
+	}
+	if (slumber_asleep) {
+		printf("adreno: gpu: %s: gpu-slumber: the GPU is asleep (failed %u); nothing of it is read\n", why, slumber_failed);
 		return;
 	}
 	/* (gpu-ifpc: the core's registers only with it up; otherwise what memory and the GMU say) */
@@ -4867,12 +4955,26 @@ dcvs_ceiling(void)
 	return dcvs_cap < dcvs_limit ? dcvs_cap : dcvs_limit;
 }
 
+static void
+gpu_dcvs_counters_start(void)
+{
+	busy_valid = false;
+	busy_sample_ns = 0;
+	if (!dcvs_running) {
+		return;
+	}
+	wr(gmu.base + GMU_BUSY_MASK, 0xff000000);
+	wr(gmu.base + GMU_POWER_SELECT, (rd(gmu.base + GMU_POWER_SELECT) & ~0xffu) | 1u << 5);
+	wr(gmu.base + GMU_POWER_ENABLE, 1);
+	dcvs_last_load = dcvs_last_tick = dcvs_ns();
+}
+
 /*
  * With the GPU's lock held, once the GPU is kept: whether the speed is to follow the load (the board's feature
  * gpu-dcvs, more than one speed); if so, the busy counter is started and the worker is to run.
  */
-bool
-hakios_gpu_dcvs_start(void)
+static bool
+gpu_dcvs_start(void)
 {
 	const struct hakios_board *board = hakios_board();
 	uint32_t off = 1;
@@ -4891,11 +4993,8 @@ hakios_gpu_dcvs_start(void)
 	for (unsigned i = 0; dcvs_has_bus && i < dcvs_top; i++) {
 		dcvs_bus[i] = board->gpu.speed_bus[i];
 	}
-	wr(gmu.base + GMU_BUSY_MASK, 0xff000000);
-	wr(gmu.base + GMU_POWER_SELECT, (rd(gmu.base + GMU_POWER_SELECT) & ~0xffu) | 1u << 5);
-	wr(gmu.base + GMU_POWER_ENABLE, 1);
-	dcvs_last_load = dcvs_last_tick = dcvs_ns();
 	dcvs_running = true;
+	gpu_dcvs_counters_start();
 	printf("adreno: gpu-dcvs: %u to %u MHz %s, at most what the GPU's sensors allow (%s); bus votes %s\n",
 	    gpu_profile->speeds[1].khz / 1000, gpu_profile->speeds[dcvs_top].khz / 1000,
 	    dcvs_auto ? "by the GPU's load" : "fixed (gpu_dcvs=0)",
@@ -4905,8 +5004,8 @@ hakios_gpu_dcvs_start(void)
 }
 
 /* The worker's look, with the GPU's lock held: the milliseconds until the next; 0, no more. */
-uint32_t
-hakios_gpu_dcvs_tick(void)
+static uint32_t
+gpu_dcvs_tick(void)
 {
 	int32_t mc[2] = { 0, 0 };
 	unsigned previous_cap = dcvs_cap, target;
@@ -4965,7 +5064,9 @@ gpu_dcvs_stop(void)
 {
 	if (dcvs_running) {
 		dcvs_running = false;
-		wr(gmu.base + GMU_POWER_ENABLE, 0);
+		if (!slumber_asleep && !cx_off) {
+			wr(gmu.base + GMU_POWER_ENABLE, 0);
+		}
 		printf("adreno: gpu-dcvs: %u votes; ms at %u/%u/%u/%u/%u MHz: %llu/%llu/%llu/%llu/%llu; %u busy readings refused\n",
 		    dcvs_votes, gpu_profile->speeds[1].khz / 1000, dcvs_top >= 2 ? gpu_profile->speeds[2].khz / 1000 : 0,
 		    dcvs_top >= 3 ? gpu_profile->speeds[3].khz / 1000 : 0, dcvs_top >= 4 ? gpu_profile->speeds[4].khz / 1000 : 0,
@@ -4990,11 +5091,15 @@ hakios_gpu_dcvs_control(unsigned kind, int value, bool write)
 		default: return -EINVAL;
 		}
 	}
-	if (!dcvs_running || dcvs_failed || !gpu_kept) {
+	if (kind > 2 || (kind == 1 ? (value < 0 || value > 1) : (value < 1 || (unsigned)value > dcvs_top))) {
+		return EINVAL;
+	}
+	if (!dcvs_running || dcvs_failed || slumber_failed || !gpu_kept ||
+	    __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
 		return ENXIO;
 	}
-	if (kind == 1 ? (value < 0 || value > 1) : (value < 1 || (unsigned)value > dcvs_top)) {
-		return EINVAL;
+	if (slumber_asleep && !gpu_runtime_resume()) {
+		return EIO;
 	}
 	switch (kind) {
 	case 0:
@@ -5064,7 +5169,7 @@ gpu_ifpc_count(uint64_t *count)
 	return false;
 }
 
-/* The steps are over and the GPU is kept (single-threaded still; the completion interrupt may be armed). */
+/* The steps are over and the GPU is kept (single-threaded at boot, or under gGPULock on runtime resume). */
 static void
 gpu_ifpc_handover(void)
 {
@@ -5073,10 +5178,14 @@ gpu_ifpc_handover(void)
 	}
 	wr(gmu.base + GMU_IFPC_COUNT_SELECT, (rd(gmu.base + GMU_IFPC_COUNT_SELECT) & ~0xffu) | 4);
 	wr(gmu.base + GMU_COUNTERS_ON, 1);
-	/* step 17's "keep the 3D core up" taken back (bit 31): the keepalive alone does not let the GMU collapse it */
-	wr(gmu.base + GMU_HOST2GMU_INTR_SET, 1u << 31);
+	/* step 17's "keep the 3D core up" taken back (bit 31) unless IFPC is held off */
+	if (ifpc_on) {
+		wr(gmu.base + GMU_HOST2GMU_INTR_SET, 1u << 31);
+	}
 	gpu_gx_put();
-	printf("adreno: gpu-ifpc: the GMU may now power the 3D core down between frames\n");
+	if (!slumber_resuming) {
+		printf("adreno: gpu-ifpc: the GMU may now power the 3D core down between frames\n");
+	}
 }
 
 /* The run ends (hakios_gpu_stop(), before the core is woken for the last time). */
@@ -5104,11 +5213,15 @@ hakios_gpu_ifpc_control(int value, bool write)
 	if (value < 0 || value > 1) {
 		return EINVAL;
 	}
-	if (!ifpc_config || !gpu_kept || ifpc_failed) {
+	if (!ifpc_config || !gpu_kept || ifpc_failed || slumber_failed ||
+	    __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
 		return ENXIO;
 	}
 	if ((uint32_t)value == ifpc_on) {
 		return 0;
+	}
+	if (slumber_asleep && !gpu_runtime_resume()) {
+		return EIO;
 	}
 	if (value == 0) {
 		uint32_t granted = 0;
@@ -5144,10 +5257,277 @@ hakios_gpu_ifpc_line(char *line, size_t size)
 		    !gpu_kept ? "the GPU is not kept" : "gpu_ifpc=0");
 		return;
 	}
+	if (slumber_asleep) {
+		snprintf(line, size, "on %u failed %u asleep 1 collapses -1 gx_status 0 power_state 0 wakes %llu wake_failures %llu\n",
+		    ifpc_on, ifpc_failed, ifpc_wakes, ifpc_wake_failures);
+		return;
+	}
 	counted = gpu_ifpc_count(&count);
 	snprintf(line, size, "on %u failed %u collapses %lld gx_status %#x power_state %#x wakes %llu wake_failures %llu\n",
 	    ifpc_on, ifpc_failed, counted ? (long long)count : -1ll, rd(gmu.base + GMU_GX_STATUS),
 	    rd(gmu.base + GMU_RPMH_POWER_STATE), ifpc_wakes, ifpc_wake_failures);
+}
+
+/* ---- beside the steps: deeper idle collapse (board feature gpu-slumber) ------------------------------------- */
+
+/*
+ * After 1 s with all fences complete and no new submissions, the worker puts the A730 into deeper slumber: drains
+ * the ring, detaches completion IRQs, sends PREPARE_SLUMBER, resets the GMU, sleeps RSCC, disables SMMU streams,
+ * and collapses CX. Client allocations, page tables, VAs, fence numbering, and the authenticated zap shader are
+ * retained; on the next submission (or runtime sysctl write), resume restores CX, clocks, GMU firmware/HFI, SMMU,
+ * ring, CP/IFPC, IRQs, counters and DCVS policy before publishing work. A failed transition latches slumber_failed
+ * and refuses later submissions (no retry or hang recovery).
+ *
+ *   gpu_slumber=0                 not set up at all (the GPU stays awake)
+ *   kern.hakios.gpu_slumber       1 deeper idle collapse allowed; 0 kept awake (wakes immediately if asleep)
+ *   kern.hakios.gpu_slumber_state a line: on, asleep, failed, suspends, resumes, last transition us, cx_off
+ *
+ * From the OnePlus 10 Pro's port (negroni-dev's 39cd50c0, GPU-POWER-PLAN.md task 4).
+ */
+#define GPU_SLUMBER_IDLE_NS     1000000000ull
+
+static bool
+gpu_runtime_suspend(void)
+{
+	uint64_t began = dcvs_ns();
+	bool gx_access, off;
+
+	slumber_stream1 = second_stream_is_on;
+	slumber_irq = gpu_irq_active();
+	gx_access = gpu_gx_get();
+	core_stuck = !gx_access;
+	if (gx_access) {
+		core_stuck = !ring_run("drain before runtime suspend");
+	} else {
+		core_runs = false;              /* never touch GX after a failed wake */
+	}
+	gpu_times();
+	busy_valid = false;
+	if (dcvs_running || ifpc_config) {
+		wr(gmu.base + GMU_POWER_ENABLE, 0);
+	}
+	gpu_irq_stop();
+	hfi_quiet = true;
+	off = gpu_block_suspend(true);
+	hfi_quiet = false;
+	slumber_suspend_us = (dcvs_ns() - began) / 1000;
+	if (!off || core_stuck) {
+		slumber_failed = true;
+		printf("adreno: gpu-slumber: runtime suspend failed (off %d, stuck %d, cx_off %d): the GPU is given up\n",
+		    off, core_stuck, cx_off);
+		return false;
+	}
+	slumber_asleep = true;
+	slumber_suspends++;
+	return true;
+}
+
+static bool
+gpu_runtime_resume(void)
+{
+	uint64_t began = dcvs_ns();
+
+	if (!slumber_asleep || slumber_failed || __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
+		return false;
+	}
+	slumber_resuming = true;
+	hfi_quiet = true;
+	/* Mark potentially on before the first power write, including partial failure. */
+	cx_off = false;
+	if (!step_cx_power() || !step_clocks()) {
+		goto failed;
+	}
+	gmu_space_is_on = true;
+	if (!space_on(&gmu_space, GMU_MATCH, GMU_STREAM)) {
+		goto failed;
+	}
+	/* No new allocations: firmware blocks, queue mapping and page tables persist. */
+	for (unsigned i = 0; i < gmu_block_count; i++) {
+		bzero((void *)gmu_blocks[i].memory, gmu_blocks[i].size);
+		to_memory(gmu_blocks[i].memory, gmu_blocks[i].size);
+	}
+	for (unsigned i = 0; i < gmu_hfi.size / 4; i++) {
+		((volatile uint32_t *)hfi)[i] = 0;
+	}
+	hakios_barrier();
+	if (!step_gmu_firmware() || !step_gmu_start() || !step_gmu_queues() || !step_core_power()) {
+		goto failed;
+	}
+	core_space_is_on = true;
+	if (!space_on(&core_space, CORE_MATCH, CORE_STREAM)) {
+		goto failed;
+	}
+	if (slumber_stream1) {
+		second_stream_is_on = true;
+		if (!space_stream(&core_space, SECOND_MATCH, 1)) {
+			goto failed;
+		}
+	}
+	/* Nothing is pending. Restart an empty ring; retain all fence/timing words. */
+	ring_at = ring_sent = 0;
+	bzero((void *)core_ring.memory, core_ring.size);
+	to_memory(core_ring.memory, core_ring.size);
+	*(volatile uint32_t *)(core_scratch.memory + 0x80) = 0;
+	*(volatile uint32_t *)(core_scratch.memory + 0x100) = 0;
+	to_memory(core_scratch.memory + 0x80, 0x84);
+	if (!step_core_start() || !step_core_commands()) {
+		goto failed;
+	}
+	if (slumber_irq) {
+		gpu_irq_start();
+		if (!gpu_irq_active()) {
+			goto failed;
+		}
+	}
+	gpu_ifpc_handover();
+	gpu_dcvs_counters_start();
+	hfi_quiet = false;
+	slumber_resuming = false;
+	slumber_asleep = false;
+	/* Restore DCVS policy and thermal ceiling before the next user command. */
+	if (dcvs_running && !dcvs_failed) {
+		int32_t mc[2] = { 0, 0 };
+		unsigned cap, target;
+
+		dcvs_temps_valid = gpu_temperatures(mc);
+		dcvs_mc[0] = mc[0];
+		dcvs_mc[1] = mc[1];
+		dcvs_cap = adreno_thermal_cap(dcvs_cap, dcvs_top, dcvs_temps_valid, mc[0], mc[1]);
+		cap = dcvs_ceiling();
+		target = dcvs_auto ? cap : (dcvs_manual < cap ? dcvs_manual : cap);
+		gpu_vote(target);
+		if (dcvs_failed) {
+			goto failed;
+		}
+	}
+	slumber_idle_ns = 0;
+	slumber_resumes++;
+	slumber_resume_us = (dcvs_ns() - began) / 1000;
+	return true;
+failed:
+	/* One bounded attempt. Quiesce partial initialization; never retry or claim recovery. */
+	hfi_quiet = true;
+	if (core_is_on && !gpu_gx_get()) {
+		core_runs = false;
+	}
+	gpu_irq_stop();
+	core_stuck = true;
+	(void)gpu_block_suspend(true);
+	hfi_quiet = false;
+	slumber_resuming = false;
+	slumber_asleep = false;
+	slumber_failed = true;
+	busy_valid = false;
+	slumber_resume_us = (dcvs_ns() - began) / 1000;
+	printf("adreno: gpu-slumber: runtime resume failed after %llu us: the GPU is given up\n", slumber_resume_us);
+	return false;
+}
+
+static bool
+gpu_slumber_start(void)
+{
+	uint32_t wanted = 1;
+
+	slumber_config = slumber_on = 0;
+	if (!gpu_kept || !adreno_gen7() || !hakios_board_has(HAKIOS_HAS_GPU_SLUMBER)) {
+		return false;
+	}
+	/* gpu_slumber=0: deeper idle collapse off (gpu-slumber; on without it) */
+	if (PE_parse_boot_argn("gpu_slumber", &wanted, sizeof(wanted)) && wanted == 0) {
+		printf("adreno: gpu-slumber: off (gpu_slumber=0)\n");
+		return false;
+	}
+	slumber_config = slumber_on = 1;
+	slumber_idle_ns = 0;
+	printf("adreno: gpu-slumber: deeper idle collapse after 1 s without work\n");
+	return true;
+}
+
+static void
+gpu_slumber_stop(void)
+{
+	if (!slumber_config) {
+		return;
+	}
+	printf("adreno: gpu-slumber: %llu suspends, %llu resumes (last %llu / %llu us)%s\n", slumber_suspends,
+	    slumber_resumes, slumber_suspend_us, slumber_resume_us, slumber_failed ? "; THE GPU WAS GIVEN UP" : "");
+}
+
+/* Called under gGPULock once the GPU is kept: start DCVS and/or slumber; returns whether the periodic worker is needed. */
+bool
+hakios_gpu_power_start(void)
+{
+	bool dcvs = gpu_dcvs_start();
+	bool slumber = gpu_slumber_start();
+
+	return dcvs || slumber;
+}
+
+/* The worker's tick under gGPULock: returns ms until the next tick, or 0 to stop. */
+uint32_t
+hakios_gpu_power_tick(void)
+{
+	uint64_t now;
+
+	if (!gpu_kept || slumber_failed || ifpc_failed || __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
+		return 0;
+	}
+	if (slumber_asleep) {
+		return 250;                     /* asleep: never touch powered-off CX/GMU/GX */
+	}
+	now = dcvs_ns();
+	if (slumber_on && gpu_irq_state != 2 && hakios_gpu_done(gpu_fence)) {
+		if (slumber_idle_ns == 0) {
+			slumber_idle_ns = now;
+		}
+		if (now - slumber_idle_ns >= GPU_SLUMBER_IDLE_NS) {
+			return gpu_runtime_suspend() ? 250 : 0;
+		}
+	} else {
+		slumber_idle_ns = 0;
+	}
+	if (dcvs_running && !dcvs_failed) {
+		uint32_t ms = gpu_dcvs_tick();
+
+		if (ms == 0) {
+			return slumber_config ? 50 : 0;
+		}
+		return slumber_on ? 50 : ms;
+	}
+	return slumber_config ? 50 : 0;
+}
+
+int
+hakios_gpu_slumber_control(int value, bool write)
+{
+	if (!write) {
+		return (int)slumber_on;
+	}
+	if (value < 0 || value > 1) {
+		return EINVAL;
+	}
+	if (!slumber_config || !gpu_kept || slumber_failed || __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
+		return ENXIO;
+	}
+	if (value == 0 && slumber_asleep && !gpu_runtime_resume()) {
+		return EIO;
+	}
+	slumber_on = (uint32_t)value;
+	slumber_idle_ns = 0;
+	return 0;
+}
+
+void
+hakios_gpu_slumber_line(char *line, size_t size)
+{
+	if (!slumber_config || !gpu_kept) {
+		snprintf(line, size, "off (%s)\n", !hakios_board_has(HAKIOS_HAS_GPU_SLUMBER) ? "no gpu-slumber on this board" :
+		    !gpu_kept ? "the GPU is not kept" : "gpu_slumber=0");
+		return;
+	}
+	snprintf(line, size, "on %u asleep %d failed %d suspends %llu resumes %llu suspend_us %llu resume_us %llu cx_off %d\n",
+	    slumber_on, slumber_asleep, slumber_failed, slumber_suspends, slumber_resumes, slumber_suspend_us,
+	    slumber_resume_us, cx_off);
 }
 
 /* ---- beside the steps: what the firmware left the display doing (boot-arg display_probe=1) ---------------- */

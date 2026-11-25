@@ -26,6 +26,7 @@
 	// gpu-a660        an Adreno of the A660 family (642, 642L, 643, 660 ...) behind a GMU (gpu=1); needs gpu { }
 	// gpu-a730        an Adreno 730 (gen7) behind a GMU: the same gpu { }, steps 1 to 10 so far (adreno=10)
 	// gpu-ifpc        with gpu-a730: the GMU powers the 3D core down between frames (gpu=1; gpu_ifpc=0 keeps it up)
+	// gpu-slumber     with gpu-a730: deeper idle collapse after 1 s without work (gpu=1; gpu_slumber=0 keeps it awake)
 	// and these, each a driver of one part wired the way one phone has it -- list one only if your phone
 	// has that part on the same pins and bus (drivers/board/board.h, Documentation/drivers.md):
 	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-s3908, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,

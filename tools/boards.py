@@ -200,7 +200,7 @@ FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virt
                  'torch-pm8350c': ('spmi',), 'ddr-rpmh': ('rpmh',),
                  'camera-sm7325': ('spmi', 'pins', 'clocks', 'rpmh', 'smmu', 'camera'),
                  'gpu-a660': ('adreno', 'clocks', 'rpmh'), 'gpu-a730': ('adreno', 'clocks', 'rpmh'),
-                 'gpu-dcvs': ('adreno',), 'gpu-ifpc': ('adreno',),
+                 'gpu-dcvs': ('adreno',), 'gpu-ifpc': ('adreno',), 'gpu-slumber': ('adreno',),
                  # the part drivers that drive the SoC's pins, switch a bus's clocks on in the GCC, ask RPMh
                  # for a part's supply, and give a device its addresses in the SMMU
                  'touch-goodix': ('pins', 'clocks', 'rpmh'), 'touch-ft3658u': ('pins', 'clocks', 'rpmh'),
@@ -228,6 +228,7 @@ FEATURE_BOOTARGS = {
     'gpu-a730': 'gpu=1 or adreno=22; gpu_irq=1 for completion interrupts',
     'gpu-dcvs': "gpu=1, on by itself; gpu_dcvs=0 keeps the default speed (the GPU's sensors still cap it)",
     'gpu-ifpc': 'gpu=1, on by itself; gpu_ifpc=0 keeps the core up between frames',
+    'gpu-slumber': 'gpu=1, on by itself; gpu_slumber=0 keeps the GPU awake',
     'virtio': 'virtio_net=1, virtio_input=1',
     'touch-goodix': 'touchscreen=1',
     'touch-ft3658u': 'touchscreen=1',
@@ -246,7 +247,7 @@ FEATURE_BOOTARGS = {
 # features that are a driver of one part as one phone has it wired, by the first word of their names
 PART_DRIVERS = ('bluetooth', 'touch', 'speaker', 'haptic', 'imu', 'torch', 'camera', 'wifi', 'mic', 'modem')
 # ... and of the board's own file
-FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'display-flip': 'display', 'gpu-a660': 'gpu', 'gpu-a730': 'gpu', 'gpu-dcvs': 'gpu', 'gpu-ifpc': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
+FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'display-flip': 'display', 'gpu-a660': 'gpu', 'gpu-a730': 'gpu', 'gpu-dcvs': 'gpu', 'gpu-ifpc': 'gpu', 'gpu-slumber': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
                           'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
                           'touch-ft3658u': 'touch', 'touch-ft5x06': 'touch_i2c', 'touch-s3908': 'touch_i2c', 'camera-sm7325': 'camera', 'imu-lsm6dso': 'imu',
                           'imu-bmi160': 'imu'}
@@ -938,6 +939,8 @@ def load(problems=None):
                          '" are drivers of different touch controllers: a board has one, list the one it has')
         if 'gpu-ifpc' in data.get('features', []) and 'gpu-a730' not in data['features']:
             problems.add(rel, "feature \"gpu-ifpc\" is the A730's collapse between frames: only beside \"gpu-a730\"")
+        if 'gpu-slumber' in data.get('features', []) and 'gpu-a730' not in data['features']:
+            problems.add(rel, "feature \"gpu-slumber\" is the A730's deeper idle collapse: only beside \"gpu-a730\"")
         if 'virtio' in data.get('features', []) and len(data['features']) > 1:
             problems.add(rel, 'feature "virtio" is an emulator\'s: not beside the features of a phone')
         if data.get('screen', {}).get('statusbar_leading_shift', 0) > 200:

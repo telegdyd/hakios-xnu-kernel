@@ -54,6 +54,9 @@ enum {
 	HAKIOS_HAS_GPU_IFPC     = 1u << 26,     /* the GMU powers a kept A730's 3D core down between frames and up for the
 	                                         * next, the command processor writing back what it lost (board/adreno.c,
 	                                         * gpu_ifpc) */
+	HAKIOS_HAS_GPU_SLUMBER  = 1u << 27,     /* deeper idle collapse of a kept A730 after 1 s without work: GMU, SMMU
+	                                         * and CX off, client allocations and fences kept (board/adreno.c,
+	                                         * gpu_slumber) */
 	/*
 	 * Drivers of one part, wired the way one phone has it (the pins, the bus, the chip): a board lists
 	 * one only if it has that part wired that way. Asked for on any other board, the driver says so and

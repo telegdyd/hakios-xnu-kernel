@@ -73,12 +73,14 @@ void hakios_gpu_worked(uint64_t * microseconds, uint32_t * submissions, uint32_t
 void hakios_gpu_report(const char * why);
 bool hakios_gpu_recover(void);
 void hakios_gpu_stop(void);
-bool hakios_gpu_dcvs_start(void);
-uint32_t hakios_gpu_dcvs_tick(void);
+bool hakios_gpu_power_start(void);
+uint32_t hakios_gpu_power_tick(void);
 int hakios_gpu_dcvs_control(unsigned kind, int value, bool write);
 void hakios_gpu_dcvs_line(char * line, size_t size);
 int hakios_gpu_ifpc_control(int value, bool write);
 void hakios_gpu_ifpc_line(char * line, size_t size);
+int hakios_gpu_slumber_control(int value, bool write);
+void hakios_gpu_slumber_line(char * line, size_t size);
 
 void HakiosGPUStart(void);
 void HakiosGPUStop(void);
@@ -460,7 +462,7 @@ dcvsTick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 	uint32_t ms;
 
 	IOLockLock(gGPULock);
-	ms = gDCVSRunning ? hakios_gpu_dcvs_tick() : 0;
+	ms = gDCVSRunning ? hakios_gpu_power_tick() : 0;
 	if (ms != 0) {
 		uint64_t deadline, leeway;
 
@@ -553,6 +555,45 @@ ifpcStateSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unuse
 }
 SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_ifpc_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, ifpcStateSysctl, "A",
     "gpu-ifpc: allowed, given up, collapses so far, the core's power now, wakes");
+
+/* gpu-slumber (board/adreno.c): deeper idle collapse of the A730 after 1 s without work. */
+static int
+slumberSysctl(struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	int value, error;
+
+	if (gGPULock == NULL) {
+		return ENXIO;
+	}
+	IOLockLock(gGPULock);
+	value = hakios_gpu_slumber_control(0, false);
+	IOLockUnlock(gGPULock);
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	IOLockLock(gGPULock);
+	error = hakios_gpu_slumber_control(value, true);
+	IOLockUnlock(gGPULock);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_slumber, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, slumberSysctl, "I",
+    "gpu-slumber: 1 deeper idle collapse after 1 s without work, 0 kept awake");
+
+static int
+slumberStateSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	char line[192] = "off (no GPU)\n";
+
+	if (gGPULock != NULL) {
+		IOLockLock(gGPULock);
+		hakios_gpu_slumber_line(line, sizeof(line));
+		IOLockUnlock(gGPULock);
+	}
+	return SYSCTL_OUT(req, line, strlen(line));
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_slumber_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, slumberStateSysctl, "A",
+    "gpu-slumber: allowed, asleep, failed, suspends, resumes, last transition us, cx_off");
 
 static inline uint32_t
 pm4Parity(uint32_t v)
@@ -1136,7 +1177,7 @@ HakiosGPUStart(void)
 	gGPULock = IOLockAlloc();
 	if (gGPULock != NULL) {
 		IOLockLock(gGPULock);
-		if (hakios_gpu_dcvs_start() && (gDCVSCall = thread_call_allocate(dcvsTick, NULL)) != NULL) {
+		if (hakios_gpu_power_start() && (gDCVSCall = thread_call_allocate(dcvsTick, NULL)) != NULL) {
 			uint64_t deadline;
 
 			gDCVSRunning = true;
