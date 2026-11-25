@@ -77,6 +77,8 @@ bool hakios_gpu_dcvs_start(void);
 uint32_t hakios_gpu_dcvs_tick(void);
 int hakios_gpu_dcvs_control(unsigned kind, int value, bool write);
 void hakios_gpu_dcvs_line(char * line, size_t size);
+int hakios_gpu_ifpc_control(int value, bool write);
+void hakios_gpu_ifpc_line(char * line, size_t size);
 
 void HakiosGPUStart(void);
 void HakiosGPUStop(void);
@@ -512,6 +514,45 @@ dcvsStateSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unuse
 }
 SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_dcvs_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, dcvsStateSysctl, "A",
     "gpu-dcvs: speed, cap, load, the GPU's temperatures, votes, ms at each speed");
+
+/* gpu-ifpc (board/adreno.c): whether the GMU may collapse the 3D core between frames, and how often it has. */
+static int
+ifpcSysctl(struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	int value, error;
+
+	if (gGPULock == NULL) {
+		return ENXIO;
+	}
+	IOLockLock(gGPULock);
+	value = hakios_gpu_ifpc_control(0, false);
+	IOLockUnlock(gGPULock);
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	IOLockLock(gGPULock);
+	error = hakios_gpu_ifpc_control(value, true);
+	IOLockUnlock(gGPULock);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_ifpc, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, ifpcSysctl, "I",
+    "gpu-ifpc: 1 the GMU may power the 3D core down between frames, 0 it is kept up");
+
+static int
+ifpcStateSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	char line[192] = "off (no GPU)\n";
+
+	if (gGPULock != NULL) {
+		IOLockLock(gGPULock);
+		hakios_gpu_ifpc_line(line, sizeof(line));
+		IOLockUnlock(gGPULock);
+	}
+	return SYSCTL_OUT(req, line, strlen(line));
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, gpu_ifpc_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, ifpcStateSysctl, "A",
+    "gpu-ifpc: allowed, given up, collapses so far, the core's power now, wakes");
 
 static inline uint32_t
 pm4Parity(uint32_t v)

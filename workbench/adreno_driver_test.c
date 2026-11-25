@@ -120,6 +120,7 @@ hakios_test_wr(vm_offset_t address, uint32_t value)
 
 vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size __unused) { return phys; }
 vm_offset_t ml_io_map_wcomb(vm_offset_t phys, vm_size_t size __unused) { return phys; }
+boolean_t ml_set_interrupts_enabled(boolean_t e) { (void)e; return FALSE; }
 uint64_t kvtophys(vm_offset_t va) { return va; }
 void loader_return(void) {}
 void MiniIOMobileFramebufferShow(const uint8_t *pixels __unused, uint32_t width __unused, uint32_t height __unused,

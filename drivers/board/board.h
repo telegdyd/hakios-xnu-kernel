@@ -51,6 +51,9 @@ enum {
 	HAKIOS_HAS_GPU_DCVS     = 1u << 25,     /* the GPU's speed follows its load, by the GMU's busy counter, and is
 	                                         * capped by the GPU's own sensors (adreno { } tsens): the board's gpu { }
 	                                         * speeds and speed-bus (board/adreno.c, gpu_dcvs) */
+	HAKIOS_HAS_GPU_IFPC     = 1u << 26,     /* the GMU powers a kept A730's 3D core down between frames and up for the
+	                                         * next, the command processor writing back what it lost (board/adreno.c,
+	                                         * gpu_ifpc) */
 	/*
 	 * Drivers of one part, wired the way one phone has it (the pins, the bus, the chip): a board lists
 	 * one only if it has that part wired that way. Asked for on any other board, the driver says so and

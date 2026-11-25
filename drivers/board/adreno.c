@@ -79,7 +79,8 @@
  *   adreno_watch=S     after the last step, say once a second for S seconds (default 20) that
  *                      the machine is still alive, and what was written last
  *   adreno_return=1    when all is over, go back to the loader instead of starting the system
- *   display_probe=1    before any step: read what the firmware left the display controller
+ *   gpu_ifpc=0         a kept A730 is not collapsed between frames (board feature gpu-ifpc; on without it)
+ *   display_probe=1   before any step: read what the firmware left the display controller
  *                      doing (display_probe() below; two clocks are turned on, nothing else written)
  * The system does not go on starting until all of this is over, so that the end of the log is
  * ours; the touch screen driver's start would talk across it (leave touchscreen=1 out).
@@ -131,6 +132,21 @@ static uint32_t speed_bin;              /* which of the GPUs of this kind the fu
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
 static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
+
+/*
+ * gpu-ifpc (the core's power collapse between frames; "inter-frame power collapse" below, after the ring): set up
+ * by step 17 and step 20 for a GPU that is to be kept, and from then on the GMU powers the 3D core down whenever it
+ * has nothing to do and up again when the ring's write position is written. Every other access to the 3D core's
+ * registers is then made inside gpu_gx_get() / gpu_gx_put().
+ */
+static uint32_t ifpc_config;            /* set up (step 17 asked the GMU for it) */
+static uint32_t ifpc_on;                /* the GMU may collapse the core (kern.hakios.gpu_ifpc) */
+static uint32_t ifpc_failed;            /* the core did not come back when asked: nothing more is given it */
+static uint64_t ifpc_wakes, ifpc_wake_failures;
+static void gpu_gx_ref(bool acquire);
+static bool gpu_gx_get(void);
+static void gpu_gx_put(void);
+static void gpu_ifpc_stop(void);
 
 /*
  * The kernel's log reaches the loader when a run is over, and a run that ends in a reset
@@ -2099,6 +2115,7 @@ step_gmu_queues(void)
 #define HFI_BW_TABLE            3
 #define HFI_PERF_TABLE          4
 #define HFI_START               10
+#define HFI_FEATURE_CTRL        11              /* {feature, on, data}: KGSL adreno_hfi.h H2F_MSG_FEATURE_CTRL */
 #define HFI_CORE_FW_START       14
 #define HFI_GX_BW_PERF_VOTE     30
 #define HFI_PREPARE_SLUMBER     33
@@ -2332,6 +2349,40 @@ static uint32_t core_bus = HFI_NO_INDEX;        /* the bus vote asked for with i
 static uint32_t core_bus_levels;        /* how many bus votes the GMU's table has */
 
 /*
+ * gpu-ifpc, the GMU's half: between the tables and "start the core firmware", the feature asked for (KGSL
+ * adreno_gen7_hfi.c, gen7_hfi_send_feature_ctrl: message 11 {feature 9, IFPC; on; KGSL's hysteresis, 0x1680}). Only
+ * for an A730 that is to be kept (gpu=1, or adreno_keep=1) on a board with the feature; gpu_ifpc=0 leaves it out.
+ * From here until the GPU is handed over (gpu_ifpc_handover()), the steps keep the core up by the keepalive word.
+ */
+static bool gpu_keep_asked;             /* the steps are to end with the GPU kept (hakios_adreno_init()) */
+
+static bool
+gpu_ifpc_boot(void)
+{
+	uint32_t wanted = 1;
+	uint32_t feature[4] = { 0, 9, 1, 0x1680 };
+
+	ifpc_config = ifpc_on = 0;
+	if (!adreno_gen7() || !hakios_board_has(HAKIOS_HAS_GPU_IFPC)) {
+		return true;
+	}
+	PE_parse_boot_argn("gpu_ifpc", &wanted, sizeof(wanted));
+	if (!gpu_keep_asked || !wanted) {
+		printf("adreno: %u: gpu-ifpc: %s: the core is not collapsed between frames\n", step,
+		    !gpu_keep_asked ? "the GPU is not to be kept" : "gpu_ifpc=0");
+		return true;
+	}
+	ifpc_config = 1;
+	gpu_gx_ref(true);
+	if (!hfi_send("the feature IFPC", HFI_FEATURE_CTRL, feature, 4)) {
+		ifpc_failed = 1;
+		return false;
+	}
+	ifpc_on = 1;
+	return true;
+}
+
+/*
  * What the vendor's driver sends at this point (a6xx_hfi_start; Linux the same with fewer
  * levels): the table of speeds of the 3D core with the supply level each needs -- the phone's
  * three lowest (dt: qcom,gpu-pwrlevels: 315, 450, 550 MHz at "levels" 64, 128, 192) -- and of the
@@ -2427,6 +2478,7 @@ step_core_power(void)
 	    "from here on it casts votes in RPMh by itself");
 	if (!hfi_send("the table of speeds", HFI_PERF_TABLE, &perf.header, sizeof(perf) / 4) ||
 	    !hfi_send("the table of bus votes", HFI_BW_TABLE, &bw.header, sizeof(bw) / 4) ||
+	    !gpu_ifpc_boot() ||
 	    !hfi_send("\"start the core firmware\"", HFI_CORE_FW_START, core_start, 2) ||
 	    (adreno_gen7() && !hfi_send("\"start\"", HFI_START, start, 1)) ||
 	    !hfi_send("the speed wanted", HFI_GX_BW_PERF_VOTE, vote, 4)) {
@@ -2490,6 +2542,7 @@ step_core_power(void)
 #define CORE_RING_SIZE          0x8000u         /* Linux's; 8192 words */
 #define CORE_SQE_ADDRESS        0x01100000u
 #define CORE_SCRATCH_ADDRESS    0x01200000u
+#define CORE_RESTORE_ADDRESS    0x01300000u     /* gpu-ifpc: what the command processor writes back after a collapse */
 #define CORE_TARGET_ADDRESS     0x10000000u
 #define CORE_NOWHERE            0x7f000000u     /* never given anything */
 
@@ -2557,11 +2610,144 @@ static struct gpu_space second_space = {
 };
 #define SECOND_MATCH            2
 static bool second_space_is_on, second_stream_is_on;
-static struct gpu_block core_ring, core_sqe, core_scratch, core_target;
+static struct gpu_block core_ring, core_sqe, core_scratch, core_target, core_restore;
 static bool core_space_is_on, core_runs, zap_is_loaded;
 #define RING_WORDS              (CORE_RING_SIZE / 4)
 static uint32_t ring_at;                /* where the next word goes: the ring goes round */
 static uint32_t ring_sent;              /* up to where the core has been told to read */
+
+/* ---- inter-frame power collapse (board feature gpu-ifpc) ----------------------------------------------------- */
+
+/*
+ * The GMU powers the 3D core down once it has been idle for a while (the hysteresis of step 17's request) and up
+ * again when the ring's write position is written, which goes through the GMU's AHB fence: a write the fence holds
+ * back is replayed once the core is up, or dropped (ahb_fence_status bit 0), and then written again. The command
+ * processor finds the registers the collapse lost in the list of step 20 (core_restore_list()) and writes them back
+ * before it reads the ring. Any other access to the core's registers needs it up and kept so: the keepalive word,
+ * shared by the threads and the completion interrupt (a count under a spin lock, interrupts off: the handler takes no
+ * other lock), and then the fence open and the core's power and clock on (gmu_gx_status bits 0 and 1 clear). A core
+ * that does not come back within 10 ms is given up (ifpc_failed): nothing more is submitted, and the end of the run
+ * reaches none of its registers. From the OnePlus 10 Pro's port (negroni-dev, docs/negroni-gpu-ifpc.md), after KGSL's
+ * gen7 (adreno_gen7.c, adreno_gen7_ringbuffer.c, adreno_gen7_gmu.c).
+ */
+#include "adreno_ifpc.h"
+
+#define GMU_KEEPALIVE           GMU_WORD(0x50c3)        /* gmu_cx_gmu_pwr_col_keepalive: 1, the core is not collapsed */
+#define GMU_GX_STATUS           GMU_WORD(0x50d0)        /* gmu_cx_gmu_gfx_pwr_clk_status: bit 0 power off, bit 1 clock off */
+#define GMU_IFPC_COUNT_LO       GMU_WORD(0x504c)        /* the power counter's XOCLK 4 (countable 4: collapses), two words */
+#define GMU_IFPC_COUNT_HI       GMU_WORD(0x504d)
+#define GMU_IFPC_COUNT_SELECT   GMU_WORD(0x5042)        /* its low byte: the countable */
+#define GMU_COUNTERS_ON         GMU_WORD(0x5040)        /* cx_gmu_power_counter_enable (gpu-dcvs's busy counter too) */
+
+extern boolean_t ml_set_interrupts_enabled(boolean_t);
+static LCK_GRP_DECLARE(gpu_gx_group, "adreno-gx");
+static LCK_SPIN_DECLARE(gpu_gx_lock, &gpu_gx_group);
+static uint32_t gx_users;
+
+static void
+gpu_gx_ref(bool acquire)
+{
+	boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+
+	lck_spin_lock(&gpu_gx_lock);
+	if (acquire) {
+		gx_users++;
+	} else if (gx_users != 0) {
+		gx_users--;
+	}
+	wr(gmu.base + GMU_KEEPALIVE, gx_users != 0);
+	hakios_barrier();
+	lck_spin_unlock(&gpu_gx_lock);
+	ml_set_interrupts_enabled(interrupts);
+}
+
+/* The 3D core up and kept up, for a thread; true at once without gpu-ifpc. */
+static bool
+gpu_gx_get(void)
+{
+	if (!ifpc_config) {
+		return true;
+	}
+	gpu_gx_ref(true);
+	for (unsigned i = 0; i < 10000; i++) {
+		if (rd(gmu.base + GMU_AO_AHB_FENCE_CTRL) == 0 && !(rd(gmu.base + GMU_GX_STATUS) & 3)) {
+			ifpc_wakes++;
+			return true;
+		}
+		/* (the write position is the one register that wakes it: the last one sent, again) */
+		wr(gpu.base + CP_RB_WPTR, ring_sent);
+		hakios_barrier();
+		spin_us(1);
+	}
+	ifpc_wake_failures++;
+	ifpc_failed = 1;
+	gpu_gx_ref(false);
+	printf("adreno: gpu-ifpc: the 3D core does not come back (gx status %#x, fence %#x): it is given up\n",
+	    rd(gmu.base + GMU_GX_STATUS), rd(gmu.base + GMU_AO_AHB_FENCE_CTRL));
+	return false;
+}
+
+static void
+gpu_gx_put(void)
+{
+	if (ifpc_config) {
+		gpu_gx_ref(false);
+	}
+}
+
+/* How far the core has read the ring: with gpu-ifpc, the copy it writes to memory, which a collapse does not lose. */
+static uint32_t
+ring_read_position(void)
+{
+	if (!ifpc_config) {
+		return rd(gpu.base + CP_RB_RPTR);
+	}
+	to_memory(core_scratch.memory + 0x80, 64);
+	return *(volatile uint32_t *)(core_scratch.memory + 0x80) % RING_WORDS;
+}
+
+/*
+ * The list the command processor writes back after a collapse (KGSL gen7_patch_pwrup_reglist): a 16-byte header of
+ * three lock words and the counts (u8 IFPC-only pairs, u8 shared pairs, u16 dynamic ones: none), then register and
+ * value pairs, the values as step 20 has just written them. Made once, before the command processor runs, and not
+ * touched again while it does.
+ */
+static void
+core_restore_list(void)
+{
+	uint32_t *out = (uint32_t *)core_restore.memory;
+	unsigned only = sizeof(ifpc_only) / sizeof(ifpc_only[0]), shared = sizeof(ifpc_shared) / sizeof(ifpc_shared[0]);
+	unsigned at = 4;
+
+	_Static_assert(4 * (4 + 2 * (sizeof(ifpc_only) / sizeof(ifpc_only[0]) + sizeof(ifpc_shared) / sizeof(ifpc_shared[0])))
+	    <= 4096, "the restore list fits its page");
+	bzero(out, 4096);
+	out[3] = only | shared << 8;
+	for (unsigned i = 0; i < only + shared; i++) {
+		uint32_t reg = i < only ? ifpc_only[i] : ifpc_shared[i - only];
+
+		out[at++] = reg;
+		out[at++] = rd(gpu.base + GPU_WORD(reg));
+	}
+	to_memory(core_restore.memory, 4096);
+	printf("adreno: %u: gpu-ifpc: the restore list: %u registers after a collapse, %u shared, at %#x\n", step, only,
+	    shared, CORE_RESTORE_ADDRESS);
+}
+
+/* gpu-ifpc's clock gating (KGSL gen7_hwcg_program, the A730's tables), with step 20's registers. */
+static void
+core_clock_gating(void)
+{
+	for (unsigned i = 0; i < sizeof(gen7_0_0_hwcg_regs) / sizeof(gen7_0_0_hwcg_regs[0]); i++) {
+		wr(gpu.base + GPU_WORD(gen7_0_0_hwcg_regs[i][0]), gen7_0_0_hwcg_regs[i][1]);
+	}
+	for (unsigned i = 0; i < sizeof(gen7_0_0_ao_hwcg_regs) / sizeof(gen7_0_0_ao_hwcg_regs[0]); i++) {
+		wr(gmu.base + GMU_WORD(gen7_0_0_ao_hwcg_regs[i][0] - 0x1a800), gen7_0_0_ao_hwcg_regs[i][1]);
+	}
+	printf("adreno: %u: gpu-ifpc: clock gating: %u registers of the core, %u always-on\n", step,
+	    (unsigned)(sizeof(gen7_0_0_hwcg_regs) / sizeof(gen7_0_0_hwcg_regs[0])),
+	    (unsigned)(sizeof(gen7_0_0_ao_hwcg_regs) / sizeof(gen7_0_0_ao_hwcg_regs[0])));
+}
 
 static uint32_t
 odd_parity(uint32_t v)
@@ -2591,8 +2777,12 @@ ring_register(uint32_t number, uint32_t value)
 	ring(value);
 }
 
-/* What has been written to the ring since the last time: out to memory, and the core told how far to read. */
-static void
+/*
+ * What has been written to the ring since the last time: out to memory, and the core told how far to read. With
+ * gpu-ifpc the write goes through the GMU's fence and wakes a collapsed core; one the fence dropped is written again
+ * (KGSL gen7_fenced_write), for 10 ms at most: false, and the core is given up.
+ */
+static bool
 ring_send(void)
 {
 	if (ring_at >= ring_sent) {
@@ -2603,6 +2793,22 @@ ring_send(void)
 	}
 	ring_sent = ring_at;
 	wr(gpu.base + CP_RB_WPTR, ring_at);
+	if (!ifpc_config) {
+		return true;
+	}
+	for (unsigned i = 0; i < 10000; i++) {
+		hakios_barrier();
+		if (!(rd(gmu.base + GMU_AHB_FENCE_STATUS) & 1)) {
+			return true;
+		}
+		spin_us(1);
+		wr(gpu.base + CP_RB_WPTR, ring_at);
+	}
+	ifpc_failed = 1;
+	ifpc_wake_failures++;
+	printf("adreno: gpu-ifpc: the GMU's fence drops the ring's write position (status %#x, gx status %#x): the 3D core "
+	    "is given up\n", rd(gmu.base + GMU_AHB_FENCE_STATUS), rd(gmu.base + GMU_GX_STATUS));
+	return false;
 }
 
 /* Let the 3D core have what is in the ring, and wait until it has taken all of it and rests. */
@@ -2614,7 +2820,9 @@ ring_run(const char *what)
 	printf("adreno: %u: about to have the 3D core %s: the ring up to word %u\n", step, what, ring_at);
 	snprintf(last_write, sizeof(last_write), "step %u had the 3D core %s", step, what);
 	hold(true);
-	ring_send();
+	if (!ring_send()) {
+		return false;
+	}
 	for (int i = 0; i < 20000 && (taken != ring_at || (status & ~1u)); i++) {
 		sleep_us(100);
 		taken = rd(gpu.base + CP_RB_RPTR);
@@ -2667,6 +2875,10 @@ step_core_space(void)
 	    !block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, kernels) ||
 	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, PTE_CORE | PTE_READ_ONLY) ||
 	    !block_new(&core_space, &core_scratch, CORE_SCRATCH_ADDRESS, 4096, kernels)) {
+		return false;
+	}
+	/* gpu-ifpc: the restore list's own page, apart from the scratch page (whose 0x400 on holds the times) */
+	if (ifpc_config && !block_new(&core_space, &core_restore, CORE_RESTORE_ADDRESS, 4096, kernels)) {
 		return false;
 	}
 	memcpy((void *)core_sqe.memory, microcode + 4, size - 4);       /* the file's first word is not microcode */
@@ -2849,6 +3061,9 @@ core_registers_a730(void)
 	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 0x6f);        /* BR: as the BV and LPAC, and the crash dumper's */
 	put(&gpu, "cp_bv_apriv_cntl", CP_BV_APRIV_CNTL, 0xf);   /* microcode, ring, ring's commands, read position */
 	put(&gpu, "cp_lpac_apriv_cntl", CP_LPAC_APRIV_CNTL, 0xf);
+	if (ifpc_config) {
+		core_clock_gating();
+	}
 	/* non-UBWC reads may not pass writes */
 	put(&gpu, "rb_cmp_dbg_eco_cntl", RB_CMP_DBG_ECO_CNTL, rd(gpu.base + RB_CMP_DBG_ECO_CNTL) | 1u << 11);
 }
@@ -2929,10 +3144,14 @@ step_core_start(void)
 	PE_parse_boot_argn("adreno_blind", &blind, sizeof(blind));
 	put64(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE, blind ? CORE_NOWHERE : CORE_SQE_ADDRESS);
 	put64(&gpu, "cp_rb_base", CP_RB_BASE, CORE_RING_ADDRESS);
-	put(&gpu, "cp_rb_cntl", CP_RB_CNTL, CP_RB_CNTL_VALUE);
+	/* (gpu-ifpc: the read position copied to memory, scratch + 0x80, where it can be read while the core is collapsed) */
+	put(&gpu, "cp_rb_cntl", CP_RB_CNTL, ifpc_config ? CP_RB_CNTL_VALUE & ~(1u << 27) : CP_RB_CNTL_VALUE);
 	if (adreno_gen7()) {
 		put64(&gpu, "cp_rb_rptr_addr", CP_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x80);
 		put64(&gpu, "cp_bv_rb_rptr_addr", CP_BV_RB_RPTR_ADDR, CORE_SCRATCH_ADDRESS + 0x100);
+	}
+	if (ifpc_config) {
+		core_restore_list();
 	}
 	get(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE);
 	get(&gpu, "cp_rb_base", CP_RB_BASE);
@@ -2965,17 +3184,20 @@ step_core_start(void)
 
 	announce("give the 3D core its first command, \"initialize\"");
 	if (adreno_gen7()) {
-		/* a7xx_cp_init with the BR thread alone and no IFPC restore list. */
+		/*
+		 * a7xx_cp_init with the BR thread alone; with gpu-ifpc, bit 8 and the restore list's address, its last
+		 * word's bit 31 saying dynamic entries are triplets (there are none: KGSL gen7_cp_init).
+		 */
 		ring_command(CP_THREAD_CONTROL, 1);
 		ring(1u << 27);
 		ring_command(CP_ME_INIT, 7);
-		ring(1u << 0 | 1u << 1 | 1u << 3 | 1u << 6);
+		ring(1u << 0 | 1u << 1 | 1u << 3 | 1u << 6 | (ifpc_config ? 1u << 8 : 0));
 		ring(0x00000003);                /* hardware contexts */
 		ring(0x20000000);                /* error detection */
 		ring(0x00000002);                /* operation mode */
+		ring(ifpc_config ? CORE_RESTORE_ADDRESS : 0);
 		ring(0);
-		ring(0);
-		ring(0);
+		ring(ifpc_config ? 1u << 31 : 0);
 	} else {
 		ring_command(CP_ME_INIT, 8);            /* a6xx_cp_init */
 		ring(0x0000002f);
@@ -3327,6 +3549,24 @@ gpu_block_stop(void)
 		put(&gmu, "host2gmu_intr_set", GMU_HOST2GMU_INTR_SET, 1u << 31);
 		core_is_on = false;
 	}
+	if (ifpc_config) {
+		/*
+		 * gpu-ifpc: the keepalive let go (whoever still held it: a step that failed, or the stop's own
+		 * gpu_gx_get()), and the GMU's slumber asked for only once it has gone down to its lowest idle state by
+		 * itself, power state 3 with the core off: asked any sooner, gen7's firmware refuses it (negroni-dev).
+		 */
+		boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+
+		lck_spin_lock(&gpu_gx_lock);
+		gx_users = 0;
+		wr(gmu.base + GMU_KEEPALIVE, 0);
+		lck_spin_unlock(&gpu_gx_lock);
+		ml_set_interrupts_enabled(interrupts);
+		if (gmu_talks && (!wait_for(&gmu, GMU_RPMH_POWER_STATE, 0xf, 3, 100) || !wait_for(&gmu, GMU_GX_STATUS, 3, 3, 100))) {
+			printf("adreno: %u: gpu-ifpc: the GMU does not go down to its idle state (power state %#x, gx status %#x)\n",
+			    step, rd(gmu.base + GMU_RPMH_POWER_STATE), rd(gmu.base + GMU_GX_STATUS));
+		}
+	}
 	if (gmu_talks) {
 		hfi_send("\"slumber\"", HFI_PREPARE_SLUMBER, slumber, 3);
 		if (!wait_for(&gmu, GMU_AO_GPU_CX_BUSY_STATUS, 1u << 23, 0, 100)) {
@@ -3613,7 +3853,6 @@ static void gpu_block_stop(void);
 #define GPU_IRQ_COMPLETION      (1u << 20)
 #define GPU_EVENT_IRQ           (1u << 31)
 #define GPU_IRQ_MASK            GPU_WORD(0x0038)
-#define GPU_IRQ_KEEPALIVE       GMU_WORD(0x50c3) /* KGSL GPU-relative word 0x1f8c3 minus GMU's 0x1a800 */
 #define GPU_IRQ_STORM           20000u          /* maximum interrupts in one second */
 
 static uint32_t gpu_irq_state;                 /* 0 off, 1 armed, 2 disabled after an unsafe/storm IRQ */
@@ -3653,15 +3892,19 @@ gpu_irq_arrived(__unused void *context, uint32_t intid)
 	if (++gpu_irq_period_count > GPU_IRQ_STORM) {
 		goto disable;
 	}
-	/* KGSL gen7_irq_handler: keep GX reachable, then check the GMU's AHB fence. */
-	wr(gmu.base + GPU_IRQ_KEEPALIVE, 1);
-	__asm__ volatile ("dsb sy" ::: "memory");
-	for (i = 0; i < 100 && rd(gmu.base + GMU_AO_AHB_FENCE_CTRL) != 0; i++) {
+	/*
+	 * KGSL gen7_irq_handler: keep GX reachable, then check the GMU's AHB fence. The keepalive is the threads' too
+	 * (gpu_gx_ref(): a count, so that this handler's letting go does not take a thread's away); with gpu-ifpc the
+	 * core also has to have come up, power and clock.
+	 */
+	gpu_gx_ref(true);
+	for (i = 0; i < 100 && (rd(gmu.base + GMU_AO_AHB_FENCE_CTRL) != 0 ||
+	    (ifpc_config && (rd(gmu.base + GMU_GX_STATUS) & 3))); i++) {
 		delay(1);
 	}
 	if (i == 100 || !(rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON)) {
 		__atomic_fetch_add(&gpu_irq_unsafe, 1, __ATOMIC_RELAXED);
-		wr(gmu.base + GPU_IRQ_KEEPALIVE, 0);
+		gpu_gx_ref(false);
 		goto disable;
 	}
 	status = rd(gpu.base + RBBM_INT_0_STATUS);
@@ -3672,7 +3915,7 @@ gpu_irq_arrived(__unused void *context, uint32_t intid)
 		__asm__ volatile ("dsb sy" ::: "memory");
 		__atomic_fetch_add(&gpu_irq_completions, 1, __ATOMIC_RELAXED);
 	}
-	wr(gmu.base + GPU_IRQ_KEEPALIVE, 0);
+	gpu_gx_ref(false);
 	if (!(status & GPU_IRQ_COMPLETION)) {
 		goto disable;
 	}
@@ -3787,7 +4030,13 @@ hakios_gpu_stop(void)
 			waited++;
 		}
 		core_stuck = !hakios_gpu_done(gpu_fence);
+		gpu_ifpc_stop();                        /* (before the counters are turned off with gpu-dcvs) */
 		gpu_dcvs_stop();
+		/* (gpu-ifpc: the core up for the rest, which reads and halts it; one that does not come back is not reached) */
+		if (!gpu_gx_get()) {
+			core_stuck = true;
+			core_runs = false;
+		}
 		gpu_irq_stop();
 		printf("adreno: the run is about to end: the GPU is given back (%s after %u us)\n",
 		    core_stuck ? "STILL AT WORK" : "it had finished what it was given", 100 * waited);
@@ -4201,12 +4450,12 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	 * caller holds the lock hakios_gpu_stop() is called under, so what it sees here stays so until it lets go; a
 	 * submission that looked before taking the lock -- BoardGPU.cpp's externalMethod -- is turned away here.)
 	 */
-	if (!gpu_kept) {
+	if (!gpu_kept || ifpc_failed) {
 		return 0;
 	}
 
 	for (int i = 0; i < 20000; i++) {
-		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
+		room = (ring_read_position() + RING_WORDS - ring_at - 1) % RING_WORDS;
 		if (room >= wanted) {
 			break;
 		}
@@ -4222,8 +4471,7 @@ hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t cou
 	}
 	if (adreno_gen7()) {
 		gpu_submit_a730(addresses, words, count);
-		ring_send();
-		return gpu_fence;
+		return ring_send() ? gpu_fence : 0;       /* (gpu-ifpc: a core that does not wake is given up) */
 	}
 	ring_time(gpu_fence, 0);
 	ring_command(CP_EVENT_WRITE, 1);
@@ -4260,6 +4508,15 @@ hakios_gpu_report(const char *why)
 		printf("adreno: gpu: %s: the GPU has been given back: nothing of it is read\n", why);
 		return;
 	}
+	/* (gpu-ifpc: the core's registers only with it up; otherwise what memory and the GMU say) */
+	if (ifpc_failed || !gpu_gx_get()) {
+		printf("adreno: gpu: %s: gpu-ifpc: the 3D core is not up: submission %u is the last, the core has done %u, read "
+		    "the ring up to %u of %u; gx status %#x, power state %#x, fence %#x\n", why, gpu_fence,
+		    *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT), ring_read_position(), ring_at,
+		    rd(gmu.base + GMU_GX_STATUS), rd(gmu.base + GMU_RPMH_POWER_STATE), rd(gmu.base + GMU_AO_AHB_FENCE_CTRL));
+		space_faulted(&core_space);
+		return;
+	}
 
 	printf("adreno: gpu: %s: submission %u is the last, the core has done %u; ring: read up to %u, written up to %u; status "
 	    "%#x, interrupts %#x; command processor: fault %#x, interrupts %#x, protection %#x\n", why, gpu_fence,
@@ -4269,6 +4526,7 @@ hakios_gpu_report(const char *why)
 	printf("adreno: gpu:   in the first command buffer at %#llx, %u words to go; in the second at %#llx, %u to go\n",
 	    (uint64_t)rd(gpu.base + CP_IB1_BASE + 4) << 32 | rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_REM_SIZE),
 	    (uint64_t)rd(gpu.base + CP_IB2_BASE + 4) << 32 | rd(gpu.base + CP_IB2_BASE), rd(gpu.base + CP_IB2_REM_SIZE));
+	gpu_gx_put();
 	step = 0;
 	if (space_faulted(&core_space)) {
 		wr(smmu.base + context + SMMU_CB_FSR, SMMU_FSR_ALL);    /* so that the next one shows */
@@ -4777,6 +5035,121 @@ hakios_gpu_dcvs_line(char *line, size_t size)
 	    dcvs_ms_at[4] / 1000000, dcvs_ms_at[5] / 1000000);
 }
 
+/* ---- beside the steps: the core's power collapse between frames (board feature gpu-ifpc) -------------------- */
+
+/*
+ * Set up by step 17 (the GMU's feature) and step 20 (the restore list, the clock gating), for an A730 that is kept;
+ * "inter-frame power collapse" above, after the ring, has how the core's registers are reached meanwhile. Here: the
+ * hand-over, once the steps are over (the hold the steps had on the core let go, and the GMU's counter of collapses
+ * started), the end of the run, and the sysctls (BoardGPU.cpp, under the GPU's lock):
+ *
+ *   gpu_ifpc=0                    not set up at all (step 17)
+ *   kern.hakios.gpu_ifpc          1 the core may collapse; 0 it may not, from now on: the GMU asked to keep it up as at
+ *                                 step 17 (this firmware says yes to the feature turned off and goes on collapsing:
+ *                                 negroni-dev's test run 2)
+ *   kern.hakios.gpu_ifpc_state    a line: set up, allowed, given up; collapses so far (the GMU's own count); whether
+ *                                 the core is down now; wakes and failed ones
+ */
+static bool
+gpu_ifpc_count(uint64_t *count)
+{
+	for (unsigned i = 0; i < 4; i++) {
+		uint32_t hi = rd(gmu.base + GMU_IFPC_COUNT_HI), lo = rd(gmu.base + GMU_IFPC_COUNT_LO);
+
+		if (rd(gmu.base + GMU_IFPC_COUNT_HI) == hi) {
+			*count = (uint64_t)hi << 32 | lo;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* The steps are over and the GPU is kept (single-threaded still; the completion interrupt may be armed). */
+static void
+gpu_ifpc_handover(void)
+{
+	if (!ifpc_config) {
+		return;
+	}
+	wr(gmu.base + GMU_IFPC_COUNT_SELECT, (rd(gmu.base + GMU_IFPC_COUNT_SELECT) & ~0xffu) | 4);
+	wr(gmu.base + GMU_COUNTERS_ON, 1);
+	/* step 17's "keep the 3D core up" taken back (bit 31): the keepalive alone does not let the GMU collapse it */
+	wr(gmu.base + GMU_HOST2GMU_INTR_SET, 1u << 31);
+	gpu_gx_put();
+	printf("adreno: gpu-ifpc: the GMU may now power the 3D core down between frames\n");
+}
+
+/* The run ends (hakios_gpu_stop(), before the core is woken for the last time). */
+static void
+gpu_ifpc_stop(void)
+{
+	uint64_t count = 0;
+	bool counted;
+
+	if (!ifpc_config) {
+		return;
+	}
+	counted = gpu_ifpc_count(&count);
+	printf("adreno: gpu-ifpc: %llu collapses%s, %llu wakes asked for, %llu failed%s\n", count,
+	    counted ? "" : " (the count did not read the same twice)", ifpc_wakes, ifpc_wake_failures,
+	    ifpc_failed ? "; THE CORE WAS GIVEN UP" : "");
+}
+
+int
+hakios_gpu_ifpc_control(int value, bool write)
+{
+	if (!write) {
+		return (int)ifpc_on;
+	}
+	if (value < 0 || value > 1) {
+		return EINVAL;
+	}
+	if (!ifpc_config || !gpu_kept || ifpc_failed) {
+		return ENXIO;
+	}
+	if ((uint32_t)value == ifpc_on) {
+		return 0;
+	}
+	if (value == 0) {
+		uint32_t granted = 0;
+
+		wr(gmu.base + GMU_GMU2HOST_INTR_CLR, GMU_CORE_GRANTED);
+		wr(gmu.base + GMU_HOST2GMU_INTR_SET, GMU_CORE_REQUEST);
+		for (int i = 0; i < 5000 && !(granted & GMU_CORE_GRANTED); i++) {
+			sleep_us(100);
+			granted = rd(gmu.base + GMU_GMU2HOST_INTR_INFO);
+		}
+		wr(gmu.base + GMU_GMU2HOST_INTR_CLR, GMU_CORE_GRANTED);
+		if (!(granted & GMU_CORE_GRANTED)) {
+			ifpc_failed = 1;
+			ifpc_wake_failures++;
+			printf("adreno: gpu-ifpc: the GMU does not keep the core up when asked: it is given up\n");
+			return EIO;
+		}
+	} else {
+		wr(gmu.base + GMU_HOST2GMU_INTR_SET, 1u << 31);
+	}
+	ifpc_on = (uint32_t)value;
+	return 0;
+}
+
+void
+hakios_gpu_ifpc_line(char *line, size_t size)
+{
+	uint64_t count = 0;
+	bool counted;
+
+	if (!ifpc_config || !gpu_kept) {
+		snprintf(line, size, "off (%s)\n", !hakios_board_has(HAKIOS_HAS_GPU_IFPC) ? "no gpu-ifpc on this board" :
+		    !gpu_kept ? "the GPU is not kept" : "gpu_ifpc=0");
+		return;
+	}
+	counted = gpu_ifpc_count(&count);
+	snprintf(line, size, "on %u failed %u collapses %lld gx_status %#x power_state %#x wakes %llu wake_failures %llu\n",
+	    ifpc_on, ifpc_failed, counted ? (long long)count : -1ll, rd(gmu.base + GMU_GX_STATUS),
+	    rd(gmu.base + GMU_RPMH_POWER_STATE), ifpc_wakes, ifpc_wake_failures);
+}
+
 /* ---- beside the steps: what the firmware left the display doing (boot-arg display_probe=1) ---------------- */
 
 /*
@@ -5200,6 +5573,8 @@ hakios_adreno_init(void)
 	PE_parse_boot_argn("adreno_watch", &watch_seconds, sizeof(watch_seconds));
 	for (newest_step = last_step; newest_step > 0 && (skip_steps & 1u << newest_step); newest_step--) {
 	}
+	PE_parse_boot_argn("adreno_keep", &keep, sizeof(keep));
+	gpu_keep_asked = keep != 0;             /* (for step 17: gpu-ifpc only for a GPU that is kept) */
 
 	printf("adreno: steps up to %u, without those in mask %#x; step %u is the new one and waits %u ms %s\n", last_step,
 	    skip_steps, newest_step, pause_ms, fine ? "before every access" : "after each announcement");
@@ -5230,6 +5605,7 @@ hakios_adreno_init(void)
 			PE_parse_boot_argn("gpu_va", &gpu_va, sizeof(gpu_va));
 			gpu_kept = true;
 			gpu_irq_start();
+			gpu_ifpc_handover();
 			quiet = true;
 			printf("adreno: THE GPU STAYS ON for the system to draw with: the service HakiosGPU\n");
 			if (gpu_va != 0) {
