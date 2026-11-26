@@ -505,6 +505,9 @@ static struct hakios_net_link lx_link = {
 	.transmit = lx_link_transmit,
 };
 
+/* (kern.hakios.wifi_doze and wifi_ps, defined with their sysctls below; their boot args are read here) */
+static unsigned wifi_doze, wifi_ps;
+
 void
 lx_os_net_attach(const unsigned char *address)
 {
@@ -535,6 +538,8 @@ lx_os_net_attach(const unsigned char *address)
 	}
 	PE_parse_boot_argn("wifi_offload", &lx_offload, sizeof(lx_offload));
 	PE_parse_boot_argn("wifi_wmm", &lx_wmm, sizeof(lx_wmm));
+	PE_parse_boot_argn("wifi_doze", &wifi_doze, sizeof(wifi_doze));
+	PE_parse_boot_argn("wifi_ps", &wifi_ps, sizeof(wifi_ps));
 	/* (ath11k's TCL fills in IPv4 header, TCP and UDP checksums, v4 and v6, for a frame given as CHECKSUM_PARTIAL: dp_tx.c) */
 	lx_link.offload = lx_offload ? HAKIOS_NET_CSUM_TX : 0;
 	memcpy(lx_link.address, address, sizeof(lx_link.address));
@@ -817,12 +822,15 @@ int lx_os_pcie_wake_line(void) { return hakios_pcie_wake_line() ? 1 : 0; }
 unsigned lx_os_pcie_sleep_mode(void) { return hakios_pcie_sleep_mode(); }
 
 /* kern.hakios.wifi_doze: 1 the radio dozes (WoW, M3, link off) with the screen off after wifi_doze_idle_ms without a
- * frame; kern.hakios.wifi_ps: 1 station power save. Both 0 by default until measured (WIFI-PLAN.md P4c/P4d). */
-static unsigned wifi_doze, wifi_doze_idle_ms = 3000, wifi_ps, wifi_doze_patterns = 0xf;
+ * frame; kern.hakios.wifi_ps: 1 station power save. Both on by default, as negroni-dev's run86 had them (93 of 120 s in
+ * CX collapse unplugged, every wake answered).
+ * wifi_doze=0: the radio never dozes (default 1: with the screen off, after 1 s without a frame).
+ * wifi_ps=0: no station power save (default 1: the firmware sleeps between beacons). */
+static unsigned wifi_doze = 1, wifi_doze_idle_ms = 1000, wifi_ps = 1, wifi_doze_patterns = 0xf;
 SYSCTL_UINT(_kern_hakios, OID_AUTO, wifi_doze_patterns, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_doze_patterns, 0,
     "doze wake events: 1 unicast to us, 2 IPv6 solicited-node multicast, 4 disconnect, 8 GTK rekey failure");
 unsigned lx_os_doze_patterns(void) { return wifi_doze_patterns; }
-static unsigned wifi_doze_kick = 1;	/* (run51: in M3 no interrupt ever came with new events; any one is the request) */
+static unsigned wifi_doze_kick = 2;	/* (run51: in M3 no interrupt came with new events, so 1; run86's wakes come by the WAKE MSI) */
 SYSCTL_UINT(_kern_hakios, OID_AUTO, wifi_doze_kick, CTLFLAG_RW | CTLFLAG_LOCKED, &wifi_doze_kick, 0,
     "the radio's MHI interrupt in M3 ends a doze: 0 never, 1 always, 2 only with new events (Linux)");
 unsigned lx_os_doze_kick_mode(void) { return wifi_doze_kick; }

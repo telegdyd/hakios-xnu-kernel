@@ -103,6 +103,8 @@ static vm_offset_t gicr_cpu_base[MAX_CPUS]; /* each processor's redistributor fr
 static uint64_t gic_active_iar[MAX_CPUS];
 uint64_t        gic_unhandled_count;
 uint32_t        gic_last_unhandled;
+#define GIC_INTID_LPI_MIN       8192        /* LPIs: 8192 and up (the ITS's) */
+extern bool     hakios_its_lpi(uint32_t intid) __attribute__((weak));   /* drivers/board/its.c */
 
 /*
  * The attached SPIs. A slot is filled before its interrupt is enabled and emptied after it has
@@ -359,6 +361,16 @@ gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub
 		} else if (intid == GIC_SGI_STOP) {
 			/* comes back only if nobody has in fact asked for that */
 			psci_smp_stop_here();
+		} else if (intid >= GIC_INTID_LPI_MIN) {
+			/*
+			 * an LPI: the ITS's (drivers/board/its.c; the radio's MSIs). One nobody owns has no distributor bit to
+			 * mask it by: only counted. (Lost in the port from negroni-dev: every MSI was counted here, and Wi-Fi ran
+			 * on lx_pci.c's sweep alone, 200 ms apart with the screen off, a minute apart in a doze.)
+			 */
+			if (!hakios_its_lpi || !hakios_its_lpi(intid)) {
+				gic_unhandled_count++;
+				gic_last_unhandled = intid;
+			}
 		} else if (intid >= GIC_INTID_SPI_MIN && gic_spi_handle(intid)) {
 			/* a driver's */
 		} else {

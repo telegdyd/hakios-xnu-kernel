@@ -188,6 +188,7 @@ static struct {
 	unsigned lost_wakes, reason_unspecified, instant;	/* instant: dozes that ended within 5 ms */
 	unsigned dozes, wakes, failed_suspend, failed_sleep, failed_wake, failed_resume, ps_changes;
 	unsigned not_ready, failed_undo;	/* MHI busy when a doze was due; a failed suspend's undo that failed too */
+	bool given_up;				/* a wake failed: no more dozes this boot */
 	unsigned lengths[DOZE_QUEUE], flags[DOZE_QUEUE];
 	unsigned reason_last[8], reason_n, reason_count[64];
 	char reason_name[8][24];
@@ -2797,9 +2798,9 @@ doze_say(void)
 	int at = 0;
 
 	snprintf(text, sizeof(text), "state %d dozes %u wakes %u (line %u msi %u send %u call %u other %u) failed: suspend %u sleep %u "
-	    "wake %u resume %u; queue lost %u; dozed_ms %llu longest_ms %llu last_wake_us %llu; ps %u (changes %u)", doze.state,
+	    "wake %u resume %u%s; queue lost %u; dozed_ms %llu longest_ms %llu last_wake_us %llu; ps %u (changes %u)", doze.state,
 	    doze.dozes, doze.wakes, doze.by_line, doze.by_msi, doze.by_send, doze.by_call, doze.by_other, doze.failed_suspend, doze.failed_sleep,
-	    doze.failed_wake, doze.failed_resume, doze.queue_lost, dozed / 1000000ull, doze.longest_ns / 1000000ull,
+	    doze.failed_wake, doze.failed_resume, doze.given_up ? " (given up)" : "", doze.queue_lost, dozed / 1000000ull, doze.longest_ns / 1000000ull,
 	    doze.last_wake_ns / 1000ull, doze.ps_applied, doze.ps_changes);
 	{
 		unsigned ev, evp, bhi, kicks, net;
@@ -3116,7 +3117,8 @@ doze_leave(struct lx_radio *radio)
 	doze_seeing = false;
 	if (ret != 0) {
 		doze.failed_resume++;
-		lx_tell("lx: doze: the driver's resume said %d\n", ret);
+		doze.given_up = true;
+		lx_tell("lx: doze: the driver's resume said %d: no more dozes this boot, the radio stays awake\n", ret);
 	}
 	doze.last_wake_ns = lx_os_nanoseconds() - began;
 	doze_seen_say(doze.wakes + 1, dozed_ms, reasons_before);
@@ -3149,6 +3151,7 @@ doze_runs(void *argument)
 		bool joined = radio != NULL && radio->joined && radio->vif != NULL;
 
 		lx_os_doze_config(&on, &idle_ms, &ps);
+		if (doze.given_up) on = 0;
 		{
 			unsigned mode;
 			if (joined && doze.state == 0 && lx_os_rx_filter_asked(&mode)) {
