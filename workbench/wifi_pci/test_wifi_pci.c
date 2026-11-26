@@ -636,11 +636,23 @@ test_chain(void)
 	CHECK_STR(fake.events, "pcie_up,smmu_up,pool_up,driver_start,scan,driver_stop,pool_down,smmu_down,pcie_down");
 	CHECK(strstr(fake.detail[10], "0 BSS") != NULL);
 
+	/* a join that fails leaves the kept radio up (en0 for wifid); stage 11 is still said as failed */
 	fresh(); fake.fail_join = ETIMEDOUT;
-	CHECK(chain(&w) == 11);
-	CHECK_STR(fake.events, "pcie_up,smmu_up,pool_up,driver_start,scan,join,driver_stop,pool_down,smmu_down,pcie_down");
+	CHECK(chain(&w) == 0);
+	CHECK_STR(fake.events, "pcie_up,smmu_up,pool_up,driver_start,scan,join");
 	CHECK_STR(fake.stage_log, "4+5+6+7+8+9+10+11-");
 	CHECK(strstr(fake.detail[11], "last error 15") != NULL);
+
+	/* ... and with wifi_keep=0 it is all taken down */
+	{
+		struct hakios_wifi_words nokeep = w;
+
+		nokeep.keep = false;
+		fresh(); fake.fail_join = ETIMEDOUT;
+		CHECK(chain(&nokeep) == 11);
+		CHECK_STR(fake.events, "pcie_up,smmu_up,pool_up,driver_start,scan,join,driver_stop,pool_down,smmu_down,pcie_down");
+		CHECK_STR(fake.stage_log, "4+5+6+7+8+9+10+11-");
+	}
 
 	/* a stage is said once even when the chain and the lx layer both think they should */
 	fresh(); fake.driver_script = 3; fake.fail_driver = EIO;

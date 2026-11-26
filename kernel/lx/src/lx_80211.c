@@ -375,8 +375,14 @@ regd_apply(struct lx_radio *radio)
 		}
 	}
 	radio->kept = true;
-	printf("lx: the regulatory domain \"%c%c\" (%d rules) allows the radio's channels:%s\n", regd->alpha2[0], regd->alpha2[1],
+	lx_tell("lx: the regulatory domain \"%c%c\" (%d rules) allows the radio's channels:%s\n", regd->alpha2[0], regd->alpha2[1],
 	    regd->n_reg_rules, said);
+	for (int r = 0; r < regd->n_reg_rules; r++) {
+		lx_tell("lx:   rule %d: %d..%d MHz, up to %d MHz wide, %d dBm, flags 0x%x\n", r,
+		    regd->reg_rules[r].freq_range.start_freq_khz / 1000, regd->reg_rules[r].freq_range.end_freq_khz / 1000,
+		    regd->reg_rules[r].freq_range.max_bandwidth_khz / 1000, regd->reg_rules[r].power_rule.max_eirp / 100,
+		    regd->reg_rules[r].flags);
+	}
 }
 
 /*
@@ -633,6 +639,8 @@ element(const uint8_t *elements, unsigned length, unsigned number)
 	}
 	return (NULL);
 }
+
+static bool adopt_heard_country(struct lx_radio *radio);
 
 /* A vendor's element (221) that begins with these four bytes. */
 static const uint8_t *
@@ -2358,8 +2366,12 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 		}
 	}
 	lx_os_unlock();
+	if (!target->found) {
+		adopt_heard_country(radio);	/* (the network may be on a channel only the country allows) */
+	}
 	for (unsigned attempt = 0; attempt < 3 && !target->found; attempt++) {
 		station_scan(radio, name, name_length, false, NULL);
+		adopt_heard_country(radio);
 	}
 	/* the choice is made: a beacon heard from here on does not change it (the join goes on with this one's address and elements) */
 	lx_os_lock();
@@ -3282,6 +3294,57 @@ boundary_power_awake(bool on)
 	return (0);
 }
 
+static int boundary_country(const char *asked, char *now);
+static bool country_by_user;		/* wifid (or whoever) set a country: the beacons no longer choose it */
+
+/*
+ * 802.11d, as Linux's cfg80211 does with the country elements (7) of the access points it hears: the
+ * country most of them name becomes the radio's, unless one was set from above. Without it the board
+ * data's domain stays (US on the NE2213), and a network on a channel that domain leaves out (13 at
+ * 2.4 GHz in Europe) is never heard. True when the domain changed: the caller scans again.
+ */
+static bool
+adopt_heard_country(struct lx_radio *radio)
+{
+	char codes[8][2], now[2];
+	unsigned votes[8] = { 0 }, kinds = 0, best = 0;
+
+	if (country_by_user) {
+		return (false);
+	}
+	lx_os_lock();
+	for (unsigned i = 0; i < radio->heard_count; i++) {
+		const struct lx_heard *network = &radio->heard[i];
+		const uint8_t *e = element(network->elements, network->elements_length, 7);
+		unsigned k;
+
+		if (e == NULL || e[1] < 3 || e[2] < 'A' || e[2] > 'Z' || e[3] < 'A' || e[3] > 'Z' || (e[2] == 'X' && e[3] == 'X')) {
+			continue;
+		}
+		for (k = 0; k < kinds && memcmp(codes[k], e + 2, 2) != 0; k++) {
+		}
+		if (k == kinds) {
+			if (kinds == nitems(codes)) {
+				continue;
+			}
+			memcpy(codes[kinds++], e + 2, 2);
+		}
+		votes[k]++;
+	}
+	now[0] = radio->regd != NULL ? radio->regd->alpha2[0] : 0;
+	now[1] = radio->regd != NULL ? radio->regd->alpha2[1] : 0;
+	lx_os_unlock();
+	for (unsigned k = 1; k < kinds; k++) {
+		best = votes[k] > votes[best] ? k : best;
+	}
+	if (kinds == 0 || memcmp(codes[best], now, 2) == 0) {
+		return (false);
+	}
+	lx_tell("lx: %u of the access points heard name the country %c%c (the domain in force: %c%c): it is taken\n", votes[best],
+	    codes[best][0], codes[best][1], now[0] ? now[0] : '-', now[1] ? now[1] : '-');
+	return (boundary_country(codes[best], NULL) == 0);
+}
+
 static int
 boundary_scan(const struct hakios_sta_scan *what)
 {
@@ -3298,6 +3361,23 @@ boundary_scan(const struct hakios_sta_scan *what)
 	}
 	began = lx_os_nanoseconds();
 	error = station_scan(radio, what->ssid, what->ssid_length <= sizeof(what->ssid) ? what->ssid_length : 0, what->passive, what);
+	if (error == 0 && adopt_heard_country(radio)) {
+		/*
+		 * (the new domain's channels: once more, so what is on them is in the answer. The driver sends the firmware
+		 * its new channel list from work of its own: a scan begun meanwhile hears nothing, so a moment first, and
+		 * again if it still heard nothing)
+		 */
+		for (unsigned again = 0; again < 3; again++) {
+			lx_os_lock();
+			(void)lx_os_sleep(&again, 500 * 1000000ull);	/* (nobody wakes it: the time only) */
+			lx_os_unlock();
+			error = station_scan(radio, what->ssid, what->ssid_length <= sizeof(what->ssid) ? what->ssid_length : 0,
+			    what->passive, what);
+			if (error == 0 && radio->heard_count != 0) {
+				break;
+			}
+		}
+	}
 	if (said < 24) {			/* (the first few are told: whoever asks goes on asking as long as the system runs) */
 		said++;
 		lx_tell("lx: a scan for the kernel: %u channels named (0: all), %s, %u ms on each (0: the radio's own): %d; %u access "
@@ -3516,6 +3596,18 @@ boundary_country(const char *asked, char *now)
 			}
 			error = radio->regd != NULL && memcmp(radio->regd->alpha2, want, 2) == 0 ? 0 : ETIMEDOUT;
 			lx_os_unlock();
+			if (error == 0) {
+				/*
+				 * What cfg80211 does once a self-managed radio's new domain is set (reg.c,
+				 * reg_process_self_managed_hint): the notifier again, as the driver's. ath11k then
+				 * sends the firmware the new channel list (ath11k_reg_update_chan_list); without it
+				 * the firmware goes on scanning the old country's channels only.
+				 */
+				bzero(&request, sizeof(request));
+				memcpy(request.alpha2, want, 2);
+				request.initiator = NL80211_REGDOM_SET_BY_DRIVER;
+				radio->wiphy->reg_notifier(radio->wiphy, &request);
+			}
 			lx_tell("lx: the country %c%c is asked of the firmware: %s in %llu ms\n", want[0], want[1], error == 0 ?
 			    "its domain has come" : "NO DOMAIN of it has come", (lx_os_nanoseconds() - began) / 1000000ull);
 		} else {
@@ -3542,6 +3634,7 @@ static int boundary_country_awake(const char *asked, char *now)
 {
 	int error;
 	if (asked == NULL) return boundary_country(NULL, now);
+	country_by_user = true;
 	doze_call_begin("country change");
 	error = boundary_country(asked, now);
 	doze_call_end();

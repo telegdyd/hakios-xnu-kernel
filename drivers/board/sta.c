@@ -239,6 +239,12 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
 			lck_mtx_lock(&sta_lock);
 			changed = in_force[0] != 0 && memcmp(country_now, in_force, sizeof(country_now)) != 0;
 			memcpy(country_now, in_force, sizeof(country_now));
+			/* the new country's channels may be where the standing network is (13 at 2.4 GHz in Europe): joined again now */
+			if (changed && error == 0 && standing.ssid_length != 0 && sta_on && !sta_joined && !asked_join && !asked_leave) {
+				asked_join_what = standing;
+				asked_join = true;
+				asked_join_by_darwin = false;
+			}
 			if (now != NULL) {
 				memcpy(channels, now, count * sizeof(*now));
 				channel_count = count;

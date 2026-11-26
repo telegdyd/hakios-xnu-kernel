@@ -649,6 +649,14 @@ hakios_wifi_pci_start(const struct hakios_wifi_words *w, const struct hakios_wif
 		if ((error = ops->join(ops->ctx, &last_error)) != 0) {
 			snprintf(detail, sizeof(detail), "the network was not joined: errno %d, last error %d", error, last_error);
 			fail_stage(ops, 11, detail);
+			/*
+			 * The radio itself is up (stages 1-10): a given network out of range or refusing us is no reason
+			 * to take en0 away. With wifi_keep it stays for wifid to join what it knows; only wifi_keep=0
+			 * takes it down, as after a successful chain.
+			 */
+			if (w->keep) {
+				return 0;
+			}
 			hakios_wifi_pci_teardown(ops, run);
 			return 11;
 		}

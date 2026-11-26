@@ -3,7 +3,8 @@
 
 The pinned upstream source remains untouched. Only a structure member's name
 changes; its declaration and accesses must agree in every translation unit.
-The monitor-status timer is serviced on existing PCI worker wakes. WMI_WOW_ENABLE's
+The monitor-status timer is serviced on existing PCI worker wakes. A country the host asked for is not
+intersected with the board data's domain (reg.c). WMI_WOW_ENABLE's
 flags come from lx_bus.c (the DRV sleep flag). Protocol
 timers, including fragment expiry and connection loss, keep their deadlines.
 """
@@ -44,6 +45,16 @@ for path in source.iterdir():
             b'\n\t\tif (ar->ab->hif.bus == ATH11K_BUS_PCI)'
             b'\n\t\t\tbitmap &= ~WMI_HW_DATA_FILTER_DROP_NON_ICMPV6_MC;'
         ))
+    if path.name == 'reg.c':
+        # A country the host asked for (ath11k_reg_set_cc() keeps it in ar->alpha2: wifid's, or the beacons' 802.11d
+        # one, lx_80211.c) is the firmware's domain for that country as it is. Upstream intersects every domain after
+        # the first with the board data's (US on the NE2213): Europe's channels 12 and 13 at 2.4 GHz and most of
+        # 6 GHz would never be used, and a network on 13 is never heard. Other domain changes keep upstream's rule.
+        old = (b'\t    !ath11k_reg_is_world_alpha((char *)reg_info->alpha2))\n'
+               b'\t\tintersect = true;\n')
+        assert data.count(old) == 1, 'ath11k regulatory intersection changed'
+        data = data.replace(old, (b'\t    !ath11k_reg_is_world_alpha((char *)reg_info->alpha2))\n'
+                                  b'\t\tintersect = memcmp(ab->pdevs[pdev_idx].ar->alpha2, reg_info->alpha2, 2) != 0;\n'))
     target = output / path.name
     if not target.exists() or target.read_bytes() != data:
         target.write_bytes(data)
