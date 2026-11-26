@@ -350,6 +350,7 @@ F:	drivers/board/ufshc.c
 F:	drivers/board/ufshc.h
 F:	drivers/board/ufshc_clock.h
 F:	drivers/board/ufshc_power.h
+F:	drivers/board/ufshc_write.h
 F:	drivers/board/virtio_blk.c
 T:	workbench/ufs_driver_test.c
 T:	workbench/ufs_whitelist_test.c

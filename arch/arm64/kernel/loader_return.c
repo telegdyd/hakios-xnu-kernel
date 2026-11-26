@@ -854,6 +854,7 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 		for (const char *c = banner; *c; c++) {
 			loader_log_putc(*c);
 		}
+		hakios_var_save_on_return();
 		if (hakios_fastboot_reset != NULL) {
 			hakios_fastboot_reset();
 		}

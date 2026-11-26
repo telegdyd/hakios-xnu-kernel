@@ -71,7 +71,12 @@ static volatile uint8_t ocs_given;              /* the OCS the controller gives 
 static volatile unsigned clears;                /* writes to UTRLCLR */
 static volatile uint8_t answer_status;          /* the SCSI status the unit answers with (0: good) */
 static volatile uint32_t residual_given;         /* bytes the unit says it did not move (its response's residual, underflow) */
-static struct { uint8_t lun, slot; uint32_t lba, blocks; } asked[64];
+static struct { uint8_t lun, slot, op; uint32_t lba, blocks; } asked[64];
+#define WRITE_BASE         100u
+#define WRITE_STORE_BLOCKS 64u
+static uint8_t write_store[WRITE_STORE_BLOCKS * BLOCK];
+static volatile bool write_store_active;
+static volatile unsigned flushes;
 
 #define REG(r)          registers[(r) / 4]
 
@@ -132,16 +137,32 @@ do_slot(unsigned slot)
 	if (commands < 64) {
 		asked[commands].lun = u[2];
 		asked[commands].slot = (uint8_t)slot;
+		asked[commands].op = u[16];
 		asked[commands].lba = lba;
 		asked[commands].blocks = blocks;
 	}
 	commands++;
-	for (uint32_t n = 0; n < entries; n++) {
-		const uint32_t *prd = ucd[slot] + (UCD_PRDT + 16 * n) / 4;
-		uint8_t *to = (uint8_t *)(uintptr_t)((uint64_t)prd[1] << 32 | prd[0]);
+	if (u[16] == 0x35) {
+		flushes++;
+	} else {
+		for (uint32_t n = 0; n < entries; n++) {
+			const uint32_t *prd = ucd[slot] + (UCD_PRDT + 16 * n) / 4;
+			uint8_t *buf = (uint8_t *)(uintptr_t)((uint64_t)prd[1] << 32 | prd[0]);
 
-		for (uint32_t i = 0; i <= prd[3]; i++) {
-			to[i] = made_up(u[2], at++);
+			for (uint32_t i = 0; i <= prd[3]; i++) {
+				if (u[16] == 0x2a) {
+					if (u[2] == 0 && at >= (uint64_t)WRITE_BASE * BLOCK &&
+					    at < (uint64_t)(WRITE_BASE + WRITE_STORE_BLOCKS) * BLOCK) {
+						write_store[at - (uint64_t)WRITE_BASE * BLOCK] = buf[i];
+					}
+					at++;
+				} else if (u[2] == 0 && write_store_active && at >= (uint64_t)WRITE_BASE * BLOCK &&
+				    at < (uint64_t)(WRITE_BASE + WRITE_STORE_BLOCKS) * BLOCK) {
+					buf[i] = write_store[at++ - (uint64_t)WRITE_BASE * BLOCK];
+				} else {
+					buf[i] = made_up(u[2], at++);
+				}
+			}
 		}
 	}
 	memset(r, 0, 64);
@@ -625,6 +646,74 @@ no_read_before_the_proof(void)
 	CHECK(ufshc_read(0, 0, out, sizeof(out)) == 0 && commands == 1, "rung once proven");
 }
 
+/* native writes and synchronous cache flushes: window checks, multi-chunk writes, read-back, flush */
+static void
+write_window_and_writes(void)
+{
+	static uint8_t src[2 * BUFFER + BLOCK], dst[2 * BUFFER + BLOCK];
+
+	in_with(2);
+	write_store_active = true;
+	memset(write_store, 0, sizeof(write_store));
+	for (unsigned i = 0; i < sizeof(src); i++) {
+		src[i] = (uint8_t)(i * 29 + 3);
+	}
+	CHECK(ufshc_write(0, (uint64_t)WRITE_BASE * BLOCK, src, BLOCK) == EROFS, "writes refused before window");
+	CHECK(ufshc_flush() == EIO && commands == 0, "flush refused before window");
+	CHECK(ufshc_allow_writes(0, WRITE_BASE + 10) == EINVAL, "LBA 0 window refused");
+	CHECK(ufshc_allow_writes(WRITE_BASE + 10, WRITE_BASE + 10) == EINVAL, "empty window refused");
+	CHECK(ufshc_allow_writes(WRITE_BASE, 0x100000001ULL) == EINVAL, "past 32-bit LBA window refused");
+	CHECK(ufshc_allow_writes(WRITE_BASE, WRITE_BASE + WRITE_STORE_BLOCKS) == 0, "valid window set");
+	CHECK(ufshc_allow_writes(1, 1000) == EINVAL, "window cannot be changed once set");
+
+	CHECK(ufshc_write(0, (uint64_t)(WRITE_BASE - 1) * BLOCK, src, BLOCK) == EROFS, "before window refused");
+	CHECK(ufshc_write(0, (uint64_t)(WRITE_BASE + WRITE_STORE_BLOCKS - 1) * BLOCK, src, 2 * BLOCK) == EROFS,
+	    "spanning past window refused");
+	CHECK(ufshc_write(1, (uint64_t)WRITE_BASE * BLOCK, src, BLOCK) == EROFS, "non-zero LUN refused");
+	CHECK(ufshc_write(0, (uint64_t)WRITE_BASE * BLOCK + 512, src, BLOCK) == EROFS, "unaligned offset refused");
+	CHECK(ufshc_write(0, (uint64_t)WRITE_BASE * BLOCK, src, 512) == EROFS, "unaligned length refused");
+	CHECK(commands == 0, "no refused write reached the controller: %u", commands);
+
+	CHECK(ufshc_write(0, (uint64_t)WRITE_BASE * BLOCK, src, sizeof(src)) == 0, "multi-chunk write ok: %s", log_text);
+	CHECK(commands == 3 && asked[0].op == 0x2a && asked[0].lba == WRITE_BASE && asked[0].blocks == 16 &&
+	    asked[1].lba == WRITE_BASE + 16 && asked[1].blocks == 16 &&
+	    asked[2].lba == WRITE_BASE + 32 && asked[2].blocks == 1, "3 WRITE(10) commands sent");
+	CHECK(ufshc_flush() == 0 && flushes == 1 && asked[3].op == 0x35, "SYNCHRONIZE CACHE(10) sent");
+	CHECK(ufshc_read(0, (uint64_t)WRITE_BASE * BLOCK, dst, sizeof(dst)) == 0 &&
+	    memcmp(src, dst, sizeof(src)) == 0, "written bytes read back identically");
+	CHECK(hc_free == 0x3 && hc_in_flight == 0, "slots free again: %#x", hc_free);
+}
+
+/* write/flush failures disable the path; a timed-out write quarantines its slot */
+static void
+write_errors_and_quarantine(void)
+{
+	static uint8_t src[BLOCK];
+
+	in_with(2);
+	CHECK(ufshc_allow_writes(WRITE_BASE, WRITE_BASE + WRITE_STORE_BLOCKS) == 0, "window");
+	residual_given = 512;
+	CHECK(ufshc_write(0, (uint64_t)WRITE_BASE * BLOCK, src, BLOCK) == EIO && hc_dead,
+	    "write underflow fails and turns path off");
+	CHECK(hc_free == 0x3, "completed slot returned");
+
+	hc_dead = false;
+	residual_given = 0;
+	answer_status = 0x02;
+	CHECK(ufshc_flush() == EIO && hc_dead, "flush error fails and turns path off");
+
+	hc_dead = false;
+	answer_status = 0;
+	fake_delay_divisor = 1000;
+	hold();
+	/* Give the poller's 1 s loop a quick timeout by holding the controller until TIMEOUT_MS passes */
+	CHECK(ufshc_write(0, (uint64_t)WRITE_BASE * BLOCK, src, BLOCK) == ETIMEDOUT && hc_dead,
+	    "timed-out write turns path off");
+	CHECK(hc_free == 0x2 && hc_in_flight == 1, "timed-out DMA slot 0 quarantined (free %#x, in_flight %u)",
+	    hc_free, hc_in_flight);
+	let_go();
+}
+
 int
 main(int argc, char **argv)
 {
@@ -634,6 +723,8 @@ main(int argc, char **argv)
 		{ "the_controller_refuses", the_controller_refuses }, { "proved", proved }, { "stuck_when_going_out", stuck_when_going_out }, { "reads_in_flight", reads_in_flight }, { "two_readers", two_readers }, { "a_slow_controller", a_slow_controller }, { "not_usable", not_usable },
 		{ "lost_when_going_out", lost_when_going_out }, { "a_short_read", a_short_read },
 		{ "cleared_slots_retired", cleared_slots_retired }, { "no_read_before_the_proof", no_read_before_the_proof },
+		{ "write_window_and_writes", write_window_and_writes },
+		{ "write_errors_and_quarantine", write_errors_and_quarantine },
 	};
 
 	if (argc < 2) {

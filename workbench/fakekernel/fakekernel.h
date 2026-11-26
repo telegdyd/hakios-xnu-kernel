@@ -308,7 +308,12 @@ struct bdevsw {
 #define DKIOCGETBLOCKCOUNT      0x40086419ul
 #define DKIOCISWRITABLE         0x4004641dul
 #define DKIOCGETMAXBLOCKCOUNTREAD 0x40086440ul
+#define DKIOCGETMAXBLOCKCOUNTWRITE 0x40086441ul
 #define DKIOCGETPHYSICALBLOCKSIZE 0x4004644dul
+#define DKIOCSYNCHRONIZE        0x80186416ul
+#define DKIOCSYNCHRONIZECACHE   0x20006416ul
+static inline int buf_map(buf_t bp, caddr_t *io_addr) { *io_addr = (caddr_t)bp->data; return 0; }
+static inline int buf_unmap(buf_t bp __unused) { return 0; }
 int bdevsw_add(int index, const struct bdevsw *devsw);
 int bdevsw_remove(int index, const struct bdevsw *devsw);
 int cdevsw_add_with_bdev(int index, const struct cdevsw *devsw, int bdev);

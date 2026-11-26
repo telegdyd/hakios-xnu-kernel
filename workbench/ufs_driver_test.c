@@ -221,10 +221,13 @@ void loader_return(void) {}
  * the scenarios of the way between the two, which say what its reads answer (darwin's bytes, from where its unit has
  * it) and whether its list goes back in
  */
-static unsigned switched_out, switched_in, native_reads;
-static int native_error = EIO, switch_in_error = EIO;
+static unsigned switched_out, switched_in, native_reads, native_writes, native_flushes;
+static int native_error = EIO, native_write_error = 0, native_flush_error = 0, switch_in_error = EIO;
 static bool probe_ok;                           /* the controller as the loader offers it */
 static bool whole_unit;                         /* its reads are of unit 0 as a whole (unit_byte), not darwin's */
+static bool allow_writes_fail, native_corrupt_readback;
+static uint64_t native_win_first, native_win_end;
+static bool native_win_enabled;
 bool ufshc_probe(const struct ufshc_loader *loader __unused, bool only __unused) { return probe_ok; }
 bool ufshc_available(void) { return probe_ok; }
 void ufshc_set_luns(uint32_t mask __unused) {}
@@ -242,7 +245,20 @@ ufshc_read(uint8_t lun __unused, uint64_t offset, uint8_t *dst, uint64_t len)
 	}
 	if (whole_unit) {
 		for (uint64_t i = 0; i < len; i++) {
-			dst[i] = offset + i >= 4096 && offset + i < 8192 ? gpt_memory[offset + i - 4096] : made_up(UNIT0, offset + i);
+			uint64_t pos = offset + i;
+			uint64_t lba = pos / 4096;
+			const uint8_t *w = lba >= DARWIN_FIRST ? written(DARWIN, lba - DARWIN_FIRST) : NULL;
+
+			if (pos >= 4096 && pos < 8192) {
+				dst[i] = gpt_memory[pos - 4096];
+			} else if (w != NULL) {
+				dst[i] = w[pos % 4096];
+			} else {
+				dst[i] = made_up(UNIT0, pos);
+			}
+		}
+		if (native_corrupt_readback && len > 0) {
+			dst[0] ^= 0xff;
 		}
 		return 0;
 	}
@@ -250,6 +266,56 @@ ufshc_read(uint8_t lun __unused, uint64_t offset, uint8_t *dst, uint64_t len)
 		dst[i] = made_up(2, offset - DARWIN_ON_ITS_UNIT + i);  /* (darwin's, part 2) */
 	}
 	return 0;
+}
+int
+ufshc_allow_writes(uint64_t first, uint64_t end)
+{
+	if (allow_writes_fail || native_win_enabled || first == 0 || first >= end) {
+		return EINVAL;
+	}
+	native_win_first = first;
+	native_win_end = end;
+	native_win_enabled = true;
+	return 0;
+}
+int
+ufshc_write(uint8_t lun, uint64_t offset, const uint8_t *src, uint64_t len)
+{
+	uint64_t first = offset / 4096, blocks = len / 4096;
+
+	native_writes++;
+	if (native_write_error != 0) {
+		return native_write_error;
+	}
+	if (!native_win_enabled || lun != 0 || offset % 4096 != 0 || len % 4096 != 0 ||
+	    first < native_win_first || first >= native_win_end || blocks > native_win_end - first) {
+		return EROFS;
+	}
+	for (uint64_t b = 0; b < blocks; b++) {
+		uint64_t rel_lba = (first + b) - DARWIN_FIRST;
+		bool updated = false;
+
+		for (unsigned k = 0; k < kept_n; k++) {
+			if (kept[k].part == DARWIN && kept[k].lba == rel_lba) {
+				memcpy(kept[k].data, src + b * 4096, 4096);
+				updated = true;
+				break;
+			}
+		}
+		if (!updated && kept_n < KEPT) {
+			kept[kept_n].part = DARWIN;
+			kept[kept_n].lba = rel_lba;
+			memcpy(kept[kept_n].data, src + b * 4096, 4096);
+			kept_n++;
+		}
+	}
+	return 0;
+}
+int
+ufshc_flush(void)
+{
+	native_flushes++;
+	return native_flush_error;
 }
 void ufshc_report(const char *when __unused) {}
 
@@ -800,12 +866,12 @@ the_writes_own_checks(void)
 
 	loader("ufs_write=1");
 	hakios_ufs_init();
-	CHECK(ufs_write(DARWIN, AT(WRITE_FIRST) + 512, data, 4096) == EINVAL, "from the middle of a block: refused");
-	CHECK(ufs_write(DARWIN, AT(WRITE_FIRST), data, 0) == EINVAL, "nothing at all: refused");
-	CHECK(ufs_write(DARWIN, AT(WRITE_FIRST), data, 1000) == EINVAL, "part of a block: refused");
-	CHECK(ufs_write(SUPER, AT(1), data, 4096) == EROFS && ufs_write(BOOT, 0, data, 512) == EROFS, "another partition: refused");
+	CHECK(ufs_write(BLOCK_OP_WRITE, DARWIN, AT(WRITE_FIRST) + 512, data, 4096) == EINVAL, "from the middle of a block: refused");
+	CHECK(ufs_write(BLOCK_OP_WRITE, DARWIN, AT(WRITE_FIRST), data, 0) == EINVAL, "nothing at all: refused");
+	CHECK(ufs_write(BLOCK_OP_WRITE, DARWIN, AT(WRITE_FIRST), data, 1000) == EINVAL, "part of a block: refused");
+	CHECK(ufs_write(BLOCK_OP_WRITE, SUPER, AT(1), data, 4096) == EROFS && ufs_write(BLOCK_OP_WRITE, BOOT, 0, data, 512) == EROFS, "another partition: refused");
 	CHECK(writes_asked == 0, "the loader was asked for none: %u", writes_asked);
-	CHECK(ufs_write(DARWIN, AT(WRITE_FIRST), data, 4096) == 0 && writes_asked == 1, "a whole block of its own goes");
+	CHECK(ufs_write(BLOCK_OP_WRITE, DARWIN, AT(WRITE_FIRST), data, 4096) == 0 && writes_asked == 1, "a whole block of its own goes");
 	ufs_write_restore();
 }
 
@@ -1247,6 +1313,128 @@ on_its_core_extents_wrong(void)
 	CHECK(asked_n == 0, "none asked of the loader");
 }
 
+/* native reads, writes, and synchronous flushes on all cores (no bootcpu=): no loader mailbox, bounded to darwin */
+static void
+on_its_core_writes_natively(void)
+{
+	static uint8_t pat_a[2 * BUFFER + 4096], pat_b[8192], patch[512], back[2 * BUFFER + 4096];
+	size_t done = 0, resid = 0;
+	uint32_t writable = 0, pbs = 0;
+	uint64_t bcount = 0, max_w = 0;
+
+	loader_on_its_core("ufs_write=1");
+	hakios_ufs_init();
+	CHECK(ufs_native_only && ufs_native_on && ufs_native_writes == 1, "native write mode active");
+	CHECK(native_win_enabled && native_win_first == DARWIN_FIRST + WRITE_FIRST &&
+	    native_win_end == DARWIN_FIRST + DARWIN_BLOCKS, "exact LUN-0 LBA window authorized");
+	CHECK(get("ufs_native_write") == 1, "sysctl kern.hakios.ufs_native_write == 1");
+	CHECK(logged("ufs: native reads, writes and flushes; NO loader mailbox/fallback"), "logged native rw");
+	CHECK(logged("ufs: /dev/ufs_darwin_data:"), "data block device announced");
+
+	for (unsigned i = 0; i < sizeof(pat_a); i++) {
+		pat_a[i] = (uint8_t)(i * 17 + 9);
+	}
+	for (unsigned i = 0; i < sizeof(pat_b); i++) {
+		pat_b[i] = (uint8_t)(i * 31 ^ 0x5a);
+	}
+	memset(patch, 0x7e, sizeof(patch));
+
+	/* /dev/rufs_darwin raw writes: flushed + read-back verified natively */
+	CHECK(try_as_root("var_busy", 1) == 0 && fake_dev_open("rufs_darwin", FREAD | FWRITE) == 0, "claim + open rufs_darwin");
+	CHECK(fake_dev_pwrite("rufs_darwin", pat_a, sizeof(pat_a), AT(WRITE_FIRST), &done) == 0 && done == sizeof(pat_a),
+	    "multi-chunk native raw write ok: %zu", done);
+	CHECK(native_writes == 3 && native_flushes == 3 && asked_n == 0 && writes_asked == 0,
+	    "3 native writes, 3 flushes, 0 loader requests");
+	CHECK(fake_dev_pread("rufs_darwin", back, sizeof(back), AT(WRITE_FIRST), &done) == 0 &&
+	    memcmp(back, pat_a, sizeof(pat_a)) == 0, "raw write read back");
+
+	/* guards: pre-write_first, past end, unaligned, other partitions */
+	CHECK(fake_dev_pwrite("rufs_darwin", pat_b, 4096, AT(WRITE_FIRST - 1), &done) == EROFS, "before write_first refused");
+	CHECK(fake_dev_pwrite("rufs_darwin", pat_b, 4096, AT(DARWIN_BLOCKS), &done) == EROFS, "past end refused");
+	CHECK(fake_dev_pwrite("rufs_darwin", pat_b, 4096, AT(WRITE_FIRST) + 512, &done) == EINVAL, "unaligned refused");
+	CHECK(fake_dev_pwrite("rufs_super", pat_b, 4096, 0, &done) == EROFS, "super refused");
+
+	/* raw read-back mismatch and flush failure propagate as EIO without falling back */
+	native_corrupt_readback = true;
+	CHECK(fake_dev_pwrite("rufs_darwin", pat_b, 4096, AT(WRITE_FIRST + 40), &done) == EIO, "corrupt readback fails");
+	native_corrupt_readback = false;
+	native_flush_error = EIO;
+	CHECK(fake_dev_pwrite("rufs_darwin", pat_b, 4096, AT(WRITE_FIRST + 40), &done) == EIO, "flush error fails");
+	native_flush_error = 0;
+	CHECK(fake_dev_close("rufs_darwin") == 0 && try_as_root("var_busy", 0) == 0, "close + release claim");
+
+	/* /dev/ufs_darwin_data block device + mutual exclusion + 512-byte RMW + DKIOCSYNCHRONIZE */
+	CHECK(fake_disk_open("ufs_darwin_data", FREAD | FWRITE) == 0, "open ufs_darwin_data rw");
+	CHECK(try_as_root("var_busy", 1) == EBUSY && fake_dev_open("rufs_darwin", FREAD | FWRITE) == EBUSY,
+	    "var_busy and rufs_darwin rw blocked while ufs_darwin_data open rw");
+	CHECK(fake_disk_ioctl("ufs_darwin_data", DKIOCISWRITABLE, &writable) == 0 && writable == 1, "writable");
+	CHECK(fake_disk_ioctl("ufs_darwin_data", DKIOCGETPHYSICALBLOCKSIZE, &pbs) == 0 && pbs == 4096, "pbs 4096");
+	CHECK(fake_disk_ioctl("ufs_darwin_data", DKIOCGETBLOCKCOUNT, &bcount) == 0 &&
+	    bcount == DARWIN_BLOCKS - WRITE_FIRST, "data block count");
+	CHECK(fake_disk_ioctl("ufs_darwin_data", DKIOCGETMAXBLOCKCOUNTWRITE, &max_w) == 0 &&
+	    max_w == BUFFER / 4096, "max write blocks");
+	CHECK(fake_disk_write("ufs_darwin_data", 2, pat_b, sizeof(pat_b), &resid) == 0 && resid == 0,
+	    "aligned data block write");
+	{
+		uint32_t bs = 512;
+		CHECK(fake_disk_ioctl("ufs_darwin_data", DKIOCSETBLOCKSIZE, &bs) == 0, "set 512-byte blocks");
+		CHECK(fake_disk_write("ufs_darwin_data", 2 * 8 + 1, patch, sizeof(patch), &resid) == 0 && resid == 0,
+		    "512-byte unaligned RMW write");
+		bs = 4096;
+		CHECK(fake_disk_ioctl("ufs_darwin_data", DKIOCSETBLOCKSIZE, &bs) == 0, "restore 4096-byte blocks");
+	}
+	CHECK(fake_disk_ioctl("ufs_darwin_data", DKIOCSYNCHRONIZE, NULL) == 0, "DKIOCSYNCHRONIZE");
+	CHECK(fake_disk_ioctl("ufs_darwin_data", DKIOCSYNCHRONIZECACHE, NULL) == 0, "DKIOCSYNCHRONIZECACHE");
+	CHECK(fake_disk_read("ufs_darwin_data", 2, back, sizeof(pat_b), &resid) == 0 && resid == 0, "read back data");
+	memcpy(pat_b + 512, patch, sizeof(patch));
+	CHECK(memcmp(back, pat_b, sizeof(pat_b)) == 0, "512-byte RMW preserved surrounding bytes");
+	hakios_var_save_on_return();
+	CHECK(logged("ufs: orderly return: native cache flush done (0)"), "orderly return flushed");
+	CHECK(asked_n == 0 && writes_asked == 0 && ufs_mailbox_refused == 0, "zero mailbox requests");
+}
+
+/* ufs_native_write=0, missing loader offer, or allow_writes failure keeps storage read-only without loader */
+static void
+on_its_core_write_disabled_or_rejected(void)
+{
+	static uint8_t data[4096];
+	const char *c = getenv("UFS_CASE");
+	size_t done = 0;
+
+	if (c != NULL && c[0] == '1') {
+		loader_on_its_core("ufs_write=1");
+		page->write_part_plus_one = 0;
+	} else if (c != NULL && c[0] == '2') {
+		loader_on_its_core("ufs_write=1");
+		allow_writes_fail = true;
+	} else {
+		loader_on_its_core("ufs_write=1 ufs_native_write=0");
+	}
+	hakios_ufs_init();
+	CHECK(ufs_native_writes == 0 && !native_win_enabled, "native writes inactive");
+	CHECK(fake_disk_open("ufs_darwin_data", FREAD | FWRITE) == -1, "ufs_darwin_data not created");
+	CHECK(try_as_root("var_busy", 1) == 0, "claim");
+	CHECK(fake_dev_pwrite("rufs_darwin", data, 4096, AT(WRITE_FIRST), &done) == EROFS, "writes refused EROFS");
+	CHECK(asked_n == 0 && native_writes == 0, "zero mailbox or native writes");
+}
+
+/* ufs_native_write=1 with bootcpu= uses native writes without mailbox fallback */
+static void
+native_write_forced_with_bootcpu(void)
+{
+	static uint8_t data[4096];
+	size_t done = 0;
+
+	loader_on_its_core("bootcpu=7 ufs_write=1 ufs_native_write=1");
+	silent = false;
+	hakios_ufs_init();
+	CHECK(ufs_native_only && ufs_native_writes == 1 && native_win_enabled, "native write forced with bootcpu");
+	memset(data, 0x33, sizeof(data));
+	CHECK(try_as_root("var_busy", 1) == 0 && fake_dev_open("rufs_darwin", FREAD | FWRITE) == 0, "claim+open");
+	CHECK(fake_dev_pwrite("rufs_darwin", data, sizeof(data), AT(WRITE_FIRST), &done) == 0, "write ok");
+	CHECK(native_writes == 1 && native_flushes == 1 && asked_n == 0 && writes_asked == 0, "no mailbox used");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1269,6 +1457,9 @@ main(int argc, char **argv)
 		{ "on_its_core_reads_natively", on_its_core_reads_natively, 1 },
 		{ "on_its_core_without_the_headers", on_its_core_without_the_headers, 2 },
 		{ "on_its_core_extents_wrong", on_its_core_extents_wrong, 5 },
+		{ "on_its_core_writes_natively", on_its_core_writes_natively, 1 },
+		{ "on_its_core_write_disabled_or_rejected", on_its_core_write_disabled_or_rejected, 3 },
+		{ "native_write_forced_with_bootcpu", native_write_forced_with_bootcpu, 1 },
 	};
 
 	if (argc < 2) {

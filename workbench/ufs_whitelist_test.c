@@ -298,6 +298,85 @@ answers(void)
 	CHECK(hc_complete(&s, "a test", true) == 0, "to TEST UNIT READY: taken");
 }
 
+static void
+write_policy_and_bitflips(void)
+{
+	struct ufshc_write_window w = { 100, 200, true };
+	uint8_t u[32], saved[32];
+
+	ufshc_write_command(u, 7, 100, 1);
+	CHECK(ufshc_write_permitted(&w, u, UTRD_CT_UFS | UTRD_DD_OUT), "valid WRITE(10) in window");
+	w.enabled = false;
+	CHECK(!ufshc_write_permitted(&w, u, UTRD_CT_UFS | UTRD_DD_OUT), "disabled window refuses WRITE(10)");
+	w.enabled = true;
+	CHECK(!ufshc_write_range(&w, 0, 99, 1) && !ufshc_write_range(&w, 0, 199, 2), "before start or past end refused");
+	CHECK(ufshc_write_range(&w, 0, 199, 1) && ufshc_write_range(&w, 0, 100, 100), "exact bounds allowed");
+	CHECK(!ufshc_write_range(&w, 0, 200, 1) && !ufshc_write_range(&w, 0, 100, 0), "at end or zero blocks refused");
+	CHECK(!ufshc_write_range(&w, 0, UINT64_MAX, 2) && !ufshc_write_range(&w, 0, 100, UINT64_MAX), "overflow refused");
+	for (unsigned lun = 1; lun < 256; lun++) {
+		CHECK(!ufshc_write_range(&w, (uint8_t)lun, 100, 1), "LUN %u refused", lun);
+	}
+	memcpy(saved, u, 32);
+	for (unsigned i = 0; i < 32; i++) {
+		if (i == 3 || (i >= 12 && i <= 15) || (i >= 18 && i <= 21) || i == 23 || i == 24) {
+			continue;
+		}
+		for (unsigned bit = 0; bit < 8; bit++) {
+			memcpy(u, saved, 32);
+			u[i] ^= (uint8_t)(1u << bit);
+			CHECK(!ufshc_write_permitted(&w, u, UTRD_CT_UFS | UTRD_DD_OUT), "WRITE bitflip %u:%u refused", i, bit);
+		}
+	}
+	ufshc_write_command(u, 7, 100, 1);
+	u[15] ^= 1;
+	CHECK(!ufshc_write_permitted(&w, u, UTRD_CT_UFS | UTRD_DD_OUT), "WRITE length mismatch refused");
+	ufshc_write_command(u, 7, 100, 1);
+	for (unsigned bit = 0; bit < 32; bit++) {
+		CHECK(!ufshc_write_permitted(&w, u, (UTRD_CT_UFS | UTRD_DD_OUT) ^ (1u << bit)), "WRITE dw0 flip %u refused", bit);
+	}
+	ufshc_flush_command(u, 7);
+	CHECK(ufshc_write_permitted(&w, u, UTRD_CT_UFS), "valid SYNCHRONIZE CACHE(10)");
+	memcpy(saved, u, 32);
+	for (unsigned i = 0; i < 32; i++) {
+		if (i == 3) {
+			continue;
+		}
+		for (unsigned bit = 0; bit < 8; bit++) {
+			memcpy(u, saved, 32);
+			u[i] ^= (uint8_t)(1u << bit);
+			CHECK(!ufshc_write_permitted(&w, u, UTRD_CT_UFS), "FLUSH bitflip %u:%u refused", i, bit);
+		}
+	}
+	for (unsigned bit = 0; bit < 32; bit++) {
+		CHECK(!ufshc_write_permitted(&w, u, UTRD_CT_UFS ^ (1u << bit)), "FLUSH dw0 flip %u refused", bit);
+	}
+	w.first = 0xffffffffULL;
+	w.end = 0x100000000ULL;
+	ufshc_write_command(u, 1, 0xffffffffu, 1);
+	CHECK(ufshc_write_permitted(&w, u, UTRD_CT_UFS | UTRD_DD_OUT), "32-bit max LBA allowed");
+	w.end++;
+	CHECK(!ufshc_write_permitted(&w, u, UTRD_CT_UFS | UTRD_DD_OUT), "past 32-bit LBA refused");
+}
+
+static void
+permitted_with_write_window(void)
+{
+	uint8_t upiu[32];
+
+	hc_write_window = (struct ufshc_write_window){ .first = 100, .end = 200, .enabled = true };
+	ufshc_write_command(upiu, 2, 100, 4);
+	CHECK(ufshc_permitted(upiu, UTRD_CT_UFS | UTRD_DD_OUT), "in-window WRITE(10) permitted");
+	ufshc_write_command(upiu, 2, 99, 1);
+	CHECK(!ufshc_permitted(upiu, UTRD_CT_UFS | UTRD_DD_OUT), "out-of-window WRITE(10) refused");
+	ufshc_write_command(upiu, 2, 100, 1);
+	upiu[2] = 1;
+	CHECK(!ufshc_permitted(upiu, UTRD_CT_UFS | UTRD_DD_OUT), "non-zero LUN WRITE(10) refused");
+	ufshc_flush_command(upiu, 2);
+	CHECK(ufshc_permitted(upiu, UTRD_CT_UFS), "SYNCHRONIZE CACHE(10) permitted");
+	CHECK(!ufshc_permitted(upiu, UTRD_CT_UFS | UTRD_DD_OUT), "SYNCHRONIZE CACHE(10) with data refused");
+	hc_write_window = (struct ufshc_write_window){ 0 };
+}
+
 int
 main(int argc, char **argv)
 {
@@ -305,7 +384,8 @@ main(int argc, char **argv)
 		{ "own_cases", own_cases }, { "every_operation", every_operation }, { "everything_else", everything_else },
 		{ "read_lengths", read_lengths }, { "units_past_the_eighth", units_past_the_eighth }, { "permitted_or_said", permitted_or_said },
 		{ "a_read_placed", a_read_placed }, { "entries_exactly", entries_exactly }, { "a_write_not_placed", a_write_not_placed },
-		{ "answers", answers },
+		{ "answers", answers }, { "write_policy_and_bitflips", write_policy_and_bitflips },
+		{ "permitted_with_write_window", permitted_with_write_window },
 	};
 
 	if (argc < 2) {
