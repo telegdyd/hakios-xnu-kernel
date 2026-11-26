@@ -1426,6 +1426,26 @@ class Generate(Sandbox):
     def test_it_is_the_same_every_time(self):
         self.assertEqual(boards.table_text(*boards.load()), boards.table_text(*boards.load()))
 
+    def test_reboot_fastboot_section_is_checked_and_generated(self):
+        path = self.dir / 'devices/phone/board.dts'
+        listed = path.read_text()
+        path.write_text(listed + '/ {\n\treboot {\n\t\tsdam = <0x071>;\n\t\toffset = <0x48>;\n\t};\n};\n')
+        self.assertIn('reboot { } needs spmi { } with channels in soc.dtsi', self.problems())
+        self.soc('\tthermal {', '\tspmi {\n\t\tcore = <0xc440000>;\n\t\tcnfg = <0xc40a000>;\n\t\tobserver = <0xe600000>;\n\t\tchannels = <0xc600000>;\n\t};\n\tthermal {')
+        self.assertEqual(self.problems(), '')
+        table = boards.table_text(*boards.load())
+        self.assertIn('.reboot = { .sdam = 0x071, .offset = 0x48, .bootloader = 2, .imem = 0x00000000, .imem_bootloader = 0x00000000u },', table)
+        path.write_text(listed + '/ {\n\treboot {\n\t\tsdam = <0x071>;\n\t\toffset = <0x48>;\n\t\timem = <0x146aa65c>;\n\t};\n};\n')
+        self.assertEqual(self.problems(), '')
+        self.assertIn('.reboot = { .sdam = 0x071, .offset = 0x48, .bootloader = 2, .imem = 0x146aa65c, .imem_bootloader = 0x77665500u },',
+                      boards.table_text(*boards.load()))
+        path.write_text(listed + '/ {\n\treboot {\n\t\tsdam = <0x100>;\n\t\toffset = <0x48>;\n\t};\n};\n')
+        self.assertIn('sdam = 0x100: SPMI slave << 8', self.problems())
+        path.write_text(listed + '/ {\n\treboot {\n\t\tsdam = <0x071>;\n\t\toffset = <0x48>;\n\t\timem = <0x146aa65d>;\n\t};\n};\n')
+        self.assertIn('imem: nonzero 32-bit-aligned', self.problems())
+        path.write_text(listed + '/ {\n\treboot {\n\t\tsdam = <0x071>;\n\t\toffset = <0x48>;\n\t\timem-bootloader = <0x1234>;\n\t};\n};\n')
+        self.assertIn('imem-bootloader goes with imem', self.problems())
+
 
 class DeviceTree(Sandbox):
     def test_the_frequency_blocks_layout_is_read(self):

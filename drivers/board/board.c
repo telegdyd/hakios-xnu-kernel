@@ -212,23 +212,52 @@ SYSCTL_PROC(_hw_board, OID_AUTO, features, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG
 
 /*
  * kern.hakios.loader_request: 1 = the run ends, back to the loader, which stays; 2 = back to the loader, which resets
- * the phone (Android) once it has the log. Root only (no CTLFLAG_ANYBODY); written by sweetd for "loader" and
- * "reboot". Reads as 0. The return itself is loader_return.c's, within a second.
+ * the phone (Android) once it has the log (or fastboot when the board has reboot { } and reboot_fastboot != 0);
+ * 3 = reboot directly into the boot loader's fastboot (board/reboot.c). Root only (no CTLFLAG_ANYBODY); written by
+ * sweetd for "loader" and "reboot". Reads as 0.
  */
 extern void loader_request_return(int mode) __attribute__((weak));     /* osfmk/arm64/loader_return.c */
+extern int hakios_fastboot_prepare(void) __attribute__((weak));        /* bsd/dev/board/reboot.c */
+extern void hakios_fastboot_reset(void) __attribute__((weak));         /* bsd/dev/board/reboot.c */
 
 static int
 sysctl_loader_request SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
+	const struct hakios_board *board = hakios_board();
 	int mode = 0, changed = 0, error;
+	uint32_t fastboot = 1;
 
 	error = sysctl_io_number(req, 0, sizeof(mode), &mode, &changed);
 	if (error || !changed) {
 		return error;
 	}
-	if (mode != 1 && mode != 2) {
+	if (mode < 1 || mode > 3) {
 		return EINVAL;
+	}
+	/* boot-arg reboot_fastboot=0: kern.hakios.loader_request 2 resets through the loader instead of fastboot (default 1 on boards with reboot { }) */
+	PE_parse_boot_argn("reboot_fastboot", &fastboot, sizeof(fastboot));
+	if (mode == 2 && board != NULL && board->reboot.sdam != 0 && fastboot != 0) {
+		mode = 3;
+	}
+	if (mode == 3) {
+		if (hakios_fastboot_prepare == NULL) {
+			return ENOTSUP;
+		}
+		error = hakios_fastboot_prepare();
+		if (error != 0) {
+			return error;
+		}
+		if (loader_request_return != NULL) {
+			hakios_say("board: loader_request 3: reboot into fastboot\n");
+			loader_request_return(3);
+			return 0;
+		}
+		if (hakios_fastboot_reset != NULL) {
+			hakios_fastboot_reset();
+			return EIO;
+		}
+		return ENOTSUP;
 	}
 	if (loader_request_return == NULL) {
 		return ENOTSUP;         /* (a kernel without the loader's return path) */
@@ -239,4 +268,4 @@ sysctl_loader_request SYSCTL_HANDLER_ARGS
 }
 SYSCTL_DECL(_kern_hakios);
 SYSCTL_PROC(_kern_hakios, OID_AUTO, loader_request, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
-    sysctl_loader_request, "I", "1: back to the loader, 2: back to the loader and reset (Android)");
+    sysctl_loader_request, "I", "1: back to the loader, 2: reset (fastboot if board has reboot { }, else Android), 3: fastboot");

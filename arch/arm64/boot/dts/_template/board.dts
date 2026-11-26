@@ -94,6 +94,17 @@
 		// name = "the PMK8350's RTC";  // for the log
 	// };
 
+	// Reboot into the boot loader's fastboot (board/reboot.c, kern.hakios.loader_request 3, or 2 unless
+	// reboot_fastboot=0): PMIC SDAM reboot-reason byte and optional IMEM cookie, then PSCI SYSTEM_RESET.
+	// Leave the section out and `sweet-sh.py reboot` returns to the loader and resets normally.
+	// reboot {
+		// sdam = <0x071>;              // PMIC SDAM peripheral (slave << 8 | high byte, PMK8350 sdam@7100: 0x071)
+		// offset = <0x48>;             // reason register offset in that SDAM (restart@48: 0x48; bits 7:1)
+		// bootloader = <2>;            // optional: value written to bits 7:1 for bootloader mode (1..127, default 2)
+		// imem = <0x146aa65c>;         // optional: IMEM restart_reason physical address (msm-poweroff)
+		// imem-bootloader = <0x77665500>; // optional (with imem): 32-bit cookie written there (default 0x77665500)
+	// };
+
 	// The port's own partition on the phone's storage: the one partition the kernel may write (ufs_write=1),
 	// and only from the block past what the build puts at its start. Leave the section out and nothing is
 	// ever written; reading the storage needs none of this. The partition is named "darwin"; these are its

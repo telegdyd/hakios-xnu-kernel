@@ -173,6 +173,8 @@ BOARD_SCHEMA = {
     'buttons': {'pon': (int, True), 'volume_up': (int, True), 'pon_name': (str, False), 'volume_up_name': (str, False),
                 'resin_volume_up': (bool, False)},
     'rtc': {'peripheral': (int, True), 'name': (str, False)},
+    'reboot': {'sdam': (int, True), 'offset': (int, True), 'bootloader': (int, False), 'imem': (int, False),
+               'imem_bootloader': (int, False)},
     'adsp': {'firmware': (str, True), 'memory': (int, True), 'memory_size': (int, True),
              'charge_counter_divisor': (int, False),
              # (SM8450 and after) the audio services' protocol, the doorbells' interrupt, the battery manager's numbering
@@ -1058,6 +1060,21 @@ def load(problems=None):
         if 'rtc' in data and 'spmi' not in soc:
             # (no feature to list: the section is the board's word that the clock is there, and the arbiter the way to it)
             problems.add(rel, '[rtc] needs [spmi] in soc.dtsi')
+        rb = data.get('reboot')
+        if rb is not None:
+            if not 0 < rb['sdam'] <= 0xfff or rb['sdam'] & 0xff == 0:
+                problems.add(f'{rel} [reboot]', f'sdam = {rb["sdam"]:#x}: SPMI slave << 8 | the high byte of the '
+                                                "SDAM's registers (0x071: slave 0, registers 0x7100)")
+            if not 0 <= rb['offset'] <= 0xff:
+                problems.add(f'{rel} [reboot]', 'offset: register offset in the SDAM peripheral, 0x00 to 0xff')
+            if 'bootloader' in rb and not 1 <= rb['bootloader'] <= 0x7f:
+                problems.add(f'{rel} [reboot]', 'bootloader: reboot reason value in bits 7:1, 1 to 0x7f')
+            if 'imem' in rb and (rb['imem'] == 0 or rb['imem'] & 3):
+                problems.add(f'{rel} [reboot]', 'imem: nonzero 32-bit-aligned physical address of restart_reason')
+            if 'imem_bootloader' in rb and 'imem' not in rb:
+                problems.add(f'{rel} [reboot]', 'imem-bootloader goes with imem')
+            if 'spmi' not in soc or 'channels' not in soc.get('spmi', {}):
+                problems.add(rel, '[reboot] needs [spmi] with channels in soc.dtsi')
     fallbacks = [name for name, data in boards.items() if 'loader' in data and 'fb_base' not in data['loader']]
     if len(fallbacks) > 1:
         problems.add('devices', 'more than one board with [loader] and no fb_base (' + ', '.join(fallbacks) +
@@ -1249,6 +1266,13 @@ def table_text(socs, boards):
         if clock:
             name = f', .name = {c_string(clock["name"])}' if 'name' in clock else ''
             out.append(f'\t\t.rtc = {{ .peripheral = {clock["peripheral"]:#05x}{name} }},')
+        reboot = board.get('reboot')
+        if reboot:
+            imem = reboot.get('imem', 0)
+            imem_bl = reboot.get('imem_bootloader', 0x77665500) if imem else 0
+            out.append(f'\t\t.reboot = {{ .sdam = {reboot["sdam"]:#05x}, .offset = {reboot["offset"]:#04x}, '
+                       f'.bootloader = {reboot.get("bootloader", 2)}, .imem = {imem:#010x}, '
+                       f'.imem_bootloader = {imem_bl:#010x}u }},')
         motor = board.get('haptic')
         if motor:
             out.append(f'\t\t.haptic = {{ .sda = {motor["sda"]}, .scl = {motor["scl"]}, .reset = {motor["reset"]}, '

@@ -89,10 +89,12 @@ F:	tools/device.py
 F:	tools/qupclocks.py
 F:	drivers/board/board.c
 F:	drivers/board/board.h
+F:	drivers/board/reboot.c
 F:	drivers/board/soc.c
 F:	drivers/board/drivers.c
 F:	samples/device-repo/
 T:	workbench/boards_test.py
+T:	workbench/reboot_driver_test.c
 T:	workbench/device_test.py
 T:	workbench/board_test.c
 T:	workbench/drivers_list_test.c

@@ -300,6 +300,15 @@ struct hakios_board {
 		const char *name;               /* for the log: "the PMK8350's RTC" */
 	} rtc;
 
+	/* reboot into the boot loader's fastboot (board: reboot { }): PMIC SDAM reboot-reason byte and optional IMEM cookie */
+	struct {
+		uint16_t sdam;                  /* SPMI slave << 8 | peripheral (PMK8350 sdam@7100: 0x071); 0: none */
+		uint8_t offset;                 /* reason register offset in that SDAM (restart@48: 0x48; bits 7:1) */
+		uint8_t bootloader;             /* value written to bits 7:1 for bootloader mode (default 2) */
+		uint32_t imem;                  /* optional IMEM restart_reason physical address (SM8450: 0x146aa65c); 0: none */
+		uint32_t imem_bootloader;       /* 32-bit cookie written there (default 0x77665500) */
+	} reboot;
+
 	/* the vibration motor's chip (board: haptic { }): which of the SoC's pins it is on, and this motor's calibration */
 	struct {
 		uint8_t sda, scl;               /* its I2C bus's two lines */

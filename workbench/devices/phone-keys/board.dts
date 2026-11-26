@@ -85,4 +85,10 @@
 		peripheral = <0x260>;
 		name = "the PMX200's RTC";
 	};
+
+	reboot {
+		sdam = <0x271>;
+		offset = <0x48>;
+		imem = <0x146aa65c>;
+	};
 };

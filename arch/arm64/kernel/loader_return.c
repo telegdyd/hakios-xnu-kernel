@@ -79,6 +79,7 @@ extern void hakios_virtio_input_quiesce(void);
 extern void hakios_virtio_sound_quiesce(void);
 extern void hakios_virtio_blk_quiesce(void);
 extern void hakios_var_save_on_return(void);   /* bsd/dev/board/ufs.c: the data volume into the flash */
+extern void hakios_fastboot_reset(void) __attribute__((weak)); /* bsd/dev/board/reboot.c: PSCI reset into fastboot */
 void loader_checkpoint(uint64_t n);
 
 /*
@@ -816,20 +817,28 @@ static thread_call_t loader_stop_call;
 
 /*
  * kern.hakios.loader_request (bsd/dev/board/board.c), written by sweetd for its "loader" and "reboot": 1 = back to
- * the loader and stay there, 2 = back to the loader, which then resets the phone (Android). The poll below does
- * the work, at once: a system call must not be the thread that stops the system.
+ * the loader and stay there, 2 = back to the loader, which then resets the phone (Android), 3 = reboot directly
+ * into the boot loader's fastboot (board/reboot.c). The poll below does the work: a system call must not be the
+ * thread that stops the system, and mode 3 pauses briefly so sweetd's reply reaches the host before the reset.
  */
 void loader_request_return(int mode);
 
 void
 loader_request_return(int mode)
 {
-	if (mode != 1 && mode != 2) {
+	if (mode < 1 || mode > 3) {
 		return;
 	}
 	loader_request = mode;
 	if (loader_stop_call != NULL) {
-		thread_call_enter(loader_stop_call);    /* (now, rather than at the next look) */
+		if (mode == 3) {
+			uint64_t deadline;
+
+			clock_interval_to_deadline(250, NSEC_PER_MSEC, &deadline);
+			thread_call_enter_delayed(loader_stop_call, deadline);
+		} else {
+			thread_call_enter(loader_stop_call);    /* (now, rather than at the next look) */
+		}
 	}
 }
 
@@ -839,6 +848,17 @@ loader_stop_poll(__unused thread_call_param_t p0, __unused thread_call_param_t p
 	uint64_t deadline;
 	int request = loader_request;
 
+	if (request == 3) {
+		static const char banner[] = "\n--- the system asked for a reboot into fastboot ---\n";
+
+		for (const char *c = banner; *c; c++) {
+			loader_log_putc(*c);
+		}
+		if (hakios_fastboot_reset != NULL) {
+			hakios_fastboot_reset();
+		}
+		return;
+	}
 	if (loader_live.stop || request != 0) {
 		const char *banner = request == 2 ? "\n--- the system asked for a reset: back to the loader, then Android ---\n" :
 		    request == 1 ? "\n--- the system asked for the loader ---\n" :
