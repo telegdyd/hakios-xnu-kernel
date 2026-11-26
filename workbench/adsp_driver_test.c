@@ -537,6 +537,19 @@ qrtr_hello_again(void)
  * taken back another intent. Kept twice, the old size stays, and a message too long for the intent as it is now
  * goes into it: the DSP drops it.
  */
+/* oplus-charger's state from the port and the current: its firmware's BATT_STATUS was 1 unplugged and at 100 % */
+static void
+battmgr_status_scenario(void)
+{
+	CHECK(battmgr_status_of(0, -171000, 9800) == 2, "unplugged: discharging (the firmware said 1)");
+	CHECK(battmgr_status_of(0, 300000, 10000) == 2, "unplugged: discharging whatever the current reads");
+	CHECK(battmgr_status_of(1, 455000, 9800) == 1, "on a charger, taking charge: charging");
+	CHECK(battmgr_status_of(1, 20000, 9800) == 3, "on a charger, 20 mA: not charging");
+	CHECK(battmgr_status_of(1, -219000, 9800) == 3, "on a charger, giving charge (the input detected again): not charging");
+	CHECK(battmgr_status_of(1, -87000, 10000) == 4, "on a charger at 100 %, not taking charge: full");
+	CHECK(battmgr_status_of(1, 74000, 10000) == 1, "at 100 % still taking charge: charging");
+}
+
 static void
 intent_told_again(void)
 {
@@ -575,6 +588,7 @@ static const struct {
 	const char *name;
 	void (*run)(void);
 } scenarios[] = {
+	{ "battmgr_status_of", battmgr_status_scenario },
 	{ "intent_answer_own_channel", intent_answer_own_channel },
 	{ "intent_told_again", intent_told_again },
 	{ "dsp_gives_up", dsp_gives_up },

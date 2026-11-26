@@ -2816,7 +2816,21 @@ static uint32_t pack_uah;               /* adsp { } pack-uah */
 static const uint32_t battmgr_icl_steps[] = { 500, 900, 1200, 1350, 1500, 1750, 2000 };
 #define BATTMGR_ICL_MAX_MA      2000
 #define BATTMGR_FCC_MA          1100
+#define BATTMGR_VBUS_GONE_UV    2000000         /* VBUS under it: no input (detection), not a weak adapter */
 #include "plug_watch_core.h"         /* when a plug between two rounds calls for one at once */
+
+/*
+ * The state (POWER_SUPPLY_STATUS_*) with adsp { } oplus-charger, whose firmware's BATT_STATUS is 1 whatever happens (on
+ * the 10 Pro: 1 unplugged, 1 at 100 %; Android's oplus_chg works it out itself): from the port, the current (Darwin's way
+ * round, more than 0 into the cell) and the charge in hundredths of a percent. 2 with no charger, 1 while the cell takes
+ * more than 20 mA (battery_core.h's BAT_TIME_LEAST_UA), 4 full on a charger, 3 on a charger and not charging.
+ */
+#define BATTMGR_TAKING_UA       20000
+static inline int
+battmgr_status_of(int external, int current_ua, int percent_hundredths)
+{
+	return !external ? 2 : current_ua > BATTMGR_TAKING_UA ? 1 : percent_hundredths >= 10000 ? 4 : 3;
+}
 
 struct battmgr_message {
 	uint32_t owner, type, opcode;
@@ -2998,7 +3012,18 @@ battmgr_charge(uint32_t usb, uint32_t usb_type, uint32_t pack_uv)
 			return;         /* (tried again next round) */
 		}
 		sleep_ms(i < 2 ? 50 : 90);
-		if (battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &vbus) && vbus < aicl_uv) {
+		if (battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &vbus) && vbus < BATTMGR_VBUS_GONE_UV) {
+			/*
+			 * No input at all, not an adapter sagging under the load: the charger detects the port again (each boot
+			 * while the USB link comes up: VBUS ~25 mV, USB online 0 a moment later). Not a step to keep: the next
+			 * round, or the plug that follows, ramps again.
+			 */
+			tell("adsp: battmgr: charge: VBUS %u uV at %u mA: no input (the port detected again), tried later\n", vbus,
+			    battmgr_icl_steps[i]);
+			tries--;
+			return;
+		}
+		if (vbus < aicl_uv) {
 			/* the adapter gives no more: the step before (the first one if it was the first) */
 			tell("adsp: battmgr: charge: VBUS %u uV at %u mA, under %u: back a step\n", vbus, battmgr_icl_steps[i], aicl_uv);
 			if (step == 0) {
@@ -3130,6 +3155,9 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 			if (current_positive_discharging) {
 				/* (the 10 Pro's gauge: +110 mA while its charge counter fell 18 mAh in 10 minutes) */
 				b.current_ua = -(int32_t)curr;
+			}
+			if (oplus_charger) {
+				b.status = battmgr_status_of(b.external, b.current_ua, b.percent_hundredths);
 			}
 			if (pack_uah != 0) {
 				/*
