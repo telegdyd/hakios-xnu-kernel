@@ -26,6 +26,9 @@
 #include <arm/machine_routines.h>
 #include <arm64/proc_reg.h>
 #include <arm64/psci_smp.h>
+#include <arm/rtclock.h>
+#include <arm/commpage/commpage.h>
+#include <kern/timer_queue.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/arm64/board_config.h>
 #include <sys/errno.h>
@@ -917,7 +920,7 @@ extern void gic_v3_sleep_unmask(uint64_t masked);
 extern uint32_t gic_v3_pending(void);
 extern uint32_t gic_v3_spi_bits(uint32_t intid);
 extern uint32_t gic_v3_sleep_take(void);
-extern void hakios_buttons_system_woke(void) __attribute__((weak));   /* drivers/board/buttons.c */
+extern uint64_t wake_abstime;           /* osfmk/arm/cpu_common.c: machdep.wake_abstime */
 extern void gic_v3_spi_set_pending(uint32_t intid);
 #define GIC_INTID_SPI_MIN_SLEEP 32
 extern void hakios_sleep_pet(void);
@@ -1000,6 +1003,15 @@ hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uin
 	 * due (1 pet in a 20 s sleep, 0 or 1 in 10 s ones), and a 600 s test sleep starved the watchdog into a reset
 	 * (run-20261126-044816: the phone came back in iOS 16).
 	 */
+	/*
+	 * mach_absolute_time() stands still across the sleep, as on a wake from S2R: cpu_sleep() takes wake_abstime here and
+	 * cpu_timebase_init() rebases the clock on it at the wake (below). clock_wakeup_calendar() (the root domain, at the
+	 * wake) then counts the sleep from the RTC: mach_continuous_time() moves past mach_absolute_time() and
+	 * machdep.wake_abstime says when. With the clock ticking on, the sleep was one of no length to userland:
+	 * SystemWake's sleep monitor never saw it end, and the first power key press after a wake did nothing
+	 * (run-20261126-055748, -060515).
+	 */
+	wake_abstime = ml_get_timebase();
 	hakios_sleep_pet();
 	fed++;
 	pet_at = start + SLEEP_PET_SECONDS * freq;
@@ -1065,11 +1077,13 @@ hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uin
 	__builtin_arm_wsr64("CNTV_CVAL_EL0", cval);     /* (the kernel's deadline, passed by now: taken at once) */
 	__builtin_arm_wsr64("CNTV_CTL_EL0", ctl);
 	__builtin_arm_isb(ISB_SY);
+	/* (the other processors are off: each takes rtclock_base_abstime when it starts again, cpu_timebase_init()) */
+	rtclock_base_abstime = wake_abstime - ml_get_hwclock();
+	getCpuDatap()->cpu_base_timebase = rtclock_base_abstime;
+	commpage_update_timebase();
+	getCpuDatap()->rtcPop = EndOfAllTime;   /* (the deadline anew, in the clock as it now is) */
+	timer_resync_deadlines();
 	gic_v3_sleep_unmask(masked);
-	/* (before the key's interrupt is taken: the press that woke it is handed to userland once it knows of the wake) */
-	if (by != SLEEP_INTID_VTIMER && hakios_buttons_system_woke) {
-		hakios_buttons_system_woke();
-	}
 	ml_set_interrupts_enabled(enabled);
 	if (hakios_its_sleep_mask) {
 		(void)hakios_its_sleep_mask(false);
