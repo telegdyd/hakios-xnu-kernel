@@ -1,16 +1,70 @@
 diff --git a/bsd/hfs/hfs.h b/bsd/hfs/hfs.h
 --- a/bsd/hfs/hfs.h
 +++ b/bsd/hfs/hfs.h
-@@ -1344,6 +1344,9 @@ SYSCTL_DECL(_vfs_generic_hfs);
+@@ -1344,6 +1344,21 @@ SYSCTL_DECL(_vfs_generic_hfs);
  		sysctl_list = &hfs_sysctl_##parent##_##name##_chain;				\
  	}
  
 +/* HakiOS: the kernel has no snapshot namespace handler any more (xnu-12377): bsd/hfs/hfs_builtin.c */
 +int nspace_snapshot_event(vnode_t vp, time_t ctime, uint64_t op_type, void *arg);
 +
++#if !CONFIG_PROTECT
++/*
++ * HakiOS: data protection classes as labels, without content protection (bsd/hfs/hfs_builtin.c): each file and
++ * directory has a class, kept in an extended attribute of the system's and told back; nothing is encrypted.
++ */
++int hfs_dpclass_valid(enum vtype type, uint32_t dpclass);
++uint32_t hfs_dpclass_get(vnode_t vp);                     /* the cnode locked, shared or exclusive */
++int hfs_dpclass_set(vnode_t vp, uint32_t dpclass);         /* the cnode locked exclusive */
++int hfs_dpclass_set_unlocked(vnode_t vp, uint32_t dpclass);
++uint32_t hfs_dpclass_get_unlocked(vnode_t vp);
++#endif
++
  __END_DECLS
  
  #endif /* __APPLE_API_PRIVATE */
+diff --git a/bsd/hfs/hfs_attrlist.c b/bsd/hfs/hfs_attrlist.c
+--- a/bsd/hfs/hfs_attrlist.c
++++ b/bsd/hfs/hfs_attrlist.c
+@@ -378,10 +378,9 @@ hfs_readdirattr_internal(struct vnode *dvp, struct attrlist *alist,
+ 
+ 		if (((alist->commonattr & ATTR_CMN_USERACCESS) &&
+ 		    (cattrp->ca_recflags & kHFSHasSecurityMask))
+-#if CONFIG_PROTECT
++		    /* (HakiOS: and for the class as a label, hfs_builtin.c) */
+ 		    ||
+ 		   ((alist->commonattr & ATTR_CMN_DATA_PROTECT_FLAGS) && (vap))
+-#endif
+ 		    ) {
+ 			/*
+ 			 * Obtain vnode for our vnode_authorize() calls.
+@@ -476,6 +475,13 @@ hfs_readdirattr_internal(struct vnode *dvp, struct attrlist *alist,
+ 					    (uint32_t)class);
+ 				}
+ 			}
++#else
++			/* HakiOS: the class as a label (hfs_builtin.c) */
++			if ((alist->commonattr & ATTR_CMN_DATA_PROTECT_FLAGS) &&
++			    vp) {
++				VATTR_RETURN(vap, va_dataprotect_class,
++				    hfs_dpclass_get_unlocked(vp));
++			}
+ #endif
+ 			error = vfs_attr_pack(vp, uio, alist, options, vap,
+ 			    NULL, ctx);
+diff --git a/bsd/hfs/hfs_cnode.h b/bsd/hfs/hfs_cnode.h
+--- a/bsd/hfs/hfs_cnode.h
++++ b/bsd/hfs/hfs_cnode.h
+@@ -199,6 +199,9 @@ struct cnode {
+ #endif /* HFS_COMPRESSION */
+ #if CONFIG_PROTECT
+ 	struct cprotect *c_cpentry;	/* content protection data */
++#else
++	uint32_t c_dpclass;		/* HakiOS: data protection class, a label (hfs_builtin.c) */
++	uint8_t c_dpclass_read;		/* c_dpclass holds what the volume has */
+ #endif
+ };
+ typedef struct cnode cnode_t;
 diff --git a/bsd/hfs/hfs_iokit.h b/bsd/hfs/hfs_iokit.h
 --- a/bsd/hfs/hfs_iokit.h
 +++ b/bsd/hfs/hfs_iokit.h
@@ -41,6 +95,31 @@ diff --git a/bsd/hfs/hfs_iokit.h b/bsd/hfs/hfs_iokit.h
  __END_DECLS
  
  #endif /* hfs_iokit_h */
+diff --git a/bsd/hfs/hfs_readwrite.c b/bsd/hfs/hfs_readwrite.c
+--- a/bsd/hfs/hfs_readwrite.c
++++ b/bsd/hfs/hfs_readwrite.c
+@@ -1709,6 +1709,21 @@ hfs_vnop_ioctl( struct vnop_ioctl_args /* {
+ 	}
+ #endif /* CONFIG_PROTECT */
+ 
++	/*
++	 * HakiOS: APFS's "mark purgeable" (APFSIOC_MARK_PURGEABLE, _IOWR('J', 68, uint64_t)), which Darwin's PosterBoard
++	 * asks of every directory and file of its wallpaper store and fails the store without (no poster is made, the
++	 * lock screen stays black). Purgeable files are what APFS may delete when space runs short; HFS deletes nothing
++	 * on its own, so the mark is taken and nothing more is done -- as ramfs does. Every other request of APFS's own
++	 * ('J', which fsctl(2) and ffsctl(2) hand down) is "not supported", what a program asking an APFS feature of a
++	 * volume without it is prepared for.
++	 */
++	if (ap->a_command == _IOWR('J', 68, uint64_t)) {
++		return 0;
++	}
++	if (IOCGROUP(ap->a_command) == 'J') {
++		return ENOTSUP;
++	}
++
+ 	switch (ap->a_command) {
+ 
+ 	case HFSIOC_GETPATH:
 diff --git a/bsd/hfs/hfs_vfsops.c b/bsd/hfs/hfs_vfsops.c
 --- a/bsd/hfs/hfs_vfsops.c
 +++ b/bsd/hfs/hfs_vfsops.c
@@ -55,6 +134,44 @@ diff --git a/bsd/hfs/hfs_vfsops.c b/bsd/hfs/hfs_vfsops.c
  	return (0);
  }
  
+@@ -4139,6 +4143,7 @@ hfs_vfs_getattr(struct mount *mp, struct vfs_attr *fsap, __unused vfs_context_t
+ #if VOL_CAP_INT_RENAME_EXCL
+ 			VOL_CAP_INT_RENAME_EXCL |
+ #endif
++			VOL_CAP_INT_RENAME_SWAP |	/* HakiOS: hfs_rename_swap() */
+ #if NAMEDSTREAMS
+ 			VOL_CAP_INT_EXTENDED_ATTR |
+ 			VOL_CAP_INT_NAMEDSTREAMS;
+@@ -4201,6 +4206,7 @@ hfs_vfs_getattr(struct mount *mp, struct vfs_attr *fsap, __unused vfs_context_t
+ #if VOL_CAP_INT_RENAME_EXCL
+ 			VOL_CAP_INT_RENAME_EXCL |
+ #endif
++			VOL_CAP_INT_RENAME_SWAP |	/* HakiOS: hfs_rename_swap() */
+ 
+ #if NAMEDSTREAMS
+ 			VOL_CAP_INT_EXTENDED_ATTR |
+@@ -4221,9 +4227,8 @@ hfs_vfs_getattr(struct mount *mp, struct vfs_attr *fsap, __unused vfs_context_t
+ 		vol_attributes_attr_t *attrp = &fsap->f_attributes;
+ 
+         	attrp->validattr.commonattr = HFS_ATTR_CMN_VOL_VALIDMASK;
+-#if CONFIG_PROTECT
++/* (HakiOS: with or without content protection: hfs_builtin.c) */
+         	attrp->validattr.commonattr |= ATTR_CMN_DATA_PROTECT_FLAGS;
+-#endif // CONFIG_PROTECT
+ 
+         	attrp->validattr.volattr = HFS_ATTR_VOL_VALIDMASK;
+         	attrp->validattr.dirattr = ATTR_DIR_VALIDMASK;
+@@ -4231,9 +4236,8 @@ hfs_vfs_getattr(struct mount *mp, struct vfs_attr *fsap, __unused vfs_context_t
+         	attrp->validattr.forkattr = 0;
+ 
+ 		attrp->nativeattr.commonattr = HFS_ATTR_CMN_VOL_VALIDMASK;
+-#if CONFIG_PROTECT
++/* (HakiOS: with or without content protection: hfs_builtin.c) */
+ 		attrp->nativeattr.commonattr |= ATTR_CMN_DATA_PROTECT_FLAGS;
+-#endif // CONFIG_PROTECT
+ 		
+         	attrp->nativeattr.volattr = HFS_ATTR_VOL_VALIDMASK;
+         	attrp->nativeattr.dirattr = ATTR_DIR_VALIDMASK;
 diff --git a/bsd/hfs/hfs_vfsutils.c b/bsd/hfs/hfs_vfsutils.c
 --- a/bsd/hfs/hfs_vfsutils.c
 +++ b/bsd/hfs/hfs_vfsutils.c
@@ -68,6 +185,304 @@ diff --git a/bsd/hfs/hfs_vfsutils.c b/bsd/hfs/hfs_vfsutils.c
  	if (error == EDEADLK && op_type == NAMESPACE_HANDLER_WRITE_OP) {
  		error = 0;
  	} else if (error) {
+diff --git a/bsd/hfs/hfs_vnops.c b/bsd/hfs/hfs_vnops.c
+--- a/bsd/hfs/hfs_vnops.c
++++ b/bsd/hfs/hfs_vnops.c
+@@ -1153,7 +1153,10 @@ hfs_vnop_getattr(struct vnop_getattr_args *ap)
+ 	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
+     		vap->va_dataprotect_class = cp->c_cpentry ? CP_CLASS(cp->c_cpentry->cp_pclass) : 0;
+     		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
+-    	} 	
++    	}
++#else
++	/* HakiOS: the class as a label (hfs_builtin.c) */
++	VATTR_RETURN(vap, va_dataprotect_class, hfs_dpclass_get(vp));
+ #endif
+ 	if (VATTR_IS_ACTIVE(vap, va_write_gencount)) {
+ 		if (ubc_is_mapped_writable(vp)) {
+@@ -1638,6 +1641,14 @@ out:
+ 	VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
+ 	if (!error && VATTR_IS_ACTIVE(vap, va_dataprotect_class))
+ 		error = cp_vnode_setclass(vp, vap->va_dataprotect_class);
++#else
++	/* HakiOS: the class as a label (hfs_builtin.c) */
++	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
++		if (!error)
++			error = hfs_dpclass_set_unlocked(vp, vap->va_dataprotect_class);
++		if (!error)
++			VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
++	}
+ #endif
+ 
+ 	return (error);
+@@ -4498,6 +4509,218 @@ int hfs_vnop_rename (struct vnop_rename_args *args) {
+  * been locked.  By taking the rsrc fork vnodes up front we ensure that they 
+  * cannot be recycled, and that the situation mentioned above cannot happen.
+  */
++
++/*
++ * HakiOS: renamex_np(2) RENAME_SWAP, the two names exchanged at once. Darwin saves files "atomically" by writing a
++ * new copy and swapping it in -- usermanagerd's persona manifest and user sessions in /private/var/keybags among
++ * them; with ENOTSUP the manifest stays the empty one it started from, no persona is ever found, and the container
++ * lookups of lsd, appprotectiond and the rest fail (INVALID_PERSONA): no lock screen. ramfs does it as well.
++ *
++ * Two regular files or symbolic links, neither a hard link: three catalog renames in one journal transaction --
++ * the first file into the private metadata directory under a name of its file ID, the second into the first's place,
++ * the first into the second's -- so the volume has either the two names as they were or exchanged. The files keep
++ * their IDs, contents and attributes; each now has the other's name and parent.
++ */
++static int
++hfs_rename_swap(struct vnop_renamex_args *ap)
++{
++	struct vnode *fdvp = ap->a_fdvp, *fvp = ap->a_fvp, *tdvp = ap->a_tdvp, *tvp = ap->a_tvp;
++	struct componentname *fcnp = ap->a_fcnp, *tcnp = ap->a_tcnp;
++	struct proc *p = vfs_context_proc(ap->a_context);
++	struct hfsmount *hfsmp = VTOHFS(tdvp);
++	struct cnode *fdcp, *fcp, *tdcp, *tcp, *error_cnode;
++	struct cat_desc f_desc, t_desc, s_desc, f_at_t, t_at_f, out_s, out_t, out_f, undo;
++	char swapname[32];
++	cat_cookie_t cookie;
++	int got_cookie = 0, started_tr = 0, lockflags, error, step = 0;
++
++	if (tvp == NULLVP) {
++		return ENOENT;
++	}
++	if (fvp == tvp) {
++		return 0;
++	}
++	if (!(vnode_isreg(fvp) || vnode_islnk(fvp)) || !(vnode_isreg(tvp) || vnode_islnk(tvp)) ||
++	    hfsmp->hfs_private_desc[FILE_HARDLINKS].cd_cnid == 0) {
++		return ENOTSUP;
++	}
++	error = hfs_lockfour(VTOC(fdvp), VTOC(fvp), VTOC(tdvp), VTOC(tvp), HFS_EXCLUSIVE_LOCK, &error_cnode);
++	if (error) {
++		return error;
++	}
++	fdcp = VTOC(fdvp);
++	fcp = VTOC(fvp);
++	tdcp = VTOC(tdvp);
++	tcp = VTOC(tvp);
++
++	if ((fcp->c_flag | tcp->c_flag) & (C_NOEXISTS | C_DELETED)) {
++		error = ENOENT;
++		goto unlock;
++	}
++	if (ISSET(fcp->c_flag, C_HARDLINK) || ISSET(tcp->c_flag, C_HARDLINK)) {
++		error = ENOTSUP;
++		goto unlock;
++	}
++	if (((fcp->c_bsdflags | tcp->c_bsdflags) & (IMMUTABLE | APPEND)) ||
++	    ((fdcp->c_bsdflags | tdcp->c_bsdflags) & APPEND)) {
++		error = EPERM;
++		goto unlock;
++	}
++	/* (looked up without the locks: the names must still lead to these two, or the system call is driven again) */
++	if (fcp->c_parentcnid != fdcp->c_fileid || tcp->c_parentcnid != tdcp->c_fileid) {
++		error = ERECYCLE;
++		goto unlock;
++	}
++
++	fdcp->c_flag |= C_DIR_MODIFICATION;
++	if (fdvp != tdvp) {
++		tdcp->c_flag |= C_DIR_MODIFICATION;
++	}
++	cache_purge(fvp);
++	cache_purge(tvp);
++
++	bzero(&f_desc, sizeof(f_desc));
++	f_desc.cd_nameptr = (const u_int8_t *)fcnp->cn_nameptr;
++	f_desc.cd_namelen = fcnp->cn_namelen;
++	f_desc.cd_parentcnid = fdcp->c_fileid;
++	f_desc.cd_flags = fcp->c_desc.cd_flags & ~(CD_HASBUF | CD_DECOMPOSED);
++	f_desc.cd_cnid = fcp->c_cnid;
++
++	bzero(&t_desc, sizeof(t_desc));
++	t_desc.cd_nameptr = (const u_int8_t *)tcnp->cn_nameptr;
++	t_desc.cd_namelen = tcnp->cn_namelen;
++	t_desc.cd_parentcnid = tdcp->c_fileid;
++	t_desc.cd_flags = tcp->c_desc.cd_flags & ~(CD_HASBUF | CD_DECOMPOSED);
++	t_desc.cd_cnid = tcp->c_cnid;
++
++	/* the first file's interim name: of its file ID, in the private directory, which nothing looks into */
++	bzero(&s_desc, sizeof(s_desc));
++	s_desc.cd_namelen = (int)snprintf(swapname, sizeof(swapname), "swap%u", fcp->c_fileid);
++	s_desc.cd_nameptr = (const u_int8_t *)swapname;
++	s_desc.cd_parentcnid = hfsmp->hfs_private_desc[FILE_HARDLINKS].cd_cnid;
++	s_desc.cd_flags = f_desc.cd_flags;
++	s_desc.cd_cnid = fcp->c_cnid;
++
++	/* each where the other was */
++	t_at_f = f_desc;
++	t_at_f.cd_cnid = tcp->c_cnid;
++	t_at_f.cd_flags = t_desc.cd_flags;
++	f_at_t = t_desc;
++	f_at_t.cd_cnid = fcp->c_cnid;
++	f_at_t.cd_flags = f_desc.cd_flags;
++
++	bzero(&out_s, sizeof(out_s));
++	bzero(&out_t, sizeof(out_t));
++	bzero(&out_f, sizeof(out_f));
++
++	if ((error = hfs_start_transaction(hfsmp)) != 0) {
++		goto out;
++	}
++	started_tr = 1;
++	if ((error = cat_preflight(hfsmp, CAT_RENAME + CAT_RENAME + CAT_RENAME, &cookie, p))) {
++		goto out;
++	}
++	got_cookie = 1;
++
++	lockflags = hfs_systemfile_lock(hfsmp, SFL_CATALOG, HFS_EXCLUSIVE_LOCK);
++	error = cat_rename(hfsmp, &f_desc, &hfsmp->hfs_private_desc[FILE_HARDLINKS], &s_desc, &out_s);
++	if (!error) {
++		step = 1;
++		error = cat_rename(hfsmp, &t_desc, &fdcp->c_desc, &t_at_f, &out_t);
++	}
++	if (!error) {
++		step = 2;
++		error = cat_rename(hfsmp, &s_desc, &tdcp->c_desc, &f_at_t, &out_f);
++	}
++	if (error) {
++		/* back as it was, as far as it went (a name that cannot be put back is reported, the file kept) */
++		int undo_error = 0;
++
++		if (step == 2) {
++			bzero(&undo, sizeof(undo));
++			undo_error = cat_rename(hfsmp, &t_at_f, &tdcp->c_desc, &t_desc, &undo);
++			cat_releasedesc(&undo);
++		}
++		if (step >= 1 && !undo_error) {
++			bzero(&undo, sizeof(undo));
++			undo_error = cat_rename(hfsmp, &s_desc, &fdcp->c_desc, &f_desc, &undo);
++			cat_releasedesc(&undo);
++		}
++		if (undo_error) {
++			printf("hfs_rename_swap: %s and %s left after step %d: %d, then %d\n", fcnp->cn_nameptr,
++			    tcnp->cn_nameptr, step, error, undo_error);
++		}
++		if (error == EEXIST) {
++			error = ERECYCLE;
++		}
++	}
++	hfs_systemfile_unlock(hfsmp, lockflags);
++	cat_releasedesc(&out_s);
++	if (error) {
++		cat_releasedesc(&out_t);
++		cat_releasedesc(&out_f);
++		goto out;
++	}
++
++	/* the cnodes and the directories as the catalog now has them */
++	replace_desc(fcp, &out_f);
++	fcp->c_parentcnid = tdcp->c_fileid;
++	fcp->c_hint = 0;
++	replace_desc(tcp, &out_t);
++	tcp->c_parentcnid = fdcp->c_fileid;
++	tcp->c_hint = 0;
++	fcp->c_touch_chgtime = TRUE;
++	tcp->c_touch_chgtime = TRUE;
++	fcp->c_flag |= C_MODIFIED;
++	tcp->c_flag |= C_MODIFIED;
++	(void) hfs_update(fvp, 0);
++	(void) hfs_update(tvp, 0);
++
++	fdcp->c_dirchangecnt++;
++	fdcp->c_touch_chgtime = TRUE;
++	fdcp->c_touch_modtime = TRUE;
++	fdcp->c_flag |= C_MODIFIED;
++	hfs_incr_gencount(fdcp);
++	(void) hfs_update(fdvp, 0);
++	if (fdvp != tdvp) {
++		tdcp->c_dirchangecnt++;
++		tdcp->c_touch_chgtime = TRUE;
++		tdcp->c_touch_modtime = TRUE;
++		tdcp->c_flag |= C_MODIFIED;
++		hfs_incr_gencount(tdcp);
++		(void) hfs_update(tdvp, 0);
++	}
++
++	vnode_update_identity(fvp, tdvp, tcnp->cn_nameptr, tcnp->cn_namelen, tcnp->cn_hash,
++	    (VNODE_UPDATE_PARENT | VNODE_UPDATE_NAME));
++	vnode_update_identity(tvp, fdvp, fcnp->cn_nameptr, fcnp->cn_namelen, fcnp->cn_hash,
++	    (VNODE_UPDATE_PARENT | VNODE_UPDATE_NAME));
++	/* (a resource fork's vnode is named after its file: looked up again by that name from now on) */
++	if (fcp->c_rsrc_vp) {
++		cache_purge(fcp->c_rsrc_vp);
++	}
++	if (tcp->c_rsrc_vp) {
++		cache_purge(tcp->c_rsrc_vp);
++	}
++
++out:
++	if (got_cookie) {
++		cat_postflight(hfsmp, &cookie, p);
++	}
++	if (started_tr) {
++		hfs_end_transaction(hfsmp);
++	}
++	fdcp->c_flag &= ~C_DIR_MODIFICATION;
++	wakeup((caddr_t)&fdcp->c_flag);
++	if (fdvp != tdvp) {
++		tdcp->c_flag &= ~C_DIR_MODIFICATION;
++		wakeup((caddr_t)&tdcp->c_flag);
++	}
++unlock:
++	hfs_unlockfour(fdcp, fcp, tdcp, tcp);
++	return error;
++}
++
+ int
+ hfs_vnop_renamex(struct vnop_renamex_args *ap)
+ {
+@@ -4549,6 +4772,10 @@ hfs_vnop_renamex(struct vnop_renamex_args *ap)
+ 	
+ 	/* Check the flags first, so we can avoid grabbing locks if necessary */
+ 	if (ap->a_flags) {
++		/* HakiOS: the two names exchanged (hfs_rename_swap() above) */
++		if (ap->a_flags == VFS_RENAME_SWAP) {
++			return hfs_rename_swap(ap);
++		}
+ 		/* These are the only flags we support for now */
+ 		if ((ap->a_flags & (VFS_RENAME_EXCL)) == 0) {
+ 			return ENOTSUP;	
+@@ -6432,7 +6659,12 @@ hfs_makenode(struct vnode *dvp, struct vnode **vpp, struct componentname *cnp,
+ 		 */
+ 		keywrap_flags &= ~CP_KEYWRAP_DIFFCLASS;
+ 	}
+-	int protected_mount = 0;	
++	int protected_mount = 0;
++#else
++	/* HakiOS: a class asked for is a label (hfs_builtin.c), refused before anything is made when it is not one */
++	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class) &&
++	    !hfs_dpclass_valid(vap->va_type == VNON ? VREG : vap->va_type, vap->va_dataprotect_class))
++		return (EINVAL);
+ #endif
+ 
+ 
+@@ -6808,6 +7040,23 @@ hfs_makenode(struct vnode *dvp, struct vnode **vpp, struct componentname *cnp,
+ 	
+ 	*vpp = tvp;
+ 
++#if !CONFIG_PROTECT
++	/*
++	 * HakiOS: the class asked for (open_dprotected_np(), a directory's mkdir), a label (hfs_builtin.c), the new cnode
++	 * locked exclusive. Not kept on the volume (no room for the attribute): this boot still has it, and says so.
++	 */
++	if (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
++		int dperror = hfs_dpclass_set(tvp, vap->va_dataprotect_class);
++
++		if (dperror) {
++			printf("hfs_makenode: class %u of file %u not kept (%d)\n", vap->va_dataprotect_class, cp->c_fileid, dperror);
++			cp->c_dpclass = vap->va_dataprotect_class;
++			cp->c_dpclass_read = 1;
++		}
++		VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
++	}
++#endif
++
+ #if CONFIG_PROTECT
+ 	/* 
+ 	 * Now that we have a vnode-in-hand, generate keys for this namespace item.
 diff --git a/bsd/hfs/kext-config.h b/bsd/hfs/kext-config.h
 --- a/bsd/hfs/kext-config.h
 +++ b/bsd/hfs/kext-config.h

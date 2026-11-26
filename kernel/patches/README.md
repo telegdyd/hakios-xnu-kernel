@@ -92,4 +92,10 @@ Apple's HFS Plus release (`kernel/UPSTREAM`, `kernel/hfs.list`; tag `apple` in t
 kernel instead of as its kext (`bsd/conf/files`, `Makefile.template` and `config/MASTER` in 0001). What the
 kext's start did, `hfs_init()` does (`hfs_vfsops.c`); content protection is off, its keys being AppleKeyStore's
 (`kext-config.h`, `hfs_iokit.h`); the namespace handler calls xnu-12377 no longer has are its successors
-(`hfs_vfsutils.c`) or `fs/hfs/hfs_builtin.c` (`hfs.h`).
+(`hfs_vfsutils.c`) or `fs/hfs/hfs_builtin.c` (`hfs.h`). Data protection classes are labels, as on ramfs: kept per file in a
+`com.apple.system.` extended attribute and told back, nothing encrypted (`hfs_vnops.c` getattr, setattr and create,
+`hfs_attrlist.c`, `hfs_vfsops.c`, the cnode's `c_dpclass`; `fs/hfs/hfs_builtin.c`). `renamex_np(2)`'s RENAME_SWAP for two
+files (`hfs_rename_swap()` in `hfs_vnops.c`: three catalog renames through the private directory in one journal
+transaction): usermanagerd saves its persona manifest that way, and without it there is no lock screen. APFS's
+"mark purgeable" ioctl taken and nothing done, the rest of APFS's `'J'` requests ENOTSUP (`hfs_readwrite.c`, as
+ramfs): PosterBoard's wallpaper store needs the mark.
