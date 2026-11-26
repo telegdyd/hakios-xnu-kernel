@@ -554,6 +554,49 @@ hakios_its_count(unsigned device_id, unsigned event)
 	return 0;
 }
 
+/*
+ * System sleep (psci_idle.c's hakios_sleep_wait(), before its interrupts go off and after they are on again): every
+ * mapped device's LPIs disabled in the property table (an INV each), or enabled again. A disabled LPI that comes is kept
+ * pending and taken once it is enabled: nothing is lost, and the radio's MSIs no longer end the sleep's WFI at once
+ * (run-20261126-040608: every test sleep woken by LPI 8205/8213/8214 within 23..2706 ms). 0, or EIO.
+ */
+int hakios_its_sleep_mask(bool masked);
+int
+hakios_its_sleep_mask(bool masked)
+{
+	int error = 0;
+
+	lck_mtx_lock(&its_lock);
+	for (unsigned i = 0; i < DEVICES_MAX; i++) {
+		struct its_device *d = &devices[i];
+		if (!d->used || !d->mapped) {
+			continue;
+		}
+		for (unsigned e = 0; e < d->events; e++) {
+			prop[d->lpi_first + e] = LPI_PRIORITY | 2 | (masked ? 0 : 1);
+		}
+	}
+	FlushPoC_DcacheRegion((vm_offset_t)prop, PAGE_SIZE);
+	__builtin_arm_dsb(0xf);
+	for (unsigned i = 0; i < DEVICES_MAX; i++) {
+		struct its_device *d = &devices[i];
+		if (!d->used || !d->mapped) {
+			continue;
+		}
+		uint64_t dev = (uint64_t)d->id << 32;
+		for (unsigned e = 0; e < d->events; e++) {
+			if (!command("INV", 0x0c | dev, e, 0)) {
+				error = EIO;
+			}
+		}
+	}
+	if (!CMD_SYNC()) {
+		error = EIO;
+	}
+	lck_mtx_unlock(&its_lock);
+	return error;
+}
+
 /* From gic_v3_irq.c, in interrupt context, for every INTID >= 8192: true when it was a device's. */
 bool
 hakios_its_lpi(uint32_t intid)

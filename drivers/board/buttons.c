@@ -53,6 +53,7 @@
 #include <kern/locks.h>
 #include <kern/sched_prim.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
@@ -244,6 +245,94 @@ now_text(char *text, size_t size, uint64_t now)
 	    (unsigned)(seconds / 3600 % 24), (unsigned)(seconds / 60 % 60), (unsigned)(seconds % 60), (unsigned)(micro / 1000));
 }
 
+/*
+ * The press that woke a sleeping system (psci_idle.c calls hakios_buttons_system_woke() before the key's interrupt is
+ * taken): handed on only WOKE_HOLD_MS later. Posted at once, it reached backboardd before userland knew of the wake and
+ * did nothing: the display came on only at the second press (run-20261126-055748: woken by 513, display off until a
+ * press 3 s later).
+ */
+/*
+ * run-20261126-060515: handed on 1 s after the wake it did nothing either; the next press did. Userland takes no notice of
+ * the first press after a wake (the timer's test wakes too): held 150 ms like a hand's, and with the display still off
+ * 800 ms after, one press more. That one lights it (run-20261126-061157: the display on at the owner's one press, ~1 s late).
+ */
+#define WOKE_HOLD_MS    1000
+#define WOKE_PRESS_MS   150
+#define WOKE_AGAIN_MS   800
+static uint64_t woke_hold_until;
+static bool woke_down, woke_up;
+static unsigned woke_stage;     /* 0 hand on, 1 its release, 2 the look at the display, 3 the extra press's release */
+static thread_call_t woke_call;
+void hakios_buttons_system_woke(void);
+extern bool hakios_display_off(void) __attribute__((weak));
+
+static void
+woke_later(uint32_t ms)
+{
+	uint64_t t;
+
+	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &t);
+	thread_call_enter_delayed(woke_call, mach_absolute_time() + t);
+}
+
+static void
+woke_replay(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	bool off;
+
+	switch (woke_stage) {
+	case 0:
+		printf("buttons: the waking press handed on now:%s%s\n", woke_down ? " down" : "", woke_up ? " up" : "");
+		if (!woke_down) {
+			return;
+		}
+		woke_down = false;
+		hakios_touch_post(HAKIOS_BUTTON_DOWN, power.record, 0, 0);
+		woke_stage = 1;
+		woke_later(WOKE_PRESS_MS);
+		return;
+	case 1:
+		if (woke_up) {          /* (still held: its release goes on as any) */
+			hakios_touch_post(HAKIOS_BUTTON_UP, power.record, 0, 0);
+		}
+		woke_up = false;
+		woke_stage = 2;
+		woke_later(WOKE_AGAIN_MS);
+		return;
+	case 2:
+		off = hakios_display_off != NULL && hakios_display_off();
+		printf("buttons: %ld ms after the waking press: the display %s\n", (long)(WOKE_PRESS_MS + WOKE_AGAIN_MS),
+		    off ? "still off: one press more" : "on");
+		if (!off || power.down) {
+			return;
+		}
+		hakios_touch_post(HAKIOS_BUTTON_DOWN, power.record, 0, 0);
+		woke_stage = 3;
+		woke_later(WOKE_PRESS_MS);
+		return;
+	default:
+		hakios_touch_post(HAKIOS_BUTTON_UP, power.record, 0, 0);
+		printf("buttons: the extra press after the wake handed on\n");
+		return;
+	}
+}
+
+void
+hakios_buttons_system_woke(void)
+{
+	uint64_t hold;
+
+	/* (interrupts off here: the call was made when the key became a wake source) */
+	if (woke_call == NULL) {
+		return;
+	}
+	nanoseconds_to_absolutetime((uint64_t)WOKE_HOLD_MS * NSEC_PER_MSEC, &hold);
+	woke_hold_until = mach_absolute_time() + hold;
+	woke_down = woke_up = false;
+	woke_stage = 0;
+	thread_call_enter_delayed(woke_call, woke_hold_until);
+}
+
 static void
 button_look(struct button *b, bool pressed)
 {
@@ -274,6 +363,16 @@ button_look(struct button *b, bool pressed)
 	} else {
 		absolutetime_to_nanoseconds(now - b->since, &held);
 		printf("buttons: %s released at %s, after %llu ms\n", b->name, when, held / NSEC_PER_MSEC);
+	}
+	if (b == &power && now < woke_hold_until) {
+		if (pressed) {
+			woke_down = true;
+		} else if (woke_down) {
+			woke_up = true;
+		} else {
+			hakios_touch_post(HAKIOS_BUTTON_UP, b->record, 0, 0);
+		}
+		return;
 	}
 	hakios_touch_post(pressed ? HAKIOS_BUTTON_DOWN : HAKIOS_BUTTON_UP, b->record, 0, 0);
 }
@@ -470,6 +569,7 @@ pin_input(void)
 #define KEYS_STORM              200
 
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context) __attribute__((weak));
+extern void hakios_sleep_wake_source(uint32_t intid) __attribute__((weak));
 extern void gic_v3_spi_mask(uint32_t intid) __attribute__((weak));
 extern void gic_v3_spi_unmask(uint32_t intid) __attribute__((weak));
 extern bool hakios_screen_off(void) __attribute__((weak));
@@ -693,6 +793,11 @@ keys_irq_start(void)
 		keys_irq.on = false;
 		printf("buttons: THE ARBITER'S INTERRUPT (GIC %u) CANNOT BE TAKEN: looking every %u ms\n", keys_irq.intid, POLL_MS);
 		return;
+	}
+	/* (the power key wakes a sleeping system: psci_idle.c keeps this interrupt unmasked through the sleep) */
+	if (hakios_sleep_wake_source != NULL) {
+		woke_call = thread_call_allocate_with_options(woke_replay, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
+		hakios_sleep_wake_source(keys_irq.intid);
 	}
 	if (pon_bits != 0) {
 		ok = keys_irq_peripheral(&pon, pon_chnl, pon_bits, pon_found, &pon_written);

@@ -332,6 +332,106 @@ gic_v3_spi_count(uint32_t intid)
 	return 0;
 }
 
+/*
+ * System sleep (psci_idle.c's hakios_sleep_wait()): every attached SPI masked but those wakes() keeps, and given back as
+ * they were at the wake (one a driver had masked stays masked). The result has a bit per slot masked here. With the
+ * processor's interrupts off, gic_v3_pending() then says what a WFI was ended by.
+ */
+uint64_t gic_v3_sleep_mask(bool (*wakes)(uint32_t intid));
+void gic_v3_sleep_unmask(uint64_t masked);
+uint32_t gic_v3_pending(void);
+
+uint64_t
+gic_v3_sleep_mask(bool (*wakes)(uint32_t intid))
+{
+	uint64_t masked = 0;
+
+	if (gicd_base == 0) {
+		return 0;
+	}
+	for (unsigned i = 0; i < GIC_SPI_MOST; i++) {
+		uint32_t intid = gic_spi[i].intid;
+
+		if (intid < GIC_INTID_SPI_MIN || intid >= GIC_INTID_SPURIOUS_MIN || wakes(intid)) {
+			continue;       /* (none, an extended SPI, or a wake source) */
+		}
+		if (gic_read32(gicd_base + GICD_ISENABLER(intid / 32)) & (1u << (intid % 32))) {
+			gic_write32(gicd_base + GICD_ICENABLER(intid / 32), 1u << (intid % 32));
+			masked |= 1ULL << i;
+		}
+	}
+	gic_distributor_settle();
+	return masked;
+}
+
+void
+gic_v3_sleep_unmask(uint64_t masked)
+{
+	for (unsigned i = 0; i < GIC_SPI_MOST; i++) {
+		uint32_t intid = gic_spi[i].intid;
+
+		if ((masked & (1ULL << i)) && intid != 0) {
+			gic_write32(gicd_base + GICD_ISENABLER(intid / 32), 1u << (intid % 32));
+		}
+	}
+}
+
+/* An SPI's distributor bits for the sleep's report: 1 enabled, 2 pending, 4 active; 8 its route (IROUTER) is not 0. */
+uint32_t gic_v3_spi_bits(uint32_t intid);
+uint32_t
+gic_v3_spi_bits(uint32_t intid)
+{
+	uint32_t bit = 1u << (intid % 32), r = 0;
+
+	if (gicd_base == 0 || intid < GIC_INTID_SPI_MIN || intid > gic_intid_most) {
+		return 0;
+	}
+	r |= (gic_read32(gicd_base + 0x0100 + 4 * (intid / 32)) & bit) ? 1 : 0;   /* GICD_ISENABLER */
+	r |= (gic_read32(gicd_base + 0x0200 + 4 * (intid / 32)) & bit) ? 2 : 0;   /* GICD_ISPENDR */
+	r |= (gic_read32(gicd_base + 0x0300 + 4 * (intid / 32)) & bit) ? 4 : 0;   /* GICD_ISACTIVER */
+	r |= *(volatile uint64_t *)(gicd_base + 0x6000 + 8 * (uint64_t)intid) != 0 ? 8 : 0;   /* GICD_IROUTER */
+	return r;
+}
+
+/* An SPI pending again (one the sleep's wait took off the CPU interface to clear the way: its handler takes it after). */
+void gic_v3_spi_set_pending(uint32_t intid);
+void
+gic_v3_spi_set_pending(uint32_t intid)
+{
+	if (gicd_base == 0 || intid < GIC_INTID_SPI_MIN || intid > gic_intid_most) {
+		return;
+	}
+	gic_write32(gicd_base + 0x0200 + 4 * (intid / 32), 1u << (intid % 32));   /* GICD_ISPENDR */
+	gic_distributor_settle();
+}
+
+/*
+ * The sleep's wait: takes what the CPU interface holds and ends it at once (1023: nothing). The timer's interrupt was
+ * left pending, ahead of the power key's, at every wake of the wait: run-20261126-055053 saw only 27 there, 300 million
+ * times in 60 s, while 513 sat pending behind it.
+ */
+uint32_t gic_v3_sleep_take(void);
+uint32_t
+gic_v3_sleep_take(void)
+{
+	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+	uint32_t intid = (uint32_t)(iar & 0xffffff);
+
+	if (intid >= GIC_INTID_SPURIOUS_MIN && intid <= GIC_INTID_SPURIOUS_MOST) {
+		return intid;
+	}
+	__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+	__builtin_arm_isb(ISB_SY);
+	return intid;
+}
+
+/* The interrupt the CPU interface would take next (1023: none), without taking it. */
+uint32_t
+gic_v3_pending(void)
+{
+	return (uint32_t)(__builtin_arm_rsr64("ICC_HPPIR1_EL1") & 0xffffff);
+}
+
 static void
 gic_irq_handler(__unused void *target, __unused void *refCon, __unused void *nub, __unused int source)
 {

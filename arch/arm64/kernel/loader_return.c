@@ -970,12 +970,9 @@ memory_short(void)
 	memory_volatile_surfaces(" (memory short)");
 }
 
-/* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */
 static void
-hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+hv_wdt_feed(void)
 {
-	uint64_t deadline;
-
 	if (hv_wdt_enabled) {
 		register uint64_t x0 __asm__("x0") = VIRT_WDT_PET;
 		register uint64_t x1 __asm__("x1") = 0;
@@ -985,6 +982,27 @@ hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3) : :
 		    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17");
 	}
+}
+
+/*
+ * The same from a processor whose interrupts are off while the system sleeps (psci_idle.c's hakios_sleep_wait(): no
+ * thread call runs then): the watchdog fed and a beat shown, nothing said.
+ */
+void hakios_sleep_pet(void);
+void
+hakios_sleep_pet(void)
+{
+	hv_wdt_feed();
+	loader_live.heartbeat++;
+}
+
+/* Every HV_WDT_PET_SECONDS: feed the watchdog if there is one, and show any watching loader a sign of life. */
+static void
+hv_wdt_pet(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t deadline;
+
+	hv_wdt_feed();
 	if (++loader_live.heartbeat % MEMORY_REPORT_BEATS == 0) {
 		memory_report();
 	} else {

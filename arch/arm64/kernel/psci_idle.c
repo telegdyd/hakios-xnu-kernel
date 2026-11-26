@@ -28,6 +28,7 @@
 #include <arm64/psci_smp.h>
 #include <pexpert/pexpert.h>
 #include <pexpert/arm64/board_config.h>
+#include <sys/errno.h>
 
 /* drivers/board/rpmh_sleep.h: the last core's hook before llcc-off (an empty one where no board driver has it) */
 void hakios_rpmh_llcc_down(void);
@@ -895,6 +896,196 @@ psci_smp_cores_up(void)
 		}
 	}
 	return up;
+}
+
+/*
+ * System sleep, suspend to idle (COMMON-PORT.md "System sleep", step 1): GenericARMPE::sleepKernel() calls this instead
+ * of IOCPUSleepKernel(), whose way back is a warm reset this port has none of. The other processors are switched off
+ * through the scheduler's powered cores (as with the display off), this thread moves to the boot processor, and that one
+ * waits in WFI with its interrupts off and every SPI masked but the wake sources (hakios_sleep_wake_source()). Its timer
+ * wakes it every SLEEP_PET_SECONDS to feed the watchdog and show the loader a beat; a wake source, or the end of a test
+ * sleep (seconds != 0), ends the wait. Nothing else runs meanwhile: userland, kernel threads and timers wait, and
+ * whatever was due is done at once after it.
+ */
+#define SLEEP_PET_SECONDS       5
+#define SLEEP_WAKES_MOST        4
+#define SLEEP_INTID_VTIMER      27
+#define SLEEP_INTID_NONE_MIN    1020
+#define SLEEP_INTID_NONE_MOST   1023
+extern uint64_t gic_v3_sleep_mask(bool (*wakes)(uint32_t intid));
+extern void gic_v3_sleep_unmask(uint64_t masked);
+extern uint32_t gic_v3_pending(void);
+extern uint32_t gic_v3_spi_bits(uint32_t intid);
+extern uint32_t gic_v3_sleep_take(void);
+extern void hakios_buttons_system_woke(void) __attribute__((weak));   /* drivers/board/buttons.c */
+extern void gic_v3_spi_set_pending(uint32_t intid);
+#define GIC_INTID_SPI_MIN_SLEEP 32
+extern void hakios_sleep_pet(void);
+extern int hakios_its_sleep_mask(bool masked) __attribute__((weak));  /* drivers/board/its.c: the MSIs' LPIs */
+int hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uint32_t *pets);
+void hakios_sleep_wake_source(uint32_t intid);
+static uint32_t sleep_wakes[SLEEP_WAKES_MOST];
+static unsigned sleep_wakes_n;
+
+/* A driver's interrupt that wakes the system (the power key's): kept unmasked while it sleeps. */
+void
+hakios_sleep_wake_source(uint32_t intid)
+{
+	for (unsigned i = 0; i < sleep_wakes_n; i++) {
+		if (sleep_wakes[i] == intid) {
+			return;
+		}
+	}
+	if (sleep_wakes_n < SLEEP_WAKES_MOST) {
+		sleep_wakes[sleep_wakes_n++] = intid;
+		psci_say("sleep: interrupt %u wakes the system\n", intid);
+	}
+}
+
+static bool
+sleep_wakes_on(uint32_t intid)
+{
+	for (unsigned i = 0; i < sleep_wakes_n; i++) {
+		if (sleep_wakes[i] == intid) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* 0, or ENODEV (nothing could end it), EBUSY (the other processors did not go). *woken_by: the interrupt that ended it. */
+int
+hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uint32_t *pets)
+{
+	int boot = psci_smp_boot_cpu();
+	uint64_t boot_bit = 1ULL << boot, masked, ctl, cval, freq, start, end, now;
+	uint32_t by = 0, fed = 0, wakes = 0;
+	uint64_t pet_at;
+	processor_t processor;
+	boolean_t enabled;
+
+	*woken_by = 0;
+	*asleep_ns = 0;
+	*pets = 0;
+	if (sleep_wakes_n == 0 && seconds == 0) {
+		return ENODEV;
+	}
+	if (ml_get_cpu_count() > 1) {
+		sched_perfcontrol_update_powered_cores(boot_bit, REASON_CLPC_SYSTEM, 0);
+		for (int i = 0; i < 200 && psci_smp_cores_up() != boot_bit; i++) {
+			delay_for_interval(10, NSEC_PER_MSEC);
+		}
+		if (psci_smp_cores_up() != boot_bit) {
+			psci_say("sleep: refused: processors 0x%llx still up\n", psci_smp_cores_up());
+			psci_smp_apply_display();
+			return EBUSY;
+		}
+	}
+	processor = processor_array[boot];
+	thread_bind(processor);
+	thread_block(THREAD_CONTINUE_NULL);     /* (onto it) */
+
+	/* (the LPIs too: the radio's MSIs, no wake source yet, ended every sleep at once; they stay pending) */
+	int lpis = hakios_its_sleep_mask ? hakios_its_sleep_mask(true) : 0;
+	enabled = ml_set_interrupts_enabled(FALSE);
+	masked = gic_v3_sleep_mask(sleep_wakes_on);
+	ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
+	cval = __builtin_arm_rsr64("CNTV_CVAL_EL0");
+	freq = __builtin_arm_rsr64("CNTFRQ_EL0");
+	start = __builtin_arm_rsr64("CNTVCT_EL0");
+	end = seconds != 0 ? start + (uint64_t)seconds * freq : UINT64_MAX;
+	/*
+	 * The pets on a fixed schedule, every SLEEP_PET_SECONDS from the start, and one now. The first version set its timer to
+	 * "now + 5 s" at every wake, early ones included: woken early again and again, the pet moved on each time and was never
+	 * due (1 pet in a 20 s sleep, 0 or 1 in 10 s ones), and a 600 s test sleep starved the watchdog into a reset
+	 * (run-20261126-044816: the phone came back in iOS 16).
+	 */
+	hakios_sleep_pet();
+	fed++;
+	pet_at = start + SLEEP_PET_SECONDS * freq;
+	for (;;) {
+		uint64_t next;
+		uint32_t intid;
+
+		now = __builtin_arm_rsr64("CNTVCT_EL0");
+		if (now >= end) {
+			by = SLEEP_INTID_VTIMER;
+			break;
+		}
+		if (now >= pet_at) {
+			hakios_sleep_pet();
+			fed++;
+			while (pet_at <= now) {
+				pet_at += SLEEP_PET_SECONDS * freq;
+			}
+		}
+		next = pet_at < end ? pet_at : end;
+		__builtin_arm_wsr64("CNTV_CVAL_EL0", next);
+		__builtin_arm_wsr64("CNTV_CTL_EL0", 1);         /* enabled, not masked */
+		__builtin_arm_isb(ISB_SY);
+		__builtin_arm_dsb(DSB_SY);
+		__builtin_arm_wfi();
+		wakes++;
+		/*
+		 * A wake source by its own pending bit: the timer's interrupt was left pending at the CPU interface, ahead of the
+		 * power key's, so every WFI ended at once (300 million wakes in a 60 s sleep) and the key never showed there while
+		 * its distributor bit said pending (run-20261126-055053). Now taken off (below), it is a few wakes a sleep.
+		 */
+		for (unsigned i = 0; i < sleep_wakes_n && by == 0; i++) {
+			if (gic_v3_spi_bits(sleep_wakes[i]) & 2) {
+				by = sleep_wakes[i];
+			}
+		}
+		if (by != 0) {
+			break;
+		}
+		intid = gic_v3_pending();
+		if (intid == SLEEP_INTID_VTIMER) {
+			/* (taken and ended, so it stops ending every WFI; a wake source taken here instead is made pending again) */
+			uint32_t took = gic_v3_sleep_take();
+
+			if (took != SLEEP_INTID_VTIMER && took < SLEEP_INTID_NONE_MIN) {
+				if (sleep_wakes_on(took)) {
+					gic_v3_spi_set_pending(took);
+					by = took;
+					break;
+				}
+				if (took >= GIC_INTID_SPI_MIN_SLEEP) {
+					gic_v3_spi_set_pending(took);
+				}
+			}
+		}
+		if (intid == SLEEP_INTID_VTIMER || (intid >= SLEEP_INTID_NONE_MIN && intid <= SLEEP_INTID_NONE_MOST)) {
+			continue;       /* (the pet and the end are looked at above) */
+		}
+		by = intid;     /* (left pending: its handler takes it once interrupts are on again) */
+		break;
+	}
+	now = __builtin_arm_rsr64("CNTVCT_EL0");
+	__builtin_arm_wsr64("CNTV_CVAL_EL0", cval);     /* (the kernel's deadline, passed by now: taken at once) */
+	__builtin_arm_wsr64("CNTV_CTL_EL0", ctl);
+	__builtin_arm_isb(ISB_SY);
+	gic_v3_sleep_unmask(masked);
+	/* (before the key's interrupt is taken: the press that woke it is handed to userland once it knows of the wake) */
+	if (by != SLEEP_INTID_VTIMER && hakios_buttons_system_woke) {
+		hakios_buttons_system_woke();
+	}
+	ml_set_interrupts_enabled(enabled);
+	if (hakios_its_sleep_mask) {
+		(void)hakios_its_sleep_mask(false);
+	}
+	if (lpis != 0) {
+		psci_say("sleep: the LPIs could not all be masked (%d)\n", lpis);
+	}
+
+	thread_bind(PROCESSOR_NULL);
+	thread_block(THREAD_CONTINUE_NULL);
+	psci_smp_apply_display();
+	*woken_by = by;
+	*asleep_ns = (now - start) / freq * NSEC_PER_SEC + (now - start) % freq * NSEC_PER_SEC / freq;
+	*pets = fed;
+	psci_say("sleep: %u wakes of the wait, %u pets\n", wakes, fed);
+	return 0;
 }
 
 #endif /* defined(GENERIC_PSCI_SMP) */

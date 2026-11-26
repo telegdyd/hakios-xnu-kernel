@@ -18,6 +18,9 @@ extern "C" {
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOCPU.h>
+#include <IOKit/IOPlatformActions.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
+#include <IOKit/pwr_mgt/IOPMPrivate.h>
 #include <kern/clock.h>
 #include <kern/thread_call.h>
 #include <sys/errno.h>
@@ -31,6 +34,8 @@ void ml_cpu_init_completed(void);      /* osfmk/arm64/machine_routines.c: every 
 kern_return_t processor_start(processor_t processor);
 kern_return_t processor_exit(processor_t processor);
 extern uint32_t processor_avail_count;
+int hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uint32_t *pets);    /* psci_idle.c */
+void loader_log_line(const char *line);
 
 /* osfmk/arm64/psci_smp.c and gic_v3_irq.c */
 void psci_smp_init(void);
@@ -313,6 +318,7 @@ public:
 	virtual bool getMachineName(char * name, int maxLength) APPLE_KEXT_OVERRIDE;
 	virtual long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
 	virtual void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+	virtual void sleepKernel(void) APPLE_KEXT_OVERRIDE;
 };
 
 #define super IODTPlatformExpert
@@ -573,6 +579,122 @@ GenericARMPE::setGMTTimeOfDay(long secs)
 	clock_get_system_microtime(&uptime, &usecs);
 	gBootEpoch = secs - (long) uptime;
 	gBootEpochKnown = true;
+}
+
+/*
+ * System sleep (COMMON-PORT.md "System sleep", step 1): what the root domain calls once every driver is asleep, in place
+ * of IOCPUSleepKernel() -- whose boot processor is to come back through a warm reset this port has not got (with more
+ * than one processor it waited for good). Suspend to idle: psci_idle.c's hakios_sleep_wait() keeps the boot processor
+ * in WFI, the others off, until a wake source (the power key) or the end of a test sleep. The time and the clocks go on
+ * meanwhile (the generic timer does not stop), so the calendar needs nothing at the wake. System sleep is still refused
+ * unless boot-arg syssleep=1 (0003-iokit.patch): asleep, the USB network and sweetd stop too.
+ *
+ * kern.hakios.sleep_test=S (root): the system to sleep now, the test's timer to wake it after S seconds (1 to 3600).
+ * kern.hakios.sleeps: the counts.
+ */
+static uint32_t gSleepTestSeconds;
+static struct {
+	uint32_t sleeps, refused, by_timer, by_interrupt, last_by, pets;
+	uint64_t asleep_ns, last_ns;
+	int last_error;
+} gSleeps;
+
+static int
+sleepTestSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	int value = 0, error = sysctl_handle_int(oidp, &value, 0, req);
+	IOPMrootDomain * root = IOService::getPMRootDomain();
+	IOReturn result;
+
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	if (value < 1 || value > 3600) {
+		return EINVAL;
+	}
+	if (root == NULL) {
+		return ENODEV;
+	}
+	gSleepTestSeconds = (uint32_t) value;
+	result = root->sleepSystemOptions(NULL);
+	if (result != kIOReturnSuccess) {
+		gSleepTestSeconds = 0;
+		return result == kIOReturnNotPermitted ? EPERM : EIO;
+	}
+	return 0;
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sleep_test, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+    sleepTestSysctl, "I", "test: the system sleeps now and its timer wakes it after this many seconds (needs syssleep=1)");
+
+static int
+sleepsSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	char text[320];
+
+	snprintf(text, sizeof(text), "sleeps %u (refused %u, last error %d); woken by the test's timer %u, by an interrupt %u "
+	    "(last: %u, after %llu ms); asleep %llu ms in all; watchdog fed %u times", gSleeps.sleeps, gSleeps.refused,
+	    gSleeps.last_error, gSleeps.by_timer, gSleeps.by_interrupt, gSleeps.last_by, gSleeps.last_ns / NSEC_PER_MSEC,
+	    gSleeps.asleep_ns / NSEC_PER_MSEC, gSleeps.pets);
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sleeps, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
+    sleepsSysctl, "A", "system sleeps: how many, what woke them, how long");
+
+void
+GenericARMPE::sleepKernel(void)
+{
+	IOPMrootDomain * root = getPMRootDomain();
+	uint32_t seconds = gSleepTestSeconds, by = 0, pets = 0;
+	uint64_t ns = 0;
+	char line[160];
+	int error;
+
+	gSleepTestSeconds = 0;
+	snprintf(line, sizeof(line), "sleep: the system sleeps%s\n", seconds != 0 ? " (a test: its timer wakes it)" : "");
+	loader_log_line(line);
+	IOPlatformActionsPreSleep();
+	if (root != NULL) {
+		root->stop_watchdog_timer();    /* (the sleep/wake watchdog: as IOCPUSleepKernel() does around the sleep) */
+	}
+	error = hakios_sleep_wait(seconds, &by, &ns, &pets);
+	if (root != NULL) {
+		root->start_watchdog_timer();
+	}
+	IOPlatformActionsPostResume();
+
+	gSleeps.last_error = error;
+	if (error != 0) {
+		gSleeps.refused++;
+		snprintf(line, sizeof(line), "sleep: NOT ASLEEP (%d: %s)\n", error,
+		    error == ENODEV ? "nothing could wake it" : "the other processors did not go");
+		loader_log_line(line);
+		return;
+	}
+	gSleeps.sleeps++;
+	gSleeps.last_by = by;
+	gSleeps.last_ns = ns;
+	gSleeps.asleep_ns += ns;
+	gSleeps.pets += pets;
+	if (by == 27) {
+		gSleeps.by_timer++;
+	} else {
+		gSleeps.by_interrupt++;
+	}
+	snprintf(line, sizeof(line), "sleep: woken by %s %u after %llu ms (watchdog fed %u times)\n",
+	    by == 27 ? "the test's timer, interrupt" : "interrupt", by, ns / NSEC_PER_MSEC, pets);
+	loader_log_line(line);
+	if (root != NULL) {
+		/*
+		 * The wake as the user's (step 1: the power key, and the test's timer standing in for it): without it the root
+		 * domain took a dark wake, the display stayed off and nothing drew (run-20261126-040608: presents 955 -> 955).
+		 * requestUserActive() is powerd's message to light the display (no display wrangler on this platform).
+		 */
+		root->claimSystemWakeEvent(this, kIOPMWakeEventSource | kIOPMWakeEventUserPME,
+		    by == 27 ? "hakios sleep test timer" : "hakios interrupt");
+		root->requestUserActive(this, by == 27 ? "sleep test wake" : "power key wake");
+	}
 }
 
 /* Device-tree nodes to drop entirely. */
