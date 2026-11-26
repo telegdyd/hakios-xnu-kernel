@@ -1,6 +1,6 @@
 # What the patches change in Apple's files
 
-Everything HakiOS *adds* is in `kernel/overlay/`. These seven patches are the changes to files Apple
+Everything HakiOS *adds* is in `kernel/overlay/`. These eight patches are the changes to files Apple
 ships, grouped by subsystem. `series` assigns every file to one patch; `kernel/export.sh` regenerates
 the patches from an assembled tree, so they are never edited by hand. The reason for each change is in
 a comment beside it in the code. This page is the map.
@@ -78,10 +78,18 @@ a comment beside it in the code. This page is the map.
 ## 0007-vfs: file systems
 
 - The root on a RAM disk of 4 GB or more (`memdev.c`), read in place by the APFS implementation.
-- `apfs` and `ramfs` registered (`vfs_conf.c`); `/dev/console` readable by every daemon.
+- `apfs`, `ramfs` and `hfs` registered (`vfs_conf.c`); `/dev/console` readable by every daemon.
 - `ATTR_CMN_FULLPATH` listed as valid on every volume: without it Darwin 27 registers no application.
 - Process 1 may bind-mount without an entitlement.
 - The type name statfs, getfsstat and getattrlist report asked of ramfs first (`vfs_subr.c`): `/private/var` is
   "apfs" to fileproviderd, for "On My iPhone" (`var_apfs=`, fs/ramfs/ramfs.c).
 - Diagnostics: `trace_open=NAME,...` and `trace_attr=NAME` log the paths and attributes a process asks
   for.
+
+## 0008-hfs: HFS Plus built in
+
+Apple's HFS Plus release (`kernel/UPSTREAM`, `kernel/hfs.list`; tag `apple` in the tree) compiled into the
+kernel instead of as its kext (`bsd/conf/files`, `Makefile.template` and `config/MASTER` in 0001). What the
+kext's start did, `hfs_init()` does (`hfs_vfsops.c`); content protection is off, its keys being AppleKeyStore's
+(`kext-config.h`, `hfs_iokit.h`); the namespace handler calls xnu-12377 no longer has are its successors
+(`hfs_vfsutils.c`) or `fs/hfs/hfs_builtin.c` (`hfs.h`).

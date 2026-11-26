@@ -79,6 +79,23 @@ diff --git a/bsd/conf/Makefile.arm64 b/bsd/conf/Makefile.arm64
  kern_csr.o_INCFLAGS += -I$(SRCROOT)/osfmk
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -644,5 +644,13 @@ do_build_all:: do_all
+ 
+ %RULES
+ 
++# HakiOS: HFS Plus built in (bsd/hfs; of bsd/hfs_encodings only the header, Apple's hfs-627.100.6), compiled as its kext was: against
++# the kernel's KPI, not its insides (no XNU/BSD/MACH_KERNEL_PRIVATE), kext-config.h first, its own headers beside it,
++# and its warnings its own (it is Apple's code as it was published, not this kernel's)
++HFS_OBJS = $(patsubst %.c,%.o,$(notdir $(wildcard $(SRCROOT)/bsd/hfs/*.c)))
++$(foreach o,$(HFS_OBJS),$(eval $(o)_CFLAGS_ADD += -UXNU_KERNEL_PRIVATE -UBSD_KERNEL_PRIVATE -UMACH_KERNEL_PRIVATE \
++	-include $(SRCROOT)/bsd/hfs/kext-config.h -I$(SRCROOT)/bsd/hfs -I$(SRCROOT)/bsd/hfs_encodings -idirafter $(SDKROOT)/usr/include))
++$(foreach o,$(HFS_OBJS),$(eval $(o)_CWARNFLAGS_ADD += -w))
++
+ include $(MakeInc_rule)
+ include $(MakeInc_dir)
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
@@ -149,7 +166,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  
  bsd/libkern/crc32.c			standard
  bsd/libkern/random.c			standard
-@@ -155,6 +208,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +215,52 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -161,10 +178,48 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 +bsd/miscfs/apfs/apfs_vfsops.c		optional apfs
 +bsd/miscfs/apfs/apfs_vnops.c		optional apfs
 +bsd/miscfs/ramfs/ramfs.c			optional ramfs
++bsd/hfs/BTree.c		optional hfs
++bsd/hfs/BTreeAllocate.c		optional hfs
++bsd/hfs/BTreeMiscOps.c		optional hfs
++bsd/hfs/BTreeNodeOps.c		optional hfs
++bsd/hfs/BTreeNodeReserve.c		optional hfs
++bsd/hfs/BTreeScanner.c		optional hfs
++bsd/hfs/BTreeTreeOps.c		optional hfs
++bsd/hfs/BTreeWrapper.c		optional hfs
++bsd/hfs/CatalogUtilities.c		optional hfs
++bsd/hfs/FileExtentMapping.c		optional hfs
++bsd/hfs/FileIDsServices.c		optional hfs
++bsd/hfs/MacOSStubs.c		optional hfs
++bsd/hfs/UnicodeWrappers.c		optional hfs
++bsd/hfs/VolumeAllocation.c		optional hfs
++bsd/hfs/hfs_attrlist.c		optional hfs
++bsd/hfs/hfs_btreeio.c		optional hfs
++bsd/hfs/hfs_builtin.c		optional hfs
++bsd/hfs/hfs_catalog.c		optional hfs
++bsd/hfs/hfs_chash.c		optional hfs
++bsd/hfs/hfs_cnode.c		optional hfs
++bsd/hfs/hfs_cprotect.c		optional hfs
++bsd/hfs/hfs_endian.c		optional hfs
++bsd/hfs/hfs_extents.c		optional hfs
++bsd/hfs/hfs_fsinfo.c		optional hfs
++bsd/hfs/hfs_hotfiles.c		optional hfs
++bsd/hfs/hfs_journal.c		optional hfs
++bsd/hfs/hfs_link.c		optional hfs
++bsd/hfs/hfs_lookup.c		optional hfs
++bsd/hfs/hfs_notification.c		optional hfs
++bsd/hfs/hfs_quota.c		optional hfs
++bsd/hfs/hfs_readwrite.c		optional hfs
++bsd/hfs/hfs_resize.c		optional hfs
++bsd/hfs/hfs_search.c		optional hfs
++bsd/hfs/hfs_vfsops.c		optional hfs
++bsd/hfs/hfs_vfsutils.c		optional hfs
++bsd/hfs/hfs_vnops.c		optional hfs
++bsd/hfs/hfs_xattr.c		optional hfs
++bsd/hfs/rangelist.c		optional hfs
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -380,6 +441,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -380,6 +486,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -172,7 +227,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -403,6 +465,7 @@ bsd/kern/kern_debug.c			standard
+@@ -403,6 +510,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -183,12 +238,13 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 diff --git a/config/MASTER b/config/MASTER
 --- a/config/MASTER
 +++ b/config/MASTER
-@@ -112,6 +112,8 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
+@@ -112,6 +112,9 @@ options		CONFIG_WORKLOOP_DEBUG	# <config_workloop_debug>
  #	4.4 filesystems
  #
  options		MOCKFS		# Boot from an executable	# <mockfs>
 +options		APFS		# Apple File System, read only	# <apfs>
 +options		RAMFS		# Read-write filesystem in memory	# <ramfs>
++options		HFS		# HFS Plus, read-write: the data volume on the flash	# <hfs>
  options		FIFO		# fifo support			# <fifo>
  options		FDESC		# fdesc_fs support		# <fdesc>
  options		DEVFS		# devfs support			# <devfs>

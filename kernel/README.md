@@ -7,7 +7,8 @@ for every board it was built with. The board is identified at boot from `/chosen
 
 | Path | What it is |
 | --- | --- |
-| `UPSTREAM` | The Apple release the kernel is made from (URL, tag, commit). |
+| `UPSTREAM` | The Apple release the kernel is made from (URL, tag, commit), and Apple's HFS Plus release (`HFS_*`). |
+| `hfs.list` | Which files of that HFS release the kernel compiles, and where they go in the tree (tag `apple`: the release with them, the base of the patches). |
 | `overlay/` | The files HakiOS adds that are kept at their place in the XNU tree here (most are kept at the top: below). |
 | `patches/` | The changes to Apple's own files, one patch per topic. `patches/series` says which file belongs to which patch; [patches/README.md](patches/README.md) says what each patch is for. |
 | `assemble.sh` | Makes the tree that is compiled: the release + `overlay/` + `patches/`. |

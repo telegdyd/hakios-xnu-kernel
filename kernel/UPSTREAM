@@ -4,3 +4,9 @@
 UPSTREAM_URL=https://github.com/apple-oss-distributions/xnu.git
 UPSTREAM_TAG=xnu-12377.121.6
 UPSTREAM_COMMIT=ac9718fb1af618d5ce8678d0dc6e8a58f252216f
+# Apple's HFS Plus, the file system of the data volume on the phone's flash (bsd/hfs, bsd/hfs_encodings): its
+# release, which kernel/hfs.list takes the files the kernel compiles from. In the tree it is tag `apple`:
+# `upstream` with those files added as Apple has them, the base kernel/patches are made against.
+HFS_URL=https://github.com/apple-oss-distributions/hfs.git
+HFS_TAG=hfs-627.100.6
+HFS_COMMIT=31d5ec238dfab485e78a9a30b8b92d13e8914f03

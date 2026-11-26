@@ -9,7 +9,8 @@
 #                   clone already on this machine: no network needed)
 #   --discard       (--update) throw away what was changed in the tree and not exported
 #
-# The tree is a git repository: tag `upstream` is Apple's release, tag `assembled` what this script put
+# The tree is a git repository: tag `upstream` is Apple's release, tag `apple` that with Apple's HFS Plus files
+# (kernel/hfs.list), tag `assembled` what this script put
 # there, branch `hakios` where work goes on. An update touches only the files whose contents change, so
 # the next build compiles only those. Work done in the tree goes back to the repository with
 # kernel/export.sh. --update never runs over such work: it leaves the tree as it is while the
@@ -67,6 +68,7 @@ else
 	fi
 fi
 tree_excludes "$D"
+apple_base "$D"
 
 tree=$(assembled_tree "$D")
 if [ $update = 1 ]; then
@@ -90,7 +92,7 @@ take the work over with kernel/export.sh $D (and settle the two in the repositor
 with assemble.sh --update --discard $D"
 	fi
 fi
-commit=$(tree_git "$D" commit-tree "$tree" -p upstream \
+commit=$(tree_git "$D" commit-tree "$tree" -p apple \
 	-m "$UPSTREAM_TAG + HakiOS (kernel/overlay, kernel/patches)")
 changed=$(git -C "$D" diff --name-only "$(git -C "$D" rev-parse -q --verify 'assembled^{commit}' || echo upstream)" "$commit" | wc -l)
 if [ $update = 1 ] && [ "$work" = "$tree" ]; then

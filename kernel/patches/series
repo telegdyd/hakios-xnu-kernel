@@ -33,3 +33,6 @@
 
 # File systems: the root in memory, APFS and ramfs registered, paths and attributes Darwin asks for.
 0007-vfs.patch                  bsd/vfs/ bsd/miscfs/ bsd/dev/memdev.c bsd/sys/disk_private.h
+
+# HFS Plus built in (Apple's release, tag apple): what its kext did that the kernel does itself.
+0008-hfs.patch                  bsd/hfs/ bsd/hfs_encodings/

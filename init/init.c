@@ -1025,6 +1025,86 @@ rtc_count(long *seconds)
 static long host_rtc_offset;
 static int host_rtc_offset_known;
 
+/*
+ * The data volume on the phone's flash (boot-arg var_hfs=DEV, DEV a node of /dev: ufs_darwin_data, darwin past the
+ * Darwin volume): HFS Plus, which this kernel has built in (bsd/hfs, fs/hfs/), so that what Darwin keeps in
+ * /private/var is there at the next boot and its size is the size of the space -- not a memory filesystem's share of
+ * the RAM. Journaled: a phone reset in the middle of a write finds the volume whole at the next mount. If it does not
+ * mount (no volume made there yet: tools/mkdatavol.py), the memory filesystem as before.
+ */
+static int var_kept;            /* /private/var is the volume on the flash: what is in it stays */
+
+static int
+mount_data_volume(void)
+{
+	const char *name = boot_arg("var_hfs");
+	static char dev[64];
+	/* struct hfs_mount_args (bsd/hfs/hfs_mount.h) */
+	struct {
+		const char *fspec;
+		uint32_t uid, gid;
+		uint16_t mask, pad;
+		uint32_t encoding;
+		int tz[2];
+		int flags, journal_tbuffer_size, journal_flags, journal_disable;
+	} args;
+
+	if (name == NULL || strcmp(name, "0") == 0 || strlen(name) + 6 > sizeof(dev)) {
+		return 0;
+	}
+	strcpy(dev, "/dev/");
+	strcpy(dev + 5, name);
+	memset(&args, 0, sizeof(args));
+	args.fspec = dev;
+	if (mount("hfs", "/private/var", 0, &args) != 0) {
+		printf("  HFS Plus from %s: %s; a memory filesystem instead, empty at every boot\n", dev, strerror(errno));
+		return 0;
+	}
+	printf("  /private/var: HFS Plus from %s, kept between boots\n", dev);
+	return 1;
+}
+
+/* What is under PATH, gone; PATH itself stays (a kept volume's tmp, run and vm are each boot's own) */
+static void
+empty_tree(const char *path, int depth)
+{
+	char buf[4096], child[1100];
+	off_t position = 0;
+	ssize_t n;
+	struct stat st;
+	int fd = open(path, O_RDONLY | O_DIRECTORY, 0), passes = 0;
+
+	if (fd < 0 || depth > 32) {
+		if (fd >= 0) {
+			close(fd);
+		}
+		return;
+	}
+	/* what is removed moves the rest, so the directory is read again from its start until it is empty (or stuck) */
+	while (passes++ < 64 && (n = getdirentries(fd, buf, sizeof(buf), &position)) > 0) {
+		for (ssize_t at = 0; at < n; at += ((struct dirent *)(buf + at))->d_reclen) {
+			const char *name = ((struct dirent *)(buf + at))->d_name;
+			size_t lp = strlen(path), ln = strlen(name);
+
+			if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || lp + ln + 2 > sizeof(child)) {
+				continue;
+			}
+			memcpy(child, path, lp);
+			child[lp] = '/';
+			memcpy(child + lp + 1, name, ln + 1);
+			if (lstat(child, &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR) {
+				empty_tree(child, depth + 1);
+				rmdir(child);
+			} else {
+				unlink(child);
+			}
+		}
+		position = 0;
+		lseek(fd, 0, 0);
+	}
+	close(fd);
+}
+
 static void
 mount_writable(void)
 {
@@ -1036,11 +1116,22 @@ mount_writable(void)
 	struct stat st;
 
 	printf("\n-- writable filesystem --\n");
-	ok = mount("ramfs", "/private/var", 0, NULL) == 0;
-	if (!ok) {
-		printf("  mount: %s\n", strerror(errno));
+	var_kept = mount_data_volume();
+	if (var_kept) {
+		static const char *const own[] = { "/private/var/tmp", "/private/var/run", "/private/var/vm" };
+
+		for (unsigned i = 0; i < sizeof(own) / sizeof(own[0]); i++) {
+			empty_tree(own[i], 0);
+		}
+		ok = 1;
+		check(ok, "mount the data volume on /private/var");
+	} else {
+		ok = mount("ramfs", "/private/var", 0, NULL) == 0;
+		if (!ok) {
+			printf("  mount: %s\n", strerror(errno));
+		}
+		check(ok, "mount a memory filesystem on /private/var");
 	}
-	check(ok, "mount a memory filesystem on /private/var");
 
 	/* the directories of the data volume, as listed in the template that ships with Darwin (darwin165/mkvarskel.py) */
 	read_whole(in_image("/etc/var.skel"), skeleton, sizeof(skeleton));
@@ -1066,8 +1157,11 @@ mount_writable(void)
 		} else if (count == 3 && f[0][0] == 'l') {
 			symlink(f[1], f[2]);
 		} else if (count == 6 && f[0][0] == 'f') {
-			/* a file of ours to start with (build.sh: the var/ directory): mode, owner, group, path, source in the image */
-			if (!copy_file(in_image(f[5]), f[4], (int)parse_number(f[1], 8), (int)parse_number(f[2], 10),
+			/* a file of ours to start with (build.sh: the var/ directory): mode, owner, group, path, source in the image;
+			 * on the kept volume only if it is not there yet -- what Darwin made of it since is what counts */
+			if (var_kept && lstat(f[4], &st) == 0) {
+				/* kept */
+			} else if (!copy_file(in_image(f[5]), f[4], (int)parse_number(f[1], 8), (int)parse_number(f[2], 10),
 			    (int)parse_number(f[3], 10))) {
 				printf("  %s: %s\n", f[4], strerror(errno));
 			}
@@ -1133,6 +1227,15 @@ mount_writable(void)
 		 * application from there, and from /private/var not at all -- everything a package put in
 		 * /var/jb/Applications was "Unable to register", with nothing on the files even looked at.
 		 */
+		/* the prefix is grafted anew at every boot: on the kept volume, last boot's goes first */
+		if (var_kept && lstat(to, &st) == 0) {
+			if ((st.st_mode & S_IFMT) == S_IFDIR) {
+				empty_tree(to, 0);
+				rmdir(to);
+			} else {
+				unlink(to);
+			}
+		}
 		if (strcmp(jb, "/private/preboot/jb") == 0 && stat("/private/preboot/jb-rw", &st) == 0) {
 			if (mount("ramfs", "/private/preboot/jb-rw", 0, NULL) == 0 &&
 			    symlink("/private/preboot/jb-rw/procursus", "/private/var/jb") == 0) {
@@ -1214,6 +1317,10 @@ restore_var(void)
 	int status = 0;
 	pid_t pid;
 
+	if (var_kept) {
+		/* /private/var is the HFS volume on the flash (var_hfs=), in the place var_store's archive would go */
+		return;
+	}
 	if (wanted != NULL && strcmp(wanted, "new") == 0) {
 		/* var_store=new: begun anew, the store not read -- what another system left in it (iOS 16.5's data
 		 * volume under iOS 27 has its data migrator run instead of SpringBoard) -- and saved at the end as with 1 */

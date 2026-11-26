@@ -22,6 +22,7 @@ OVERLAY_PLACES=(
 	"crypto:osfmk/minicrypto"
 	"fs/apfs:bsd/miscfs/apfs"
 	"fs/ramfs:bsd/miscfs/ramfs"
+	"fs/hfs:bsd/hfs"
 	"arch/arm64/include/pexpert:pexpert/pexpert/arm64"
 	"arch/arm64/configs/xnu:config"
 	"security/amfi:libkern/amfi"
@@ -128,13 +129,13 @@ tree_git() {
 		-c diff.algorithm=myers -c core.autocrlf=false -c user.name=hakios -c user.email=hakios@localhost "$@"
 }
 
-# The tree object of upstream + overlay + patches as the repository has them now, made in the tree DIR's
-# git, in an index of its own: nothing in its working tree is touched by this.
+# The tree object of apple (upstream + Apple's HFS: apple_base) + overlay + patches as the repository has them
+# now, made in the tree DIR's git, in an index of its own: nothing in its working tree is touched by this.
 assembled_tree() {
 	local D=$1 patch
 	export GIT_INDEX_FILE=$D/.git/hakios-assemble-index
 	rm -f "$GIT_INDEX_FILE"
-	tree_git "$D" read-tree upstream
+	tree_git "$D" read-tree apple
 	# (every file of the overlay at its place in the tree: hashed into the tree's objects, then put in the index)
 	local list=$D/.git/hakios-overlay-list
 	overlay_files > "$list"
@@ -157,4 +158,33 @@ assembled_tree() {
 
 is_assembled_tree() {
 	[ -d "$1/.git" ] && git -C "$1" rev-parse -q --verify refs/tags/upstream > /dev/null 2>&1
+}
+
+# apple_base DIR: tag `apple` in the tree DIR -- `upstream` and Apple's HFS release's files that kernel/hfs.list names,
+# as Apple has them (kernel/UPSTREAM: HFS_*), the base the overlay and the patches go over. Made once; a tree made
+# before HFS was part of the kernel gets it at its next update. HFS_FROM: another repository or URL to fetch from.
+apple_base() {
+	local D=$1 from=${HFS_FROM:-$HFS_URL} got src dst
+	if git -C "$D" rev-parse -q --verify refs/tags/apple > /dev/null &&
+		[ "$(git -C "$D" log -1 --format=%B apple)" = "$UPSTREAM_TAG + $HFS_TAG ($HFS_COMMIT)" ]; then
+		return 0
+	fi
+	log "fetching $HFS_TAG from $from"
+	git -C "$D" fetch -q --depth 1 "$from" "refs/tags/$HFS_TAG:refs/tags/$HFS_TAG" ||
+		die "cannot fetch refs/tags/$HFS_TAG from $from"
+	got=$(git -C "$D" rev-parse "refs/tags/$HFS_TAG^{commit}")
+	[ "$got" = "$HFS_COMMIT" ] || die "$from has $HFS_TAG at $got, not at $HFS_COMMIT (kernel/UPSTREAM): not using it"
+	export GIT_INDEX_FILE=$D/.git/hakios-apple-index
+	rm -f "$GIT_INDEX_FILE"
+	tree_git "$D" read-tree upstream
+	while read -r src dst; do
+		case "$src" in ''|'#'*) continue ;; esac
+		tree_git "$D" ls-tree "$got" -- "$src" | grep -q . || die "$HFS_TAG has no $src (kernel/hfs.list)"
+		tree_git "$D" ls-tree "$got" -- "$src" | awk -v d="$dst" -F '\t' '{ print $1 "\t" d }' |
+			tree_git "$D" update-index --add --index-info
+	done < "$KERNEL_DIR/hfs.list"
+	got=$(tree_git "$D" commit-tree "$(tree_git "$D" write-tree)" -p upstream -m "$UPSTREAM_TAG + $HFS_TAG ($HFS_COMMIT)")
+	rm -f "$GIT_INDEX_FILE"
+	unset GIT_INDEX_FILE
+	git -C "$D" tag -f apple "$got" > /dev/null
 }

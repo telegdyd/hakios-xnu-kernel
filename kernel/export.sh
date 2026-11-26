@@ -1,7 +1,7 @@
 #!/bin/bash
 # Take the kernel's sources out of an assembled tree, back into the repository: the files the tree has
-# and Apple's release has not become kernel/overlay (or the directory of the top that holds that part of
-# the tree: kernel/lib.sh's OVERLAY_PLACES), the changes to Apple's files become the patches
+# and Apple's (its release and HFS Plus: tag apple) has not become kernel/overlay (or the directory of the
+# top that holds that part of the tree: kernel/lib.sh's OVERLAY_PLACES), the changes to Apple's files become the patches
 # of kernel/patches/series. Run it after working in the tree; `git diff` in the repository then shows
 # what the work was.
 #
@@ -47,7 +47,7 @@ tree_excludes "$D"
 # The tree as it lies there (committed or not, new files included) in an index of its own.
 export GIT_INDEX_FILE=$D/.git/hakios-export-index
 rm -f "$GIT_INDEX_FILE"
-tree_git "$D" read-tree upstream
+tree_git "$D" read-tree apple
 tree_git "$D" add -A .
 
 mkdir -p "$work/overlay" "$work/patches"
@@ -72,7 +72,7 @@ while IFS=$'\t' read -r status file; do
 		fi
 		;;
 	esac
-done < <(tree_git "$D" diff --cached --no-renames --name-status upstream)
+done < <(tree_git "$D" diff --cached --no-renames --name-status apple)
 [ -z "$unclaimed" ] || die "changed files of Apple's that no line of kernel/patches/series claims:
 $unclaimed"
 
@@ -81,7 +81,7 @@ for patch in $(series_patches); do
 	mapfile -t files < <(printf '%s' "${files_of[$patch]}")
 	# (without the "index" lines: their hashes are abbreviated by how many objects a clone has)
 	tree_git "$D" diff --cached --no-color --no-ext-diff --no-textconv --no-renames -U3 \
-		--src-prefix=a/ --dst-prefix=b/ upstream -- "${files[@]}" |
+		--src-prefix=a/ --dst-prefix=b/ apple -- "${files[@]}" |
 		sed -E '/^index [0-9a-f]+\.\.[0-9a-f]+( [0-7]+)?$/d' > "$work/patches/$patch"
 done
 exported=$(tree_git "$D" write-tree)
@@ -113,7 +113,7 @@ done
 if [ "$out" = "$KERNEL_DIR" ]; then
 	# The tree is now what the repository says: noted in the tree, so that the next update knows the work
 	# was taken over (and touches nothing for it).
-	commit=$(tree_git "$D" commit-tree "$exported" -p upstream -m "$UPSTREAM_TAG + HakiOS (exported to the repository)")
+	commit=$(tree_git "$D" commit-tree "$exported" -p apple -m "$UPSTREAM_TAG + HakiOS (exported to the repository)")
 	git -C "$D" symbolic-ref HEAD refs/heads/hakios
 	git -C "$D" update-ref refs/heads/hakios "$commit"
 	git -C "$D" read-tree "$commit"

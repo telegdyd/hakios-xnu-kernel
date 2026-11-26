@@ -9,3 +9,10 @@ config FS_RAMFS
 	def_bool y
 	help
 	  The RAM file system /private/var lives in (fs/ramfs/).
+
+config FS_HFS
+	def_bool y
+	help
+	  Apple's HFS Plus, read/write and journaled, built in (bsd/hfs: Apple's release, kernel/UPSTREAM's HFS_*,
+	  with fs/hfs/ and kernel/patches/0008-hfs.patch): the data volume on the phone's flash, /private/var kept
+	  between boots (init's var_hfs=).
