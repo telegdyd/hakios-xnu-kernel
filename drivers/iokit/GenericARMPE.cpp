@@ -47,6 +47,7 @@ uint32_t hakios_adsp_wake_intid(void) __attribute__((weak));                    
 uint32_t hakios_usb_wake_intid(void) __attribute__((weak));                                             /* usb_net.c */
 extern "C" void hakios_charger_arrived(void);
 static IOService * gThePE;              /* (start(): the device requestUserActive() names) */
+static void alarmsRegister(IOService * pe);
 void loader_log_line(const char *line);
 
 /* osfmk/arm64/psci_smp.c and gic_v3_irq.c */
@@ -330,6 +331,8 @@ public:
 	virtual bool getMachineName(char * name, int maxLength) APPLE_KEXT_OVERRIDE;
 	virtual long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
 	virtual void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+	virtual void getUTCTimeOfDay(clock_sec_t * secs, clock_nsec_t * nsecs) APPLE_KEXT_OVERRIDE;
+	virtual void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
 	virtual void sleepKernel(void) APPLE_KEXT_OVERRIDE;
 };
 
@@ -364,6 +367,7 @@ GenericARMPE::start(IOService * provider)
 	 * never comes before it reads the calendar from here all the same.
 	 */
 	publishResource("IORTC", this);
+	alarmsRegister(this);
 
 	/*
 	 * super::start() published the /cpus children as nubs. Attach a CPU driver to each
@@ -528,8 +532,26 @@ GenericARMPE::start(IOService * provider)
  * one earlier than this kernel was built, the calendar starts at the build (build_date.h):
  * a time we know to have passed, where 1970 has every daemon catch up on fifty-six years once
  * the network says the date. Process 1 may raise it further from what the volumes last wrote.
+ *
+ * The count is the generic timer's own (ml_get_hwclock(), CNTVCT), which runs on while the system sleeps, not
+ * mach_absolute_time(), which the sleep holds still (psci_idle.c): clock_wakeup_calendar() counts the sleep from this
+ * clock, and on the absolute time every sleep was one of no length -- the calendar fell behind by each, and powerd sent
+ * an alarm already rung over and over (run-20261127-063920).
  */
 static long gBootEpoch;         /* the calendar time at which the system timer read zero */
+
+extern "C" uint64_t ml_get_hwclock(void);       /* osfmk/arm64: CNTVCT (machine_routines.h keeps it private) */
+
+/* The generic timer's count since it started, which a sleep does not stop. */
+static void
+hwUptime(clock_sec_t * secs, clock_nsec_t * nsecs)
+{
+	uint64_t ns = 0;
+
+	absolutetime_to_nanoseconds(ml_get_hwclock(), &ns);
+	*secs = (clock_sec_t) (ns / NSEC_PER_SEC);
+	*nsecs = (clock_nsec_t) (ns % NSEC_PER_SEC);
+}
 static bool gBootEpochKnown;
 
 static void
@@ -539,7 +561,7 @@ findBootEpoch(void)
 	long earliest;
 	const char * from = "epoch=";
 	clock_sec_t secs;
-	clock_usec_t usecs;
+	clock_nsec_t nsecs;
 
 	if (gBootEpochKnown) {
 		return;
@@ -556,7 +578,7 @@ findBootEpoch(void)
 		}
 		OSSafeReleaseNULL(chosen);
 	}
-	clock_get_system_microtime(&secs, &usecs);
+	hwUptime(&secs, &nsecs);
 	if (epoch < (uint64_t) earliest) {
 		if (epoch == 0) {
 			printf("GenericARMPE: no time given: the calendar starts at %ld, this kernel's build\n", earliest);
@@ -573,26 +595,236 @@ long
 GenericARMPE::getGMTTimeOfDay(void)
 {
 	clock_sec_t secs;
-	clock_usec_t usecs;
+	clock_nsec_t nsecs;
 
-	findBootEpoch();
-	if (gBootEpoch == 0) {
-		return 0;
-	}
-	clock_get_system_microtime(&secs, &usecs);
-	return gBootEpoch + (long) secs;
+	getUTCTimeOfDay(&secs, &nsecs);
+	return (long) secs;
 }
 
 void
 GenericARMPE::setGMTTimeOfDay(long secs)
 {
-	clock_sec_t uptime;
-	clock_usec_t usecs;
+	setUTCTimeOfDay((clock_sec_t) secs, 0);
+}
 
-	clock_get_system_microtime(&uptime, &usecs);
-	gBootEpoch = secs - (long) uptime;
+/* (what PEGetUTCTimeOfDay() asks, clock_wakeup_calendar() among others: to the nanosecond) */
+void
+GenericARMPE::getUTCTimeOfDay(clock_sec_t * secs, clock_nsec_t * nsecs)
+{
+	clock_sec_t up;
+	clock_nsec_t upns;
+
+	findBootEpoch();
+	if (gBootEpoch == 0) {
+		*secs = 0;
+		*nsecs = 0;
+		return;
+	}
+	hwUptime(&up, &upns);
+	*secs = (clock_sec_t) gBootEpoch + up;
+	*nsecs = upns;
+}
+
+void
+GenericARMPE::setUTCTimeOfDay(clock_sec_t secs, __unused clock_nsec_t nsecs)
+{
+	clock_sec_t up;
+	clock_nsec_t upns;
+
+	hwUptime(&up, &upns);
+	gBootEpoch = (long) secs - (long) up;
 	gBootEpochKnown = true;
 }
+
+/*
+ * Alarms (COMMON-PORT.md "System sleep", step 3): the wakes powerd schedules (IOPMSchedulePowerEvent, its own
+ * maintenance and sleep-service wakes) reach the root domain as PM settings, for a controller to set the RTC's alarm
+ * with (a Mac's AppleRTC). Here the sleep's own wait keeps the time: the boot processor's timer, which runs on in
+ * llcc-off, ends the wait at the earliest alarm still to come: a dark wake (sleepKernel()). powerd hands the next one
+ * over as the system goes to sleep. Each is a calendar date in UTC (IOPMCalendarStruct, year 0: none) but the relative
+ * one, seconds from the sleep's start. An alarm that has fired is forgotten; powerd sets the next.
+ */
+enum { kAlarmCalendar, kAlarmMaintenance, kAlarmSleepService, kAlarmKinds };
+static const char * const gAlarmKeys[kAlarmKinds] = {
+	kIOPMSettingAutoWakeCalendarKey, kIOPMSettingMaintenanceWakeCalendarKey, kIOPMSettingSleepServiceWakeCalendarKey
+};
+static IOLock * gAlarmLock;
+static uint64_t gAlarmUTC[kAlarmKinds];         /* seconds since 1970; 0: none */
+static uint32_t gAlarmRelative;                 /* WakeRelativeToSleep: seconds; 0: none */
+static uint32_t gAlarmSets, gAlarmFired[kAlarmKinds + 1];
+#define ALARM_RING 6
+static struct { uint64_t due, woke; } gAlarmRing[ALARM_RING];  /* the last that rang: when due, when it woke (UTC s) */
+static uint32_t gAlarmRingN;
+static OSObject * gAlarmHandle;
+
+/* (IOPMrootDomain's IOPMConvertCalendarToSeconds() is its own: days from 1970-01-01, the proleptic Gregorian way) */
+static uint64_t
+alarmSeconds(const IOPMCalendarStruct * c)
+{
+	int64_t y = (int64_t) c->year - (c->month <= 2);
+	int64_t era = (y >= 0 ? y : y - 399) / 400;
+	int64_t yoe = y - era * 400;
+	int64_t doy = (153 * (c->month + (c->month > 2 ? -3 : 9)) + 2) / 5 + c->day - 1;
+	int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	int64_t days = era * 146097 + doe - 719468;
+
+	return days < 0 ? 0 : (uint64_t) days * 86400 + c->hour * 3600u + c->minute * 60u + c->second;
+}
+
+static IOReturn
+alarmSetting(__unused OSObject * target, const OSSymbol * type, OSObject * value, __unused uintptr_t refcon)
+{
+	char line[160];
+
+	IOLockLock(gAlarmLock);
+	gAlarmSets++;
+	if (type->isEqualTo(kIOPMSettingDebugWakeRelativeKey)) {
+		OSNumber * n = OSDynamicCast(OSNumber, value);
+		gAlarmRelative = n != NULL ? n->unsigned32BitValue() : 0;
+		snprintf(line, sizeof(line), "sleep: alarm %s: %u s after the sleep's start\n", type->getCStringNoCopy(),
+		    gAlarmRelative);
+	} else {
+		for (int k = 0; k < kAlarmKinds; k++) {
+			if (!type->isEqualTo(gAlarmKeys[k])) {
+				continue;
+			}
+			OSData * d = OSDynamicCast(OSData, value);
+			const IOPMCalendarStruct * c = (d != NULL && d->getLength() == sizeof(IOPMCalendarStruct)) ?
+			    (const IOPMCalendarStruct *) d->getBytesNoCopy() : NULL;
+			gAlarmUTC[k] = (c != NULL && c->year != 0) ? alarmSeconds(c) : 0;
+			if (c != NULL && c->year != 0) {
+				snprintf(line, sizeof(line), "sleep: alarm %s: %04u-%02u-%02u %02u:%02u:%02u UTC\n",
+				    type->getCStringNoCopy(), c->year, c->month, c->day, c->hour, c->minute, c->second);
+			} else {
+				snprintf(line, sizeof(line), "sleep: alarm %s: none\n", type->getCStringNoCopy());
+			}
+		}
+	}
+	IOLockUnlock(gAlarmLock);
+	loader_log_line(line);
+	return kIOReturnSuccess;
+}
+
+static void
+alarmsRegister(IOService * pe)
+{
+	IOPMrootDomain * root = IOService::getPMRootDomain();
+	const OSSymbol * keys[kAlarmKinds + 2];
+	IOReturn r;
+
+	if (gAlarmLock == NULL) {
+		gAlarmLock = IOLockAlloc();
+	}
+	if (root == NULL) {
+		IOLog("GenericARMPE: no root domain yet: powerd's alarms do not reach the sleep\n");
+		return;
+	}
+	for (int k = 0; k < kAlarmKinds; k++) {
+		keys[k] = OSSymbol::withCString(gAlarmKeys[k]);
+	}
+	keys[kAlarmKinds] = OSSymbol::withCString(kIOPMSettingDebugWakeRelativeKey);
+	keys[kAlarmKinds + 1] = NULL;
+	r = root->registerPMSettingController(keys, alarmSetting, pe, 0, &gAlarmHandle);
+	for (int k = 0; k <= kAlarmKinds; k++) {
+		keys[k]->release();
+	}
+	IOLog("GenericARMPE: powerd's alarms end the sleep (the wait's timer): 0x%x\n", r);
+}
+
+/*
+ * The alarm that ends a sleep starting now: seconds to wait (0: none) and which (kAlarmKinds: the relative one).
+ * Calendar alarms already past are left out.
+ */
+static uint32_t
+alarmNext(int * kind)
+{
+	clock_sec_t now;
+	clock_usec_t us;
+	uint64_t best = 0;
+
+	*kind = -1;
+	if (gAlarmLock == NULL) {
+		return 0;
+	}
+	clock_get_calendar_microtime(&now, &us);
+	IOLockLock(gAlarmLock);
+	for (int k = 0; k < kAlarmKinds; k++) {
+		if (gAlarmUTC[k] > (uint64_t) now && (best == 0 || gAlarmUTC[k] - now < best)) {
+			best = gAlarmUTC[k] - now;
+			*kind = k;
+		}
+	}
+	if (gAlarmRelative != 0 && (best == 0 || gAlarmRelative < best)) {
+		best = gAlarmRelative;
+		*kind = kAlarmKinds;
+	}
+	IOLockUnlock(gAlarmLock);
+	return best > 3600 * 24 * 365 ? 3600 * 24 * 365 : (uint32_t) best;
+}
+
+/* An alarm that ended the sleep: forgotten (one shot), counted. */
+static void
+alarmFired(int kind)
+{
+	clock_sec_t up, now;
+	clock_nsec_t upns;
+
+	/*
+	 * (the platform's clock, the generic timer's: the calendar takes the sleep in only later, at the root domain's
+	 * clock_wakeup_calendar(), and read here it was a whole sleep behind -- run-20261127-065451: "late -143 s")
+	 */
+	hwUptime(&up, &upns);
+	now = (clock_sec_t) gBootEpoch + up;
+	IOLockLock(gAlarmLock);
+	if (kind >= 0 && kind < kAlarmKinds) {
+		gAlarmRing[gAlarmRingN % ALARM_RING].due = gAlarmUTC[kind];
+		gAlarmRing[gAlarmRingN % ALARM_RING].woke = now;
+		gAlarmRingN++;
+	}
+	if (kind == kAlarmKinds) {
+		gAlarmRelative = 0;
+	} else if (kind >= 0) {
+		gAlarmUTC[kind] = 0;
+	}
+	if (kind >= 0) {
+		gAlarmFired[kind]++;
+	}
+	IOLockUnlock(gAlarmLock);
+}
+
+static int
+alarmsSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
+{
+	char text[700];
+	clock_sec_t now;
+	clock_usec_t us;
+	size_t at;
+
+	if (gAlarmLock == NULL) {
+		return SYSCTL_OUT(req, "not started", sizeof("not started"));
+	}
+	clock_get_calendar_microtime(&now, &us);
+	IOLockLock(gAlarmLock);
+	at = (size_t) snprintf(text, sizeof(text), "now %lu; registered %s; settings %u; in s from now (0 none): calendar %lld, maintenance %lld, "
+	    "sleep service %lld; relative %u s; fired: calendar %u, maintenance %u, sleep service %u, relative %u",
+	    (unsigned long) now, gAlarmHandle != NULL ? "yes" : "NO", gAlarmSets,
+	    gAlarmUTC[0] ? (long long) gAlarmUTC[0] - (long long) now : 0LL,
+	    gAlarmUTC[1] ? (long long) gAlarmUTC[1] - (long long) now : 0LL,
+	    gAlarmUTC[2] ? (long long) gAlarmUTC[2] - (long long) now : 0LL, gAlarmRelative,
+	    gAlarmFired[0], gAlarmFired[1], gAlarmFired[2], gAlarmFired[3]);
+	/* (the last that rang, oldest first: due@woke, in UTC seconds) */
+	uint32_t first = gAlarmRingN > ALARM_RING ? gAlarmRingN - ALARM_RING : 0;
+	for (uint32_t i = first; i < gAlarmRingN && at < sizeof(text); i++) {
+		at += (size_t) snprintf(text + at, sizeof(text) - at, "%s%llu@%llu", i == first ? "; rang " : " ",
+		    (unsigned long long) gAlarmRing[i % ALARM_RING].due,
+		    (unsigned long long) gAlarmRing[i % ALARM_RING].woke);
+	}
+	IOLockUnlock(gAlarmLock);
+	return SYSCTL_OUT(req, text, strlen(text) + 1);
+}
+
+SYSCTL_PROC(_kern_hakios, OID_AUTO, sleep_alarms, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
+    alarmsSysctl, "A", "powerd's scheduled wakes as the sleep sees them");
 
 /*
  * System sleep (COMMON-PORT.md "System sleep", step 1): what the root domain calls once every driver is asleep, in place
@@ -621,6 +853,7 @@ static struct {
 	int gpu;                        /* the GPU at the last sleep's start: 1 in slumber, 0 awake, -1 none */
 	uint32_t dark;                  /* wakes left dark (not the key's nor the test's: the display stays off) */
 	uint32_t by_dsp;                /* of those, by the audio DSP's doorbells (its battery manager: a charger plugged in) */
+	uint32_t by_alarm;              /* wakes at an alarm's time (powerd's scheduled wakes) */
 	uint32_t by_usb;                /* of those, by USB's event interrupt (the host's traffic, on the cable) */
 	uint32_t charger_lit;           /* a charger plugged in that lit the display (hakios_charger_arrived()) */
 	char set_line[420];             /* what the llcc-off asks found while it slept (soc_sleep.c) */
@@ -686,13 +919,13 @@ sleepsSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused i
 	}
 	if (at < sizeof(text)) {
 		(void) snprintf(text + at, sizeof(text) - at, "; Wi-Fi at the last sleep's start: %s (dozed for %u sleeps); "
-		    "GPU %s; UFS %s; %s; test sleeps asked %u; dark wakes %u (by the DSP %u, by USB %u); a charger lit it %u; LPIs %s", gSleeps.wifi_doze == 2 ? "dozing" : gSleeps.wifi_doze == -2 ? "none" :
+		    "GPU %s; UFS %s; %s; test sleeps asked %u; dark wakes %u (by the DSP %u, by USB %u); alarms %u; a charger lit it %u; LPIs %s", gSleeps.wifi_doze == 2 ? "dozing" : gSleeps.wifi_doze == -2 ? "none" :
 		    gSleeps.wifi_doze == -1 ? "no doze thread" : "awake", gSleeps.wifi_dozed,
 		    gSleeps.gpu == 1 ? "in slumber" : gSleeps.gpu == 0 ? "AWAKE" : "none",
 		    gSleeps.ufs == 1 ? "off" : gSleeps.ufs == -1 ? "none" : gSleeps.ufs_why == 1 ? "ON (busy)" :
 		    gSleeps.ufs_why == 2 ? "ON (not in Hibern8)" : "ON (power-down off)",
 		    gSleeps.set_line[0] ? gSleeps.set_line : "sleep set: not read", gSleeps.test_asks, gSleeps.dark,
-		    gSleeps.by_dsp, gSleeps.by_usb, gSleeps.charger_lit, gSleeps.lpis_kept ? "live" : "masked");
+		    gSleeps.by_dsp, gSleeps.by_usb, gSleeps.by_alarm, gSleeps.charger_lit, gSleeps.lpis_kept ? "live" : "masked");
 	}
 	return SYSCTL_OUT(req, text, strlen(text) + 1);
 }
@@ -712,8 +945,12 @@ GenericARMPE::sleepKernel(void)
 	uint32_t n0[3] = { 0 }, n1[3] = { 0 };
 	uint64_t ms0[3] = { 0 }, ms1[3] = { 0 };
 	bool known;
+	int alarm = -1;                 /* the alarm whose time ends this sleep (alarmNext()); -1: none */
 
 	gSleepTestSeconds = 0;
+	if (seconds == 0) {
+		seconds = alarmNext(&alarm);
+	}
 	/*
 	 * Step 2: the radio dozes first (threads still run), so that PCIe gives up its bus vote and CX can collapse while
 	 * the system sleeps; frames sent meanwhile wait for the wake.
@@ -731,8 +968,9 @@ GenericARMPE::sleepKernel(void)
 	if (hakios_soc_sleep_arc_delta != NULL) {
 		(void) hakios_soc_sleep_arc_delta(true, NULL, 0);
 	}
-	snprintf(line, sizeof(line), "sleep: the system sleeps%s; Wi-Fi %s\n",
-	    seconds != 0 ? " (a test: its timer wakes it)" : "", gSleeps.wifi_doze == 2 ? "dozing" : "not dozing");
+	snprintf(line, sizeof(line), "sleep: the system sleeps%s%s; Wi-Fi %s\n",
+	    alarm >= 0 ? " until an alarm: " : seconds != 0 ? " (a test: its timer wakes it)" : "",
+	    alarm < 0 ? "" : alarm == kAlarmKinds ? kIOPMSettingDebugWakeRelativeKey : gAlarmKeys[alarm], gSleeps.wifi_doze == 2 ? "dozing" : "not dozing");
 	loader_log_line(line);
 	IOPlatformActionsPreSleep();
 	if (root != NULL) {
@@ -784,7 +1022,21 @@ GenericARMPE::sleepKernel(void)
 	if (root == NULL) {
 		return;
 	}
-	if (by == 27 || by == 513) {
+	if (by == 27 && alarm >= 0) {
+		/*
+		 * An alarm's time: a dark wake, whichever key brought it. powerd sends every scheduled wake as
+		 * WakeByCalendarDate, the push service's keepalive and the activity scheduler's alike (run-20261127-063920:
+		 * six in seven minutes, UserVisible 0); what has something to show (an alarm clock's alert) lights the display
+		 * itself, as on an iPhone.
+		 */
+		alarmFired(alarm);
+		gSleeps.by_alarm++;
+		gSleeps.dark++;
+		snprintf(line, sizeof(line), "sleep: the alarm %s ended it (a dark wake)\n",
+		    alarm == kAlarmKinds ? kIOPMSettingDebugWakeRelativeKey : gAlarmKeys[alarm]);
+		loader_log_line(line);
+		root->claimSystemWakeEvent(this, kIOPMWakeEventSource, "hakios alarm");
+	} else if (by == 27 || by == 513) {
 		/*
 		 * The power key (the PMIC arbiter's line), and the test's timer standing in for it: the user's wake. Without
 		 * the claim the root domain took a dark wake, the display stayed off and nothing drew (run-20261126-040608:

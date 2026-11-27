@@ -6,6 +6,9 @@
  *
  *   pmdiag        assertions
  *   pmdiag -k     assertions, then the kernel's buffer
+ *   pmdiag -w S   a wake scheduled through powerd S seconds from now (IOPMSchedulePowerEvent, "wake": what an alarm
+ *                 asks for; powerd hands the root domain WakeByCalendarDate), then the list below
+ *   pmdiag -l     the power events powerd has scheduled (IOPMCopyScheduledPowerEvents)
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
@@ -17,6 +20,8 @@ typedef int IOReturn;
 extern IOReturn IOPMCopyAssertionsByProcess(CFDictionaryRef *assertionsByPID);
 extern IOReturn IOPMCopyAssertionsStatus(CFDictionaryRef *assertionsStatus);
 extern int proc_kmsgbuf(void *buffer, uint32_t buffersize);
+extern IOReturn IOPMSchedulePowerEvent(CFDateRef time_to_wake, CFStringRef my_id, CFStringRef type);
+extern CFArrayRef IOPMCopyScheduledPowerEvents(void);
 
 static void
 show(const char *title, CFTypeRef value)
@@ -45,6 +50,21 @@ main(int argc, char **argv)
 	CFDictionaryRef by = NULL, status = NULL;
 	IOReturn r;
 
+	if (argc > 2 && strcmp(argv[1], "-w") == 0) {
+		double secs = atof(argv[2]);
+		CFDateRef when = CFDateCreate(NULL, CFAbsoluteTimeGetCurrent() + secs);
+
+		r = IOPMSchedulePowerEvent(when, CFSTR("com.hakios.pmdiag"), CFSTR("wake"));
+		printf("IOPMSchedulePowerEvent(now + %.0f s, wake): 0x%x\n", secs, r);
+		CFRelease(when);
+	}
+	if (argc > 1 && (strcmp(argv[1], "-l") == 0 || strcmp(argv[1], "-w") == 0)) {
+		CFArrayRef events = IOPMCopyScheduledPowerEvents();
+
+		show("scheduled power events", events);
+		if (events != NULL) CFRelease(events);
+		return 0;
+	}
 	r = IOPMCopyAssertionsByProcess(&by);
 	printf("IOPMCopyAssertionsByProcess: 0x%x\n", r);
 	show("assertions by process", by);
