@@ -18,7 +18,7 @@ the two the same. What each key means is in `arch/arm64/boot/dts/_template/soc.d
 | `adsp` | `rpmh { }`; `ipc { }` | `adsp { }`: `firmware`, `memory`, `memory-size` | `adsp=1` |
 | `touch-goodix` | `pins { }`; `clocks { }`; `rpmh { }` | `touch { }`: `serial-engine`, `clocks`, `vote-register`, `votes`, `bus-pins`, `interrupt`, `reset`, `io-supply`, `analog-enable`, `vendor-pins`, `coordinates` | `touchscreen=1` |
 | `touch-ft3658u` | `pins { }`; `clocks { }`; `rpmh { }` | `touch { }`: `serial-engine`, `clocks`, `vote-register`, `votes`, `bus-pins`, `interrupt`, `reset`, `io-supply`, `analog-supply` | `touchscreen=1` |
-| `speaker-aw88261` | `pins { }`; `clocks { }`; `rpmh { }`; `smmu { }`: `audio-stream` | `speaker { }`: `sda`, `scl`, `addresses`, `interrupts`, `sound-pins`, `sound-function` | `speaker_probe=N looks; sound=N with adsp=1` |
+| `speaker-aw88261` | `pins { }`; `clocks { }`; `rpmh { }`; `smmu { }`: `audio-stream` | `speaker { }`: `sda`, `scl`, `addresses`, `sound-pins`, `sound-function`, `interrupts` | `speaker_probe=N looks; sound=N with adsp=1` |
 | `haptic-aw86927` | `pins { }` | `haptic { }`: `sda`, `scl`, `reset`, `interrupt`, `f0-calibration` | `haptic=N` |
 | `torch-pm8350c` | `spmi { }`: `channels` | `torch { }`: `flash`, `alarm` | `torch=1 looks; torch=3 is the light for Darwin` |
 | `camera-sm7325` | `spmi { }`: `channels`; `pins { }`; `clocks { }`; `rpmh { }`; `smmu { }`: `camera-stream`; `camera { }` | `camera { }`: `pmic-pins`, `pmic-reset`, `sensors` | `cam=N` |
@@ -43,6 +43,7 @@ the two the same. What each key means is in `arch/arm64/boot/dts/_template/soc.d
 | `cpu-idle` | `cpu-idle { }` | nothing | `on by itself; cpu_idle=0 keeps idle cores in WFI, screen_off_cores=0 every core up with the display off` |
 | `soc-sleep` | `rpmh { }`; `clocks { }` | nothing | `cpufreq=1 ddr=2, on by itself; rpmh_sleep=0 disables sleep sets, rpmh_cx_collapse=0 keeps CX up` |
 | `wifi-qca6490` | `rpmh { }`; `pins { }`; `smmu { }`; `clocks { }`; `pcie { }` | `wifi { }`: `radio-model` | `wifi=1; wifi_join=1 with wifi_ssid and wifi_psk joins at the start` |
+| `speaker-tfa9874` | `pins { }`; `smmu { }`: `audio-stream` | `speaker { }`: `sda`, `scl`, `addresses`, `sound-pins`, `sound-function`, `resets` | `speaker_probe=N looks; sound=N with adsp=1` |
 
 The brightness (`backlight { }`), the thermal floors (`thermal { }`), the PMIC's clock (`rtc { }`, which
 needs `spmi { }` in the SoC file) and the partition that may be written (`storage { }`) are not

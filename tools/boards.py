@@ -168,8 +168,8 @@ BOARD_SCHEMA = {
                   'uart_pins': ([int], True), 'uart_function': (int, True), 'enable_ppid': (int, True),
                   'sw_ctrl': (int, True), 'supplies': ([str], True), 'supply_mv': ([int], True), 'rf_clock': (str, True),
                   'firmware': (str, False), 'rampatch': (str, False), 'nvm': (str, False)},
-    'speaker': {'sda': (int, True), 'scl': (int, True), 'addresses': ([int], True), 'interrupts': ([int], True),
-                'sound_pins': ([int], True), 'sound_function': (int, True), 'tdm': (int, False)},
+    'speaker': {'sda': (int, True), 'scl': (int, True), 'addresses': ([int], True), 'interrupts': ([int], False),
+                'resets': ([int], False), 'sound_pins': ([int], True), 'sound_function': (int, True), 'tdm': (int, False)},
     'buttons': {'pon': (int, True), 'volume_up': (int, True), 'pon_name': (str, False), 'volume_up_name': (str, False),
                 'resin_volume_up': (bool, False)},
     'rtc': {'peripheral': (int, True), 'name': (str, False)},
@@ -216,11 +216,13 @@ FEATURE_NEEDS = {'bluetooth-wcn-uart': ('pins', 'clocks', 'rpmh', 'spmi'), 'virt
                  'touch-goodix': ('pins', 'clocks', 'rpmh'), 'touch-ft3658u': ('pins', 'clocks', 'rpmh'),
                  'touch-ft5x06': ('pins',),      # (and rpmh, if its touch_i2c names a supply: feature_needs())
                  'touch-s3908': ('pins',),
-                 'speaker-aw88261': ('pins', 'clocks', 'rpmh', 'smmu'), 'haptic-aw86927': ('pins',),
+                 'speaker-aw88261': ('pins', 'clocks', 'rpmh', 'smmu'),
+                 'speaker-tfa9874': ('pins', 'smmu'),
+                 'haptic-aw86927': ('pins',),
                  'imu-lsm6dso': ('pins',), 'imu-bmi160': ('pins',),
                  'adsp': ('rpmh', 'ipc'), 'wifi-wcn6750': ('rpmh', 'pins', 'spmi', 'ipc', 'smmu'), 'wifi-qca6490': ('rpmh', 'pins', 'smmu', 'clocks', 'pcie'), 'mic-wcd938x': ('pins', 'lpass')}
 # ... and the stream of the SMMU that a part's DMA comes in on: [stream ID, mask], from the device tree's iommus
-STREAM_OF = {'speaker-aw88261': 'audio_stream', 'wifi-wcn6750': 'wifi_stream', 'camera-sm7325': 'camera_stream'}
+STREAM_OF = {'speaker-aw88261': 'audio_stream', 'speaker-tfa9874': 'audio_stream', 'wifi-wcn6750': 'wifi_stream', 'camera-sm7325': 'camera_stream'}
 WRITES_TO_PMIC = ('bluetooth-wcn-uart', 'torch-pm8350c', 'camera-sm7325')    # ... these through the arbiter's channels as well
 # The boot arguments that start a feature's driver, as a porter is to try them: the level that only looks
 # first where there is one. (Documentation/boot-args.md has every argument; a test holds these names to it.)
@@ -248,6 +250,7 @@ FEATURE_BOOTARGS = {
     'touch-ft5x06': 'touchscreen=-1 looks; touchscreen=1',
     'touch-s3908': 'touchscreen=-1 looks; touchscreen=1',
     'speaker-aw88261': 'speaker_probe=N looks; sound=N with adsp=1',
+    'speaker-tfa9874': 'speaker_probe=N looks; sound=N with adsp=1',
     'haptic-aw86927': 'haptic=N',
     'imu-lsm6dso': 'sensors=1 looks; sensors=2 follows the orientation',
     'imu-bmi160': 'sensors=1 looks; sensors=2 follows the orientation',
@@ -262,11 +265,13 @@ FEATURE_BOOTARGS = {
 PART_DRIVERS = ('bluetooth', 'touch', 'speaker', 'haptic', 'imu', 'torch', 'camera', 'wifi', 'mic', 'modem')
 # ... and of the board's own file
 FEATURE_NEEDS_OF_BOARD = {'bluetooth-wcn-uart': 'bluetooth', 'display-flip': 'display', 'display-power': 'display', 'gpu-a660': 'gpu', 'gpu-a730': 'gpu', 'gpu-dcvs': 'gpu', 'gpu-ifpc': 'gpu', 'gpu-slumber': 'gpu', 'adsp': 'adsp', 'buttons-pmic': 'buttons', 'torch-pm8350c': 'torch',
-                          'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
+                          'haptic-aw86927': 'haptic', 'speaker-aw88261': 'speaker', 'speaker-tfa9874': 'speaker', 'mic-wcd938x': 'mic', 'touch-goodix': 'touch',
                           'touch-ft3658u': 'touch', 'touch-ft5x06': 'touch_i2c', 'touch-s3908': 'touch_i2c', 'camera-sm7325': 'camera', 'imu-lsm6dso': 'imu',
                           'imu-bmi160': 'imu'}
-# ... and what a controller's driver uses of [touch] beyond what every one needs
+# ... and what a controller's driver uses of [touch] or [speaker] beyond what every one needs
 TOUCH_NEEDS = {'touch-goodix': ('analog_enable', 'vendor_pins', 'coordinates'), 'touch-ft3658u': ('analog_supply',)}
+SPEAKER_CHIPS = ('speaker-aw88261', 'speaker-tfa9874')
+SPEAKER_NEEDS = {'speaker-aw88261': ('interrupts',), 'speaker-tfa9874': ('resets',)}
 # the touch controllers' drivers, each a feature: a board has one controller (board/drivers.c starts one)
 TOUCH_CHIPS = ('touch-goodix', 'touch-ft3658u', 'touch-ft5x06', 'touch-s3908')
 # what a chip of the FT5x06 family can say (board/ft5x06_report.h): so many fingers, coordinates of 12 bits; and the
@@ -369,7 +374,7 @@ def touch_i2c_extras(wired):
 
 def feature_bits():
     """The features the kernel knows, HAKIOS_HAS_* of board/board.h: [(bit, name as board.dts spells it)]."""
-    found = re.findall(r'^\s*HAKIOS_HAS_([A-Z0-9_]+)\s*=\s*1u\s*<<\s*(\d+)', BOARD_HEADER.read_text(), re.M)
+    found = re.findall(r'^\s*HAKIOS_HAS_([A-Z0-9_]+)\s*=\s*1u(?:ll)?\s*<<\s*(\d+)', BOARD_HEADER.read_text(), re.M)
     return sorted((int(bit), name.lower().replace('_', '-')) for name, bit in found)
 
 
@@ -401,6 +406,9 @@ def feature_needs(feature, board, soc):
     touch = board.get('touch')
     if isinstance(touch, dict) and any(key not in touch for key in TOUCH_NEEDS.get(feature, ())):
         needs.append(' and '.join(key for key in TOUCH_NEEDS[feature] if key not in touch) + ' in [touch] of the board file')
+    amps = board.get('speaker')
+    if isinstance(amps, dict) and any(key not in amps for key in SPEAKER_NEEDS.get(feature, ())):
+        needs.append(' and '.join(key for key in SPEAKER_NEEDS[feature] if key not in amps) + ' in [speaker] of the board file')
     wired = board.get('touch_i2c')
     if feature == 'touch-ft5x06' and isinstance(wired, dict) and ('io_supply' in wired or 'analog_supply' in wired) and \
             'rpmh' not in soc:
@@ -468,7 +476,8 @@ def feature_requirements(feature):
     of_board = {}
     section = FEATURE_NEEDS_OF_BOARD.get(feature)
     if section:
-        of_board[section] = [key for key, (_, needed) in BOARD_SCHEMA[section].items() if needed] + list(TOUCH_NEEDS.get(feature, ()))
+        of_board[section] = [key for key, (_, needed) in BOARD_SCHEMA[section].items() if needed] + \
+            list(TOUCH_NEEDS.get(feature, ())) + list(SPEAKER_NEEDS.get(feature, ()))
     if feature == 'wifi-wcn6750':
         of_board['wifi'] = ['radio_model', 'dsp_memory', 'dsp_memory_size']
     if feature == 'wifi-qca6490':
@@ -874,10 +883,18 @@ def load(problems=None):
             touch_i2c_bus_problems(f'{rel} [touch_i2c]', wired, problems)
         amps = data.get('speaker')
         if amps is not None:
-            wires = [amps['sda'], amps['scl']] + list(amps['interrupts']) + list(amps['sound_pins'])
-            if len(amps['interrupts']) != 2 or len(amps['sound_pins']) != 4 or any(not 0 <= pin <= 255 for pin in wires) or \
-                    len(set(wires)) != len(wires):
-                problems.add(f'{rel} [speaker]', 'sda, scl, the two interrupts and the four sound_pins are eight different pins of the SoC, 0 to 255')
+            interrupts = amps.get('interrupts', [])
+            resets = amps.get('resets', [])
+            if 'interrupts' in amps and len(interrupts) != 2:
+                problems.add(f'{rel} [speaker]', 'interrupts are the two amplifiers\' interrupt pins, 0 to 255')
+            if 'resets' in amps and len(resets) != 2:
+                problems.add(f'{rel} [speaker]', 'resets are the two amplifiers\' reset pins, 0 to 255')
+            wires = [amps['sda'], amps['scl']] + list(interrupts) + list(resets) + list(amps['sound_pins'])
+            if len(amps['sound_pins']) != 4 or any(not 0 <= pin <= 255 for pin in wires) or len(set(wires)) != len(wires):
+                if 'interrupts' in amps and 'resets' not in amps:
+                    problems.add(f'{rel} [speaker]', 'sda, scl, the two interrupts and the four sound_pins are eight different pins of the SoC, 0 to 255')
+                else:
+                    problems.add(f'{rel} [speaker]', 'sda, scl, resets/interrupts and the four sound_pins are different pins of the SoC, 0 to 255')
             if not 0 <= amps.get('tdm', 0) <= 4:
                 problems.add(f'{rel} [speaker]', 'tdm is the TDM interface: 0 the primary, 1 the secondary, 2 the tertiary, 3 the quaternary, '
                              '4 the quinary')
@@ -964,6 +981,9 @@ def load(problems=None):
         if sum(chip in data.get('features', []) for chip in TOUCH_CHIPS) > 1:
             problems.add(rel, 'features "' + '", "'.join(chip for chip in TOUCH_CHIPS if chip in data['features']) +
                          '" are drivers of different touch controllers: a board has one, list the one it has')
+        if sum(chip in data.get('features', []) for chip in SPEAKER_CHIPS) > 1:
+            problems.add(rel, 'features "' + '", "'.join(chip for chip in SPEAKER_CHIPS if chip in data['features']) +
+                         '" are drivers of different speaker amplifiers: a board has one, list the one it has')
         if 'gpu-ifpc' in data.get('features', []) and 'gpu-a730' not in data['features']:
             problems.add(rel, "feature \"gpu-ifpc\" is the A730's collapse between frames: only beside \"gpu-a730\"")
         if 'gpu-slumber' in data.get('features', []) and 'gpu-a730' not in data['features']:
@@ -1333,11 +1353,14 @@ def table_text(socs, boards):
             ]
         amps = board.get('speaker')
         if amps:
+            interrupts = amps.get("interrupts", [0, 0])
+            resets = (f', .reset = {{ {amps["resets"][0]}, {amps["resets"][1]} }}, .has_resets = 1'
+                      if 'resets' in amps else '')
             out.append(f'\t\t.speaker = {{ .sda = {amps["sda"]}, .scl = {amps["scl"]}, '
                        f'.address = {{ {amps["addresses"][0]:#04x}, {amps["addresses"][1]:#04x} }}, '
-                       f'.interrupt = {{ {amps["interrupts"][0]}, {amps["interrupts"][1]} }},\n\t\t\t'
+                       f'.interrupt = {{ {interrupts[0]}, {interrupts[1]} }},\n\t\t\t'
                        f'.sound_pin = {{ {", ".join(str(pin) for pin in amps["sound_pins"])} }}, '
-                       f'.sound_function = {amps["sound_function"]}, .tdm = {amps.get("tdm", 0)} }},')
+                       f'.sound_function = {amps["sound_function"]}, .tdm = {amps.get("tdm", 0)}{resets} }},')
         torch = board.get('torch')
         if torch:
             out.append(f'\t\t.torch = {{ .flash = {torch["flash"]:#05x}, .temp_alarm = {torch["alarm"]:#05x} }},')

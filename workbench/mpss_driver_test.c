@@ -92,7 +92,7 @@ void hakios_cell_session(bool up __unused, uint32_t ip __unused, uint32_t mask _
     uint32_t dns1 __unused, uint32_t dns2 __unused, uint32_t mtu __unused) { }
 bool hakios_ipa_data_setup(void) { return false; }
 void hakios_ipa_data_stop(bool leaving __unused) { }
-bool hakios_board_has(uint32_t feature __unused) { return true; }
+bool hakios_board_has(uint64_t feature __unused) { return true; }
 void loader_return(void) { }
 
 static char *

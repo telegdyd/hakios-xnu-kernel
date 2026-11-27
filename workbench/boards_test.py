@@ -866,6 +866,17 @@ class Generate(Sandbox):
         self.assertIn('.speaker = { .sda = 12, .scl = 13, .address = { 0x35, 0x34 }, .interrupt = { 102, 45 },\n\t\t\t'
                       '.sound_pin = { 97, 100, 98, 99 }, .sound_function = 1, .tdm = 0 },',
                       boards.table_text(*boards.load()))
+        # TFA9874 amplifiers need resets instead of interrupts, and cannot coexist with AW88261
+        self.board('"cpufreq-epss", "speaker-aw88261"', '"cpufreq-epss", "speaker-tfa9874"')
+        self.assertIn('resets in speaker { } of the board file', self.problems())
+        plain_tfa = plain.replace('"speaker-aw88261"', '"speaker-tfa9874"')
+        path.write_text(plain_tfa + '/ {\n\tspeaker {\n\t\tsda = <48>;\n\t\tscl = <49>;\n\t\taddresses = <0x34 0x35>;\n\t\tresets = <50 51>;\n\t\tsound-pins = <121 123 122 124>;\n\t\tsound-function = <1>;\n\t\ttdm = <2>;\n\t};\n};\n')
+        self.assertEqual(self.problems(), '')
+        table = boards.table_text(*boards.load())
+        self.assertIn('HAKIOS_HAS_SPEAKER_TFA9874', table)
+        self.assertIn('.reset = { 50, 51 }, .has_resets = 1', table)
+        self.board('"cpufreq-epss", "speaker-tfa9874"', '"cpufreq-epss", "speaker-aw88261", "speaker-tfa9874"')
+        self.assertIn('drivers of different speaker amplifiers', self.problems())
 
     def test_the_cameras_are_described_one_table_a_sensor(self):
         path = self.dir / 'devices/phone/board.dts'
@@ -2172,8 +2183,9 @@ class Repository(unittest.TestCase):
                     kept = part.pop(section)
                     self.assertNotEqual(boards.feature_needs(feature, board, soc), [], f'{feature} without [{section}]')
                     part[section] = kept
-                    for key in keys if part is soc or section in ('touch', 'wifi') else ():
-                        if section == 'wifi' and key == 'radio_model' or section == 'touch' and key not in boards.TOUCH_NEEDS[feature]:
+                    for key in keys if part is soc or section in ('touch', 'speaker', 'wifi') else ():
+                        if section == 'wifi' and key == 'radio_model' or section == 'touch' and key not in boards.TOUCH_NEEDS[feature] or \
+                                section == 'speaker' and key not in boards.SPEAKER_NEEDS[feature]:
                             continue        # (the schema's, for every board with the section)
                         value = part[section].pop(key)
                         self.assertNotEqual(boards.feature_needs(feature, board, soc), [], f'{feature} without {key} in [{section}]')

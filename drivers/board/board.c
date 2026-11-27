@@ -62,7 +62,7 @@ hakios_board(void)
 }
 
 bool
-hakios_board_has(uint32_t feature)
+hakios_board_has(uint64_t feature)
 {
 	const struct hakios_board *board = hakios_board();
 
@@ -149,7 +149,7 @@ features_text(const struct hakios_board *board, char *text, size_t size)
 
 	text[0] = 0;
 	for (unsigned bit = 0; board != NULL && bit < hakios_feature_count; bit++) {
-		if (board->features & (1u << bit)) {
+		if (board->features & (1ull << bit)) {
 			at += (size_t)snprintf(text + at, size - at, "%s%s", at ? " " : "", hakios_feature_names[bit]);
 			if (at >= size) {
 				break;

@@ -118,7 +118,7 @@ side to see it by.
 | `bsd/dev/board/audio.c` | `/dev/hakios-audio`: what Darwin plays, to whichever sink is there. | — | any |
 | `bsd/dev/board/sound.c`, `board/guard.c` | What the DSP is told so the AW88261 speakers play; speaker protection. | `speaker-aw88261` / `sound=N` with `adsp=1` | part; the sound's pins, its TDM interface and the DSP's stream are data (`speaker { }`, `smmu { }`) |
 | `bsd/dev/board/mic.c` | The microphones on a WCD938x codec, through the DSP. | `mic-wcd938x` / `mic=N` with `adsp=1` | part; the codec's reset pin is data (`mic { }`), and so are the LPASS blocks and the SoundWire pins (`lpass { }`) |
-| `bsd/dev/board/speaker.c` | Two Awinic AW88261 amplifiers on I2C. | `speaker-aw88261` / `speaker_probe=` | part; the bus's pins, each amplifier's address and interrupt and the sound's four pins are data (`speaker { }`) |
+| `bsd/dev/board/speaker.c`, `board/tfa.c` | Two Awinic AW88261 or NXP TFA9874 amplifiers on I2C. | `speaker-aw88261` / `speaker-tfa9874` / `speaker_probe=` | part; the bus's pins, each amplifier's address and interrupt or reset, and the sound's four pins are data (`speaker { }`) |
 | `bsd/dev/board/haptic.c` | An Awinic AW86927 vibration motor driver. | `haptic-aw86927` / `haptic=` | part; which pins it is on and the motor's calibration are data (`haptic { }`) |
 | `bsd/dev/board/torch.c` | The flash LED module of a PM8350C. | `torch-pm8350c` / `torch=` | part; the arbiter and where the module is on the PMICs' bus are data (`spmi { }`, `torch { }`) |
 | `bsd/dev/board/camera.c` | cameras on an SM7325 as the board's `camera { }` wires them: sensors (four chips known), CSI, ISP. | `camera-sm7325` / `cam=` | part; each sensor's wiring and supplies, and which is Darwin's back and front camera, are data (`camera { }`), as are where the camera's clocks are in its clock controller and how its PLLs are configured (the SoC file's `camera { }`) |
@@ -214,6 +214,7 @@ says what each test covers and what it leaves out.
 | `board/haptic.c` | `haptic_driver_test.c` | the SoC's pins with an I2C chip on them |
 | `board/imu.c` | `imu_driver_test.c` | the SoC's pins with an LSM6DSO on them, or a BMI160 |
 | `board/speaker.c` | `speaker_driver_test.c` | the pins with two amplifiers, a configuration file |
+| `board/tfa.c` | `tfa_driver_test.c` | the pins with two TFA9874 amplifiers, a PM3 container |
 | `board/guard.c` | `guard_test.c` | (none: tones in, samples out) |
 | `board/ufs.c` | `ufs_driver_test.c` | the loader on core 0: its page and buffer over a made-up disk, noting every write and whether the port may make it |
 | `board/ufshc.c` (its whitelist) | `ufs_whitelist_test.c` | (none: commands made up and never sent) |

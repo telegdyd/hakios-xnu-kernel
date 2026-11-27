@@ -90,7 +90,7 @@ every_feature_said(void)
 	    b->imu.sign[1] == 1 && b->imu.sign[2] == -1, "the motion sensor's board data");
 	hakios_board_init();
 	for (unsigned bit = 0; b != NULL && bit < hakios_feature_count; bit++) {
-		if (b->features & (1u << bit)) {
+		if (b->features & (1ull << bit)) {
 			char name[64];
 
 			/* (as a word of its own: the name, then a space or the line's end) */
@@ -111,7 +111,7 @@ every_feature_said(void)
 static void
 features_cut_short(void)
 {
-	struct hakios_board all = { .features = 0xffffffffu };
+	struct hakios_board all = { .features = ~0ull };
 	char text[64];
 	size_t first = strlen(hakios_feature_names[0]);
 
@@ -195,8 +195,8 @@ emulator(void)
 	board = "qemu-virt";
 	CHECK(adreno_profile_for_board() == NULL, "no GPU to start");
 	CHECK(hakios_board() != NULL && hakios_board()->backlight.type == HAKIOS_BACKLIGHT_SOFT, "the row of QEMU");
-	for (unsigned bit = 0; bit < 32; bit++) {
-		CHECK(hakios_board_has(1u << bit) == ((1u << bit) == HAKIOS_HAS_VIRTIO), "QEMU has its virtio devices and no "
+	for (unsigned bit = 0; bit < hakios_feature_count; bit++) {
+		CHECK(hakios_board_has(1ull << bit) == ((1ull << bit) == HAKIOS_HAS_VIRTIO), "QEMU has its virtio devices and no "
 		    "feature of a phone (bit %u)", bit);
 	}
 	CHECK(strcmp(get_string("features"), "virtio") == 0, "hw.board.features \"%s\"", get_string("features"));
@@ -209,8 +209,8 @@ unknown(void)
 	board = "a-phone-nobody-described";
 	CHECK(hakios_board() == NULL, "no row");
 	CHECK(adreno_profile_for_board() == NULL, "no GPU to start");
-	for (unsigned bit = 0; bit < 32; bit++) {
-		CHECK(!hakios_board_has(1u << bit), "no feature (bit %u)", bit);
+	for (unsigned bit = 0; bit < hakios_feature_count; bit++) {
+		CHECK(!hakios_board_has(1ull << bit), "no feature (bit %u)", bit);
 	}
 	CHECK(strcmp(get_string("name"), "unknown") == 0, "hw.board.name %s", get_string("name"));
 	hakios_board_init();
@@ -240,9 +240,9 @@ table(void)
 		CHECK(!(b->features & (HAKIOS_HAS_TORCH_PM8350C | HAKIOS_HAS_CAMERA_SM7325)) || (b->spmi.core != 0 &&
 		    b->spmi.channels != 0), "%s: a driver that writes to a PMIC without the arbiter's channels", b->name);
 		CHECK(!(b->features & (HAKIOS_HAS_TOUCH_GOODIX | HAKIOS_HAS_TOUCH_FT3658U | HAKIOS_HAS_SPEAKER_AW88261 |
-		    HAKIOS_HAS_HAPTIC_AW86927 | HAKIOS_HAS_CAMERA_SM7325 | HAKIOS_HAS_MIC_WCD938X | HAKIOS_HAS_WIFI_WCN6750 |
-		    HAKIOS_HAS_IMU_LSM6DSO | HAKIOS_HAS_IMU_BMI160 | HAKIOS_HAS_TOUCH_FT5X06)) || b->pins.tlmm != 0,
-		    "%s: a driver that drives the SoC's pins without pins { }", b->name);
+		    HAKIOS_HAS_SPEAKER_TFA9874 | HAKIOS_HAS_HAPTIC_AW86927 | HAKIOS_HAS_CAMERA_SM7325 | HAKIOS_HAS_MIC_WCD938X |
+		    HAKIOS_HAS_WIFI_WCN6750 | HAKIOS_HAS_IMU_LSM6DSO | HAKIOS_HAS_IMU_BMI160 | HAKIOS_HAS_TOUCH_FT5X06)) ||
+		    b->pins.tlmm != 0, "%s: a driver that drives the SoC's pins without pins { }", b->name);
 		CHECK(!(b->features & (HAKIOS_HAS_TOUCH_GOODIX | HAKIOS_HAS_TOUCH_FT3658U | HAKIOS_HAS_SPEAKER_AW88261 |
 		    HAKIOS_HAS_CAMERA_SM7325)) || b->clocks.gcc != 0, "%s: a driver that switches a bus's clocks on without clocks { }",
 		    b->name);
@@ -250,8 +250,9 @@ table(void)
 		    HAKIOS_HAS_CAMERA_SM7325 | HAKIOS_HAS_ADSP | HAKIOS_HAS_WIFI_WCN6750)) || (b->rpmh.cmd_db != 0 &&
 		    b->rpmh.cmd_db_size != 0 && b->rpmh.rsc != 0 && b->rpmh.tcs_offset != 0),
 		    "%s: a driver that asks RPMh for a supply without rpmh { }", b->name);
-		CHECK(!(b->features & (HAKIOS_HAS_SPEAKER_AW88261 | HAKIOS_HAS_CAMERA_SM7325 | HAKIOS_HAS_WIFI_WCN6750)) ||
-		    b->smmu.apps != 0, "%s: a driver that gives a device its addresses without smmu { }", b->name);
+		CHECK(!(b->features & (HAKIOS_HAS_SPEAKER_AW88261 | HAKIOS_HAS_SPEAKER_TFA9874 | HAKIOS_HAS_CAMERA_SM7325 |
+		    HAKIOS_HAS_WIFI_WCN6750)) || b->smmu.apps != 0, "%s: a driver that gives a device its addresses without smmu { }",
+		    b->name);
 		CHECK(!(b->features & (HAKIOS_HAS_ADSP | HAKIOS_HAS_WIFI_WCN6750)) || (b->ipc.aoss != 0 && b->ipc.ipcc != 0 &&
 		    b->ipc.smem != 0 && b->ipc.smem_size != 0 && b->ipc.smem_lock != 0),
 		    "%s: a driver that talks to another processor without ipc { }", b->name);
@@ -288,9 +289,13 @@ table(void)
 		    "voltage go together", b->name);
 		CHECK(b->storage.blocks == 0 || (b->storage.first_lba != 0 && b->storage.write_first != 0 &&
 		    b->storage.write_first < b->storage.blocks), "%s: a partition to write into that begins at 0, or from a block outside it", b->name);
-		CHECK(!(b->features & HAKIOS_HAS_SPEAKER_AW88261) || (b->speaker.sda != b->speaker.scl &&
+		CHECK(!(b->features & (HAKIOS_HAS_SPEAKER_AW88261 | HAKIOS_HAS_SPEAKER_TFA9874)) || (b->speaker.sda != b->speaker.scl &&
 		    b->speaker.address[0] != 0 && b->speaker.address[1] != 0 && b->speaker.address[0] != b->speaker.address[1]),
 		    "%s: the speaker amplifiers' driver without their bus and addresses", b->name);
+		CHECK(!(b->features & HAKIOS_HAS_SPEAKER_TFA9874) || (b->speaker.has_resets &&
+		    b->speaker.reset[0] != b->speaker.reset[1]), "%s: TFA9874 amplifiers without their reset pins", b->name);
+		CHECK((b->features & (HAKIOS_HAS_SPEAKER_AW88261 | HAKIOS_HAS_SPEAKER_TFA9874)) !=
+		    (HAKIOS_HAS_SPEAKER_AW88261 | HAKIOS_HAS_SPEAKER_TFA9874), "%s lists two speaker amplifier chips", b->name);
 		CHECK(!(b->features & HAKIOS_HAS_TORCH_PM8350C) || (b->torch.flash != 0 && b->torch.temp_alarm != 0),
 		    "%s: the flashlight's driver without its peripherals", b->name);
 		CHECK(!(b->features & HAKIOS_HAS_DDR_RPMH) || (b->rpmh.cmd_db != 0 && b->rpmh.cmd_db_size != 0 && b->rpmh.rsc != 0 &&
@@ -312,7 +317,7 @@ table(void)
 		}
 		CHECK(!(b->features & HAKIOS_HAS_VIRTIO) || !(b->features & ~HAKIOS_HAS_VIRTIO), "%s: virtio beside a phone's parts",
 		    b->name);
-		CHECK(__builtin_popcount(b->features & (HAKIOS_HAS_TOUCH_GOODIX | HAKIOS_HAS_TOUCH_FT3658U | HAKIOS_HAS_TOUCH_FT5X06)) <= 1,
+		CHECK(__builtin_popcountll(b->features & (HAKIOS_HAS_TOUCH_GOODIX | HAKIOS_HAS_TOUCH_FT3658U | HAKIOS_HAS_TOUCH_FT5X06)) <= 1,
 		    "%s lists two touch controllers", b->name);
 		for (unsigned j = 0; j < i; j++) {
 			CHECK(strcmp(b->name, hakios_boards[j].name) != 0, "%s is there twice", b->name);

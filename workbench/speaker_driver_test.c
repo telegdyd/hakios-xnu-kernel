@@ -96,6 +96,16 @@ amplifier_written(uint8_t index, uint8_t value)
 void hakios_speaker_init(void);
 void hakios_speaker_quiesce(void);
 
+bool hakios_tfa_wanted(void) { return false; }
+void hakios_tfa_probe(__unused uint32_t level) {}
+bool hakios_tfa_prepare(__unused const uint8_t *acf, __unused uint64_t size) { return false; }
+bool hakios_tfa_start(void) { return false; }
+bool hakios_tfa_volume(__unused uint32_t below, __unused uint32_t step_ms) { return false; }
+bool hakios_tfa_healthy(void) { return false; }
+uint32_t hakios_tfa_monitor(__unused bool tell) { return 0; }
+void hakios_tfa_stop(void) {}
+void hakios_tfa_quiesce(void) {}
+
 #pragma GCC diagnostic ignored "-Wformat"
 #define KERNEL 1
 #define HAKIOS_MMIO_TEST 1

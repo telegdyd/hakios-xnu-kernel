@@ -75,6 +75,7 @@
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <libkern/OSAtomic.h>
@@ -88,6 +89,7 @@
 
 #include "kernel.h"
 #include "smmu.h"
+#include <sys/board/smmu_ctx.h>
 #include "cache.h"
 #include "board.h"
 #include "log.h"
@@ -98,8 +100,11 @@ extern lck_mtx_t hakios_smmu_lock;
 
 static LCK_GRP_DECLARE(sound_lock_group, "hakios-sound");
 static LCK_MTX_DECLARE(sound_lock, &sound_lock_group);  /* the path being set up or taken down */
+static LCK_MTX_DECLARE(audio_space_lock, &sound_lock_group);
+static LCK_MTX_DECLARE(idle_lock, &sound_lock_group);
 
 static uint32_t level, seconds = 3, below = 240, pause_ms = 1000, gain = HAKIOS_GUARD_MAX_GAIN;
+static uint32_t idle_s = 10;            /* boot-arg sound_idle=S: idle seconds before stopping AR graph (0: never) */
 static uint32_t guard_as = UINT32_MAX;  /* boot-arg sound_guard_as=N: the guard reckons the amplifiers at most N under (a test) */
 static char last_write[96] = "nothing written";
 
@@ -488,7 +493,12 @@ static struct block apps_smmu_context = { "apps smmu, the audio context", 0, 0x1
 #define PERIOD_BYTES            (PERIOD_FRAMES * 4)
 #define BUFFER_BYTES            (PERIODS * 4096)        /* a page each */
 #define MIC_BYTES               (16 * 4096)             /* the microphones' (board/mic.c), behind the periods */
-#define SHARED_BYTES            (BUFFER_BYTES + MIC_BYTES)
+#define COMMAND_BYTES           4096                    /* one page for out-of-band AudioReach commands, behind mics */
+#define COMMAND_OFFSET          (BUFFER_BYTES + MIC_BYTES)
+#define SHARED_BYTES            (BUFFER_BYTES + MIC_BYTES + COMMAND_BYTES)
+#define AR                      (hakios_board_has(HAKIOS_HAS_SPEAKER_TFA9874))
+
+static struct hakios_smmu_context *ar_smmu;
 
 static struct {
 	bool found, on, passed;         /* passed: the boot chain lets the stream through untranslated */
@@ -572,6 +582,12 @@ space_faults(void)
 {
 	uint32_t status, global;
 
+	if (AR) {
+		if (ar_smmu != NULL) {
+			(void)hakios_smmu_faults(ar_smmu);
+		}
+		return;
+	}
 	if (!space.on) {
 		return;
 	}
@@ -677,9 +693,10 @@ space_off(void)
 }
 
 /*
- * The DSP's view of our memory is one: the sound's periods and the microphones' buffers behind them
- * (board/mic.c), through the same stream and context. Whoever comes first sets it up, whoever
- * leaves last takes it down. user: 0 the sound, 1 the microphones. With hakios_smmu_lock held.
+ * The DSP's view of our memory is one: the sound's periods and the microphones' buffers (and AR out-of-band
+ * command page) behind them, through the same stream and context. Whoever comes first sets it up, whoever
+ * leaves last takes it down. user: 0 the sound, 1 the microphones.
+ * Under hakios_smmu_lock for APR, or audio_space_lock for AR (smmu_ctx.c locks hakios_smmu_lock itself).
  */
 static uint32_t space_users;
 
@@ -693,19 +710,37 @@ shared_get(unsigned user)
 			say("sound: no memory for the DSP's buffers\n");
 			return false;
 		}
-		if (!space.found && !space.passed && !space_find()) {
-			return false;
-		}
-		if (!space.passed && !space.on && !space_on()) {
-			space.found = false;    /* (the next try looks for free ones again, as after space_off()) */
-			return false;
-		}
-		buffer_address = space.passed ? (kvtophys(buffer) | AUDIO_STREAM_BITS) : (AUDIO_ADDRESSES | AUDIO_STREAM_BITS);
-		if (space.passed) {
-			for (unsigned page = 1; page < SHARED_BYTES / 4096; page++) {
-				if (kvtophys(buffer + 4096 * page) != kvtophys(buffer) + 4096 * page) {
-					say("sound: the DSP's buffers are not one piece of memory, and the stream is not translated\n");
+		if (AR) {
+			if (ar_smmu == NULL) {
+				ar_smmu = hakios_smmu_claim(AUDIO_STREAM, AUDIO_STREAM_MASK, AUDIO_ADDRESSES, SHARED_BYTES,
+				    "audio");
+				if (ar_smmu == NULL) {
 					return false;
+				}
+				if (hakios_smmu_map_kva(ar_smmu, AUDIO_ADDRESSES, (unsigned long)buffer, SHARED_BYTES,
+				    HAKIOS_SMMU_READ | HAKIOS_SMMU_WRITE) != 0) {
+					hakios_smmu_release(ar_smmu);
+					ar_smmu = NULL;
+					return false;
+				}
+			}
+			buffer_address = AUDIO_ADDRESSES | AUDIO_STREAM_BITS;
+		} else {
+			if (!space.found && !space.passed && !space_find()) {
+				return false;
+			}
+			if (!space.passed && !space.on && !space_on()) {
+				space.found = false;    /* (the next try looks for free ones again, as after space_off()) */
+				return false;
+			}
+			buffer_address = space.passed ? (kvtophys(buffer) | AUDIO_STREAM_BITS) :
+			    (AUDIO_ADDRESSES | AUDIO_STREAM_BITS);
+			if (space.passed) {
+				for (unsigned page = 1; page < SHARED_BYTES / 4096; page++) {
+					if (kvtophys(buffer + 4096 * page) != kvtophys(buffer) + 4096 * page) {
+						say("sound: the DSP's buffers are not one piece of memory, and the stream is not translated\n");
+						return false;
+					}
 				}
 			}
 		}
@@ -722,7 +757,14 @@ shared_put(unsigned user)
 	}
 	space_users &= ~(1u << user);
 	if (space_users == 0) {
-		space_off();
+		if (AR) {
+			if (ar_smmu != NULL) {
+				hakios_smmu_release(ar_smmu);
+				ar_smmu = NULL;
+			}
+		} else {
+			space_off();
+		}
 	}
 }
 
@@ -730,10 +772,11 @@ bool
 hakios_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *bytes)
 {
 	bool ok;
+	lck_mtx_t *lock = AR ? &audio_space_lock : &hakios_smmu_lock;
 
-	lck_mtx_lock(&hakios_smmu_lock);
+	lck_mtx_lock(lock);
 	ok = shared_get(1);
-	lck_mtx_unlock(&hakios_smmu_lock);
+	lck_mtx_unlock(lock);
 	if (ok) {
 		*memory = buffer + BUFFER_BYTES;
 		*dsp_address = buffer_address + BUFFER_BYTES;
@@ -745,9 +788,11 @@ hakios_audio_dsp_memory(uintptr_t *memory, uint64_t *dsp_address, uint32_t *byte
 void
 hakios_audio_dsp_memory_put(void)
 {
-	lck_mtx_lock(&hakios_smmu_lock);
+	lck_mtx_t *lock = AR ? &audio_space_lock : &hakios_smmu_lock;
+
+	lck_mtx_lock(lock);
 	shared_put(1);
-	lck_mtx_unlock(&hakios_smmu_lock);
+	lck_mtx_unlock(lock);
 }
 
 /* ---- ADM and ASM: the path and the stream --------------------------------------------------------------- */
@@ -799,6 +844,7 @@ events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token,
 		}
 		OSIncrementAtomic((volatile SInt32 *)&written_done);
 		OSBitOrAtomic(1u << (token & 31), &returned);
+		thread_wakeup((event_t)&returned);
 		return true;
 	}
 	if (opcode == APR_BASIC_RSP_RESULT && (token & WRITE_TOKEN)) {
@@ -806,6 +852,7 @@ events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token,
 		OSIncrementAtomic((volatile SInt32 *)&write_errors);
 		OSIncrementAtomic((volatile SInt32 *)&written_done);
 		OSBitOrAtomic(1u << (token & 31), &returned);
+		thread_wakeup((event_t)&returned);
 		return true;
 	}
 	if (opcode == ASM_SESSION_EVENT_RX_UNDERFLOW) {
@@ -903,6 +950,510 @@ stream_off(void)
 	}
 }
 
+/* ---- AudioReach: SPF over GPR (speaker-tfa9874) ------------------------------------------------------- */
+
+#define AR_PORT_APM                             1
+#define AR_PORT_PRM                             2
+#define AR_OURS                                 3       /* our port for APM's commands (Android's spf_core: 3) */
+#define AR_OURS_PRM                             7       /* and for PRM's (Android's q6prm: 7) */
+#define AR_OURS_DATA                            0x10000001u
+#define AR_WAIT_MS                              5000
+#define GPR_BASIC_RSP_RESULT                    0x02001005u
+#define APM_CMD_GRAPH_OPEN                      0x01001000u
+#define APM_CMD_GRAPH_PREPARE                   0x01001001u
+#define APM_CMD_GRAPH_START                     0x01001002u
+#define APM_CMD_GRAPH_STOP                      0x01001003u
+#define APM_CMD_GRAPH_CLOSE                     0x01001004u
+#define APM_CMD_SET_CFG                         0x01001006u
+#define APM_CMD_SHARED_MEM_MAP_REGIONS          0x0100100cu
+#define APM_CMD_SHARED_MEM_UNMAP_REGIONS        0x0100100du
+#define APM_CMD_RSP_SHARED_MEM_MAP_REGIONS      0x02001001u
+#define PRM_CMD_REQUEST_HW_RSC                  0x0100100fu
+#define PRM_CMD_RSP_REQUEST_HW_RSC              0x02001002u
+#define PRM_CMD_RELEASE_HW_RSC                  0x01001010u
+#define PRM_CMD_RSP_RELEASE_HW_RSC              0x02001003u
+#define PARAM_ID_RSC_AUDIO_HW_CLK               0x0800102cu
+#define APM_PARAM_ID_CONTAINER_CONFIG           0x08001000u
+#define APM_PARAM_ID_SUB_GRAPH_CONFIG           0x08001001u
+#define APM_PARAM_ID_MODULE_LIST                0x08001002u
+#define APM_PARAM_ID_MODULE_PROP                0x08001003u
+#define APM_PARAM_ID_MODULE_CONN                0x08001004u
+#define APM_PARAM_ID_SUB_GRAPH_LIST             0x08001005u
+#define PARAM_ID_PCM_OUTPUT_FORMAT_CFG          0x08001008u
+#define PARAM_ID_MEDIA_FORMAT                   0x0800100cu
+#define APM_SUB_GRAPH_PROP_ID_PERF_MODE         0x0800100eu
+#define APM_SUB_GRAPH_PROP_ID_DIRECTION         0x0800100fu
+#define APM_SUB_GRAPH_PROP_ID_SCENARIO_ID       0x08001010u
+#define APM_CONTAINER_PROP_ID_CAPABILITY_LIST   0x08001011u
+#define APM_CONTAINER_PROP_ID_GRAPH_POS         0x08001012u
+#define APM_CONTAINER_PROP_ID_STACK_SIZE        0x08001013u
+#define APM_CONTAINER_PROP_ID_PROC_DOMAIN       0x08001014u
+#define APM_MODULE_PROP_ID_PORT_INFO            0x08001015u
+#define PARAM_ID_HW_EP_MF_CFG                   0x08001017u
+#define PARAM_ID_HW_EP_FRAME_SIZE_FACTOR        0x08001018u
+#define PARAM_ID_I2S_INTF_CFG                   0x08001019u
+#define PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT        0x08001024u
+#define DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2    0x0400100au
+#define DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2 0x05001004u
+#define MODULE_ID_WR_SHARED_MEM_EP              0x07001000u
+#define MODULE_ID_PCM_CNV                       0x07001003u
+#define MODULE_ID_PCM_DEC                       0x07001005u
+#define MODULE_ID_I2S_SINK                      0x0700100au
+#define MODULE_ID_MFC                           0x07001015u
+#define MEDIA_FMT_ID_PCM                        0x09001000u
+#define AR_BCLK                                 (RATE * 2 * 32)
+#define AR_SG_STREAM                            0x4001
+#define AR_SG_DEVICE                            0x4002
+#define AR_CONT_STREAM                          0x5001
+#define AR_CONT_DEVICE                          0x5002
+#define AR_WR_EP                                0x6001
+#define AR_PCM_DEC                              0x6002
+#define AR_PCM_CNV                              0x6003
+#define AR_MFC                                  0x6004
+#define AR_I2S                                  0x6005
+#define AR_DEVICE_BITS                          24
+
+static bool ar_clock_on, ar_open, ar_started;
+
+static const uint32_t ar_clocks[5] = { 0x100, 0x102, 0x104, 0x106, 0x108 };
+#define AR_CLOCK_TDM_IBIT                       (TDM < 5 ? ar_clocks[TDM] : 0x104u)
+
+static const char *
+ar_error(uint32_t status)
+{
+	return hakios_apr_status_name(status);
+}
+
+struct words {
+	uint32_t w[256];
+	unsigned n;
+	bool full;
+};
+
+static void
+word(struct words *p, uint32_t value)
+{
+	if (p->n >= sizeof(p->w) / sizeof(p->w[0])) {
+		p->full = true;
+		return;
+	}
+	p->w[p->n++] = value;
+}
+
+static void
+halves(struct words *p, uint16_t low, uint16_t high)
+{
+	word(p, (uint32_t)low | (uint32_t)high << 16);
+}
+
+static bool
+ar_command(const char *what, uint32_t to_port, uint32_t from_port, uint32_t opcode, bool apm_header, const struct words *p,
+    uint32_t wanted, struct hakios_apr_answer *answer)
+{
+	struct hakios_apr_answer local;
+	uint32_t packet[4 + 256];
+	uint32_t length = 0;
+
+	if (answer == NULL) {
+		answer = &local;
+	}
+	if (p != NULL && p->full) {
+		say("sound: %s: THE PACKET IS TOO BIG to be built here: not sent\n", what);
+		return false;
+	}
+	bzero(packet, sizeof(packet));
+	if (apm_header) {
+		packet[3] = p != NULL ? p->n * 4 : 0;
+		length = 16;
+	}
+	if (p != NULL) {
+		memcpy((uint8_t *)packet + length, p->w, p->n * 4);
+		length += p->n * 4;
+	}
+	snprintf(last_write, sizeof(last_write), "sent %s (opcode %#x to %#x)", what, opcode, to_port);
+	if (!hakios_adsp_gpr(to_port, from_port, 0, opcode, packet, length, AR_WAIT_MS, answer)) {
+		uint32_t bytes = p != NULL ? p->n * 4 : 0;
+		uint64_t at = buffer_address + COMMAND_OFFSET;
+
+		if (hakios_adsp_gpr_error == 0 || !apm_header || bytes == 0 || bytes > COMMAND_BYTES || !mapped) {
+			say("sound: %s (opcode %#x to port %#x, %u bytes): %s\n", what, opcode, to_port, length,
+			    hakios_adsp_gpr_error == 0 ? "NO ANSWER" : "NOT SENT");
+			return false;
+		}
+		memcpy((void *)(buffer + COMMAND_OFFSET), p->w, bytes);
+		hakios_cache_flush((uintptr_t)(buffer + COMMAND_OFFSET), (uintptr_t)(buffer + COMMAND_OFFSET + bytes));
+		packet[0] = (uint32_t)at;
+		packet[1] = (uint32_t)(at >> 32);
+		packet[2] = map_handle;
+		packet[3] = bytes;
+		say("sound: %s: too big for the link (%u bytes), sent out of band: its %u bytes at %#llx, handle %#x\n", what, length,
+		    bytes, at, map_handle);
+		if (!hakios_adsp_gpr(to_port, from_port, 0, opcode, packet, 16, AR_WAIT_MS, answer)) {
+			say("sound: %s, out of band (opcode %#x to port %#x): %s\n", what, opcode, to_port,
+			    hakios_adsp_gpr_error == 0 ? "NO ANSWER" : "NOT SENT");
+			return false;
+		}
+	}
+	if (answer->opcode == GPR_BASIC_RSP_RESULT && answer->words[0] == opcode) {
+		say("sound: %s: %s%s\n", what, answer->words[1] == 0 ? "done" : "REFUSED: ", answer->words[1] == 0 ? "" :
+		    ar_error(answer->words[1]));
+		return answer->words[1] == 0 && wanted == 0;
+	}
+	if (wanted != 0 && answer->opcode == wanted) {
+		return true;
+	}
+	say("sound: %s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", what, answer->opcode, answer->length,
+	    answer->words[0], answer->words[1]);
+	return false;
+}
+
+static void
+param(struct words *p, uint32_t instance, uint32_t id, uint32_t bytes)
+{
+	word(p, instance);
+	word(p, id);
+	word(p, bytes);
+	word(p, 0);
+}
+
+static void
+pad8(struct words *p)
+{
+	if (p->n & 1) {
+		word(p, 0);
+	}
+}
+
+static bool
+ar_clock(bool on)
+{
+	struct words p = { .n = 0 };
+	struct hakios_apr_answer answer;
+	bool ok;
+
+	param(&p, AR_PORT_PRM, PARAM_ID_RSC_AUDIO_HW_CLK, on ? 20 : 8);
+	word(&p, 1);                                    /* one clock */
+	word(&p, AR_CLOCK_TDM_IBIT);
+	if (on) {
+		word(&p, AR_BCLK);
+		word(&p, 1);                            /* Q6PRM_LPASS_CLK_ATTRIBUTE_COUPLE_NO */
+		word(&p, 0);                            /* default root */
+	}
+	ok = ar_command(on ? "PRM: the MI2S bit clock at 3.072 MHz" : "PRM: the MI2S bit clock, released",
+	    AR_PORT_PRM, AR_OURS_PRM, on ? PRM_CMD_REQUEST_HW_RSC : PRM_CMD_RELEASE_HW_RSC, true, &p,
+	    on ? PRM_CMD_RSP_REQUEST_HW_RSC : PRM_CMD_RSP_RELEASE_HW_RSC, &answer);
+	if (ok) {
+		say("sound: %s: %s%s\n", on ? "the bit clock" : "the bit clock's release", answer.words[1] == 0 ? "GRANTED" : "REFUSED: ",
+		    answer.words[1] == 0 ? "" : ar_error(answer.words[1]));
+		ok = answer.words[1] == 0;
+	}
+	return ok;
+}
+
+static bool
+ar_graph_open(void)
+{
+	static const struct {
+		uint32_t subgraph, container, module, instance, inputs, outputs;
+	} modules[] = {
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_WR_SHARED_MEM_EP, AR_WR_EP, 0, 1 },
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_PCM_DEC, AR_PCM_DEC, 1, 1 },
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_PCM_CNV, AR_PCM_CNV, 1, 1 },
+		{ AR_SG_STREAM, AR_CONT_STREAM, MODULE_ID_MFC, AR_MFC, 1, 1 },
+		{ AR_SG_DEVICE, AR_CONT_DEVICE, MODULE_ID_I2S_SINK, AR_I2S, 1, 0 },
+	};
+	static const uint32_t connections[][2] = {
+		{ AR_WR_EP, AR_PCM_DEC }, { AR_PCM_DEC, AR_PCM_CNV }, { AR_PCM_CNV, AR_MFC }, { AR_MFC, AR_I2S },
+	};
+	struct words p = { .n = 0 };
+	unsigned at;
+
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_SUB_GRAPH_CONFIG, 0);
+	word(&p, 2);
+	for (unsigned s = 0; s < 2; s++) {
+		word(&p, s == 0 ? AR_SG_STREAM : AR_SG_DEVICE);
+		word(&p, 3);
+		word(&p, APM_SUB_GRAPH_PROP_ID_PERF_MODE);
+		word(&p, 4);
+		word(&p, 2);
+		word(&p, APM_SUB_GRAPH_PROP_ID_DIRECTION);
+		word(&p, 4);
+		word(&p, s == 0 ? 2 : 1);
+		word(&p, APM_SUB_GRAPH_PROP_ID_SCENARIO_ID);
+		word(&p, 4);
+		word(&p, 1);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_CONTAINER_CONFIG, 0);
+	word(&p, 2);
+	for (unsigned c = 0; c < 2; c++) {
+		word(&p, c == 0 ? AR_CONT_STREAM : AR_CONT_DEVICE);
+		word(&p, 4);
+		word(&p, APM_CONTAINER_PROP_ID_CAPABILITY_LIST);
+		word(&p, 8);
+		word(&p, 1);
+		word(&p, c == 0 ? 2 : 3);
+		word(&p, APM_CONTAINER_PROP_ID_GRAPH_POS);
+		word(&p, 4);
+		word(&p, 1);
+		word(&p, APM_CONTAINER_PROP_ID_STACK_SIZE);
+		word(&p, 4);
+		word(&p, 8192);
+		word(&p, APM_CONTAINER_PROP_ID_PROC_DOMAIN);
+		word(&p, 4);
+		word(&p, 2);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_MODULE_LIST, 0);
+	word(&p, 2);
+	for (unsigned c = 0; c < 2; c++) {
+		uint32_t container = c == 0 ? AR_CONT_STREAM : AR_CONT_DEVICE;
+		unsigned count = 0;
+
+		for (unsigned m = 0; m < sizeof(modules) / sizeof(modules[0]); m++) {
+			count += modules[m].container == container;
+		}
+		word(&p, c == 0 ? AR_SG_STREAM : AR_SG_DEVICE);
+		word(&p, container);
+		word(&p, count);
+		for (unsigned m = 0; m < sizeof(modules) / sizeof(modules[0]); m++) {
+			if (modules[m].container == container) {
+				word(&p, modules[m].module);
+				word(&p, modules[m].instance);
+			}
+		}
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_MODULE_PROP, 0);
+	word(&p, sizeof(modules) / sizeof(modules[0]));
+	for (unsigned m = 0; m < sizeof(modules) / sizeof(modules[0]); m++) {
+		word(&p, modules[m].instance);
+		word(&p, 1);
+		word(&p, APM_MODULE_PROP_ID_PORT_INFO);
+		word(&p, 8);
+		word(&p, modules[m].inputs);
+		word(&p, modules[m].outputs);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	at = p.n;
+	param(&p, AR_PORT_APM, APM_PARAM_ID_MODULE_CONN, 0);
+	word(&p, sizeof(connections) / sizeof(connections[0]));
+	for (unsigned c = 0; c < sizeof(connections) / sizeof(connections[0]); c++) {
+		word(&p, connections[c][0]);
+		word(&p, 1);
+		word(&p, connections[c][1]);
+		word(&p, 2);
+	}
+	pad8(&p);
+	p.w[at + 2] = (p.n - at - 4) * 4;
+	say("sound: the graph: %u bytes of GRAPH_OPEN\n", p.n * 4 + 16);
+	ar_open = ar_command("APM: GRAPH_OPEN (the stream 0x4001: WR_SHARED_MEM_EP, PCM_DEC, PCM_CNV, MFC; the device 0x4002: "
+	    "I2S_SINK)", AR_PORT_APM, AR_OURS, APM_CMD_GRAPH_OPEN, true, &p, 0, NULL);
+	return ar_open;
+}
+
+static bool
+ar_graph_formats(void)
+{
+	struct words p;
+
+	p.n = 0;
+	p.full = false;
+	param(&p, AR_WR_EP, PARAM_ID_MEDIA_FORMAT, 32);
+	word(&p, 1);                                    /* DATA_FORMAT_FIXED_POINT */
+	word(&p, MEDIA_FMT_ID_PCM);
+	word(&p, 48 - 12);
+	word(&p, RATE);
+	halves(&p, 16, 1);                              /* bit width, alignment: LSB */
+	halves(&p, 16, 15);                             /* bits per sample, Q factor */
+	halves(&p, 1, 2);                               /* little-endian, channels */
+	halves(&p, PCM_CHANNEL_FL | PCM_CHANNEL_FR << 8, 0);
+	if (!ar_command("the end point 0x6001's input: 16-bit PCM, 2 channels, 48 kHz", AR_WR_EP, AR_OURS_DATA, APM_CMD_SET_CFG, true,
+	    &p, 0, NULL)) {
+		return false;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		p.n = 0;
+		p.full = false;
+		param(&p, i == 0 ? AR_PCM_DEC : AR_PCM_CNV, PARAM_ID_PCM_OUTPUT_FORMAT_CFG, 32);
+		word(&p, 1);
+		word(&p, MEDIA_FMT_ID_PCM);
+		word(&p, 20);
+		halves(&p, 16, 1);                      /* bit width, alignment */
+		halves(&p, 16, 15);                     /* bits per sample, Q factor */
+		halves(&p, 1, i == 0 ? 1 : 3);          /* endianness, interleaving */
+		halves(&p, 0, 2);                       /* reserved, channels */
+		halves(&p, PCM_CHANNEL_FL | PCM_CHANNEL_FR << 8, 0);
+		if (!ar_command(i == 0 ? "PCM_DEC 0x6002: 16 bits out, interleaved" : "PCM_CNV 0x6003: 16 bits out, de-interleaved",
+		    AR_PORT_APM, AR_OURS, APM_CMD_SET_CFG, true, &p, 0, NULL)) {
+			return false;
+		}
+	}
+	p.n = 0;
+	p.full = false;
+	param(&p, AR_MFC, PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT, 12);
+	word(&p, RATE);
+	halves(&p, AR_DEVICE_BITS, 2);
+	halves(&p, PCM_CHANNEL_FL, PCM_CHANNEL_FR);
+	if (!ar_command("MFC 0x6004: 48 kHz, 24 bits, 2 channels out", AR_PORT_APM, AR_OURS, APM_CMD_SET_CFG, true, &p, 0, NULL)) {
+		return false;
+	}
+	p.n = 0;
+	p.full = false;
+	param(&p, AR_I2S, PARAM_ID_I2S_INTF_CFG, 16);
+	word(&p, 0);                                    /* LPAIF */
+	word(&p, TDM);                                  /* I2S_INTF_TYPE from speaker.tdm */
+	halves(&p, 2, 1);                               /* I2S_SD1; CONFIG_I2S_WS_SRC_INTERNAL */
+	word(&p, 0);
+	param(&p, AR_I2S, PARAM_ID_HW_EP_MF_CFG, 16);
+	word(&p, RATE);
+	halves(&p, AR_DEVICE_BITS, 2);
+	word(&p, 1);                                    /* fixed point */
+	word(&p, 0);
+	param(&p, AR_I2S, PARAM_ID_HW_EP_FRAME_SIZE_FACTOR, 8);
+	word(&p, 1);
+	word(&p, 0);
+	return ar_command("I2S_SINK 0x6005: MI2S, SD1, 48 kHz, 24 bits, 2 channels", AR_PORT_APM, AR_OURS, APM_CMD_SET_CFG,
+	           true, &p, 0, NULL);
+}
+
+static bool
+ar_graph_command(const char *what, uint32_t opcode)
+{
+	struct words p = { .n = 0 };
+
+	param(&p, AR_PORT_APM, APM_PARAM_ID_SUB_GRAPH_LIST, 16);
+	word(&p, 2);
+	word(&p, AR_SG_STREAM);
+	word(&p, AR_SG_DEVICE);
+	pad8(&p);
+	return ar_command(what, AR_PORT_APM, AR_OURS, opcode, true, &p, 0, NULL);
+}
+
+static bool
+ar_events(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
+{
+	if (service != HAKIOS_GPR_SERVICE || port != AR_WR_EP || !(token & WRITE_TOKEN)) {
+		return false;
+	}
+	if (opcode == DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2) {
+		if (length >= 16 && payload[3] != 0) {
+			OSIncrementAtomic((volatile SInt32 *)&write_errors);
+		}
+	} else if (opcode == GPR_BASIC_RSP_RESULT) {
+		OSIncrementAtomic((volatile SInt32 *)&write_errors);
+	} else {
+		return false;
+	}
+	OSIncrementAtomic((volatile SInt32 *)&written_done);
+	OSBitOrAtomic(1u << (token & 31), &returned);
+	thread_wakeup((event_t)&returned);
+	return true;
+}
+
+static bool
+ar_stream_on(void)
+{
+	struct words p = { .n = 0 };
+	struct hakios_apr_answer answer;
+
+	announce("the DSP is given the graph (APM: GRAPH_OPEN), its formats (SET_CFG), our periods (SHARED_MEM_MAP), and the graph "
+	    "is prepared and started");
+	halves(&p, 3, 1);                               /* APM_MEMORY_MAP_SHMEM8_4K_POOL, one region */
+	word(&p, 0);
+	word(&p, (uint32_t)buffer_address);
+	word(&p, (uint32_t)(buffer_address >> 32));
+	word(&p, SHARED_BYTES);
+	if (!ar_command("our periods, mapped for the DSP", AR_PORT_APM, AR_OURS_DATA, APM_CMD_SHARED_MEM_MAP_REGIONS, false, &p,
+	    APM_CMD_RSP_SHARED_MEM_MAP_REGIONS, &answer)) {
+		return false;
+	}
+	mapped = true;
+	map_handle = answer.words[0];
+	say("sound: our %u KB at %#llx are the DSP's handle %#x\n", SHARED_BYTES / 1024, buffer_address, map_handle);
+	if (!ar_graph_open() || !ar_graph_formats()) {
+		return false;
+	}
+	if (!ar_graph_command("APM: GRAPH_PREPARE", APM_CMD_GRAPH_PREPARE)) {
+		return false;
+	}
+	ar_started = ar_graph_command("APM: GRAPH_START", APM_CMD_GRAPH_START);
+	return ar_started;
+}
+
+static void
+ar_stream_off(void)
+{
+	if (ar_started) {
+		ar_graph_command("APM: GRAPH_STOP", APM_CMD_GRAPH_STOP);
+		ar_started = false;
+	}
+	if (mapped) {
+		struct words p = { .n = 0 };
+
+		word(&p, map_handle);
+		ar_command("our periods, unmapped", AR_PORT_APM, AR_OURS_DATA, APM_CMD_SHARED_MEM_UNMAP_REGIONS, false, &p, 0, NULL);
+		mapped = false;
+	}
+	if (ar_open) {
+		ar_graph_command("APM: GRAPH_CLOSE", APM_CMD_GRAPH_CLOSE);
+		ar_open = false;
+	}
+}
+
+static bool
+ar_period_write(unsigned period)
+{
+	uint64_t at = buffer_address + 4096 * period;
+	uint32_t write[11] = { (uint32_t)at, (uint32_t)(at >> 32), map_handle, PERIOD_BYTES, 0, 0, 0, 0, 0, 0, 0 };
+
+	return hakios_adsp_gpr(AR_WR_EP, AR_OURS_DATA, WRITE_TOKEN | period, DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2, write,
+	           sizeof(write), 0, NULL);
+}
+
+static volatile uint32_t soft_q15 = 0;  /* 0: silence until a level is set */
+
+static uint32_t
+q15_of(uint32_t below_eights)
+{
+	uint64_t g = 1ull << 30;
+
+	if (below_eights >= 90 * 8) {
+		return 0;
+	}
+	for (uint32_t db = 0; db < below_eights / 8; db++) {
+		g = g * 957037441ull >> 30;             /* -1 dB */
+	}
+	for (uint32_t e = 0; e < below_eights % 8; e++) {
+		g = g * 1058396570ull >> 30;            /* -1/8 dB */
+	}
+	return (uint32_t)(g >> 15);
+}
+
+void
+hakios_sound_soft_level(uint32_t below_eights, bool muted)
+{
+	soft_q15 = muted ? 0 : q15_of(below_eights);
+}
+
+static void
+soft_apply(int16_t *samples, uint32_t count)
+{
+	uint32_t g = soft_q15;
+
+	for (uint32_t i = 0; i < count; i++) {
+		samples[i] = (int16_t)(((int32_t)samples[i] * (int32_t)g) >> 15);
+	}
+}
+
 /* ---- the test tone ----------------------------------------------------------------------------------- */
 
 /* 1 kHz at 48 kHz, -20 dBFS (a peak of 3277): one cycle */
@@ -925,6 +1476,9 @@ period_fill(unsigned period, bool silent)
 		samples[2 * frame] = sample;
 		samples[2 * frame + 1] = sample;
 	}
+	if (AR) {
+		soft_apply(samples, 2 * PERIOD_FRAMES);
+	}
 	/* the DSP reads memory, not our caches */
 	hakios_cache_clean((uintptr_t)samples, (uintptr_t)samples + PERIOD_BYTES);
 }
@@ -932,6 +1486,9 @@ period_fill(unsigned period, bool silent)
 static bool
 period_write(unsigned period)
 {
+	if (AR) {
+		return ar_period_write(period);
+	}
 	uint32_t write[8] = { (uint32_t)(buffer_address + 4096 * period), (uint32_t)((buffer_address + 4096 * period) >> 32),
 		              map_handle, PERIOD_BYTES, period, 0, 0, 0 };
 
@@ -1044,7 +1601,14 @@ static volatile uint64_t last_sound_us;         /* when the latest write that wa
 static volatile bool feeder_runs, watcher_runs;
 static uint64_t fed_frames, silent_frames, darwin_frames, dropped_frames;
 static volatile bool cut_off;                   /* the amplifiers given up on: none of Darwin's sound goes to the DSP */
-static volatile uint32_t darwin_peak;              /* the largest sample since the amplifiers last started */
+static volatile uint32_t darwin_peak;           /* the largest sample since the amplifiers last started */
+static volatile uint32_t short_periods, primings;
+static bool primed;
+#define CUSHION_FRAMES          (2 * PERIOD_FRAMES)
+static volatile bool want_park, parked, park_heard;
+static volatile uint64_t parked_us, idle_sounded;
+static volatile bool guard_on;                  /* the amplifiers are on: what the guard lets through is heard */
+static uint32_t guard_periods;                  /* periods through the guard */
 
 /* From the writer's thread, under board/audio.c's lock: never waits. */
 static uint32_t
@@ -1053,6 +1617,17 @@ darwin_sink(const int16_t *frames, uint32_t count)
 	uint32_t head = ring_head, room = RING_FRAMES - (head - ring_tail), taken = count < room ? count : room;
 	bool sound = false;
 
+	if (parked && !park_heard) {
+		for (uint32_t i = 0; i < 2 * count && !sound; i++) {
+			sound = frames[i] > SILENCE || frames[i] < -SILENCE;
+		}
+		if (!sound) {
+			darwin_frames += count;
+			return count;                   /* silence while the stream is stopped: nothing to keep */
+		}
+		park_heard = true;
+		sound = false;
+	}
 	for (uint32_t i = 0; i < taken; i++) {
 		int16_t left = frames[2 * i], right = frames[2 * i + 1];
 		uint32_t l = left < 0 ? (uint32_t)-(int32_t)left : (uint32_t)left, r = right < 0 ? (uint32_t)-(int32_t)right : (uint32_t)right;
@@ -1060,21 +1635,22 @@ darwin_sink(const int16_t *frames, uint32_t count)
 		ring[2 * ((head + i) % RING_FRAMES)] = left;
 		ring[2 * ((head + i) % RING_FRAMES) + 1] = right;
 		sound |= l > SILENCE || r > SILENCE;
-		if (l > darwin_peak || r > darwin_peak) {
+		if ((l > SILENCE || r > SILENCE) && (l > darwin_peak || r > darwin_peak)) {
 			darwin_peak = l > r ? l : r;
 		}
 	}
 	OSMemoryBarrier();
 	ring_head = head + taken;
 	darwin_frames += taken;
+	dropped_frames += count - taken;
 	if (sound) {
 		last_sound_us = now_us();
+		if (!guard_on) {
+			thread_wakeup((event_t)&last_sound_us);
+		}
 	}
 	return taken;
 }
-
-static uint32_t guard_periods;                  /* periods through the guard */
-static volatile bool guard_on;                  /* the amplifiers are on: what the guard lets through is heard */
 
 /* tenths of a dB as text: "-5.7" */
 static const char *
@@ -1113,8 +1689,32 @@ static void
 period_fill_darwin(unsigned period)
 {
 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
-	uint32_t tail = ring_tail, available = ring_head - tail, n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
-	uint32_t kept = cut_off ? 0 : n;
+	uint32_t tail, available, n, kept;
+
+	if (AR) {
+		for (unsigned waited = 0; guard_on && primed && ring_head - ring_tail < PERIOD_FRAMES &&
+		    ring_head != ring_tail && waited < 10; waited++) {
+			sleep_ms(1);
+		}
+	}
+	tail = ring_tail;
+	available = ring_head - tail;
+	if (AR) {
+		if (!primed && available != 0 && available < CUSHION_FRAMES && now_us() - last_sound_us < 200000) {
+			available = 0;
+		} else if (!primed && available != 0) {
+			primed = true;
+			primings++;
+		}
+	}
+	n = available < PERIOD_FRAMES ? available : PERIOD_FRAMES;
+	if (AR && n < PERIOD_FRAMES && primed) {
+		if (n != 0 && guard_on) {
+			short_periods++;
+		}
+		primed = false;
+	}
+	kept = cut_off ? 0 : n;
 
 	OSMemoryBarrier();
 	for (uint32_t i = 0; i < kept; i++) {
@@ -1138,8 +1738,11 @@ period_fill_darwin(unsigned period)
 	fed_frames += kept;
 	dropped_frames += n - kept;
 	silent_frames += PERIOD_FRAMES - kept;
-	if (kept != 0 && hakios_audio_recording_fed()) {
-		hakios_audio_record_fed(samples, kept);
+	if ((AR ? (kept != 0 || guard_on) : kept != 0) && hakios_audio_recording_fed()) {
+		hakios_audio_record_fed(samples, AR ? PERIOD_FRAMES : kept);
+	}
+	if (AR) {
+		soft_apply(samples, 2 * PERIOD_FRAMES);
 	}
 	guard_periods++;
 	hakios_cache_clean((uintptr_t)samples, (uintptr_t)samples + PERIOD_BYTES);
@@ -1148,12 +1751,10 @@ period_fill_darwin(unsigned period)
 static void
 feeder_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint32_t sent = 0, failed = 0;
+	uint32_t sent = 0, failed = 0, queued = 0, parks = 0;
 	/*
 	 * The periods whose write could not be sent (the link found no room at the DSP for five seconds, say): the DSP
-	 * never gives those back, so they are written again on the next pass, filled anew. Were they not, every period
-	 * that once failed would be gone for good -- and after eight, nothing would be queued at the DSP and nothing
-	 * would ever come back to be written: silence until the run ends.
+	 * never gives those back, so they are written again on the next pass, filled anew.
 	 */
 	uint32_t unsent = 0;
 
@@ -1162,6 +1763,7 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 		period_fill_darwin(p);
 		if (period_write(p)) {
 			sent++;
+			queued |= 1u << p;
 		} else {
 			failed++;
 			unsent |= 1u << p;
@@ -1171,6 +1773,45 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 		uint32_t back = returned, due;
 		static bool was_on;
 
+		if (want_park && queued == 0 && back == 0) {
+			parked_us = now_us();
+			OSMemoryBarrier();
+			parked = true;
+			parks++;
+			thread_wakeup((event_t)&parked);
+			while (want_park && !stopping) {
+				assert_wait_timeout((event_t)&want_park, THREAD_UNINT, 5000, NSEC_PER_MSEC);
+				if (!want_park || stopping) {
+					clear_wait(current_thread(), THREAD_AWAKENED);
+				} else {
+					(void)thread_block(THREAD_CONTINUE_NULL);
+				}
+			}
+			if (stopping) {
+				parked = false;
+				break;
+			}
+			hakios_guard_silence((now_us() - parked_us) * 48 / 1000);
+			parked = false;
+			OSMemoryBarrier();
+			park_heard = false;
+			returned = 0;
+			primed = false;
+			unsent = 0;
+			for (unsigned p = 0; p < PERIODS; p++) {
+				period_fill(p, true);
+				if (period_write(p)) {
+					sent++;
+					queued |= 1u << p;
+				} else {
+					failed++;
+					unsent |= 1u << p;
+				}
+			}
+			thread_wakeup((event_t)&parked);
+			continue;
+		}
+
 		if (guard_on && !was_on) {
 			guard_say("", true);    /* (what it did to the silence meanwhile is of no interest) */
 			guard_periods = 0;
@@ -1178,11 +1819,32 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 			guard_say(" until the amplifiers stopped", false);
 		} else if (guard_on && guard_periods >= 250) {
 			guard_say(", 5 s", false);
+			if (AR) {
+				say("sound: Darwin's, 5 s: %u periods cut short, %llu frames dropped (the ring full), %u frames in the "
+				    "ring now, %u starts behind a cushion\n", short_periods, dropped_frames, ring_head - ring_tail,
+				    primings);
+				short_periods = 0;
+				primings = 0;
+				dropped_frames = 0;
+			}
 			guard_periods = 0;
 		}
 		was_on = guard_on;
 		if (back != 0) {
 			OSBitAndAtomic(~back, &returned);
+			queued &= ~back;
+		}
+		if (want_park) {
+			/* draining queued periods so we can park; do not refill completed periods, and stop retrying unsent */
+			if (queued != 0) {
+				assert_wait_timeout((event_t)&returned, THREAD_UNINT, 40, NSEC_PER_MSEC);
+				if (returned != 0 || stopping || !want_park) {
+					clear_wait(current_thread(), THREAD_AWAKENED);
+				} else {
+					(void)thread_block(THREAD_CONTINUE_NULL);
+				}
+			}
+			continue;
 		}
 		/* (filled anew also when it is one that could not be sent: not Darwin's sound of long ago, nor any once given up on) */
 		due = (back | unsent) & ((1u << PERIODS) - 1);
@@ -1191,6 +1853,7 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 				period_fill_darwin(p);
 				if (period_write(p)) {
 					sent++;
+					queued |= 1u << p;
 					unsent &= ~(1u << p);
 				} else {
 					failed++;
@@ -1198,11 +1861,21 @@ feeder_thread(__unused void *parameter, __unused wait_result_t result)
 				}
 			}
 		}
-		sleep_ms(2);
+		if (unsent != 0) {
+			sleep_ms(2);
+		} else {
+			assert_wait_timeout((event_t)&returned, THREAD_UNINT, 40, NSEC_PER_MSEC);
+			if (returned != 0 || stopping || want_park) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				(void)thread_block(THREAD_CONTINUE_NULL);
+			}
+		}
 	}
 	say("sound: the feeder stops: %u periods written (%u could not be sent), %u given back (%u with an error), %u underflows; "
 	    "from Darwin %llu frames came, %llu went to the DSP, %llu were dropped (the amplifiers given up on), %llu of silence "
-	    "filled in\n", sent, failed, written_done, write_errors, underflows, darwin_frames, fed_frames, dropped_frames, silent_frames);
+	    "filled in; parked %u times while idle\n", sent, failed, written_done, write_errors, underflows, darwin_frames,
+	    fed_frames, dropped_frames, silent_frames, parks);
 	feeder_runs = false;
 	thread_terminate(current_thread());
 }
@@ -1247,6 +1920,116 @@ give_up(void)
 	guard_off(true);
 }
 
+static uint32_t
+below_with(uint32_t extra)
+{
+	uint64_t total = (uint64_t)below + extra;
+
+	return total > HAKIOS_GUARD_SILENT - 1 ? HAKIOS_GUARD_SILENT - 1 : (uint32_t)total;
+}
+
+static bool graph_idle;                 /* the graph stopped and the clock released while idle */
+static uint32_t idle_stops, idle_starts;
+
+/* Idle: the feeder parked, then the graph stopped and the bit clock released. Under idle_lock. */
+static bool
+idle_stop(void)
+{
+	uint64_t began = now_us();
+	bool stopped, released;
+
+	idle_sounded = last_sound_us;
+	want_park = true;
+	OSMemoryBarrier();
+	thread_wakeup((event_t)&returned);
+	while (!parked && !stopping && now_us() - began < 1000000) {
+		assert_wait_timeout((event_t)&parked, THREAD_UNINT, 50, NSEC_PER_MSEC);
+		if (parked || stopping) {
+			clear_wait(current_thread(), THREAD_AWAKENED);
+		} else {
+			(void)thread_block(THREAD_CONTINUE_NULL);
+		}
+	}
+	if (!parked) {
+		want_park = false;
+		thread_wakeup((event_t)&want_park);
+		if (!stopping) {
+			say("sound: idle: THE FEEDER DID NOT PARK in a second (the DSP kept periods); the stream goes on, idle stops are off\n");
+		}
+		return false;
+	}
+	lck_mtx_lock(&sound_lock);
+	stopped = ar_graph_command("APM: GRAPH_STOP (idle)", APM_CMD_GRAPH_STOP);
+	ar_started = false;
+	released = ar_clock_on && ar_clock(false);
+	ar_clock_on = false;
+	lck_mtx_unlock(&sound_lock);
+	graph_idle = true;
+	idle_stops++;
+	say("sound: idle %u s: the stream is stopped (the feeder parked after %llu ms; GRAPH_STOP %s, the bit clock %s)\n", idle_s,
+	    (parked_us - began) / 1000, stopped ? "done" : "REFUSED", released ? "released" : "NOT RELEASED");
+	return true;
+}
+
+/* Sound after idle: bit clock and graph restarted, or closed and reopened if needed. Under idle_lock. */
+static bool
+idle_start(void)
+{
+	uint64_t began = now_us();
+	bool ok, anew = false;
+
+	lck_mtx_lock(&sound_lock);
+	ar_clock_on = ar_clock(true);
+	ok = ar_clock_on && ar_graph_command("APM: GRAPH_PREPARE (after idle)", APM_CMD_GRAPH_PREPARE) &&
+	    ar_graph_command("APM: GRAPH_START (after idle)", APM_CMD_GRAPH_START);
+	if (!ok) {
+		anew = true;
+		say("sound: after idle: THE GRAPH DID NOT START AGAIN: it is closed and set up anew\n");
+		ar_stream_off();
+		if (!ar_clock_on) {
+			ar_clock_on = ar_clock(true);
+		}
+		ok = ar_clock_on && ar_stream_on();
+	} else {
+		ar_started = true;
+	}
+	lck_mtx_unlock(&sound_lock);
+	if (!ok) {
+		say("sound: after idle: THE STREAM COULD NOT BE STARTED AGAIN; Darwin's sound is not played\n");
+		return false;
+	}
+	graph_idle = false;
+	idle_starts++;
+	want_park = false;
+	OSMemoryBarrier();
+	thread_wakeup((event_t)&want_park);
+	say("sound: after idle: the stream runs again %llu ms after Darwin's write%s\n", (now_us() - began) / 1000,
+	    anew ? " (the graph set up anew)" : "");
+	return true;
+}
+
+static bool running, taken_down;
+
+int
+hakios_sound_sleep_prepare(void)
+{
+	int state;
+
+	if (!AR || !running || taken_down || level != 4) {
+		return -1;
+	}
+	if (guard_on) {
+		return 0;
+	}
+	lck_mtx_lock(&idle_lock);
+	if (!graph_idle && !stopping && !taken_down && !guard_on) {
+		(void)idle_stop();
+	}
+	state = graph_idle ? 1 : 0;
+	lck_mtx_unlock(&idle_lock);
+	return state;
+}
+
 /*
  * The amplifiers on while there is sound, at the volume Darwin has set (hakios_audio_volume(): how
  * far under the loudest, sound_below under Android's level), and off while Darwin's volume is 0;
@@ -1256,7 +2039,7 @@ static void
 watch(void)
 {
 	bool on = false, given_up = false, muted = false;
-	uint64_t last_look = 0, last_monitor = 0;
+	uint64_t last_look = 0, last_monitor = 0, idle_from = now_us();
 	uint32_t starts = 0, changes = 0, generation = 0, extra = 0, monitor = 0, monitor_looks = 0;
 
 	guard_level(below);                     /* (from the first sample on: see guard_off()) */
@@ -1289,24 +2072,32 @@ watch(void)
 				if (on) {
 					hakios_speaker_stop();
 					on = false;
+					darwin_peak = 0;
 					if (!hakios_speaker_healthy()) {
 						give_up();      /* (the stop failed: both were powered down at once) */
 						given_up = true;
 					}
 				}
-			} else if (on && !hakios_speaker_volume(below + extra, 1)) {
+			} else if (on && !hakios_speaker_volume(below_with(extra), 1)) {
 				give_up();
 				on = false;
 				given_up = true;
 			} else if (!given_up) {
-				guard_level(below + extra);
+				guard_level(below_with(extra));
 			}
 		}
-		if (!on && !given_up && !muted && sounded != 0 && now - sounded < 100000) {
+		if (!on && !given_up && !muted && sounded != 0 &&
+		    (now - sounded < 100000 || (graph_idle && sounded != idle_sounded))) {
+			bool wake_ok = true;
+
 			say_when("Darwin plays: the amplifiers are started");
 			starts++;
-			darwin_peak = 0;
-			if (!hakios_speaker_start() || !hakios_speaker_volume(below + extra, 1)) {
+			if (graph_idle) {
+				lck_mtx_lock(&idle_lock);
+				wake_ok = !graph_idle || idle_start();
+				lck_mtx_unlock(&idle_lock);
+			}
+			if (!wake_ok || !hakios_speaker_start() || !hakios_speaker_volume(below_with(extra), 1)) {
 				say("sound: THE AMPLIFIERS DID NOT START\n");
 				give_up();
 				given_up = true;
@@ -1326,6 +2117,7 @@ watch(void)
 			say_when("three seconds of silence: the amplifiers are stopped");
 			say("sound: what Darwin wrote while they were on peaked at %u%% of full scale (%u)\n", darwin_peak * 100 / 32768,
 			    darwin_peak);
+			darwin_peak = 0;
 			guard_off(false);
 			hakios_speaker_stop();
 			on = false;
@@ -1334,7 +2126,14 @@ watch(void)
 				given_up = true;
 				last_look = now_us();
 			}
-		} else if (given_up && now - last_look >= 200000) {
+		} else if (!on && !given_up && AR && idle_s != 0 && !graph_idle &&
+		    now - (sounded > idle_from ? sounded : idle_from) > idle_s * 1000000ull) {
+			lck_mtx_lock(&idle_lock);
+			if (!graph_idle && !idle_stop()) {
+				idle_s = 0;
+			}
+			lck_mtx_unlock(&idle_lock);
+		} else if (!AR && given_up && now - last_look >= 200000) {
 			/* a power-down that did not read back, tried again (nothing, once it has) */
 			last_look = now;
 			hakios_speaker_stop();
@@ -1358,22 +2157,34 @@ watch(void)
 				}
 			}
 		}
-		sleep_ms(5);
+		if (on || given_up || !AR) {
+			sleep_ms(5);
+		} else {
+			(void)hakios_assert_wait_net((event_t)&last_sound_us, hakios_screen_off() ? 1000 : 200);
+			if (last_sound_us != sounded || stopping) {
+				clear_wait(current_thread(), THREAD_AWAKENED);
+			} else {
+				(void)thread_block(THREAD_CONTINUE_NULL);
+			}
+		}
 	}
 	guard_off(true);
-	say("sound: the watcher stops; the amplifiers were started %u times, Darwin set the volume %u times%s\n", starts, changes,
-	    given_up ? ", and the amplifiers were then given up on" : "");
+	say("sound: the watcher stops; the amplifiers were started %u times, Darwin set the volume %u times%s; "
+	    "the stream stopped %u times while idle and started again %u times\n", starts, changes,
+	    given_up ? ", and the amplifiers were then given up on" : "", idle_stops, idle_starts);
 	watcher_runs = false;
 }
 
 /* ---- the whole ---------------------------------------------------------------------------------------- */
 
-static bool running, taken_down;
-
 static void
 take_down(void)
 {
 	stopping = true;
+	thread_wakeup((event_t)&returned);
+	thread_wakeup((event_t)&last_sound_us);
+	thread_wakeup((event_t)&want_park);
+	thread_wakeup((event_t)&parked);
 	if (level >= 4) {
 		hakios_audio_set_sink("nothing", NULL);
 	}
@@ -1395,14 +2206,24 @@ take_down(void)
 		hakios_audio_set_sink("nothing", NULL);
 	}
 	if (running && !taken_down) {
+		lck_mtx_t *space_lock = AR ? &audio_space_lock : &hakios_smmu_lock;
+
 		taken_down = true;
 		hakios_speaker_stop();
-		stream_off();
-		afe_off();
+		if (AR) {
+			ar_stream_off();
+			if (ar_clock_on) {
+				ar_clock(false);
+				ar_clock_on = false;
+			}
+		} else {
+			stream_off();
+			afe_off();
+		}
 		pins_off();
-		lck_mtx_lock(&hakios_smmu_lock);
+		lck_mtx_lock(space_lock);
 		shared_put(0);
-		lck_mtx_unlock(&hakios_smmu_lock);
+		lck_mtx_unlock(space_lock);
 		hakios_adsp_apr_events(NULL);
 		say("sound: everything of the sound's is stopped and put back\n");
 	}
@@ -1429,26 +2250,37 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		    "the port, a stream with a test tone, and the amplifiers", seconds);
 	}
 	if (level >= 3) {
-		acf = hakios_adsp_fw_file("aw882xx_acf.bin", &acf_size);
+		const char *file = AR ? "tfa98xx.cnt" : "aw882xx_acf.bin";
+
+		acf = hakios_adsp_fw_file(file, &acf_size);
 		if (acf == NULL) {
-			say("sound: no aw882xx_acf.bin in fw/ of the small image nor /fw of the root: put the phone's "
-			    "/vendor/firmware/aw882xx_acf.bin into firmware/BOARD/fw/ (iOS 26/27) or fw-audio/ (16.5)\n");
+			say("sound: no %s in fw/ of the small image nor /fw of the root: put the phone's %s into "
+			    "firmware/BOARD/fw/ (iOS 26/27) or fw-audio/ (16.5)\n", file,
+			    AR ? "/odm/firmware/tfa98xx.cnt" : "/vendor/firmware/aw882xx_acf.bin");
 			goto out;
 		}
 	}
-	if (level >= 2) {
-		lck_mtx_lock(&hakios_smmu_lock);
+	if (level >= 2 || AR) {
+		lck_mtx_t *space_lock = AR ? &audio_space_lock : &hakios_smmu_lock;
+
+		lck_mtx_lock(space_lock);
 		ok = shared_get(0);
-		lck_mtx_unlock(&hakios_smmu_lock);
+		lck_mtx_unlock(space_lock);
 		if (!ok) {
 			goto out;
 		}
 		ok = false;
-		hakios_adsp_apr_events(events);
+		hakios_adsp_apr_events(AR ? ar_events : events);
 	}
 	announce("the TDM pins (the board's speaker { } sound-pins) to the interface, as Android's active state has them");
 	pins_on();
-	if (!afe_on()) {
+	if (AR) {
+		announce("the DSP is asked for the speakers' bit clock (PRM)");
+		ar_clock_on = ar_clock(true);
+		if (!ar_clock_on || !ar_stream_on()) {
+			goto out;
+		}
+	} else if (!afe_on()) {
 		goto out;
 	}
 	sleep_ms(20);
@@ -1462,7 +2294,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 		ok = true;
 		goto out;
 	}
-	if (!stream_on()) {
+	if (!AR && !stream_on()) {
 		goto out;
 	}
 	if (level == 4) {
@@ -1485,6 +2317,7 @@ sound_thread(__unused void *parameter, __unused wait_result_t result)
 			say("sound: no thread for the feeder\n");
 			goto out;
 		}
+		thread_set_thread_name(feeder, "sound-feeder");
 		thread_deallocate(feeder);
 		watcher_runs = true;
 		hakios_audio_set_sink("the speakers (the audio DSP, board/sound.c)", darwin_sink);
@@ -1537,9 +2370,14 @@ hakios_sound_dsp_up(void)
 	if (!PE_parse_boot_argn("sound", &level, sizeof(level)) || level == 0) {
 		return;
 	}
-	if (!hakios_board_has(HAKIOS_HAS_SPEAKER_AW88261)) {
+	if (!hakios_board_has(HAKIOS_HAS_SPEAKER_AW88261) && !AR) {
 		/* what the DSP is told here is for those amplifiers and their wiring */
-		say("sound: disabled: this board's board.dts lists no \"speaker-aw88261\"\n");
+		say("sound: disabled: this board's board.dts lists no \"speaker-aw88261\" or \"speaker-tfa9874\"\n");
+		level = 0;
+		return;
+	}
+	if (AR && !hakios_adsp_is_gpr()) {
+		say("sound: disabled: AudioReach requires an ADSP speaking GPR\n");
 		level = 0;
 		return;
 	}
@@ -1568,6 +2406,8 @@ hakios_sound_dsp_up(void)
 	PE_parse_boot_argn("sound_pause", &pause_ms, sizeof(pause_ms));
 	PE_parse_boot_argn("sound_guard_as", &guard_as, sizeof(guard_as));
 	PE_parse_boot_argn("sound_gain", &gain, sizeof(gain));
+	/* boot-arg sound_idle=S: idle seconds after non-silent sound before stopping AudioReach stream (default 10; 0: never) */
+	PE_parse_boot_argn("sound_idle", &idle_s, sizeof(idle_s));
 	if (gain > HAKIOS_GUARD_MAX_GAIN) {
 		gain = HAKIOS_GUARD_MAX_GAIN;
 	}
@@ -1581,6 +2421,7 @@ hakios_sound_dsp_up(void)
 		say("sound: no thread\n");
 		return;
 	}
+	thread_set_thread_name(thread, "sound-watch");
 	thread_deallocate(thread);
 }
 

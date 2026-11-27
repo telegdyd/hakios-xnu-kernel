@@ -99,7 +99,7 @@ diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
 diff --git a/bsd/conf/files b/bsd/conf/files
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,66 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -108,6 +108,67 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c         optional config_cpu_counters
@@ -132,6 +132,7 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 +bsd/dev/board/audio.c	standard
 +bsd/dev/board/virtio_sound.c	standard
 +bsd/dev/board/speaker.c	standard
++bsd/dev/board/tfa.c		standard
 +bsd/dev/board/guard.c	standard
 +bsd/dev/board/haptic.c	standard
 +bsd/dev/board/imu.c	standard

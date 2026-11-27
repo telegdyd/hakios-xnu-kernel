@@ -403,7 +403,7 @@ test_hakios_board(void)
 	return test_board_override ? test_board_override : hakios_board();
 }
 static inline bool
-test_hakios_board_has(uint32_t feature)
+test_hakios_board_has(uint64_t feature)
 {
 	return test_board_override ? ((test_board_override->features & feature) != 0) : hakios_board_has(feature);
 }

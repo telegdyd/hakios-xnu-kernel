@@ -76,6 +76,21 @@ void hakios_speaker_quiesce(void);     /* powered down at once, without sleeping
 /* the amplifiers' own temperature and battery voltage read (every second while they play): the reduction they call for */
 uint32_t hakios_speaker_monitor(bool tell);
 
+/* TFA9874 dual amplifiers (bsd/dev/board/tfa.c), dispatched from speaker.c when present on the board. */
+bool hakios_tfa_wanted(void);
+void hakios_tfa_probe(uint32_t level);
+bool hakios_tfa_prepare(const uint8_t *acf, uint64_t size);
+bool hakios_tfa_start(void);
+bool hakios_tfa_volume(uint32_t below, uint32_t step_ms);
+bool hakios_tfa_healthy(void);
+uint32_t hakios_tfa_monitor(bool tell);
+void hakios_tfa_stop(void);
+void hakios_tfa_quiesce(void);
+
+/* Software attenuation for AudioReach (and board/sound.c suspend hook for GenericARMPE). */
+void hakios_sound_soft_level(uint32_t below, bool muted);
+int hakios_sound_sleep_prepare(void);
+
 /*
  * The speakers' guard (bsd/dev/board/guard.c): what the samples go through in the feeder on their
  * way to the amplifiers, for want of the DSP's speaker protection. Levels in eighths of a dB.
@@ -98,6 +113,7 @@ void hakios_guard_monitor(uint32_t below);                     /* a reduction as
 void hakios_guard_process(int16_t *frames, uint32_t count);    /* stereo frames, in place */
 void hakios_guard_take_report(struct hakios_guard_report *report);   /* what happened since the last call */
 int hakios_guard_decibels(uint64_t ratio);                     /* 10 log10 of a Q30 ratio, in tenths of a dB */
+void hakios_guard_silence(uint64_t frames);                    /* advance the envelopes across skipped silent periods */
 /* boot-arg rec_sound_fed=1: the recording (rec_sound=N) has what the guard let through instead of what Darwin wrote */
 bool hakios_audio_recording_fed(void);
 void hakios_audio_record_fed(const int16_t *frames, uint32_t count);
@@ -131,6 +147,14 @@ hakios_apr_status_name(uint32_t status)
 	return status < sizeof(names) / sizeof(names[0]) ? names[status] : "an error this does not know";
 }
 void hakios_adsp_apr_events(hakios_apr_events_t handler);
+
+/* GPR (AudioReach on newer SoCs): service ID passed to apr_events handlers, and packet send/wait API. */
+#define HAKIOS_GPR_SERVICE              0xff
+bool hakios_adsp_gpr(uint32_t to_port, uint32_t from_port, uint32_t token, uint32_t opcode, const void *payload,
+    uint32_t length, uint32_t wait_ms, struct hakios_apr_answer *answer);
+bool hakios_adsp_is_gpr(void);
+extern int hakios_adsp_gpr_error;
+uint32_t hakios_adsp_gpr_room(void);
 const uint8_t *hakios_adsp_fw_file(const char *name, uint64_t *size);        /* /fw/name, read whole; give back with: */
 void hakios_adsp_fw_free(const uint8_t *data, uint64_t size);
 

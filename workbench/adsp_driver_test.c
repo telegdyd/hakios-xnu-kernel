@@ -584,6 +584,67 @@ intent_told_again(void)
 	CHECK(sending.error == ENOBUFS, "and not sent when the DSP refuses it: %d", sending.error);
 }
 
+static uint32_t gpr_event_calls, gpr_event_port, gpr_event_opcode, gpr_event_token;
+static uint8_t gpr_event_service;
+
+static bool
+test_gpr_events(uint8_t service, uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload __unused,
+    uint32_t length __unused)
+{
+	gpr_event_calls++;
+	gpr_event_service = service;
+	gpr_event_port = port;
+	gpr_event_opcode = opcode;
+	gpr_event_token = token;
+	return true;
+}
+
+static void
+gpr_dispatch_and_fire_and_forget(void)
+{
+	struct gpr_header pkt = { 0 };
+	uint32_t payload = 0x11223344u;
+	struct hakios_apr_answer ans = { 0 };
+	unsigned counts[16] = { 0 };
+
+	phone();
+	shared_memory();
+	glink_queues();
+	link_taken_up();
+	channel_opened(CHANNEL_APR, 4);
+	gpr = true;
+	hakios_adsp_apr_events(test_gpr_events);
+
+	/* unsolicited GPR packet from DSP goes to apr_events with HAKIOS_GPR_SERVICE */
+	pkt.sizes = (uint32_t)GPR_HEADER_WORDS << 4 | ((uint32_t)sizeof(pkt)) << 8;
+	pkt.domains = GPR_DOMAIN_ADSP | GPR_DOMAIN_APPS << 8;
+	pkt.from_port = 0x6001;
+	pkt.to_port = 0x10000001u;
+	pkt.token = 0x80000003u;
+	pkt.opcode = 0x05001004u;
+	gpr_input((const uint8_t *)&pkt, sizeof(pkt));
+	CHECK(gpr_event_calls == 1 && gpr_event_service == HAKIOS_GPR_SERVICE && gpr_event_port == 0x6001 &&
+	    gpr_event_opcode == 0x05001004u && gpr_event_token == 0x80000003u,
+	    "GPR event forwarded: calls=%u svc=%#x port=%#x op=%#x tok=%#x",
+	    gpr_event_calls, gpr_event_service, gpr_event_port, gpr_event_opcode, gpr_event_token);
+	hakios_adsp_apr_events(NULL);
+
+	/* offer two 0x1000 intents and verify ms=0 fire-and-forget + ms>0 timeout sets gpr_error=0 */
+	uint32_t two_intents[4] = { 0x1000, 1, 0x1000, 2 };
+	dsp_says(GLINK_INTENT, 4, 2, two_intents, sizeof(two_intents));
+	pump();
+	CHECK(hakios_adsp_gpr(0x6001, 0x10000001u, 0x80000005u, 0x0400100au, &payload, sizeof(payload), 0, NULL),
+	    "ms=0 GPR send succeeded");
+	CHECK(hakios_adsp_gpr_error == 0, "ms=0 GPR error 0: %d", hakios_adsp_gpr_error);
+	dsp_reads(counts);
+	CHECK(counts[GLINK_DATA] == 1, "one GLINK_DATA sent: %u", counts[GLINK_DATA]);
+
+	CHECK(!hakios_adsp_gpr(1, 3, 0, 0x01001000u, &payload, sizeof(payload), 10, &ans),
+	    "ms>0 with no answer times out");
+	CHECK(hakios_adsp_gpr_error == 0, "timeout still reports send error 0: %d", hakios_adsp_gpr_error);
+	gpr = false;
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
@@ -594,6 +655,7 @@ static const struct {
 	{ "dsp_gives_up", dsp_gives_up },
 	{ "dsp_text_filtered", dsp_text_filtered },
 	{ "qrtr_hello_again", qrtr_hello_again },
+	{ "gpr_dispatch_and_fire_and_forget", gpr_dispatch_and_fire_and_forget },
 };
 
 int

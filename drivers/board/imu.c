@@ -327,7 +327,7 @@ struct imu_counts {
 
 struct imu_chip {
 	const char *feature;            /* what a board lists for it */
-	uint32_t has;                   /* ... as board.h has it (HAKIOS_HAS_*) */
+	uint64_t has;                   /* ... as board.h has it (HAKIOS_HAS_*) */
 	const char *a, *of;             /* "an LSM6DSO", "THE LSM6DSO'S": as the identity's line says them */
 	const char *identity;           /* its identity register's name ... */
 	uint8_t identity_reg, identity_is;      /* ... its number, and what the chip answers there */

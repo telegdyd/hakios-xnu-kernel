@@ -28,6 +28,7 @@ AUDIO
 F:	drivers/board/audio.c
 F:	drivers/board/sound.c
 F:	drivers/board/speaker.c
+F:	drivers/board/tfa.c
 F:	drivers/board/mic.c
 F:	drivers/board/guard.c
 F:	drivers/board/adsp.c
@@ -38,11 +39,12 @@ T:	workbench/audio_plugin_test.c
 T:	workbench/record_analysis_test.c
 T:	workbench/sound_driver_test.c
 T:	workbench/speaker_driver_test.c
+T:	workbench/tfa_driver_test.c
 T:	workbench/mic_driver_test.c
 T:	workbench/adsp_driver_test.c
 T:	workbench/guard_test.c
 D:	Documentation/drivers.md
-K:	speaker-aw88261, mic-wcd938x, adsp; sound=, adsp=
+K:	speaker-aw88261, speaker-tfa9874, mic-wcd938x, adsp; sound=, adsp=
 
 BACKLIGHT AND BRIGHTNESS
 F:	drivers/board/backlight.c

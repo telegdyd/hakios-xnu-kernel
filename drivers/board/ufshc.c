@@ -65,7 +65,7 @@
 #include <vm/vm_kern_xnu.h>  /* xnu-12377: the KMA flags and kmem_alloc moved to the internal header */
 #include <vm/memory_types.h>
 extern const struct hakios_board *hakios_board(void) __attribute__((weak));
-extern bool hakios_board_has(uint32_t feature) __attribute__((weak));
+extern bool hakios_board_has(uint64_t feature) __attribute__((weak));
 
 #include "board.h"
 #include "kernel.h"

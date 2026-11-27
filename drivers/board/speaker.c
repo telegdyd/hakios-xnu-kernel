@@ -689,6 +689,9 @@ faulty(struct amplifier *a, uint16_t *status)
 bool
 hakios_speaker_prepare(const uint8_t *acf, uint64_t size)
 {
+	if (hakios_tfa_wanted()) {
+		return hakios_tfa_prepare(acf, size);
+	}
 	if (!hakios_board_has(HAKIOS_HAS_SPEAKER_AW88261) || hakios_board()->pins.tlmm == 0) {
 		say("speaker: not on this board: its board.dts lists no \"speaker-aw88261\", or its SoC file has no pins { }\n");
 		return false;
@@ -787,6 +790,9 @@ hakios_speaker_prepare(const uint8_t *acf, uint64_t size)
 bool
 hakios_speaker_start(void)
 {
+	if (hakios_tfa_wanted()) {
+		return hakios_tfa_start();
+	}
 	/*
 	 * Both prepared, before either is started. A preparing that stopped at the second (another chip there, its fuses
 	 * not read) leaves the first prepared and not broken: asked to start, the first would be powered up and unmuted,
@@ -869,6 +875,10 @@ hakios_speaker_volume(uint32_t below, uint32_t step_ms)
 {
 	uint16_t status;
 
+	if (hakios_tfa_wanted()) {
+		return hakios_tfa_volume(below, step_ms);
+	}
+
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint32_t target = below > VOLUME_LOWEST ? VOLUME_LOWEST : a->volume_at + below;
@@ -922,6 +932,9 @@ hakios_speaker_volume(uint32_t below, uint32_t step_ms)
 bool
 hakios_speaker_healthy(void)
 {
+	if (hakios_tfa_wanted()) {
+		return hakios_tfa_healthy();
+	}
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t status;
@@ -968,6 +981,10 @@ hakios_speaker_monitor(bool tell)
 {
 	uint32_t wanted = 0;
 
+	if (hakios_tfa_wanted()) {
+		return hakios_tfa_monitor(tell);
+	}
+
 	for (unsigned i = 0; i < 2; i++) {
 		struct amplifier *a = &amplifiers[i];
 		uint16_t vbat = 0, temp = 0, pvdd = 0, isn = 0, vsn = 0;
@@ -1012,6 +1029,10 @@ hakios_speaker_monitor(bool tell)
 void
 hakios_speaker_stop(void)
 {
+	if (hakios_tfa_wanted()) {
+		hakios_tfa_stop();
+		return;
+	}
 	if (broken) {
 		power_down_again();     /* (already powered down, but for one that was not read back so) */
 		return;
@@ -1050,6 +1071,11 @@ hakios_speaker_quiesce(void)
 {
 	bool any = false, interrupted;
 	struct i2c_gpio as_found;
+
+	if (hakios_tfa_wanted()) {
+		hakios_tfa_quiesce();
+		return;
+	}
 
 	for (unsigned i = 0; i < 2; i++) {
 		any |= amplifiers[i].started || amplifiers[i].down_pending;
@@ -1165,9 +1191,13 @@ hakios_speaker_init(void)
 	if (!PE_parse_boot_argn("speaker_probe", &probe_level, sizeof(probe_level)) || probe_level == 0) {
 		return;
 	}
+	if (hakios_tfa_wanted()) {
+		hakios_tfa_probe(probe_level);
+		return;
+	}
 	if (!hakios_board_has(HAKIOS_HAS_SPEAKER_AW88261)) {
 		/* every address below is one phone's: not on a board that does not say it is wired the same */
-		say("speaker: disabled: this board's board.dts lists no \"speaker-aw88261\"\n");
+		say("speaker: disabled: this board's board.dts lists no \"speaker-aw88261\" or \"speaker-tfa9874\"\n");
 		probe_level = 0;
 		return;
 	}

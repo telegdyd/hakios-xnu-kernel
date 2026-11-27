@@ -115,9 +115,17 @@ struct fake_lock hakios_smmu_lock = { PTHREAD_MUTEX_INITIALIZER };
 #define KERNEL 1
 #define HAKIOS_MMIO_TEST 1
 #include "board/board.c"
+static bool use_tfa_board;
+static struct hakios_board tfa_board_override;
+static inline const struct hakios_board *sound_test_board(void) { return use_tfa_board ? &tfa_board_override : hakios_board(); }
+static inline bool sound_test_board_has(uint64_t feature) { return (sound_test_board()->features & feature) != 0; }
+#define hakios_board sound_test_board
+#define hakios_board_has sound_test_board_has
 #define get sound_get
 #include "board/sound.c"
 #undef get
+#undef hakios_board
+#undef hakios_board_has
 #undef printf
 
 /* (the audio DSP's driver, the amplifiers', the guard's and Darwin's audio device: these scenarios reach none of them) */
@@ -174,6 +182,83 @@ hakios_adsp_apr(uint8_t service, uint16_t port, uint32_t token __unused, uint32_
 	return false;
 }
 void hakios_adsp_apr_events(hakios_apr_events_t handler __unused) { }
+int hakios_adsp_gpr_error;
+static bool test_is_gpr;
+static unsigned gpr_cmds, gpr_oob_cmds, gpr_data_writes;
+static uint32_t gpr_last_clks[4], gpr_last_clock_n;
+static bool gpr_force_inband_fail;
+bool hakios_adsp_is_gpr(void) { return test_is_gpr; }
+bool
+hakios_adsp_gpr(uint32_t to_port, uint32_t from_port __unused, uint32_t token __unused, uint32_t opcode,
+    const void *payload, uint32_t length, uint32_t wait_ms __unused, struct hakios_apr_answer *answer)
+{
+	const uint32_t *w = (const uint32_t *)payload;
+
+	if (opcode == DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2) {
+		gpr_data_writes++;
+		hakios_adsp_gpr_error = 0;
+		return true;
+	}
+	gpr_cmds++;
+	if (gpr_force_inband_fail && length > 256) {
+		hakios_adsp_gpr_error = EMSGSIZE;
+		return false;
+	}
+	if (length == 16 && w != NULL && w[2] == map_handle && w[3] > 0) {
+		gpr_oob_cmds++;
+	}
+	if (opcode == PRM_CMD_REQUEST_HW_RSC && length >= 40 && w != NULL) {
+		gpr_last_clks[gpr_last_clock_n++ % 4] = w[9];  /* clk_id after apm(4) + param(4) + num_clks(1) */
+	}
+	hakios_adsp_gpr_error = 0;
+	if (answer != NULL) {
+		memset(answer, 0, sizeof(*answer));
+		if (opcode == APM_CMD_SHARED_MEM_MAP_REGIONS) {
+			answer->opcode = APM_CMD_RSP_SHARED_MEM_MAP_REGIONS;
+			answer->length = 4;
+			answer->words[0] = 0x4444u;
+		} else if (opcode == PRM_CMD_REQUEST_HW_RSC || opcode == PRM_CMD_RELEASE_HW_RSC) {
+			answer->opcode = opcode == PRM_CMD_REQUEST_HW_RSC ? PRM_CMD_RSP_REQUEST_HW_RSC : PRM_CMD_RSP_RELEASE_HW_RSC;
+			answer->length = 8;
+			answer->words[0] = opcode;
+			answer->words[1] = 0;
+		} else {
+			answer->opcode = GPR_BASIC_RSP_RESULT;
+			answer->length = 8;
+			answer->words[0] = opcode;
+			answer->words[1] = 0;
+		}
+	}
+	return true;
+}
+
+static struct {
+	bool claimed, mapped, released;
+	unsigned sid, mask;
+	unsigned long long iova;
+	unsigned long size;
+} test_ar_smmu;
+struct hakios_smmu_context { int dummy; };
+static struct hakios_smmu_context test_ar_smmu_ctx;
+struct hakios_smmu_context *
+hakios_smmu_claim(unsigned sid, unsigned mask, unsigned long long iova_base, unsigned long iova_size, const char *who __unused)
+{
+	test_ar_smmu.claimed = true;
+	test_ar_smmu.sid = sid;
+	test_ar_smmu.mask = mask;
+	test_ar_smmu.iova = iova_base;
+	test_ar_smmu.size = iova_size;
+	return &test_ar_smmu_ctx;
+}
+int
+hakios_smmu_map_kva(struct hakios_smmu_context *ctx __unused, unsigned long long iova __unused,
+    unsigned long kva __unused, unsigned long size __unused, unsigned prot __unused)
+{
+	test_ar_smmu.mapped = true;
+	return 0;
+}
+bool hakios_smmu_faults(struct hakios_smmu_context *ctx __unused) { return true; }
+int hakios_smmu_release(struct hakios_smmu_context *ctx __unused) { test_ar_smmu.released = true; return 0; }
 const uint8_t *hakios_adsp_fw_file(const char *name __unused, uint64_t *size __unused) { return NULL; }
 void hakios_adsp_fw_free(const uint8_t *data __unused, uint64_t size __unused) { }
 /*
@@ -210,6 +295,8 @@ static volatile uint32_t guard_attenuation;
 static bool guard_holds;
 void hakios_guard_attenuation(uint32_t below) { guard_attenuation = below; }
 void hakios_guard_monitor(uint32_t below __unused) { }
+static uint64_t silence_frames_noted;
+void hakios_guard_silence(uint64_t frames) { silence_frames_noted += frames; }
 void
 hakios_guard_process(int16_t *frames __unused, uint32_t count __unused)
 {
@@ -831,6 +918,84 @@ far_under_and_darwin_under_that(void)
 	pthread_join(thread, NULL);
 }
 
+static void
+audioreach_soft_volume_smmu_and_sleep(void)
+{
+	int16_t buf[4] = { 16000, -16000, 8000, -8000 };
+
+	tfa_board_override = (struct hakios_board){
+		.name = "tfa-test",
+		.features = HAKIOS_HAS_SPEAKER_TFA9874,
+		.pins = { .tlmm = 0x0f100000 },
+		.smmu = { .apps = SMMU_AT, .audio_stream = { 0x1801, 0x0 } },
+		.speaker = {
+			.sda = 48, .scl = 49, .address = { 0x34, 0x35 }, .reset = { 50, 51 }, .has_resets = 1,
+			.sound_pin = { 121, 123, 122, 124 }, .sound_function = 1, .tdm = 2,
+		},
+	};
+	use_tfa_board = true;
+	CHECK(sound_test_board_has(HAKIOS_HAS_SPEAKER_TFA9874), "speaker-tfa9874 board enables AudioReach mode");
+	CHECK(ar_clocks[tfa_board_override.speaker.tdm] == 0x104u, "tdm=2 maps to clock 0x104 (%#x)",
+	    ar_clocks[tfa_board_override.speaker.tdm]);
+
+	/* software attenuation: muted=true zeroes samples; 0 dB leaves unchanged; 6 dB halves */
+	hakios_sound_soft_level(0, true);
+	soft_apply(buf, 4);
+	CHECK(buf[0] == 0 && buf[1] == 0, "muted zeroes samples");
+	buf[0] = 16000; buf[1] = -16000;
+	hakios_sound_soft_level(48, false);    /* 6 dB down */
+	soft_apply(buf, 2);
+	CHECK(buf[0] > 7900 && buf[0] < 8100 && buf[1] < -7900 && buf[1] > -8100, "6 dB down halves: %d %d", buf[0], buf[1]);
+
+	/* period_fill() for sound=2/3 must also apply soft_q15 under AudioReach */
+	{
+		static int16_t ar_periods[4096 * 2 / 2] __attribute__((aligned(4096)));
+
+		buffer = (vm_offset_t)ar_periods;
+		tone_at = 0;
+		hakios_sound_soft_level(240, false); /* 30 dB down: tone[12] 3277 -> ~103 */
+		period_fill(0, false);
+		CHECK(ar_periods[2 * 12] > 90 && ar_periods[2 * 12] < 120 && ar_periods[2 * 12 + 1] == ar_periods[2 * 12],
+		    "period_fill applies 30 dB attenuation under AR: %d %d", ar_periods[2 * 12], ar_periods[2 * 12 + 1]);
+		tone_at = 0;
+		hakios_sound_soft_level(720, false); /* 90 dB down: silent */
+		period_fill(1, false);
+		CHECK(all_silence(ar_periods + 4096 / 2), "period_fill at -90 dB is silent under AR: %d",
+		    ar_periods[4096 / 2 + 2 * 12]);
+		buffer = 0;
+	}
+
+	/* shared SMMU claim/map + GPR out-of-band command path + release */
+	test_is_gpr = true;
+	memset(&test_ar_smmu, 0, sizeof(test_ar_smmu));
+	lck_mtx_lock(&audio_space_lock);
+	CHECK(shared_get(0), "AR shared_get claims/maps smmu_ctx");
+	lck_mtx_unlock(&audio_space_lock);
+	CHECK(test_ar_smmu.claimed && test_ar_smmu.mapped && test_ar_smmu.sid == 0x1801 &&
+	    test_ar_smmu.size == SHARED_BYTES, "smmu_ctx got stream 0x1801 and %u bytes", SHARED_BYTES);
+
+	gpr_cmds = gpr_oob_cmds = 0;
+	gpr_force_inband_fail = true;
+	CHECK(ar_clock(true) && gpr_last_clks[0] == 0x104u, "PRM clock 0x104 requested (got %#x)", gpr_last_clks[0]);
+	CHECK(ar_stream_on(), "AR stream_on opens and starts graph");
+	CHECK(gpr_oob_cmds >= 1 && map_handle == 0x4444u, "out-of-band command fallback used for GRAPH_OPEN (%u)", gpr_oob_cmds);
+	gpr_force_inband_fail = false;
+	ar_stream_off();
+	ar_clock(false);
+	lck_mtx_lock(&audio_space_lock);
+	shared_put(0);
+	lck_mtx_unlock(&audio_space_lock);
+	CHECK(test_ar_smmu.released, "AR smmu_ctx released");
+
+	/* sleep_prepare: -1 when not running */
+	CHECK(hakios_sound_sleep_prepare() == -1, "sleep_prepare is -1 when stopped");
+	running = true; taken_down = false; level = 4; guard_on = true;
+	CHECK(hakios_sound_sleep_prepare() == 0, "sleep_prepare is 0 when playing");
+	guard_on = false; graph_idle = true;
+	CHECK(hakios_sound_sleep_prepare() == 1, "sleep_prepare is 1 when already idle");
+	running = false;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -849,6 +1014,7 @@ main(int argc, char **argv)
 		{ "smmu_taken_meanwhile", smmu_taken_meanwhile, 1 }, { "a_write_not_sent_is_tried_again", a_write_not_sent_is_tried_again, 1 },
 		{ "a_write_as_the_watcher_looks", a_write_as_the_watcher_looks, 1 },
 		{ "far_under_and_darwin_under_that", far_under_and_darwin_under_that, 1 },
+		{ "audioreach_soft_volume_smmu_and_sleep", audioreach_soft_volume_smmu_and_sleep, 1 },
 	};
 	char name[64];
 	const char *colon;

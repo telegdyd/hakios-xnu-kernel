@@ -38,7 +38,7 @@
 	// gpu-slumber     with gpu-a730: deeper idle collapse after 1 s without work (gpu=1; gpu_slumber=0 keeps it awake)
 	// and these, each a driver of one part wired the way one phone has it -- list one only if your phone
 	// has that part on the same pins and bus (drivers/board/board.h, Documentation/drivers.md):
-	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-s3908, speaker-aw88261, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,
+	// touch-goodix, touch-ft3658u, touch-ft5x06, touch-s3908, speaker-aw88261, speaker-tfa9874, haptic-aw86927, imu-lsm6dso, imu-bmi160, torch-pm8350c,
 	// camera-sm7325, wifi-wcn6750, wifi-qca6490, mic-wcd938x, modem-sm7325, bluetooth-wcn-uart
 	// Documentation/features.md has what each needs written down first; tools/boards.py status NAME says it for
 	// this board.
@@ -177,13 +177,14 @@
 		// codec-reset = <83>;          // the codec's node: reset-gpios (qcom,wcd-rst-gpio-node's pin in vendor trees)
 	// };
 
-	// The speaker's two amplifiers, for the feature "speaker-aw88261": Awinic AW88261 on two of the SoC's
-	// pins (I2C by hand), each with an address and an interrupt pin of its own.
+	// The speaker's two amplifiers, for the feature "speaker-aw88261" or "speaker-tfa9874": Awinic AW88261 or
+	// NXP TFA9874 on two of the SoC's pins (I2C by hand), each with an address and an interrupt or reset pin of its own.
 	// speaker {
 		// sda = <12>;                  // the I2C bus's data line: the first pin of the bus's pinctrl node
 		// scl = <13>;                  // ... and its clock, the second
-		// addresses = <0x35 0x34>;     // the two aw882xx_smartpa@NN nodes' reg; the first is the one with sound-channel 0
-		// interrupts = <102 45>;       // ... and their irq-gpio, in the same order
+		// addresses = <0x35 0x34>;     // the two amplifier nodes' reg; the first is channel 0
+		// interrupts = <102 45>;       // ... and their irq-gpio, in the same order (for speaker-aw88261)
+		// resets = <50 51>;            // active-high reset GPIOs, in the same order (for speaker-tfa9874)
 		// sound-pins = <97 100 98 99>; // the pins the sound goes to them on (the MI2S or TDM port's pinctrl nodes):
 		//                              // bit clock, frame sync (word select), data in, data out
 		// sound-function = <1>;        // which of those pins' functions that is (pinctrl-SOC.c: "mi2s0_sck" is function 1)

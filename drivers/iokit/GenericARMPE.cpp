@@ -45,6 +45,7 @@ void lx_doze_sleep_over(void);
 int hakios_gpu_sleep_now(void) __attribute__((weak));                                                   /* BoardGPU.cpp */
 uint32_t hakios_adsp_wake_intid(void) __attribute__((weak));                                            /* adsp.c */
 uint32_t hakios_usb_wake_intid(void) __attribute__((weak));                                             /* usb_net.c */
+int hakios_sound_sleep_prepare(void) __attribute__((weak));                                             /* sound.c */
 extern "C" void hakios_charger_arrived(void);
 static IOService * gThePE;              /* (start(): the device requestUserActive() names) */
 static void alarmsRegister(IOService * pe);
@@ -860,6 +861,7 @@ static struct {
 	bool lpis_kept;                 /* the last sleep left the radio's MSIs (LPIs) unmasked: a wake source */
 	int ufs, ufs_why;               /* UFS's domain at the last sleep's start: 1 off, 0 on (why: 1 busy, 2 not in Hibern8,
 	                                 * 3 power-down off), -1 none */
+	int sound;                      /* the speakers' stream at the last sleep's start: 1 stopped, 0 RUNNING, -1 none */
 } gSleeps;
 /* kern.hakios.sleep_lpis: 1 (default) a dozing radio's MSIs wake the system; 0 masked while it sleeps (as step 1) */
 static uint32_t gSleepLpis = 1;
@@ -919,11 +921,12 @@ sleepsSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused i
 	}
 	if (at < sizeof(text)) {
 		(void) snprintf(text + at, sizeof(text) - at, "; Wi-Fi at the last sleep's start: %s (dozed for %u sleeps); "
-		    "GPU %s; UFS %s; %s; test sleeps asked %u; dark wakes %u (by the DSP %u, by USB %u); alarms %u; a charger lit it %u; LPIs %s", gSleeps.wifi_doze == 2 ? "dozing" : gSleeps.wifi_doze == -2 ? "none" :
+		    "GPU %s; UFS %s; sound %s; %s; test sleeps asked %u; dark wakes %u (by the DSP %u, by USB %u); alarms %u; a charger lit it %u; LPIs %s", gSleeps.wifi_doze == 2 ? "dozing" : gSleeps.wifi_doze == -2 ? "none" :
 		    gSleeps.wifi_doze == -1 ? "no doze thread" : "awake", gSleeps.wifi_dozed,
 		    gSleeps.gpu == 1 ? "in slumber" : gSleeps.gpu == 0 ? "AWAKE" : "none",
 		    gSleeps.ufs == 1 ? "off" : gSleeps.ufs == -1 ? "none" : gSleeps.ufs_why == 1 ? "ON (busy)" :
 		    gSleeps.ufs_why == 2 ? "ON (not in Hibern8)" : "ON (power-down off)",
+		    gSleeps.sound == 1 ? "stopped" : gSleeps.sound == 0 ? "RUNNING" : "none",
 		    gSleeps.set_line[0] ? gSleeps.set_line : "sleep set: not read", gSleeps.test_asks, gSleeps.dark,
 		    gSleeps.by_dsp, gSleeps.by_usb, gSleeps.by_alarm, gSleeps.charger_lit, gSleeps.lpis_kept ? "live" : "masked");
 	}
@@ -955,6 +958,7 @@ GenericARMPE::sleepKernel(void)
 	 * Step 2: the radio dozes first (threads still run), so that PCIe gives up its bus vote and CX can collapse while
 	 * the system sleeps; frames sent meanwhile wait for the wake.
 	 */
+	gSleeps.sound = hakios_sound_sleep_prepare != NULL ? hakios_sound_sleep_prepare() : -1;
 	gSleeps.gpu = hakios_gpu_sleep_now != NULL ? hakios_gpu_sleep_now() : -1;
 	gSleeps.wifi_doze = lx_doze_for_sleep(2500);
 	hakios_sleep_keep_lpis(gSleeps.wifi_doze == 2 && gSleepLpis != 0);  /* (a dozing radio calls by MSI: a wake source) */

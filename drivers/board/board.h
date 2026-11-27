@@ -31,70 +31,71 @@
  * here and nowhere else.
  */
 enum {
-	HAKIOS_HAS_CPUFREQ_EPSS = 1u << 0,      /* CPU frequency through Qualcomm's EPSS (bsd/dev/board/cpufreq.c) */
-	HAKIOS_HAS_DDR_RPMH     = 1u << 1,      /* memory bandwidth votes through RPMh (board/ddr.c) */
-	HAKIOS_HAS_BATTERY_UEFI = 1u << 2,      /* the battery as the firmware reports it to the loader (board/battery.c) */
-	HAKIOS_HAS_BUTTONS_PMIC = 1u << 3,      /* power and volume keys on the PMIC, through the SPMI arbiter (board/buttons.c) */
-	HAKIOS_HAS_ADSP         = 1u << 4,      /* the audio DSP: sound, and the battery manager behind it (board/adsp.c) */
-	HAKIOS_HAS_DISPLAY_SCAN = 1u << 13,     /* a command-mode panel whose readout is followed on the DSI interface's
+	HAKIOS_HAS_CPUFREQ_EPSS = 1ull << 0,      /* CPU frequency through Qualcomm's EPSS (bsd/dev/board/cpufreq.c) */
+	HAKIOS_HAS_DDR_RPMH     = 1ull << 1,      /* memory bandwidth votes through RPMh (board/ddr.c) */
+	HAKIOS_HAS_BATTERY_UEFI = 1ull << 2,      /* the battery as the firmware reports it to the loader (board/battery.c) */
+	HAKIOS_HAS_BUTTONS_PMIC = 1ull << 3,      /* power and volume keys on the PMIC, through the SPMI arbiter (board/buttons.c) */
+	HAKIOS_HAS_ADSP         = 1ull << 4,      /* the audio DSP: sound, and the battery manager behind it (board/adsp.c) */
+	HAKIOS_HAS_DISPLAY_SCAN = 1ull << 13,     /* a command-mode panel whose readout is followed on the DSI interface's
 	                                         * counters, for frames without tearing (board/adreno.c, fb_scan) */
-	HAKIOS_HAS_VIRTIO       = 1u << 15,     /* an emulator's virtio devices on its MMIO transport: network, tablet
+	HAKIOS_HAS_VIRTIO       = 1ull << 15,     /* an emulator's virtio devices on its MMIO transport: network, tablet
 	                                         * and keyboard (board/virtio_net.c, board/virtio_input.c) */
-	HAKIOS_HAS_GPU_A660     = 1u << 14,     /* an Adreno of the A660 family behind a GMU; what differs from one to
+	HAKIOS_HAS_GPU_A660     = 1ull << 14,     /* an Adreno of the A660 family behind a GMU; what differs from one to
 	                                         * the next is the board's gpu { } (board/adreno.c, gpu=1) */
-	HAKIOS_HAS_GPU_A730     = 1u << 23,     /* an Adreno 730 (gen7) behind a GMU: the same driver, board data and
+	HAKIOS_HAS_GPU_A730     = 1ull << 23,     /* an Adreno 730 (gen7) behind a GMU: the same driver, board data and
 	                                         * steps, with gen7's own parts; steps 1 to 10 so far (board/adreno.c) */
-	HAKIOS_HAS_DISPLAY_FLIP = 1u << 24,     /* frames shown by pointing the display controller's pipes at one of two
+	HAKIOS_HAS_DISPLAY_FLIP = 1ull << 24,     /* frames shown by pointing the display controller's pipes at one of two
 	                                         * buffers in turn while the GPU draws into the other (an SM8450-layout
 	                                         * DPU under the firmware's auto-refresh; iokit/MiniIOMobileFramebuffer.cpp,
 	                                         * fb_flip) */
-	HAKIOS_HAS_GPU_DCVS     = 1u << 25,     /* the GPU's speed follows its load, by the GMU's busy counter, and is
+	HAKIOS_HAS_GPU_DCVS     = 1ull << 25,     /* the GPU's speed follows its load, by the GMU's busy counter, and is
 	                                         * capped by the GPU's own sensors (adreno { } tsens): the board's gpu { }
 	                                         * speeds and speed-bus (board/adreno.c, gpu_dcvs) */
-	HAKIOS_HAS_GPU_IFPC     = 1u << 26,     /* the GMU powers a kept A730's 3D core down between frames and up for the
+	HAKIOS_HAS_GPU_IFPC     = 1ull << 26,     /* the GMU powers a kept A730's 3D core down between frames and up for the
 	                                         * next, the command processor writing back what it lost (board/adreno.c,
 	                                         * gpu_ifpc) */
-	HAKIOS_HAS_GPU_SLUMBER  = 1u << 27,     /* deeper idle collapse of a kept A730 after 1 s without work: GMU, SMMU
+	HAKIOS_HAS_GPU_SLUMBER  = 1ull << 27,     /* deeper idle collapse of a kept A730 after 1 s without work: GMU, SMMU
 	                                         * and CX off, client allocations and fences kept (board/adreno.c,
 	                                         * gpu_slumber) */
-	HAKIOS_HAS_DISPLAY_POWER = 1u << 28,    /* panel sleep/wake (DCS 0x28/0x10 and the Samsung AMB670YF08's
+	HAKIOS_HAS_DISPLAY_POWER = 1ull << 28,    /* panel sleep/wake (DCS 0x28/0x10 and the Samsung AMB670YF08's
 	                                         * on-sequence) and SM8450 MDSS/DSI hardware power-down while the panel
 	                                         * sleeps (board/backlight.c, display_power_down) */
-	HAKIOS_HAS_CPU_IDLE      = 1u << 29,    /* idle cores power down (PSCI CPU_SUSPEND), the last one up taking the
+	HAKIOS_HAS_CPU_IDLE      = 1ull << 29,    /* idle cores power down (PSCI CPU_SUSPEND), the last one up taking the
 	                                         * cluster's L3 and system cache with it; the processors of cpu-idle { }
 	                                         * screen-off-cores off while the display is off (arch/arm64/kernel/
 	                                         * psci_smp.c, cpu_idle, screen_off_cores) */
-	HAKIOS_HAS_SOC_SLEEP     = 1u << 30,    /* APSS RPMh sleep/wake TCS sets, ARC/MMCX/CX collapse, UFS idle/power-down
+	HAKIOS_HAS_SOC_SLEEP     = 1ull << 30,    /* APSS RPMh sleep/wake TCS sets, ARC/MMCX/CX collapse, UFS idle/power-down
 	                                         * and USB cable-out parking (drivers/board/soc_sleep.c, ufshc.c, usb_net.c) */
 	/*
 	 * Drivers of one part, wired the way one phone has it (the pins, the bus, the chip): a board lists
 	 * one only if it has that part wired that way. Asked for on any other board, the driver says so and
 	 * does nothing, rather than write to another phone's pins.
 	 */
-	HAKIOS_HAS_TOUCH_GOODIX    = 1u << 5,   /* Goodix GT9916 or FocalTech FT3680 on SPI, wired as touch { } says (board/goodix.c) */
-	HAKIOS_HAS_TOUCH_FT3658U   = 1u << 6,   /* FocalTech FT3658U on SPI, wired as touch { } says (board/fts.c) */
-	HAKIOS_HAS_SPEAKER_AW88261 = 1u << 7,   /* two Awinic AW88261 amplifiers on I2C (board/speaker.c, board/sound.c) */
-	HAKIOS_HAS_HAPTIC_AW86927  = 1u << 8,   /* an Awinic AW86927 vibration motor driver (board/haptic.c) */
-	HAKIOS_HAS_TORCH_PM8350C   = 1u << 9,   /* the flash LED module of a PM8350C (board/torch.c) */
-	HAKIOS_HAS_CAMERA_SM7325   = 1u << 10,  /* cameras on an SM7325's camera blocks, powered by a PM8008, wired as
+	HAKIOS_HAS_TOUCH_GOODIX    = 1ull << 5,   /* Goodix GT9916 or FocalTech FT3680 on SPI, wired as touch { } says (board/goodix.c) */
+	HAKIOS_HAS_TOUCH_FT3658U   = 1ull << 6,   /* FocalTech FT3658U on SPI, wired as touch { } says (board/fts.c) */
+	HAKIOS_HAS_SPEAKER_AW88261 = 1ull << 7,   /* two Awinic AW88261 amplifiers on I2C (board/speaker.c, board/sound.c) */
+	HAKIOS_HAS_HAPTIC_AW86927  = 1ull << 8,   /* an Awinic AW86927 vibration motor driver (board/haptic.c) */
+	HAKIOS_HAS_TORCH_PM8350C   = 1ull << 9,   /* the flash LED module of a PM8350C (board/torch.c) */
+	HAKIOS_HAS_CAMERA_SM7325   = 1ull << 10,  /* cameras on an SM7325's camera blocks, powered by a PM8008, wired as
 	                                         * the board's camera { } says (board/camera.c) */
-	HAKIOS_HAS_WIFI_WCN6750    = 1u << 11,  /* a WCN6750 radio on the SoC's own Wi-Fi DSP (board/wifi.c) */
-	HAKIOS_HAS_WIFI_QCA6490    = 1u << 31,  /* a QCA6490 (Linux: WCN6855) radio on the SM8450's first PCIe controller, its
+	HAKIOS_HAS_WIFI_WCN6750    = 1ull << 11,  /* a WCN6750 radio on the SoC's own Wi-Fi DSP (board/wifi.c) */
+	HAKIOS_HAS_WIFI_QCA6490    = 1ull << 31,  /* a QCA6490 (Linux: WCN6855) radio on the SM8450's first PCIe controller, its
 	                                         * enable pins and supplies as the OnePlus 10 Pro has them (board/wifi_pci.c,
 	                                         * board/pcie.c; MHI and ath11k's PCI path in kernel/lx) */
-	HAKIOS_HAS_MIC_WCD938X     = 1u << 12,  /* the microphones on a WCD938x codec, through the audio DSP (board/mic.c) */
-	HAKIOS_HAS_BLUETOOTH_WCN_UART = 1u << 17, /* Qualcomm Bluetooth over a GENI UART (board/bt_uart.c) */
-	HAKIOS_HAS_MODEM_SM7325    = 1u << 18,  /* an SM7325's modem, its packet engine and the SIM as this phone has them
+	HAKIOS_HAS_MIC_WCD938X     = 1ull << 12,  /* the microphones on a WCD938x codec, through the audio DSP (board/mic.c) */
+	HAKIOS_HAS_BLUETOOTH_WCN_UART = 1ull << 17, /* Qualcomm Bluetooth over a GENI UART (board/bt_uart.c) */
+	HAKIOS_HAS_MODEM_SM7325    = 1ull << 18,  /* an SM7325's modem, its packet engine and the SIM as this phone has them
 	                                         * (board/mpss.c, board/ipa.c, board/nas.c, board/cell.c) */
-	HAKIOS_HAS_IMU_LSM6DSO     = 1u << 19,  /* an ST LSM6DSO accelerometer on I2C, wired and mounted as the board's
+	HAKIOS_HAS_IMU_LSM6DSO     = 1ull << 19,  /* an ST LSM6DSO accelerometer on I2C, wired and mounted as the board's
 	                                         * imu { } says: the phone's orientation (board/imu.c) */
-	HAKIOS_HAS_IMU_BMI160      = 1u << 20,  /* ... or a Bosch BMI160 there instead: the same imu { }, the same driver; a
+	HAKIOS_HAS_IMU_BMI160      = 1ull << 20,  /* ... or a Bosch BMI160 there instead: the same imu { }, the same driver; a
 	                                         * board lists one of the two */
-	HAKIOS_HAS_TOUCH_FT5X06    = 1u << 21,  /* a FocalTech controller of the FT5x06 register family (FT5x06, FT5x46,
+	HAKIOS_HAS_TOUCH_FT5X06    = 1ull << 21,  /* a FocalTech controller of the FT5x06 register family (FT5x06, FT5x46,
 	                                         * FT6x36 ...) on I2C, wired as touch-i2c { } says (board/ft5x06.c) */
-	HAKIOS_HAS_TOUCH_S3908     = 1u << 22,  /* a Synaptics S3908 (TouchComm v1) on I2C, wired as touch-i2c { } says
+	HAKIOS_HAS_TOUCH_S3908     = 1ull << 22,  /* a Synaptics S3908 (TouchComm v1) on I2C, wired as touch-i2c { } says
 	                                         * (board/s3908.c) */
-	HAKIOS_HAS_CPUFREQ_SCMI = 1u << 16,     /* CPU performance queries via SCMI */
+	HAKIOS_HAS_CPUFREQ_SCMI    = 1ull << 16,  /* CPU performance queries via SCMI */
+	HAKIOS_HAS_SPEAKER_TFA9874 = 1ull << 32,  /* two NXP TFA9874 amplifiers on I2C over AudioReach/GPR (board/tfa.c, board/sound.c) */
 };
 
 /* how the panel's light is set (bsd/dev/board/backlight.c) */
@@ -131,7 +132,7 @@ struct hakios_board {
 	const char *name;                       /* /chosen/darwin-board */
 	const char *description;
 	const char *soc;
-	uint32_t features;                      /* HAKIOS_HAS_* */
+	uint64_t features;                      /* HAKIOS_HAS_* */
 
 	/* the clocks the display block's registers need (soc: clocks { }) */
 	struct {
@@ -396,7 +397,9 @@ struct hakios_board {
 	struct {
 		uint8_t sda, scl;               /* the bus's two lines, pins of the SoC */
 		uint8_t address[2];             /* each one's I2C address; the first plays the sound's slot 0 */
-		uint8_t interrupt[2];           /* each one's interrupt pin (only looked at) */
+		uint8_t interrupt[2];           /* each one's interrupt pin (only looked at; speaker-aw88261) */
+		uint8_t reset[2];               /* each one's active-high reset pin (speaker-tfa9874) */
+		uint8_t has_resets;             /* 1 when resets = <...>; was given */
 		uint8_t sound_pin[4];           /* the sound's own pins: bit clock, frame sync, data in, data out */
 		uint8_t sound_function;         /* which of those pins' functions is the sound's (the SoC's first MI2S: 1) */
 		uint8_t tdm;                    /* which of the SoC's TDM interfaces they are on: 0 the primary ... 4 the quinary */
@@ -519,7 +522,7 @@ struct hakios_board {
 const struct hakios_board *hakios_board(void);
 
 /* Has this board the feature (one HAKIOS_HAS_*)? Never, on a board that is not known. */
-bool hakios_board_has(uint32_t feature);
+bool hakios_board_has(uint64_t feature);
 
 /* display-flip's data (MDSS, the panel's interface, the firmware's display memory); false without the feature */
 bool hakios_display_flip_data(uint64_t *mdss, uint64_t *intf, uint64_t *splash_size);

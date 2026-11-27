@@ -26,13 +26,13 @@ static unsigned failures;
 #include <sys/board/input.h>
 
 static struct hakios_board test_board;
-static uint32_t test_features;
+static uint64_t test_features;
 static bool mock_screen_off, mock_display_off, mock_ufs_down;
 static int mock_charger = 1;
 static uint32_t mock_locks, mock_unlocks;
 
 const struct hakios_board *hakios_board(void) { return &test_board; }
-bool hakios_board_has(uint32_t f) { return (test_features & f) != 0; }
+bool hakios_board_has(uint64_t f) { return (test_features & f) != 0; }
 void hakios_rpmh_lock(void) { mock_locks++; }
 void hakios_rpmh_unlock(void) { mock_unlocks++; }
 #define hakios_screen_off mock_hakios_screen_off

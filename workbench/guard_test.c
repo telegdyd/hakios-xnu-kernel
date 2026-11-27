@@ -371,6 +371,33 @@ decibels(void)
 	CHECK(isqrt(0) == 0 && isqrt(1) == 1 && isqrt(99) == 9 && isqrt(100) == 10 && isqrt(1ull << 60) == 1ull << 30, "the square root");
 }
 
+/* skipped silent periods decay the thermal averages and reset the filter/envelope state */
+static void
+silence_decays_averages_and_resets_state(void)
+{
+	uint64_t slow_before;
+
+	hakios_guard_configure(true, 0);
+	hakios_guard_attenuation(0);
+	tone_of(1000);
+	play(FULL, 600);
+	hakios_guard_take_report(&report);
+	slow_before = report.slow;
+	CHECK(report.rms > 0 && report.fast > 0 && slow_before > 0 && guard.envelope > 0,
+	    "averages and envelope built up while playing");
+	hakios_guard_silence(300 * 960);        /* 6 seconds of silence (300 periods) */
+	CHECK(guard.envelope == 0, "envelope zeroed after skipped silence: %llu", (unsigned long long)guard.envelope);
+	for (unsigned c = 0; c < 2; c++) {
+		CHECK(guard.x1[c] == 0 && guard.x2[c] == 0 && guard.y1[c] == 0 && guard.y2[c] == 0,
+		    "filter state zeroed on ch %u", c);
+	}
+	play(0, 1);
+	hakios_guard_take_report(&report);
+	CHECK(report.rms < slow_before / 100 && report.slow < slow_before,
+	    "averages decayed during silence: rms=%llu slow_before=%llu slow_after=%llu",
+	    (unsigned long long)report.rms, (unsigned long long)slow_before, (unsigned long long)report.slow);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -381,6 +408,7 @@ main(int argc, char **argv)
 		{ "gain_is_limited_not_clipped", gain_is_limited_not_clipped }, { "one_spike", one_spike },
 		{ "amplifiers_turned_down", amplifiers_turned_down }, { "monitor_is_obeyed", monitor_is_obeyed },
 		{ "the_gain_arrives_by_the_last_frame", the_gain_arrives_by_the_last_frame }, { "long_call", long_call }, { "decibels", decibels },
+		{ "silence_decays_averages_and_resets_state", silence_decays_averages_and_resets_state },
 	};
 
 	if (argc < 2) {

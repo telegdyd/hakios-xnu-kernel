@@ -2621,7 +2621,7 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 #define GPR_PORT_OURS                   3       /* (Android's spf_core node: reg 3) */
 #define APM_CMD_GET_SPF_STATE           0x01001021u
 #define APM_CMD_RSP_GET_SPF_STATE       0x02001007u
-#define GPR_MAX_PAYLOAD                 256
+#define GPR_MAX_PAYLOAD                 2048
 
 struct gpr_header {
 	uint32_t sizes;                 /* [3:0] version, [7:4] header words, [31:8] packet bytes */
@@ -2662,9 +2662,28 @@ gpr_input(const uint8_t *data, uint32_t length)
 		    header.from_port, header.domains >> 8 & 0xff, header.to_port, header.opcode, header.token, payload, w[0], w[1], w[2],
 		    w[3]);
 	}
+	/* unsolicited or mismatched packets go to the audio/mic event handlers */
+	if (header.token == 0 || header.token != __atomic_load_n(&apr_waited_for, __ATOMIC_ACQUIRE)) {
+		uint32_t words[64];
+		uint32_t words_len = payload < sizeof(words) ? payload : sizeof(words);
+		hakios_apr_events_t events = apr_events;
+
+		bzero(words, sizeof(words));
+		if (words_len != 0) {
+			memcpy(words, data + header_length, words_len);
+		}
+		if (events != NULL && events(HAKIOS_GPR_SERVICE, (uint16_t)header.from_port, header.opcode, header.token,
+		    words, words_len)) {
+			return;
+		}
+		events = apr_events_second;
+		if (events != NULL) {
+			events(HAKIOS_GPR_SERVICE, (uint16_t)header.from_port, header.opcode, header.token, words, words_len);
+		}
+		return;
+	}
 	/* (kept only as the answer to the question waited for, the first one standing: as apr_input()) */
-	if (header.token == 0 || header.token != __atomic_load_n(&apr_waited_for, __ATOMIC_ACQUIRE) ||
-	    __atomic_load_n(&apr_answer.there, __ATOMIC_ACQUIRE)) {
+	if (__atomic_load_n(&apr_answer.there, __ATOMIC_ACQUIRE)) {
 		return;
 	}
 	bzero(apr_answer.words, sizeof(apr_answer.words));
@@ -2675,37 +2694,74 @@ gpr_input(const uint8_t *data, uint32_t length)
 	__atomic_store_n(&apr_answer.there, true, __ATOMIC_RELEASE);
 }
 
-/* A GPR command to a module of the DSP (to_port: its instance ID), its answer waited for ms: true when it came. */
-static bool
-gpr_ask(uint32_t to_port, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms, struct hakios_apr_answer *answer)
+int hakios_adsp_gpr_error;
+
+bool
+hakios_adsp_is_gpr(void)
 {
-	uint8_t packet[sizeof(struct gpr_header) + GPR_MAX_PAYLOAD];
-	struct gpr_header *header = (struct gpr_header *)packet;
-	uint32_t size = (uint32_t)sizeof(*header) + length, token;
+	return gpr;
+}
+
+uint32_t
+hakios_adsp_gpr_room(void)
+{
+	return glink.up ? glink_room() : 0;
+}
+
+/* A GPR command to a module of the DSP (to_port: its instance ID), its answer waited for ms (0: fire-and-forget): true when sent/answered. */
+bool
+hakios_adsp_gpr(uint32_t to_port, uint32_t from_port, uint32_t token, uint32_t opcode, const void *payload, uint32_t length,
+    uint32_t ms, struct hakios_apr_answer *answer)
+{
+	uint8_t *packet;
+	struct gpr_header *header;
+	uint32_t size = (uint32_t)sizeof(*header) + length;
 	bool answered = false;
 	int error;
 
 	if (!gpr || length > GPR_MAX_PAYLOAD || !glink.channel[CHANNEL_APR].open) {
+		hakios_adsp_gpr_error = !glink.channel[CHANNEL_APR].open ? ENOTCONN : EINVAL;
 		return false;
 	}
-	bzero(packet, sizeof(packet));
+	packet = kalloc_data(size, Z_WAITOK | Z_ZERO);
+	if (packet == NULL) {
+		hakios_adsp_gpr_error = ENOMEM;
+		return false;
+	}
+	header = (struct gpr_header *)packet;
 	header->sizes = (uint32_t)GPR_HEADER_WORDS << 4 | size << 8;
 	header->domains = GPR_DOMAIN_ADSP | GPR_DOMAIN_APPS << 8;
-	header->from_port = GPR_PORT_OURS;
+	header->from_port = from_port != 0 ? from_port : GPR_PORT_OURS;
 	header->to_port = to_port;
 	header->opcode = opcode;
 	if (length != 0) {
 		memcpy(packet + sizeof(*header), payload, length);
 	}
+	if (ms == 0) {
+		/* sent and not waited for: lockless on apr_lock, caller provides token if events() cares */
+		header->token = token;
+		error = glink_send(&glink.channel[CHANNEL_APR], packet, size);
+		hakios_adsp_gpr_error = error;
+		if (error != 0) {
+			printf("adsp: gpr: > opcode %#x to port %#x: NOT SENT (%d)\n", opcode, to_port, error);
+		} else {
+			gpr_out++;
+		}
+		kfree_data(packet, size);
+		return error == 0;
+	}
 	lck_mtx_lock(&apr_lock);
-	token = apr_next_token++;
-	if (apr_next_token >= 0x01000000u) {
-		apr_next_token = 1;
+	if (token == 0) {
+		token = apr_next_token++;
+		if (apr_next_token >= 0x01000000u) {
+			apr_next_token = 1;
+		}
 	}
 	header->token = token;
 	apr_answer.there = false;
 	__atomic_store_n(&apr_waited_for, token, __ATOMIC_RELEASE);
 	error = glink_send(&glink.channel[CHANNEL_APR], packet, size);
+	hakios_adsp_gpr_error = error;
 	if (error != 0) {
 		printf("adsp: gpr: > opcode %#x to port %#x: NOT SENT (%d)\n", opcode, to_port, error);
 	} else {
@@ -2726,7 +2782,14 @@ gpr_ask(uint32_t to_port, uint32_t opcode, const void *payload, uint32_t length,
 	}
 	__atomic_store_n(&apr_waited_for, 0, __ATOMIC_RELEASE);
 	lck_mtx_unlock(&apr_lock);
+	kfree_data(packet, size);
 	return answered;
+}
+
+static bool
+gpr_ask(uint32_t to_port, uint32_t opcode, const void *payload, uint32_t length, uint32_t ms, struct hakios_apr_answer *answer)
+{
+	return hakios_adsp_gpr(to_port, GPR_PORT_OURS, 0, opcode, payload, length, ms, answer);
 }
 
 /* ---- the battery manager, on the channel PMIC_RTR_ADSP_APPS ------------------------------------------ */
@@ -3895,14 +3958,22 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		services += qrtr_servers[i].there;
 	}
 	if ((step == STEPS || (gpr && step >= 10)) && dsp_started) {
+		uint32_t wait_s = 0;
+
 		tell("adsp: THE AUDIO DSP IS UP AND LINKED%s, %llu ms after the kernel began on it (the root's waited for included): "
 		    "node %u, %u services; it stays on\n", step != STEPS ? ", ITS AUDIO SERVICES NOT UP" : gpr ?
 		    ", its audio framework ready (GPR)" : ", its audio services up (APR)", (now_us() - began) / 1000, qrtr_peer, services);
-		if (step == STEPS && !gpr) {
-			hakios_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, board/sound.c; APR's) */
-			hakios_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, board/mic.c; APR's) */
-		}
 		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
+		/* boot-arg audio_wait=S: pause this many seconds (+15) before starting the sound path (for testing) */
+		if (PE_parse_boot_argn("audio_wait", &wait_s, sizeof(wait_s)) && wait_s != 0) {
+			sleep_ms((wait_s + 15) * 1000);
+		}
+		if (step == STEPS) {
+			hakios_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, board/sound.c) */
+			if (!gpr) {
+				hakios_mic_dsp_up();   /* (boot-arg mic=N: the microphones' path, board/mic.c; APR's) */
+			}
+		}
 	} else {
 		tell("adsp: THE AUDIO DSP DID NOT COME UP: step %u failed (%s); see the kernel's own log for the steps\n", step + 1,
 		    last_write);
