@@ -3303,6 +3303,7 @@ extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler
 extern void gic_v3_spi_mask(uint32_t intid);
 extern void gic_v3_spi_unmask(uint32_t intid);
 extern void gic_v3_spi_detach(uint32_t intid);
+extern void hakios_sleep_wake_source(uint32_t intid) __attribute__((weak));     /* psci_idle.c */
 
 static volatile bool link_wanted, link_runs;
 
@@ -3360,6 +3361,22 @@ link_irq_start(void)
 	link_irq.attached = true;
 	tell("adsp: link: the doorbells' interrupt (GIC %u, level) wakes the link's thread; a net every %u ms\n", link_irq.intid,
 	    LINK_NET_MS);
+	/*
+	 * And the system while it sleeps (COMMON-PORT.md "System sleep", step 3): the battery manager's notices (a charger
+	 * plugged in or pulled out) ring these doorbells. Its handler runs once the sleep is over (a dark wake), the link's
+	 * thread reads the notice, the battery manager's round tells battery.c, and a charger plugged in lights the display.
+	 */
+	if (hakios_sleep_wake_source != NULL) {
+		hakios_sleep_wake_source(link_irq.intid);
+	}
+}
+
+/* The doorbells' interrupt while it wakes the system (GenericARMPE.cpp names such a wake); 0: none. */
+uint32_t hakios_adsp_wake_intid(void);
+uint32_t
+hakios_adsp_wake_intid(void)
+{
+	return link_irq.attached ? link_irq.intid : 0;
 }
 
 static void

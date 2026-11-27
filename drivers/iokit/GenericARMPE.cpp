@@ -43,6 +43,9 @@ size_t hakios_soc_sleep_arc_delta(bool start, char *buf, size_t size) __attribut
 int lx_doze_for_sleep(unsigned ms);                                                                     /* lx_80211.c */
 void lx_doze_sleep_over(void);
 int hakios_gpu_sleep_now(void) __attribute__((weak));                                                   /* BoardGPU.cpp */
+uint32_t hakios_adsp_wake_intid(void) __attribute__((weak));                                            /* adsp.c */
+extern "C" void hakios_charger_arrived(void);
+static IOService * gThePE;              /* (start(): the device requestUserActive() names) */
 void loader_log_line(const char *line);
 
 /* osfmk/arm64/psci_smp.c and gic_v3_irq.c */
@@ -352,6 +355,7 @@ GenericARMPE::start(IOService * provider)
 	if (!super::start(provider)) {
 		return false;
 	}
+	gThePE = this;
 	IOLog("GenericARMPE: platform \"%s\"\n", provider->getName());
 	/*
 	 * The time of day is this platform expert's (getGMTTimeOfDay(): the loader's boot epoch), not an
@@ -615,6 +619,8 @@ static struct {
 	uint32_t test_asks;             /* kern.hakios.sleep_test writes the root domain took */
 	int gpu;                        /* the GPU at the last sleep's start: 1 in slumber, 0 awake, -1 none */
 	uint32_t dark;                  /* wakes left dark (not the key's nor the test's: the display stays off) */
+	uint32_t by_dsp;                /* of those, by the audio DSP's doorbells (its battery manager: a charger plugged in) */
+	uint32_t charger_lit;           /* a charger plugged in that lit the display (hakios_charger_arrived()) */
 	char set_line[420];             /* what the llcc-off asks found while it slept (soc_sleep.c) */
 	bool lpis_kept;                 /* the last sleep left the radio's MSIs (LPIs) unmasked: a wake source */
 	int ufs, ufs_why;               /* UFS's domain at the last sleep's start: 1 off, 0 on (why: 1 busy, 2 not in Hibern8,
@@ -678,13 +684,13 @@ sleepsSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused i
 	}
 	if (at < sizeof(text)) {
 		(void) snprintf(text + at, sizeof(text) - at, "; Wi-Fi at the last sleep's start: %s (dozed for %u sleeps); "
-		    "GPU %s; UFS %s; %s; test sleeps asked %u; dark wakes %u; LPIs %s", gSleeps.wifi_doze == 2 ? "dozing" : gSleeps.wifi_doze == -2 ? "none" :
+		    "GPU %s; UFS %s; %s; test sleeps asked %u; dark wakes %u (by the DSP %u); a charger lit it %u; LPIs %s", gSleeps.wifi_doze == 2 ? "dozing" : gSleeps.wifi_doze == -2 ? "none" :
 		    gSleeps.wifi_doze == -1 ? "no doze thread" : "awake", gSleeps.wifi_dozed,
 		    gSleeps.gpu == 1 ? "in slumber" : gSleeps.gpu == 0 ? "AWAKE" : "none",
 		    gSleeps.ufs == 1 ? "off" : gSleeps.ufs == -1 ? "none" : gSleeps.ufs_why == 1 ? "ON (busy)" :
 		    gSleeps.ufs_why == 2 ? "ON (not in Hibern8)" : "ON (power-down off)",
 		    gSleeps.set_line[0] ? gSleeps.set_line : "sleep set: not read", gSleeps.test_asks, gSleeps.dark,
-		    gSleeps.lpis_kept ? "live" : "masked");
+		    gSleeps.by_dsp, gSleeps.charger_lit, gSleeps.lpis_kept ? "live" : "masked");
 	}
 	return SYSCTL_OUT(req, text, strlen(text) + 1);
 }
@@ -791,10 +797,31 @@ GenericARMPE::sleepKernel(void)
 		 * Step 3: any other wake source (the dozing radio's MSI, an LPI; its WAKE#, 651) is a dark wake: the display
 		 * stays off, what woke it is handled (the radio's frames, a sweetd request), and powerd sleeps the system again.
 		 */
+		bool dsp = hakios_adsp_wake_intid != NULL && by == hakios_adsp_wake_intid();
+
 		gSleeps.dark++;
+		gSleeps.by_dsp += dsp;
 		root->claimSystemWakeEvent(this, kIOPMWakeEventSource,
-		    (by == 651 || by >= 8192) ? "hakios wifi wake" : "hakios wake source");
+		    (by == 651 || by >= 8192) ? "hakios wifi wake" : dsp ? "hakios DSP wake" : "hakios wake source");
 	}
+}
+
+/*
+ * A charger plugged in (battery.c, as the DSP's battery manager or the loader's cache first says so): the display comes
+ * on, as on an iPhone. Asleep, the battery manager's notice rang the DSP's doorbells, a dark wake (above); this makes it
+ * the user's. Awake with the display off, the same. (requestUserActive() is a message to powerd: any thread.)
+ */
+extern "C" void
+hakios_charger_arrived(void)
+{
+	IOPMrootDomain * root = IOService::getPMRootDomain();
+
+	if (root == NULL || gThePE == NULL) {
+		return;
+	}
+	gSleeps.charger_lit++;
+	loader_log_line("sleep: a charger plugged in: the display on\n");
+	root->requestUserActive(gThePE, "charger plugged in");
 }
 
 /* Device-tree nodes to drop entirely. */

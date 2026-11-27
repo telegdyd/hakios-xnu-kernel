@@ -329,6 +329,8 @@ battery_tell_ios(const struct loader_battery *sample)
  * While the audio DSP's battery manager reports, the cache is only looked at: the DSP knows better, unless it has
  * gone quiet while the cache is new -- then the cache is passed on again, until the DSP speaks again.
  */
+static void battery_charger_tell(bool plugged, bool first);
+
 static void
 battery_poll(void)
 {
@@ -336,7 +338,7 @@ battery_poll(void)
 	bool fresh, taken_over = false;
 
 	uint32_t new_charger;
-	bool charger_changed;
+	bool charger_changed, first;
 
 	if (!battery_snapshot(&sample) || sample.magic != LOADER_BATTERY_MAGIC ||
 	    sample.version != LOADER_BATTERY_VERSION || sample.size < sizeof(sample) ||
@@ -369,6 +371,7 @@ battery_poll(void)
 	battery_temperature_c = battery_plausible_c(sample.temperature_c);
 	battery_present = (sample.flags & LOADER_BATTERY_PRESENT) != 0;
 	new_charger = (sample.flags & LOADER_BATTERY_CHARGER_PRESENT) != 0;
+	first = battery_updates == 0;
 	charger_changed = (uint32_t)battery_charger_present != new_charger;
 	battery_charger_present = (int)new_charger;
 	battery_charging = (sample.flags & LOADER_BATTERY_CHARGING) != 0;
@@ -377,8 +380,7 @@ battery_poll(void)
 	battery_updates++;
 	lck_mtx_unlock(&battery_report_lock);
 	if (charger_changed) {
-		__atomic_add_fetch(&hakios_battery_charger_changes, 1, __ATOMIC_RELEASE);
-		thread_wakeup((event_t)&hakios_battery_charger_changes);
+		battery_charger_tell(new_charger != 0, first);
 	}
 	if (taken_over) {
 		/* (this says it, not battery_quiet(): the source is another now, and it is not quiet) */
@@ -403,6 +405,18 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_design_uah, CTLFLAG_RD | CTLFLAG_LOCK
 SYSCTL_INT(_kern_hakios, OID_AUTO, battery_cycles, CTLFLAG_RD | CTLFLAG_LOCKED,
     &battery_cycles, 0, "the battery's charge cycles (0 if unknown)");
 volatile uint32_t hakios_battery_charger_changes;
+extern void hakios_charger_arrived(void) __attribute__((weak));        /* iokit/GenericARMPE.cpp */
+
+/* (outside the lock) Who waits for a charger's coming and going hears of it; a charger plugged in lights the display. */
+static void
+battery_charger_tell(bool plugged, bool first)
+{
+	__atomic_add_fetch(&hakios_battery_charger_changes, 1, __ATOMIC_RELEASE);
+	thread_wakeup((event_t)&hakios_battery_charger_changes);
+	if (plugged && !first && hakios_charger_arrived != NULL) {
+		hakios_charger_arrived();
+	}
+}
 
 bool
 hakios_battery_get(int *soc, int *present, int *charger)
@@ -432,7 +446,7 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	const int hundredths = b->temperature_hundredths;
 	struct hakios_battery_state told = *b;  /* what is handed on: the DSP's, and how long the charge lasts */
 	int new_charger = b->external != 0;
-	bool back, charger_changed;
+	bool back, charger_changed, first;
 
 	/* (under the lock, as the loader's readings: see battery_report_lock) */
 	lck_mtx_lock(&battery_report_lock);
@@ -446,6 +460,7 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	battery_temperature_c = hundredths >= BATTERY_COLDEST_C * 100 && hundredths <= BATTERY_HOTTEST_C * 100 ?
 	    battery_plausible_c((hundredths + (hundredths < 0 ? -50 : 50)) / 100) : -273;
 	battery_present = b->present != 0;
+	first = battery_updates == 0;
 	charger_changed = battery_charger_present != new_charger;
 	battery_charger_present = new_charger;
 	battery_charging = b->status == 1;      /* POWER_SUPPLY_STATUS_CHARGING */
@@ -470,8 +485,7 @@ hakios_battery_report(const struct hakios_battery_state *b)
 	HakiosBatteryReport(&told, sizeof(told));
 	lck_mtx_unlock(&battery_report_lock);
 	if (charger_changed) {
-		__atomic_add_fetch(&hakios_battery_charger_changes, 1, __ATOMIC_RELEASE);
-		thread_wakeup((event_t)&hakios_battery_charger_changes);
+		battery_charger_tell(new_charger != 0, first);
 	}
 	if (back) {
 		printf("battery: the audio DSP's battery manager speaks again: its readings are passed on again\n");
