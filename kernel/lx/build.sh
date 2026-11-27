@@ -210,9 +210,11 @@ for s in $(cat out/undefined.txt); do
 done
 [ -z "$missing" ] || exit 1
 $CC -c out/stubs.s -o out/stubs.o
-# five names are shown: where the kernel enters (lx_prepare(), lx_start(), lx_stop() and lx_transmit() of board/lx.h),
-# and lx_thread_release(), the clean-up of a kernel thread that called into the driver, when it ends
-printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n_lx_thread_release\n' > out/exported.txt
+# seven names are shown: where the kernel enters (lx_prepare(), lx_start(), lx_stop(), lx_transmit(), and the system
+# sleep's lx_doze_for_sleep() / lx_doze_sleep_over() of board/lx.h), and lx_thread_release(), the clean-up of a kernel
+# thread that called into the driver, when it ends
+printf '_lx_prepare\n_lx_start\n_lx_stop\n_lx_transmit\n_lx_thread_release\n_lx_doze_for_sleep\n_lx_doze_sleep_over\n' \
+	> out/exported.txt
 $LD -r -arch arm64 -exported_symbols_list out/exported.txt out/all.o out/stubs.o -o out/ath11k.o 2> out/ld.err ||
 	{ cat out/ld.err; exit 1; }
 rm -f out/all.o

@@ -174,6 +174,12 @@ unsigned lx_os_doze_kick_mode(void);
 int lx_os_wifi_ipv4(unsigned *be_addr);
 void	 lx_stop(void);
 int	 lx_transmit(const unsigned char *frame, unsigned long length, unsigned flags);
+/*
+ * The system about to sleep: the radio dozes now (frames sent meanwhile wait), waiting up to ms for it; 2 dozing, 0 or 1
+ * not, -1 no doze thread, -2 no driver. lx_doze_sleep_over() at the wake: what waited goes.
+ */
+int	 lx_doze_for_sleep(unsigned ms);
+void	 lx_doze_sleep_over(void);
 /* before lx_start(), if the kernel wants it early: take the memory the radio will be shown. 0, or an errno. */
 int	 lx_prepare(void);
 

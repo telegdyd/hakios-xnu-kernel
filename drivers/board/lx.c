@@ -1336,6 +1336,18 @@ lx_transmit(__unused const unsigned char *frame, __unused unsigned long length, 
 	return ENXIO;
 }
 
+/* (the system's sleep, GenericARMPE::sleepKernel(): no radio to doze) */
+__attribute__((weak)) int
+lx_doze_for_sleep(__unused unsigned ms)
+{
+	return -2;
+}
+
+__attribute__((weak)) void
+lx_doze_sleep_over(void)
+{
+}
+
 int
 hakios_lx_start(void)
 {

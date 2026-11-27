@@ -85,6 +85,7 @@ void hakios_gpu_recover_line(char * line, size_t size);
 void hakios_gpu_stop(void);
 bool hakios_gpu_power_start(void);
 uint32_t hakios_gpu_power_tick(void);
+int hakios_gpu_slumber_now(void);
 int hakios_gpu_dcvs_control(unsigned kind, int value, bool write);
 void hakios_gpu_dcvs_line(char * line, size_t size);
 int hakios_gpu_ifpc_control(int value, bool write);
@@ -535,6 +536,25 @@ dcvsTick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
 		gDCVSRunning = false;
 	}
 	IOLockUnlock(gGPULock);
+}
+
+/*
+ * The system's sleep (GenericARMPE::sleepKernel()): the GPU into slumber now, under gGPULock. 1 asleep, 0 awake, -1 no
+ * GPU. The worker, slowed for slumber, finds it asleep at its next look.
+ */
+extern "C" int hakios_gpu_sleep_now(void);
+extern "C" int
+hakios_gpu_sleep_now(void)
+{
+	int r;
+
+	if (gGPULock == NULL || !gDCVSRunning) {
+		return -1;
+	}
+	IOLockLock(gGPULock);
+	r = gDCVSRunning ? hakios_gpu_slumber_now() : -1;
+	IOLockUnlock(gGPULock);
+	return r;
 }
 
 /*

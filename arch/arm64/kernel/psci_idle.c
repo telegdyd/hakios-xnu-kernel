@@ -562,9 +562,14 @@ psci_idle_cluster_choice(int self, uint64_t pop, uint64_t now)
 }
 
 /* The processor's cpu_idle_notify: enter = TRUE just before cpu_idle()'s WFI, FALSE in cpu_idle_exit(). Interrupts off. */
+static void sleep_deep_resumed(cpu_data_t *cdp);
+
 void
 psci_idle_notify(__unused cpu_id_t cpu_id, boolean_t enter, __unused uint64_t *new_timeout_ticks)
 {
+	if (!enter) {
+		sleep_deep_resumed(getCpuDatap());      /* (the system's deep sleep: does not return if it was one) */
+	}
 	if (!os_atomic_load(&psci_idle_ready, acquire)) {
 		return;
 	}
@@ -925,6 +930,20 @@ extern void gic_v3_spi_set_pending(uint32_t intid);
 #define GIC_INTID_SPI_MIN_SLEEP 32
 extern void hakios_sleep_pet(void);
 extern int hakios_its_sleep_mask(bool masked) __attribute__((weak));  /* drivers/board/its.c: the MSIs' LPIs */
+extern bool hakios_its_lpi(uint32_t intid) __attribute__((weak));     /* drivers/board/its.c: an LPI's handler */
+#define SLEEP_INTID_LPI_MIN     8192
+void hakios_sleep_keep_lpis(bool keep);
+/*
+ * Step 3: the radio, dozing when the system goes to sleep, calls the host by MSI (an LPI), not by WAKE# (every doze's
+ * count: "line 0 msi 9"): its LPIs then stay unmasked and one ends the sleep (a dark wake). Awake at the sleep's start,
+ * they are masked as in step 1 (they ended every sleep at once).
+ */
+static bool sleep_keep_lpis;
+void
+hakios_sleep_keep_lpis(bool keep)
+{
+	sleep_keep_lpis = keep;
+}
 int hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uint32_t *pets);
 void hakios_sleep_wake_source(uint32_t intid);
 static uint32_t sleep_wakes[SLEEP_WAKES_MOST];
@@ -956,6 +975,123 @@ sleep_wakes_on(uint32_t intid)
 	return false;
 }
 
+/*
+ * Deep (step 2): the boot processor, the only one up, waits in llcc-off instead of WFI: CPU_SUSPEND with the cluster's
+ * deepest state (OS-initiated: the last core chooses), the RSC's sleep set armed first (hakios_rpmh_llcc_down(): CX
+ * collapse when nothing holds it), so the SoC can reach aosd/cxsd and DDR self-refresh. A power-down comes back at the
+ * reset vector into the idle path (resume_idle_cpu -> arm_init_idle_cpu() -> cpu_idle_exit(TRUE) -> psci_idle_notify),
+ * not here: the registers this thread needs (callee-saved, frame, return address, stack) are kept before the call and
+ * psci_idle_notify(FALSE) jumps back into them (sleep_deep_resumed()), as from a CPU_SUSPEND that returned. A wait
+ * shorter than llcc-off's least residency stays a WFI; so does every wait with the boot-arg below at 0 (as in step 1).
+ */
+/* sleep_deep=0: the system's sleep waits in WFI (default 1: in llcc-off, the RSC's sleep set armed) */
+TUNABLE(uint32_t, sleep_deep_level, "sleep_deep", 1);
+struct sleep_ctx {
+	uint64_t        x19_x30[12];
+	uint64_t        sp;
+};
+static struct sleep_ctx sleep_ctx;
+static int      sleep_ctx_cpu;                  /* the processor number + 1, between the keep and its CPU_SUSPEND */
+static struct {
+	uint64_t        asked, down, returned, denied, short_waits, down_abs;
+	int64_t         last_rc;
+} sleep_deep;
+extern int hakios_sleep_ctx_save(struct sleep_ctx *ctx) __attribute__((returns_twice));
+extern void hakios_sleep_ctx_restore(struct sleep_ctx *ctx) __attribute__((noreturn));
+__asm__(
+	"	.text\n"
+	"	.align 2\n"
+	"	.globl _hakios_sleep_ctx_save\n"
+	"	.private_extern _hakios_sleep_ctx_save\n"
+	"_hakios_sleep_ctx_save:\n"
+	"	hint #34\n"                     /* (bti c) */
+	"	stp x19, x20, [x0, #0]\n"
+	"	stp x21, x22, [x0, #16]\n"
+	"	stp x23, x24, [x0, #32]\n"
+	"	stp x25, x26, [x0, #48]\n"
+	"	stp x27, x28, [x0, #64]\n"
+	"	stp x29, x30, [x0, #80]\n"
+	"	mov x1, sp\n"
+	"	str x1, [x0, #96]\n"
+	"	dsb sy\n"
+	"	mov x0, #0\n"
+	"	ret\n"
+	"	.globl _hakios_sleep_ctx_restore\n"
+	"	.private_extern _hakios_sleep_ctx_restore\n"
+	"_hakios_sleep_ctx_restore:\n"
+	"	hint #34\n"
+	"	ldp x19, x20, [x0, #0]\n"
+	"	ldp x21, x22, [x0, #16]\n"
+	"	ldp x23, x24, [x0, #32]\n"
+	"	ldp x25, x26, [x0, #48]\n"
+	"	ldp x27, x28, [x0, #64]\n"
+	"	ldp x29, x30, [x0, #80]\n"
+	"	ldr x1, [x0, #96]\n"
+	"	mov sp, x1\n"
+	"	mov x0, #1\n"
+	"	ret\n");
+
+#define SLEEP_DEEP_DOWN 1
+
+/* Whether this sleep waits in llcc-off: the firmware's OS-initiated mode and the state, the boot processor's power-down. */
+static bool
+sleep_deep_on(int boot)
+{
+	return sleep_deep_level != 0 && os_atomic_load(&psci_idle_ready, acquire) && psci_idle_osi &&
+	       (os_atomic_load(&psci_idle_states_live, relaxed) & (1u << PSCI_STATE_LLCC)) &&
+	       psci_cluster_state[PSCI_STATE_LLCC].param != 0 && boot >= 0 && boot < MAX_CPUS && psci_idle[boot].param != 0;
+}
+
+/* 1 (SLEEP_DEEP_DOWN): it powered down and came back; 0: CPU_SUSPEND returned (an interrupt pending); <0: refused. */
+static __attribute__((noinline)) int64_t
+sleep_deep_suspend(int cpu)
+{
+	int64_t rc;
+
+	getCpuDatap()->cpu_active_thread = current_thread();   /* (arm_init_idle_cpu() takes it as the thread) */
+	hakios_rpmh_llcc_down();
+	if (hakios_sleep_ctx_save(&sleep_ctx) != 0) {
+		return SLEEP_DEEP_DOWN;
+	}
+	os_atomic_store(&sleep_ctx_cpu, cpu + 1, release);
+	__builtin_arm_dsb(DSB_SY);
+	rc = psci_smp_loader_entry != 0 ?
+	    (int32_t)psci_call(PSCI_CPU_SUSPEND64, psci_cluster_state[PSCI_STATE_LLCC].param, psci_smp_loader_entry,
+	    psci_idle_entry) :
+	    (int32_t)psci_call(PSCI_CPU_SUSPEND64, psci_cluster_state[PSCI_STATE_LLCC].param, psci_idle_entry, (uint64_t)cpu);
+	os_atomic_store(&sleep_ctx_cpu, 0, relaxed);
+	return rc;
+}
+
+/* psci_idle_notify(FALSE): the boot processor back from the sleep's power-down goes on in hakios_sleep_wait(). */
+static void
+sleep_deep_resumed(cpu_data_t *cdp)
+{
+	if (os_atomic_load(&sleep_ctx_cpu, acquire) != cdp->cpu_number + 1) {
+		return;
+	}
+	os_atomic_store(&sleep_ctx_cpu, 0, relaxed);
+	gic_v3_irq_cpu_resume();
+	hakios_sleep_ctx_restore(&sleep_ctx);
+}
+
+/* kern.hakios.sleeps' deep part (GenericARMPE.cpp) */
+size_t hakios_sleep_deep_text(char *buf, size_t size);
+size_t
+hakios_sleep_deep_text(char *buf, size_t size)
+{
+	uint64_t ms = 0;
+	int n;
+
+	absolutetime_to_nanoseconds(sleep_deep.down_abs, &ms);
+	ms /= NSEC_PER_MSEC;
+	n = snprintf(buf, size, "deep %s: llcc-off asked %llu, powered down %llu (%llu ms), returned %llu, refused %llu "
+	    "(last rc %lld), short waits in WFI %llu", sleep_deep_level == 0 ? "off (sleep_deep=0)" :
+	    sleep_deep_on(psci_smp_boot_cpu()) ? "on" : "not available", sleep_deep.asked, sleep_deep.down, ms,
+	    sleep_deep.returned, sleep_deep.denied, sleep_deep.last_rc, sleep_deep.short_waits);
+	return n < 0 ? 0 : (size_t)n;
+}
+
 /* 0, or ENODEV (nothing could end it), EBUSY (the other processors did not go). *woken_by: the interrupt that ended it. */
 int
 hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uint32_t *pets)
@@ -966,6 +1102,7 @@ hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uin
 	uint64_t pet_at;
 	processor_t processor;
 	boolean_t enabled;
+	bool deep;
 
 	*woken_by = 0;
 	*asleep_ns = 0;
@@ -989,7 +1126,9 @@ hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uin
 	thread_block(THREAD_CONTINUE_NULL);     /* (onto it) */
 
 	/* (the LPIs too: the radio's MSIs, no wake source yet, ended every sleep at once; they stay pending) */
-	int lpis = hakios_its_sleep_mask ? hakios_its_sleep_mask(true) : 0;
+	bool lpis_masked = !sleep_keep_lpis && hakios_its_sleep_mask != NULL;
+	int lpis = lpis_masked ? hakios_its_sleep_mask(true) : 0;
+	uint32_t lpi_taken = 0;         /* an LPI the timer's take acknowledged: handed to its handler at the end */
 	enabled = ml_set_interrupts_enabled(FALSE);
 	masked = gic_v3_sleep_mask(sleep_wakes_on);
 	ctl = __builtin_arm_rsr64("CNTV_CTL_EL0");
@@ -1012,6 +1151,7 @@ hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uin
 	 * (run-20261126-055748, -060515).
 	 */
 	wake_abstime = ml_get_timebase();
+	deep = sleep_deep_on(boot);
 	hakios_sleep_pet();
 	fed++;
 	pet_at = start + SLEEP_PET_SECONDS * freq;
@@ -1036,7 +1176,30 @@ hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uin
 		__builtin_arm_wsr64("CNTV_CTL_EL0", 1);         /* enabled, not masked */
 		__builtin_arm_isb(ISB_SY);
 		__builtin_arm_dsb(DSB_SY);
-		__builtin_arm_wfi();
+		if (deep && next - now >= psci_idle_state_abs[PSCI_STATE_LLCC]) {
+			uint64_t t0 = now;
+			int64_t rc;
+
+			sleep_deep.asked++;
+			rc = sleep_deep_suspend(boot);
+			if (rc == SLEEP_DEEP_DOWN) {
+				sleep_deep.down++;
+				sleep_deep.down_abs += __builtin_arm_rsr64("CNTVCT_EL0") - t0;
+			} else if (rc == 0) {
+				sleep_deep.returned++;
+			} else {
+				sleep_deep.denied++;
+				sleep_deep.last_rc = rc;
+				if (rc == PSCI_INVALID_PARAMETERS) {
+					deep = false;
+				}
+			}
+		} else {
+			if (deep) {
+				sleep_deep.short_waits++;
+			}
+			__builtin_arm_wfi();
+		}
 		wakes++;
 		/*
 		 * A wake source by its own pending bit: the timer's interrupt was left pending at the CPU interface, ahead of the
@@ -1056,6 +1219,11 @@ hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uin
 			/* (taken and ended, so it stops ending every WFI; a wake source taken here instead is made pending again) */
 			uint32_t took = gic_v3_sleep_take();
 
+			if (took >= SLEEP_INTID_LPI_MIN) {
+				lpi_taken = took;       /* (acknowledged and ended: its handler runs below, nothing lost) */
+				by = took;
+				break;
+			}
 			if (took != SLEEP_INTID_VTIMER && took < SLEEP_INTID_NONE_MIN) {
 				if (sleep_wakes_on(took)) {
 					gic_v3_spi_set_pending(took);
@@ -1084,8 +1252,11 @@ hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uin
 	getCpuDatap()->rtcPop = EndOfAllTime;   /* (the deadline anew, in the clock as it now is) */
 	timer_resync_deadlines();
 	gic_v3_sleep_unmask(masked);
+	if (lpi_taken != 0 && hakios_its_lpi != NULL) {
+		(void)hakios_its_lpi(lpi_taken);
+	}
 	ml_set_interrupts_enabled(enabled);
-	if (hakios_its_sleep_mask) {
+	if (lpis_masked) {
 		(void)hakios_its_sleep_mask(false);
 	}
 	if (lpis != 0) {

@@ -189,6 +189,8 @@ static struct {
 	unsigned dozes, wakes, failed_suspend, failed_sleep, failed_wake, failed_resume, ps_changes;
 	unsigned not_ready, failed_undo;	/* MHI busy when a doze was due; a failed suspend's undo that failed too */
 	bool given_up;				/* a wake failed: no more dozes this boot */
+	volatile bool for_sleep;		/* the system sleeps (lx_doze_for_sleep()): doze now, frames to send wait */
+	unsigned sleep_asks, sleep_dozed, sleep_queued;
 	unsigned lengths[DOZE_QUEUE], flags[DOZE_QUEUE];
 	unsigned reason_last[8], reason_n, reason_count[64];
 	char reason_name[8][24];
@@ -2750,12 +2752,30 @@ station_send(const unsigned char *frame, unsigned long length, unsigned flags)
 		} else {
 			doze.queue_lost++;
 		}
+		if (doze.for_sleep) {
+			doze.sleep_queued++;	/* (the system sleeps: it goes at the wake, lx_doze_sleep_over()) */
+			lx_os_unlock();
+			return (0);
+		}
 		if (!doze.wanted) {
 			doze.by_send++;
 			doze_note_send(frame, length);
 		}
 		doze.wanted = true;
 		lx_os_wakeup(&doze);
+		lx_os_unlock();
+		return (0);
+	}
+	if (doze.for_sleep && doze.queue != NULL) {
+		/* (the system about to sleep: the frame waits for the wake rather than keep the radio from dozing) */
+		if (doze.queued < DOZE_QUEUE && length <= DOZE_FRAME) {
+			memcpy(doze.queue + doze.queued * DOZE_FRAME, frame, length);
+			doze.lengths[doze.queued] = (unsigned)length;
+			doze.flags[doze.queued++] = flags;
+		} else {
+			doze.queue_lost++;
+		}
+		doze.sleep_queued++;
 		lx_os_unlock();
 		return (0);
 	}
@@ -2798,10 +2818,11 @@ doze_say(void)
 	int at = 0;
 
 	snprintf(text, sizeof(text), "state %d dozes %u wakes %u (line %u msi %u send %u call %u other %u) failed: suspend %u sleep %u "
-	    "wake %u resume %u%s; queue lost %u; dozed_ms %llu longest_ms %llu last_wake_us %llu; ps %u (changes %u)", doze.state,
+	    "wake %u resume %u%s; queue lost %u; dozed_ms %llu longest_ms %llu last_wake_us %llu; ps %u (changes %u); "
+	    "system sleeps: asked %u dozed %u frames held %u", doze.state,
 	    doze.dozes, doze.wakes, doze.by_line, doze.by_msi, doze.by_send, doze.by_call, doze.by_other, doze.failed_suspend, doze.failed_sleep,
 	    doze.failed_wake, doze.failed_resume, doze.given_up ? " (given up)" : "", doze.queue_lost, dozed / 1000000ull, doze.longest_ns / 1000000ull,
-	    doze.last_wake_ns / 1000ull, doze.ps_applied, doze.ps_changes);
+	    doze.last_wake_ns / 1000ull, doze.ps_applied, doze.ps_changes, doze.sleep_asks, doze.sleep_dozed, doze.sleep_queued);
 	{
 		unsigned ev, evp, bhi, kicks, net;
 		lx_mhi_m3_irqs(&ev, &evp, &bhi, &kicks, &net);
@@ -3198,6 +3219,18 @@ doze_runs(void *argument)
 			(void)lx_os_sleep(&doze, 60ull * 1000000000ull);	/* (WAKE# wakes it; this only catches a lost wakeup) */
 			continue;
 		}
+		if (doze.state == 0 && !doze.for_sleep && doze.queued != 0) {
+			/* frames that waited for a sleep the radio did not doze through: sent now, in order */
+			for (unsigned i = 0; i < doze.queued; i++) {
+				doze.sending++;
+				lx_os_unlock();
+				(void)ethernet_send(radio, doze.queue + i * DOZE_FRAME, doze.lengths[i], doze.flags[i]);
+				lx_os_lock();
+				doze.sending--;
+			}
+			doze.queued = 0;
+			doze.active_at = lx_os_nanoseconds();
+		}
 		if (joined && doze.calls == 0 && doze.sending == 0 && (bool)ps != doze.ps_applied) {
 			doze.calls++;	/* (the station's calls wait meanwhile) */
 			lx_os_unlock();
@@ -3205,8 +3238,9 @@ doze_runs(void *argument)
 			lx_os_lock();
 			doze.calls--;
 		}
-		if (on && joined && lx_os_screen_off() && doze.calls == 0 && doze.sending == 0 && doze.queued == 0 &&
-		    now >= doze.backoff_until && now - doze.active_at >= (unsigned long long)idle_ms * 1000000ull) {
+		if (on && joined && lx_os_screen_off() && doze.calls == 0 && doze.sending == 0 &&
+		    (doze.queued == 0 || doze.for_sleep) && now >= doze.backoff_until &&
+		    (doze.for_sleep || now - doze.active_at >= (unsigned long long)idle_ms * 1000000ull)) {
 			int error;
 
 			unsigned long long entering = lx_os_nanoseconds();
@@ -3227,6 +3261,7 @@ doze_runs(void *argument)
 				doze.since = lx_os_nanoseconds();
 				doze.dozes++;
 				lx_os_pcie_wake_arm(1);
+				lx_os_wakeup(&doze.state);	/* (lx_doze_for_sleep() waits for it) */
 			}
 			doze_say();
 			continue;
@@ -3240,6 +3275,59 @@ doze_runs(void *argument)
 		}
 		(void)lx_os_sleep(&doze, wait);
 	}
+}
+
+/*
+ * The system about to sleep (GenericARMPE::sleepKernel(), threads still running): the radio dozes now, without waiting
+ * for wifi_doze_idle_ms, and frames sent meanwhile wait for the wake (the doze's queue), so PCIe gives up its bus vote and
+ * CX can collapse while the system sleeps. Waits up to ms for the doze. 2: dozing; 0 or 1: not (no network joined, doze
+ * off or given up, or not in time); -1: no doze thread. lx_doze_sleep_over() at the wake: the waiting frames go.
+ */
+int lx_doze_for_sleep(unsigned ms);
+int
+lx_doze_for_sleep(unsigned ms)
+{
+	struct lx_radio *radio = the_radio;
+	unsigned on = 0, idle_ms = 0, ps = 0;
+	unsigned long long until;
+	int state;
+
+	if (!doze.thread) return (-1);
+	lx_os_doze_config(&on, &idle_ms, &ps);
+	lx_os_lock();
+	doze.sleep_asks++;
+	if (!on || doze.given_up || radio == NULL || !radio->joined || radio->vif == NULL) {
+		state = doze.state;
+		lx_os_unlock();
+		return (state);
+	}
+	doze.for_sleep = true;
+	lx_os_wakeup(&doze);
+	until = lx_os_nanoseconds() + (unsigned long long)ms * 1000000ull;
+	while (doze.state != 2 && !doze.given_up) {
+		unsigned long long now = lx_os_nanoseconds();
+
+		if (now >= until) break;
+		(void)lx_os_sleep(&doze.state, until - now);
+	}
+	state = doze.state;
+	if (state == 2) doze.sleep_dozed++;
+	lx_os_unlock();
+	return (state);
+}
+
+void lx_doze_sleep_over(void);
+void
+lx_doze_sleep_over(void)
+{
+	if (!doze.thread) return;
+	lx_os_lock();
+	doze.for_sleep = false;
+	if (doze.state != 0 && doze.queued != 0) {
+		doze.wanted = true;	/* (what waited goes now) */
+	}
+	lx_os_wakeup(&doze);
+	lx_os_unlock();
 }
 
 /* Once, at the first join. */

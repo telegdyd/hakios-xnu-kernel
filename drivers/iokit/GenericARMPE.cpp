@@ -35,6 +35,14 @@ kern_return_t processor_start(processor_t processor);
 kern_return_t processor_exit(processor_t processor);
 extern uint32_t processor_avail_count;
 int hakios_sleep_wait(uint32_t seconds, uint32_t *woken_by, uint64_t *asleep_ns, uint32_t *pets);    /* psci_idle.c */
+size_t hakios_sleep_deep_text(char *buf, size_t size);                                                  /* psci_idle.c */
+void hakios_sleep_keep_lpis(bool keep);                                                                 /* psci_idle.c */
+int hakios_ufs_sleep_prepare(unsigned ms, int *why) __attribute__((weak));                              /* ufshc_power.h */
+bool hakios_soc_sleep_records(uint32_t count[3], uint64_t ms[3]) __attribute__((weak));                 /* soc_sleep.c */
+size_t hakios_soc_sleep_arc_delta(bool start, char *buf, size_t size) __attribute__((weak));             /* soc_sleep.c */
+int lx_doze_for_sleep(unsigned ms);                                                                     /* lx_80211.c */
+void lx_doze_sleep_over(void);
+int hakios_gpu_sleep_now(void) __attribute__((weak));                                                   /* BoardGPU.cpp */
 void loader_log_line(const char *line);
 
 /* osfmk/arm64/psci_smp.c and gic_v3_irq.c */
@@ -597,7 +605,25 @@ static struct {
 	uint32_t sleeps, refused, by_timer, by_interrupt, last_by, pets;
 	uint64_t asleep_ns, last_ns;
 	int last_error;
+	/* the last sleep: the radio at its start (2: dozing; -1: no doze thread; -2: no Wi-Fi), the AOP's records' growth
+	 * over it (aosd, cxsd, DDR's low-power modes: counts and ms; known: the records were readable) */
+	int wifi_doze;
+	uint32_t wifi_dozed;
+	bool records_known;
+	uint32_t record_n[3];
+	uint64_t record_ms[3];
+	uint32_t test_asks;             /* kern.hakios.sleep_test writes the root domain took */
+	int gpu;                        /* the GPU at the last sleep's start: 1 in slumber, 0 awake, -1 none */
+	uint32_t dark;                  /* wakes left dark (not the key's nor the test's: the display stays off) */
+	char set_line[420];             /* what the llcc-off asks found while it slept (soc_sleep.c) */
+	bool lpis_kept;                 /* the last sleep left the radio's MSIs (LPIs) unmasked: a wake source */
+	int ufs, ufs_why;               /* UFS's domain at the last sleep's start: 1 off, 0 on (why: 1 busy, 2 not in Hibern8,
+	                                 * 3 power-down off), -1 none */
 } gSleeps;
+/* kern.hakios.sleep_lpis: 1 (default) a dozing radio's MSIs wake the system; 0 masked while it sleeps (as step 1) */
+static uint32_t gSleepLpis = 1;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, sleep_lpis, CTLFLAG_RW | CTLFLAG_LOCKED, &gSleepLpis, 0,
+    "1: a dozing radio's MSIs (LPIs) wake the sleeping system (Wi-Fi reaches it); 0: masked while it sleeps");
 
 static int
 sleepTestSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
@@ -621,6 +647,7 @@ sleepTestSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unuse
 		gSleepTestSeconds = 0;
 		return result == kIOReturnNotPermitted ? EPERM : EIO;
 	}
+	gSleeps.test_asks++;
 	return 0;
 }
 
@@ -630,12 +657,35 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, sleep_test, CTLTYPE_INT | CTLFLAG_RW | CTLFL
 static int
 sleepsSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)
 {
-	char text[320];
+	char text[1500];
+	size_t at;
 
-	snprintf(text, sizeof(text), "sleeps %u (refused %u, last error %d); woken by the test's timer %u, by an interrupt %u "
-	    "(last: %u, after %llu ms); asleep %llu ms in all; watchdog fed %u times", gSleeps.sleeps, gSleeps.refused,
-	    gSleeps.last_error, gSleeps.by_timer, gSleeps.by_interrupt, gSleeps.last_by, gSleeps.last_ns / NSEC_PER_MSEC,
-	    gSleeps.asleep_ns / NSEC_PER_MSEC, gSleeps.pets);
+	at = (size_t) snprintf(text, sizeof(text), "sleeps %u (refused %u, last error %d); woken by the test's timer %u, by an "
+	    "interrupt %u (last: %u, after %llu ms); asleep %llu ms in all; watchdog fed %u times; ", gSleeps.sleeps,
+	    gSleeps.refused, gSleeps.last_error, gSleeps.by_timer, gSleeps.by_interrupt, gSleeps.last_by,
+	    gSleeps.last_ns / NSEC_PER_MSEC, gSleeps.asleep_ns / NSEC_PER_MSEC, gSleeps.pets);
+	if (at < sizeof(text)) {
+		at += hakios_sleep_deep_text(text + at, sizeof(text) - at);
+	}
+	if (at < sizeof(text)) {
+		if (gSleeps.records_known) {
+			at += (size_t) snprintf(text + at, sizeof(text) - at, "; last sleep: aosd +%u (+%llu ms), cxsd +%u "
+			    "(+%llu ms), ddr lpm +%u (+%llu ms)", gSleeps.record_n[0], gSleeps.record_ms[0], gSleeps.record_n[1],
+			    gSleeps.record_ms[1], gSleeps.record_n[2], gSleeps.record_ms[2]);
+		} else {
+			at += (size_t) snprintf(text + at, sizeof(text) - at, "; last sleep: the AOP's records not read");
+		}
+	}
+	if (at < sizeof(text)) {
+		(void) snprintf(text + at, sizeof(text) - at, "; Wi-Fi at the last sleep's start: %s (dozed for %u sleeps); "
+		    "GPU %s; UFS %s; %s; test sleeps asked %u; dark wakes %u; LPIs %s", gSleeps.wifi_doze == 2 ? "dozing" : gSleeps.wifi_doze == -2 ? "none" :
+		    gSleeps.wifi_doze == -1 ? "no doze thread" : "awake", gSleeps.wifi_dozed,
+		    gSleeps.gpu == 1 ? "in slumber" : gSleeps.gpu == 0 ? "AWAKE" : "none",
+		    gSleeps.ufs == 1 ? "off" : gSleeps.ufs == -1 ? "none" : gSleeps.ufs_why == 1 ? "ON (busy)" :
+		    gSleeps.ufs_why == 2 ? "ON (not in Hibern8)" : "ON (power-down off)",
+		    gSleeps.set_line[0] ? gSleeps.set_line : "sleep set: not read", gSleeps.test_asks, gSleeps.dark,
+		    gSleeps.lpis_kept ? "live" : "masked");
+	}
 	return SYSCTL_OUT(req, text, strlen(text) + 1);
 }
 
@@ -651,8 +701,30 @@ GenericARMPE::sleepKernel(void)
 	char line[160];
 	int error;
 
+	uint32_t n0[3] = { 0 }, n1[3] = { 0 };
+	uint64_t ms0[3] = { 0 }, ms1[3] = { 0 };
+	bool known;
+
 	gSleepTestSeconds = 0;
-	snprintf(line, sizeof(line), "sleep: the system sleeps%s\n", seconds != 0 ? " (a test: its timer wakes it)" : "");
+	/*
+	 * Step 2: the radio dozes first (threads still run), so that PCIe gives up its bus vote and CX can collapse while
+	 * the system sleeps; frames sent meanwhile wait for the wake.
+	 */
+	gSleeps.gpu = hakios_gpu_sleep_now != NULL ? hakios_gpu_sleep_now() : -1;
+	gSleeps.wifi_doze = lx_doze_for_sleep(2500);
+	hakios_sleep_keep_lpis(gSleeps.wifi_doze == 2 && gSleepLpis != 0);  /* (a dozing radio calls by MSI: a wake source) */
+	/* (storage last: what the radio and the GPU did may have written; its domain on keeps CX up the whole sleep) */
+	gSleeps.ufs = hakios_ufs_sleep_prepare != NULL ? hakios_ufs_sleep_prepare(1500, &gSleeps.ufs_why) : -1;
+	gSleeps.lpis_kept = gSleeps.wifi_doze == 2 && gSleepLpis != 0;
+	if (gSleeps.wifi_doze == 2) {
+		gSleeps.wifi_dozed++;
+	}
+	known = hakios_soc_sleep_records != NULL && hakios_soc_sleep_records(n0, ms0);
+	if (hakios_soc_sleep_arc_delta != NULL) {
+		(void) hakios_soc_sleep_arc_delta(true, NULL, 0);
+	}
+	snprintf(line, sizeof(line), "sleep: the system sleeps%s; Wi-Fi %s\n",
+	    seconds != 0 ? " (a test: its timer wakes it)" : "", gSleeps.wifi_doze == 2 ? "dozing" : "not dozing");
 	loader_log_line(line);
 	IOPlatformActionsPreSleep();
 	if (root != NULL) {
@@ -663,6 +735,18 @@ GenericARMPE::sleepKernel(void)
 		root->start_watchdog_timer();
 	}
 	IOPlatformActionsPostResume();
+	lx_doze_sleep_over();
+	gSleeps.records_known = known && hakios_soc_sleep_records(n1, ms1);
+	gSleeps.set_line[0] = 0;
+	if (hakios_soc_sleep_arc_delta != NULL) {
+		(void) hakios_soc_sleep_arc_delta(false, gSleeps.set_line, sizeof(gSleeps.set_line));
+		snprintf(line, sizeof(line), "sleep: %.150s\n", gSleeps.set_line);
+		loader_log_line(line);
+	}
+	for (int i = 0; i < 3; i++) {
+		gSleeps.record_n[i] = n1[i] - n0[i];
+		gSleeps.record_ms[i] = ms1[i] - ms0[i];
+	}
 
 	gSleeps.last_error = error;
 	if (error != 0) {
@@ -685,15 +769,31 @@ GenericARMPE::sleepKernel(void)
 	snprintf(line, sizeof(line), "sleep: woken by %s %u after %llu ms (watchdog fed %u times)\n",
 	    by == 27 ? "the test's timer, interrupt" : "interrupt", by, ns / NSEC_PER_MSEC, pets);
 	loader_log_line(line);
-	if (root != NULL) {
+	snprintf(line, sizeof(line), "sleep: aosd +%u (+%llu ms), cxsd +%u (+%llu ms), ddr lpm +%u (+%llu ms)%s\n",
+	    gSleeps.record_n[0], gSleeps.record_ms[0], gSleeps.record_n[1], gSleeps.record_ms[1], gSleeps.record_n[2],
+	    gSleeps.record_ms[2], gSleeps.records_known ? "" : " (not read)");
+	loader_log_line(line);
+	if (root == NULL) {
+		return;
+	}
+	if (by == 27 || by == 513) {
 		/*
-		 * The wake as the user's (step 1: the power key, and the test's timer standing in for it): without it the root
-		 * domain took a dark wake, the display stayed off and nothing drew (run-20261126-040608: presents 955 -> 955).
-		 * requestUserActive() is powerd's message to light the display (no display wrangler on this platform).
+		 * The power key (the PMIC arbiter's line), and the test's timer standing in for it: the user's wake. Without
+		 * the claim the root domain took a dark wake, the display stayed off and nothing drew (run-20261126-040608:
+		 * presents 955 -> 955). requestUserActive() is powerd's message to light the display (no display wrangler on
+		 * this platform).
 		 */
 		root->claimSystemWakeEvent(this, kIOPMWakeEventSource | kIOPMWakeEventUserPME,
-		    by == 27 ? "hakios sleep test timer" : "hakios interrupt");
+		    by == 27 ? "hakios sleep test timer" : "hakios power key");
 		root->requestUserActive(this, by == 27 ? "sleep test wake" : "power key wake");
+	} else {
+		/*
+		 * Step 3: any other wake source (the dozing radio's MSI, an LPI; its WAKE#, 651) is a dark wake: the display
+		 * stays off, what woke it is handled (the radio's frames, a sweetd request), and powerd sleeps the system again.
+		 */
+		gSleeps.dark++;
+		root->claimSystemWakeEvent(this, kIOPMWakeEventSource,
+		    (by == 651 || by >= 8192) ? "hakios wifi wake" : "hakios wake source");
 	}
 }
 

@@ -978,6 +978,38 @@ hakios_rpmh_llcc_down(void)
 	}
 }
 
+/*
+ * The system's sleep (GenericARMPE::sleepKernel()): what the llcc-off asks found while it slept. start: the counts kept;
+ * then (start false) the growth since, as a line, into buf. 0, or the line's length.
+ */
+size_t hakios_soc_sleep_arc_delta(bool start, char *buf, size_t size);
+size_t
+hakios_soc_sleep_arc_delta(bool start, char *buf, size_t size)
+{
+	static __typeof__(arc_count) at_start;
+	uint64_t gates = 0;
+	int n;
+
+	if (start) {
+		at_start = arc_count;
+		return 0;
+	}
+	for (uint32_t g = 0; g < ARC_GATES; g++) {
+		gates += arc_count.gate[g] - at_start.gate[g];
+	}
+	n = snprintf(buf, size, "sleep set: asks +%llu armed +%llu cx collapse +%llu; held by screen +%llu usb +%llu pcie +%llu "
+	    "a running clock +%llu; cx held by a power domain +%llu (usb +%llu pcie0 +%llu pcie1 +%llu ufs +%llu), a driver's "
+	    "vote +%llu, MMCX +%llu, display/camera/video +%llu; ready %u",
+	    arc_count.asks - at_start.asks, arc_count.armed - at_start.armed, arc_count.collapse - at_start.collapse,
+	    arc_count.screen - at_start.screen, arc_count.usb - at_start.usb, arc_count.pcie - at_start.pcie, gates,
+	    arc_count.collapse_gdsc - at_start.collapse_gdsc, arc_count.gdsc_held[0] - at_start.gdsc_held[0],
+	    arc_count.gdsc_held[1] - at_start.gdsc_held[1], arc_count.gdsc_held[2] - at_start.gdsc_held[2],
+	    arc_count.gdsc_held[3] - at_start.gdsc_held[3], arc_count.collapse_raised - at_start.collapse_raised,
+	    arc_count.mmcx_held - at_start.mmcx_held, arc_count.display_held - at_start.display_held,
+	    __atomic_load_n(&arc_ready, __ATOMIC_RELAXED));
+	return n < 0 ? 0 : (size_t)n;
+}
+
 static void
 arc_disarm(void)
 {
@@ -1713,6 +1745,42 @@ ss_sample(void)
 		}
 	}
 	ss_logged++;
+}
+
+/*
+ * The system's sleep (GenericARMPE::sleepKernel()): the AOP's records as they are, before and after it. count/ms: aosd,
+ * cxsd, then DDR's low-power modes (self-refresh among them) summed. false when the records cannot be read.
+ */
+bool hakios_soc_sleep_records(uint32_t count[3], uint64_t ms[3]);
+bool
+hakios_soc_sleep_records(uint32_t count[3], uint64_t ms[3])
+{
+	char name[5];
+	bool in = false, ok = true;
+
+	lck_mtx_lock(&ss_lock);
+	ss_map();
+	for (int i = 0; i < 3; i++) {
+		count[i] = 0;
+		ms[i] = 0;
+	}
+	for (int i = 0; i < 2; i++) {
+		uint64_t ticks = 0;
+
+		ok = ss_record(i, name, &count[i], &ticks, &in) && ok;
+		ms[i] = ticks / AOP_TICKS_PER_MS;
+	}
+	for (uint32_t i = 0; ss_ddr_off != 0 && i < ss_ddr_n; i++) {
+		uint32_t n = 0, c = 0;
+		uint64_t ticks = 0;
+
+		if (ss_ddr_entry(i, &n, &c, &ticks) && ((n >> 8) & 0xffu) == 0) {
+			count[2] += c;
+			ms[2] += ticks / AOP_TICKS_PER_MS;
+		}
+	}
+	lck_mtx_unlock(&ss_lock);
+	return ok;
 }
 
 static void

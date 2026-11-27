@@ -184,6 +184,39 @@ hakios_ufs_power_down(void)
 	return off;
 }
 
+/*
+ * The system about to sleep (GenericARMPE::sleepKernel(), threads still running): the domain down now, waiting up to ms
+ * for what is in flight to finish and the link to reach Hibern8 (the auto-hibernate timer). Left to the llcc-off asks,
+ * an I/O issued just before the sleep stayed in flight through all of it (no interrupt nor poller runs asleep) and its
+ * domain kept CX up (run-20261127-052106: "cx held by ufs" at all 46 asks of two 120 s sleeps, 0 ms cxsd; 96% in a
+ * sleep that found it off). 1 off; 0 not (*why: 1 busy, 2 not in Hibern8, 3 power-down off or lost); -1 no UFS here.
+ */
+int hakios_ufs_sleep_prepare(unsigned ms, int *why);
+int
+hakios_ufs_sleep_prepare(unsigned ms, int *why)
+{
+	uint64_t busy0 = hc_pd_busy, h80 = hc_pd_not_h8;
+
+	*why = 0;
+	if (hc_gcc == 0) {
+		return -1;
+	}
+	for (unsigned waited = 0;; waited += 10) {
+		if (hakios_ufs_power_down()) {
+			return 1;
+		}
+		if (!hc_pd_on || hc_pd_lost) {
+			*why = 3;
+			return 0;
+		}
+		if (waited >= ms) {
+			*why = hc_pd_not_h8 != h80 && hc_pd_busy == busy0 ? 2 : 1;
+			return 0;
+		}
+		delay_for_interval(10, NSEC_PER_MSEC);
+	}
+}
+
 static bool
 hc_pd_wake(void)
 {

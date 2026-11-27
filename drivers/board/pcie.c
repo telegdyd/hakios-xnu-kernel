@@ -1370,6 +1370,7 @@ hakios_pcie_bar_write32(volatile void *va, unsigned value)
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
 extern void gic_v3_spi_mask(uint32_t intid);
 extern void gic_v3_spi_unmask(uint32_t intid);
+extern void hakios_sleep_wake_source(uint32_t intid) __attribute__((weak));     /* psci_idle.c */
 static vm_offset_t wake_pdc;
 static void (*wake_cb)(void);
 static bool wake_ready;
@@ -1411,6 +1412,8 @@ hakios_pcie_wake_irq(void (*cb)(void))
 	if (gic_v3_spi_attach(WAKE_INTID, false, wake_arrived, NULL) != KERN_SUCCESS) return EIO;
 	gic_v3_spi_mask(WAKE_INTID);
 	wake_ready = true;
+	/* (the system's sleep keeps it unmasked while it is armed: the dozing radio's wake ends a sleep, a dark wake) */
+	if (hakios_sleep_wake_source != NULL) hakios_sleep_wake_source(WAKE_INTID);
 	say("pcie: WAKE# GPIO %u -> PDC pin %u (version %#x) -> GIC %u\n", WAKE_PIN, WAKE_PDC_PIN, version, WAKE_INTID);
 	return 0;
 }

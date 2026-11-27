@@ -5767,6 +5767,30 @@ hakios_gpu_power_start(void)
 	return dcvs || slumber || (gpu_kept && gpu_recover && adreno_gen7());
 }
 
+/*
+ * The system about to sleep (GenericARMPE::sleepKernel() through BoardGPU.cpp, under gGPULock): slumber now rather than
+ * after GPU_SLUMBER_IDLE_NS, since the worker's tick does not run while the system sleeps. Awake, the GMU's vote kept
+ * CX up through whole test sleeps that came seconds after the display went off (run-20261127-042012: the AOP's CX
+ * monitor showed GPU in 17 of 42 lines, no aosd/cxsd with the APSS sleep set armed). 1 asleep (or now), 0 awake
+ * (work outstanding, slumber off or failed), -1 no GPU.
+ */
+int hakios_gpu_slumber_now(void);
+int
+hakios_gpu_slumber_now(void)
+{
+	if (!gpu_kept || gpu_lost) {
+		return -1;
+	}
+	if (slumber_asleep) {
+		return 1;
+	}
+	if (!slumber_on || slumber_failed || gpu_irq_state == 2 || !hakios_gpu_done(gpu_fence) ||
+	    __atomic_load_n(&power_quiescing, __ATOMIC_ACQUIRE)) {
+		return 0;
+	}
+	return gpu_runtime_suspend() ? 1 : 0;
+}
+
 /* The worker's tick under gGPULock: returns ms until the next tick, or 0 to stop. */
 uint32_t
 hakios_gpu_power_tick(void)
