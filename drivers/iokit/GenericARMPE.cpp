@@ -831,8 +831,8 @@ SYSCTL_PROC(_kern_hakios, OID_AUTO, sleep_alarms, CTLTYPE_STRING | CTLFLAG_RD | 
  * of IOCPUSleepKernel() -- whose boot processor is to come back through a warm reset this port has not got (with more
  * than one processor it waited for good). Suspend to idle: psci_idle.c's hakios_sleep_wait() keeps the boot processor
  * in WFI, the others off, until a wake source (the power key) or the end of a test sleep. The time and the clocks go on
- * meanwhile (the generic timer does not stop), so the calendar needs nothing at the wake. System sleep is still refused
- * unless boot-arg syssleep=1 (0003-iokit.patch): asleep, the USB network and sweetd stop too.
+ * meanwhile (the generic timer does not stop), so the calendar needs nothing at the wake. Boot-arg syssleep=0 refuses
+ * system sleep (0003-iokit.patch).
  *
  * kern.hakios.sleep_test=S (root): the system to sleep now, the test's timer to wake it after S seconds (1 to 3600).
  * kern.hakios.sleeps: the counts.
@@ -893,7 +893,7 @@ sleepTestSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unuse
 }
 
 SYSCTL_PROC(_kern_hakios, OID_AUTO, sleep_test, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
-    sleepTestSysctl, "I", "test: the system sleeps now and its timer wakes it after this many seconds (needs syssleep=1)");
+    sleepTestSysctl, "I", "test: the system sleeps now and its timer wakes it after this many seconds (not with syssleep=0)");
 
 static int
 sleepsSysctl(__unused struct sysctl_oid * oidp, __unused void * arg1, __unused int arg2, struct sysctl_req * req)

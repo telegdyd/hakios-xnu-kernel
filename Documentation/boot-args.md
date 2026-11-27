@@ -253,7 +253,7 @@ beside the code, so the file named in each heading has the full explanation.
 
 | Argument | What the source says |
 | --- | --- |
-| `syssleep` | syssleep=1 gives the old behaviour back. |
+| `syssleep` | syssleep=0 refuses it: the system stays awake with its display off, and the side button or a tap wakes the screen. |
 
 ## Sound, camera, haptics, flashlight
 
