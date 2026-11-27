@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <signal.h>
 #include <sys/ucontext.h>
@@ -2121,6 +2122,261 @@ wait_stack_start(const char *arguments)
 	say("hakios: waitstack=1: the stacks of the busy threads sampled every 2 ms, said every 5 s\n");
 }
 
+/*
+ * The window server's CPU profile, asked for at run time (uibench run ... prof): while the notification
+ * com.hakios.prof has the state 1, every 2 ms each thread of this process that is on a core is stopped, its stack
+ * read (CP_DEPTH frames) and started again. Counted by thread name: each return address once a sample (inclusive:
+ * the time under that function) and the innermost pc (self: the time in it). When the state goes back to 0 (or
+ * after CP_MAX_S), CP_FILE is written and com.hakios.prof.done posted. Lines: "PROF threads ...", then for the
+ * busiest threads "PROF NAME self|incl COUNT ADDRESS", each address an unslid one of the shared cache (ipsw dyld
+ * a2s on the host names it) or IMAGE+OFFSET. Unlike waitstack=1 this keeps the innermost frames of running threads:
+ * where the processor time goes, not which callout it is in. Sampled from inside: from another process, a
+ * thread_get_state on these threads every 2 ms (2026-11-27) left the window server showing a lock screen that
+ * SpringBoard had long left.
+ */
+#define CP_FILE         "/private/var/tmp/hakios-prof.txt"
+#define CP_SLOTS        16384
+#define CP_NAMES        64
+#define CP_DEPTH        128
+#define CP_MAX_S        120
+
+static struct {
+	uintptr_t address;
+	uint32_t incl, self;
+	uint8_t name;           /* (index into cp_names + 1; 0: a free slot) */
+} cp_seen[CP_SLOTS];
+static struct {
+	char name[48];
+	uint32_t samples;
+} cp_names[CP_NAMES];
+static unsigned cp_nnames, cp_lost, cp_ticks, cp_samples;
+
+static unsigned
+cp_name(const char *name)
+{
+	for (unsigned i = 0; i < cp_nnames; i++) {
+		if (strcmp(cp_names[i].name, name) == 0) {
+			return i;
+		}
+	}
+	if (cp_nnames == CP_NAMES) {
+		return CP_NAMES - 1;    /* (the last one takes in the rest) */
+	}
+	strlcpy(cp_names[cp_nnames].name, name, sizeof(cp_names[0].name));
+	return cp_nnames++;
+}
+
+static void
+cp_count(unsigned name, uintptr_t address, bool self)
+{
+	unsigned i = (unsigned)(((address >> 2) * 2654435761u + name * 40503u) % CP_SLOTS);
+
+	for (unsigned k = 0; k < CP_SLOTS; k++, i = (i + 1) % CP_SLOTS) {
+		if (cp_seen[i].name == 0) {
+			cp_seen[i].name = (uint8_t)(name + 1);
+			cp_seen[i].address = address;
+		}
+		if (cp_seen[i].name == name + 1 && cp_seen[i].address == address) {
+			if (self) {
+				cp_seen[i].self++;
+			} else {
+				cp_seen[i].incl++;
+			}
+			return;
+		}
+	}
+	cp_lost++;
+}
+
+/* the profile into CP_FILE: the threads, then the busiest ones' hottest addresses */
+static void
+cp_write(double seconds)
+{
+	size_t cache_length = 0;
+	const uintptr_t cache = (uintptr_t)_dyld_get_shared_cache_range(&cache_length);
+	FILE *f = fopen(CP_FILE ".new", "w");
+	bool shown[CP_NAMES] = { false };
+
+	if (f == NULL) {
+		say("hakios: prof: %s: %s\n", CP_FILE ".new", strerror(errno));
+		return;
+	}
+	fprintf(f, "PROF backboardd: %u looks in %.1f s, %u running-thread samples (%.2f cores busy), %u lost; "
+	    "cache base %#lx\n", cp_ticks, seconds, cp_samples, cp_ticks != 0 ? (double)cp_samples / cp_ticks : 0,
+	    cp_lost, (unsigned long)CACHE_BASE);
+	for (unsigned k = 0; k < cp_nnames; k++) {
+		unsigned best = CP_NAMES;
+
+		for (unsigned i = 0; i < cp_nnames; i++) {
+			if (!shown[i] && (best == CP_NAMES || cp_names[i].samples > cp_names[best].samples)) {
+				best = i;
+			}
+		}
+		shown[best] = true;
+		fprintf(f, "PROF thread %s %u (%.0f%%)\n", cp_names[best].name[0] != 0 ? cp_names[best].name : "-",
+		    cp_names[best].samples, cp_samples != 0 ? 100.0 * cp_names[best].samples / cp_samples : 0);
+	}
+	/* the threads with a tenth of the samples or more: their 30 hottest addresses by self time, 50 by inclusive */
+	for (unsigned t = 0; t < cp_nnames; t++) {
+		if (cp_names[t].samples * 10 < cp_samples || cp_names[t].samples < 20) {
+			continue;
+		}
+		for (int kind = 0; kind < 2; kind++) {
+			static bool taken[CP_SLOTS];
+
+			memset(taken, 0, sizeof(taken));
+			for (unsigned k = 0; k < (kind == 0 ? 30u : 50u); k++) {
+				unsigned best = CP_SLOTS;
+				char where[160] = "";
+
+				for (unsigned i = 0; i < CP_SLOTS; i++) {
+					const uint32_t n = kind == 0 ? cp_seen[i].self : cp_seen[i].incl;
+
+					if (cp_seen[i].name == t + 1 && !taken[i] && n != 0 &&
+					    (best == CP_SLOTS || n > (kind == 0 ? cp_seen[best].self : cp_seen[best].incl))) {
+						best = i;
+					}
+				}
+				if (best == CP_SLOTS) {
+					break;
+				}
+				taken[best] = true;
+				ws_frame(where, sizeof(where), cp_seen[best].address, cache, cache_length);
+				fprintf(f, "PROF %s %s %u%s\n", cp_names[t].name[0] != 0 ? cp_names[t].name : "-",
+				    kind == 0 ? "self" : "incl", kind == 0 ? cp_seen[best].self : cp_seen[best].incl, where);
+			}
+		}
+	}
+	fclose(f);
+	chmod(CP_FILE ".new", 0644);
+	rename(CP_FILE ".new", CP_FILE);
+}
+
+static void *
+cp_sampler(void *unused)
+{
+	int token = -1;
+	uint64_t state = 0, began = 0;
+	bool on = false;
+	mach_timebase_info_data_t tb;
+
+	(void)unused;
+	pthread_setname_np("hakios.prof");
+	mach_timebase_info(&tb);
+	if (notify_register_check("com.hakios.prof", &token) != NOTIFY_STATUS_OK) {
+		return NULL;
+	}
+	for (;;) {
+		int changed = 0;
+		double seconds;
+
+		notify_check(token, &changed);  /* (shared memory: no message unless it was posted) */
+		if (changed) {
+			notify_get_state(token, &state);
+		}
+		seconds = on ? (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e9 : 0;
+		if (on && (state != 1 || seconds > CP_MAX_S)) {
+			on = false;
+			state = 0;
+			cp_write(seconds);
+			notify_post("com.hakios.prof.done");
+			continue;
+		}
+		if (!on && state == 1) {
+			on = true;
+			began = mach_absolute_time();
+			memset(cp_seen, 0, sizeof(cp_seen));
+			memset(cp_names, 0, sizeof(cp_names));
+			cp_nnames = cp_lost = cp_ticks = cp_samples = 0;
+		}
+		if (!on) {
+			usleep(100000);
+			continue;
+		}
+		usleep(2000);
+		cp_ticks++;
+
+		thread_act_array_t threads;
+		mach_msg_type_number_t count = 0;
+		const thread_t self = mach_thread_self();
+
+		if (task_threads(mach_task_self(), &threads, &count) == KERN_SUCCESS) {
+			for (mach_msg_type_number_t t = 0; t < count; t++) {
+				thread_basic_info_data_t basic;
+				thread_extended_info_data_t ext;
+				mach_msg_type_number_t bn = THREAD_BASIC_INFO_COUNT, en = THREAD_EXTENDED_INFO_COUNT;
+				arm_thread_state64_t st;
+				mach_msg_type_number_t sn = ARM_THREAD_STATE64_COUNT;
+				uintptr_t all[CP_DEPTH];
+				unsigned n = 0;
+
+				if (threads[t] == self || thread_info(threads[t], THREAD_BASIC_INFO, (thread_info_t)&basic, &bn) != KERN_SUCCESS ||
+				    basic.run_state != TH_STATE_RUNNING || thread_suspend(threads[t]) != KERN_SUCCESS) {
+					mach_port_deallocate(mach_task_self(), threads[t]);
+					continue;
+				}
+				/* (stopped: nothing here may take a lock the thread could hold -- no malloc, no say) */
+				if (thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&st, &sn) == KERN_SUCCESS) {
+					uintptr_t fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(st);
+
+					/* (the pc, then the frame chain; not the lr, which is the caller only in a leaf and stale elsewhere) */
+					all[n++] = (uintptr_t)ptrauth_strip((void *)__darwin_arm_thread_state64_get_pc(st), ptrauth_key_function_pointer);
+					while (n < CP_DEPTH && fp != 0 && (fp & 7) == 0) {
+						uint64_t frame[2];
+						vm_size_t read = 0;
+
+						if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof(frame), (vm_address_t)(uintptr_t)frame,
+						    &read) != KERN_SUCCESS || read != sizeof(frame) || frame[0] <= fp) {
+							break;
+						}
+						const uintptr_t ret = (uintptr_t)ptrauth_strip((void *)(uintptr_t)frame[1], ptrauth_key_return_address);
+
+						if (ret != 0) {
+							all[n++] = ret;
+						}
+						fp = (uintptr_t)frame[0];
+					}
+				}
+				ext.pth_name[0] = 0;
+				thread_info(threads[t], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &en);
+				thread_resume(threads[t]);
+				mach_port_deallocate(mach_task_self(), threads[t]);
+				if (n == 0) {
+					continue;
+				}
+				const unsigned name = cp_name(ext.pth_name);
+
+				cp_names[name].samples++;
+				cp_samples++;
+				cp_count(name, all[0], true);
+				for (unsigned i = 0; i < n; i++) {
+					bool again = false;
+
+					for (unsigned j = 0; j < i && !again; j++) {
+						again = all[j] == all[i];
+					}
+					if (!again) {
+						cp_count(name, all[i], false);
+					}
+				}
+			}
+			vm_deallocate(mach_task_self(), (vm_address_t)(uintptr_t)threads, count * sizeof(thread_t));
+		}
+		mach_port_deallocate(mach_task_self(), self);
+	}
+	return NULL;
+}
+
+static void
+cpu_profile_start(void)
+{
+	pthread_t thread;
+
+	if (pthread_create(&thread, NULL, cp_sampler, NULL) == 0) {
+		pthread_detach(thread);
+	}
+}
+
 __attribute__((constructor))
 static void
 hakios_init(void)
@@ -2171,6 +2427,7 @@ hakios_init(void)
 		}
 		dyld_count_start(arguments);
 		wait_stack_start(arguments);
+		cpu_profile_start();            /* (idle until uibench asks: a look at a notification every 100 ms) */
 		/*
 		 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
 		 * CoreAnimation's own switches (CA_LOG_TRIPLE_BUFFERING=1, CA_FORCE_DOUBLE_BUFFERING=1 ...).
