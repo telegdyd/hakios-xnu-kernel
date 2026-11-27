@@ -1,8 +1,9 @@
 /*
  * uibench: drive the screen through a list of steps, checking each one landed, and measure it.
  *
- *   usage: uibench run STEPS [quiet MS] [settle MS] [idle S]    the steps of the file STEPS, in order
- *                                                   (first waiting at most idle S, 60, for the system to be quiet)
+ *   usage: uibench run STEPS [quiet MS] [settle MS] [idle S] [prof]    the steps of the file STEPS, in order
+ *                                                   (first waiting at most idle S, 30, for the system to be quiet;
+ *                                                   prof: backboardd's CPU profile of the steps after the last line)
  *          uibench state                                what the screen is now (SpringBoard's answer)
  *          uibench do ACTION...                         one action (as in a step), then the state
  *
@@ -18,9 +19,12 @@
  * After the action uibench waits for the screen to be still (no frame for `quiet` ms, 120; at most `settle` ms,
  * 3000), asks SpringBoard what it shows (com.hakios.uistate, inject_sb.c) and checks AFTER, asking again for a
  * second while it does not hold. Each step's line:
- *   STEP NAME PASS|FAIL [why] | still after MS | frames N, X% within 18 ms, longest MS, 95% under MS | cpu NAME MS ...
- * the frames from the start of the action until the screen was still (kern.hakios.fb_step), and the processes
- * that took the most CPU time meanwhile. The last line: "UIBENCH N steps, P passed, F failed, S s".
+ *   STEP NAME PASS|FAIL [why] | still after MS | screen moved D | frames N, X% within 18 ms, longest MS, 95% under MS |
+ *       NAME MS ...
+ * how far the picture on the panel moved (a step whose state changed fails below SCREEN_MIN: the screen did not
+ * follow), the frames from the start of the action until the screen was still (kern.hakios.fb_step), and the
+ * processes that took the most CPU time meanwhile. A display that a tap does not wake fails the step. The last
+ * line: "UIBENCH N steps, P passed, F failed, S s".
  *
  * Gestures are written to /dev/hakios-touch in one go with each sample's time: the kernel posts them then
  * (board/input.c), with those times, so a swipe is the same swipe however busy the system is.
@@ -328,6 +332,126 @@ display_off(void)
 	return strstr(text, "off now 1") != NULL;
 }
 
+/*
+ * The display on: a tap if it is off (backboardd's library turns it into a press of the lock button while the window
+ * server has the touch screen waking), else the lock button itself, as the owner would; false when it stays off.
+ */
+static bool
+display_wake(void)
+{
+	double still;
+
+	for (int how = 0; how < 2 && display_off(); how++) {
+		if (how == 0) {
+			tap(0.5, 0.5);
+		} else {
+			button(HAKIOS_BUTTON_LOCK);
+		}
+		wait_still_after(now_ms(), &still, now_ms());
+		for (double until = now_ms() + 1000; display_off() && now_ms() < until; sleep_ms(50)) {
+		}
+	}
+	return !display_off();
+}
+
+/*
+ * --- what the panel shows, coarsely -----------------------------------------------------------------
+ * The image the display is given (kern.hakios.screen, as screencap reads it) as a grid of mean brightness, 40 by 40
+ * pixels a cell. A step whose state changed (unlocked, another page, Control Center, another application in front)
+ * must also change the picture: on 2026-11-27 backboardd went on showing a lock screen while SpringBoard unlocked and
+ * turned pages behind it, and every step still passed. How far the grid moved (the mean of the cells' differences,
+ * 0 to 255) is on each step's line.
+ */
+#define GRID_CELL       40
+#define GRID_W          27
+#define GRID_H          61
+#define SCREEN_MIN      2.0             /* a step whose state changed moves the grid at least this much */
+
+struct grid {
+	bool ok;
+	float cell[GRID_H][GRID_W];
+};
+
+static uint8_t *screen_buf;
+static size_t screen_size;
+
+static void
+screen_grid(struct grid *g)
+{
+	struct { char magic[8]; uint32_t width, height, rowBytes, format; } h;
+	size_t size = 0;
+
+	g->ok = false;
+	if (sysctlbyname("kern.hakios.screen", NULL, &size, NULL, 0) != 0 || size <= sizeof(h)) {
+		return;
+	}
+	if (size > screen_size) {
+		free(screen_buf);
+		screen_buf = malloc(size);
+		screen_size = screen_buf != NULL ? size : 0;
+		if (screen_buf == NULL) {
+			return;
+		}
+	}
+	if (sysctlbyname("kern.hakios.screen", screen_buf, &size, NULL, 0) != 0 || size <= sizeof(h)) {
+		return;
+	}
+	memcpy(&h, screen_buf, sizeof(h));
+	if (memcmp(h.magic, "HKSCREEN", 8) != 0 || h.format != 0 || h.width == 0 || h.height == 0 ||
+	    size < sizeof(h) + (size_t)h.rowBytes * h.height) {
+		return;
+	}
+	for (unsigned gy = 0; gy < GRID_H; gy++) {
+		for (unsigned gx = 0; gx < GRID_W; gx++) {
+			unsigned sum = 0, n = 0;
+
+			/* (every fourth pixel each way: BGRx, the brightness of each) */
+			for (unsigned y = gy * GRID_CELL; y < (gy + 1) * GRID_CELL && y < h.height; y += 4) {
+				const uint8_t *row = screen_buf + sizeof(h) + (size_t)y * h.rowBytes;
+
+				for (unsigned x = gx * GRID_CELL; x < (gx + 1) * GRID_CELL && x < h.width; x += 4) {
+					sum += (row[x * 4 + 2] * 77u + row[x * 4 + 1] * 150u + row[x * 4] * 29u) >> 8;
+					n++;
+				}
+			}
+			g->cell[gy][gx] = n != 0 ? (float)sum / (float)n : 0;
+		}
+	}
+	g->ok = true;
+}
+
+/* how far the picture moved from a to b: the mean difference of the cells; -1 when either was not read */
+static double
+grid_moved(const struct grid *a, const struct grid *b)
+{
+	double sum = 0;
+
+	if (!a->ok || !b->ok) {
+		return -1;
+	}
+	for (unsigned gy = 0; gy < GRID_H; gy++) {
+		for (unsigned gx = 0; gx < GRID_W; gx++) {
+			float d = a->cell[gy][gx] - b->cell[gy][gx];
+
+			sum += d < 0 ? -d : d;
+		}
+	}
+	return sum / (GRID_W * GRID_H);
+}
+
+/* what SpringBoard shows differently in b than in a, for the screen check ("" when nothing) */
+static const char *
+state_changed(const struct state *a, const struct state *b)
+{
+	if (a->locked != b->locked) return "locked";
+	if (a->coversheet != b->coversheet) return "coversheet";
+	if (a->cc != b->cc) return "cc";
+	if (a->switcher != b->switcher) return "switcher";
+	if (strcmp(a->front, b->front) != 0) return "front";
+	if (a->page != b->page) return "page";
+	return "";
+}
+
 /* --- actions and conditions ------------------------------------------------------------------------ */
 
 /* an action's words; false (and why in `why`) when it cannot be done */
@@ -481,9 +605,9 @@ reach(const struct condition *c, int n, struct state *s, char *is, size_t is_siz
 	for (int tries = 0; tries < 14; tries++) {
 		int i;
 
-		if (display_off()) {
-			tap(0.5, 0.5);
-			wait_still_after(now_ms(), &still, now_ms());
+		if (!display_wake()) {
+			snprintf(is, is_size, "the display stays off after a tap and the lock button");
+			return false;
 		}
 		if (!ask_state(s)) {
 			snprintf(is, is_size, "SpringBoard did not answer");
@@ -661,6 +785,55 @@ trim(char *s)
 	return s;
 }
 
+/*
+ * --- the window server's CPU profile (run ... prof) ---------------------------------------------------
+ * backboardd's library (inject.c, cp_sampler) samples its running threads from the first step to the last when the
+ * notification com.hakios.prof has the state 1, and when it goes back to 0 writes PROF_FILE and posts
+ * com.hakios.prof.done; its lines (each beginning "PROF") follow the last step's.
+ */
+#define PROF_FILE       "/private/var/tmp/hakios-prof.txt"
+static bool prof_on;
+
+static void
+prof_set(uint64_t on)
+{
+	static int token = -1;
+
+	if (token < 0 && notify_register_check("com.hakios.prof", &token) != NOTIFY_STATUS_OK) {
+		return;
+	}
+	notify_set_state(token, on);
+	notify_post("com.hakios.prof");
+}
+
+static void
+prof_finish(void)
+{
+	int done = -1, posted = 0;
+	char line[1024];
+	FILE *f;
+
+	if (notify_register_check("com.hakios.prof.done", &done) == NOTIFY_STATUS_OK) {
+		notify_check(done, &posted);    /* (an old answer is not this one) */
+	}
+	posted = 0;
+	prof_set(0);
+	for (double until = now_ms() + 5000; !posted && now_ms() < until; sleep_ms(20)) {
+		if (done >= 0) {
+			notify_check(done, &posted);
+		}
+	}
+	f = posted ? fopen(PROF_FILE, "r") : NULL;
+	if (f == NULL) {
+		printf("PROF none: backboardd wrote no profile (its library too old, or not in it)\n");
+		return;
+	}
+	while (fgets(line, sizeof(line), f) != NULL) {
+		fputs(line, stdout);
+	}
+	fclose(f);
+}
+
 /* "frames N under10 A under18 B ... longest L half H most M pauses P" as a short summary */
 static void
 frames_summary(const char *step, char *text, size_t size)
@@ -689,14 +862,21 @@ run(const char *path)
 		return 2;
 	}
 	wait_idle();
+	if (prof_on) {
+		unlink(PROF_FILE);
+		prof_set(1);
+	}
 	began = now_ms();
 	while (fgets(line, sizeof(line), f) != NULL) {
 		char *hash = strchr(line, '#'), *field[4] = { NULL }, *w[12], why[256] = "", is[256] = "", frames[192], fsum[160],
 		    cpu[192] = "", actcopy[256];
 		struct condition pre[CONDITIONS], post[CONDITIONS];
 		int fields = 0, npre, npost, nw = 0, page_before;
-		struct state s;
-		double start, still;
+		struct state s, before;
+		static struct grid grid_before, grid_after;
+		char screen[64];
+		const char *changed;
+		double start, still, moved;
 		bool ok = false, was_still;
 
 		if (hash != NULL) {
@@ -736,11 +916,8 @@ run(const char *path)
 			}
 			npre = kept;
 			if (nlooks > 0) {
-				if (display_off()) {
-					tap(0.5, 0.5);
-					wait_still_after(now_ms(), &still, now_ms());
-				}
-				skip = ask_state(&s) && !all_hold(looks, nlooks, &s, s.page, is, sizeof(is));
+				/* (a display that stays off fails the step below, in reach) */
+				skip = display_wake() && ask_state(&s) && !all_hold(looks, nlooks, &s, s.page, is, sizeof(is));
 			}
 			if (skip) {
 				printf("STEP %s SKIP (%s)\n", field[0], is);
@@ -748,13 +925,23 @@ run(const char *path)
 				continue;
 			}
 		}
+		memset(&s, 0, sizeof(s));
+		s.locked = s.coversheet = s.cc = s.switcher = s.page = s.pages = -1;
+		strcpy(s.front, "?");
 		if (!reach(pre, npre, &s, is, sizeof(is))) {
 			printf("STEP %s FAIL before: %s\n", field[0], is);
 			print_state("  state: ", &s);
 			fflush(stdout);
+			if (display_off()) {
+				/* (every step after would only wait for it again) */
+				printf("UIBENCH stopped: the display cannot be woken\n");
+				break;
+			}
 			continue;
 		}
 		page_before = s.page;
+		before = s;
+		screen_grid(&grid_before);              /* (before anything is timed: a read and its sums take some 50 ms) */
 		frame_step(frames, sizeof(frames));     /* (counted afresh from here) */
 		cpu_before_n = cpu_look(cpu_before);
 		start = now_ms();
@@ -782,9 +969,29 @@ run(const char *path)
 			}
 			sleep_ms(100);
 		}
+		/* the picture followed what SpringBoard says changed (the screen check above) */
+		screen_grid(&grid_after);
+		moved = grid_moved(&grid_before, &grid_after);
+		changed = state_changed(&before, &s);
+		/* (an application's first picture may come after the screen was still: Settings opened 95 ms after the tap
+		 * and drew nothing yet; a picture that has not moved in 1.5 s is a screen that does not follow) */
+		for (double until = now_ms() + 1500; changed[0] != 0 && moved >= 0 && moved < SCREEN_MIN && now_ms() < until;) {
+			sleep_ms(100);
+			screen_grid(&grid_after);
+			moved = grid_moved(&grid_before, &grid_after);
+		}
+		if (moved < 0) {
+			snprintf(screen, sizeof(screen), "screen not read");
+		} else {
+			snprintf(screen, sizeof(screen), "screen moved %.1f", moved);
+		}
+		if (ok && moved >= 0 && changed[0] != 0 && moved < SCREEN_MIN) {
+			ok = false;
+			snprintf(is, sizeof(is), "the screen did not follow (%s changed, the picture moved %.1f)", changed, moved);
+		}
 		passed += ok;
-		printf("STEP %s %s%s%s | %s %.0f ms | %s |%s\n", field[0], ok ? "PASS" : "FAIL", ok ? "" : " ", ok ? "" : is,
-		    was_still ? "still after" : "never still, gave up after", still - start, fsum, cpu);
+		printf("STEP %s %s%s%s | %s %.0f ms | %s | %s |%s\n", field[0], ok ? "PASS" : "FAIL", ok ? "" : " ", ok ? "" : is,
+		    was_still ? "still after" : "never still, gave up after", still - start, screen, fsum, cpu);
 		if (!ok) {
 			print_state("  state: ", &s);
 		}
@@ -792,6 +999,9 @@ run(const char *path)
 	}
 	fclose(f);
 	printf("UIBENCH %d steps, %d passed, %d failed, %.1f s\n", steps, passed, steps - passed, (now_ms() - began) / 1000);
+	if (prof_on) {
+		prof_finish();
+	}
 	return passed == steps ? 0 : 1;
 }
 
@@ -820,13 +1030,17 @@ main(int argc, char **argv)
 		return 1;
 	}
 	if (argc >= 3 && strcmp(argv[1], "run") == 0) {
-		for (int i = 3; i + 1 < argc; i += 2) {
-			if (strcmp(argv[i], "quiet") == 0) {
-				quiet_ms = (unsigned)atoi(argv[i + 1]);
+		for (int i = 3; i < argc; i++) {
+			if (strcmp(argv[i], "prof") == 0) {
+				prof_on = true;
+			} else if (i + 1 >= argc) {
+				break;
+			} else if (strcmp(argv[i], "quiet") == 0) {
+				quiet_ms = (unsigned)atoi(argv[++i]);
 			} else if (strcmp(argv[i], "settle") == 0) {
-				settle_ms = (unsigned)atoi(argv[i + 1]);
+				settle_ms = (unsigned)atoi(argv[++i]);
 			} else if (strcmp(argv[i], "idle") == 0) {
-				idle_s = (unsigned)atoi(argv[i + 1]);
+				idle_s = (unsigned)atoi(argv[++i]);
 			}
 		}
 		return run(argv[2]);
@@ -845,6 +1059,6 @@ main(int argc, char **argv)
 		print_state("", &s);
 		return 0;
 	}
-	fprintf(stderr, "usage: uibench run STEPS [quiet MS] [settle MS] [idle S] | uibench state | uibench do ACTION...\n");
+	fprintf(stderr, "usage: uibench run STEPS [quiet MS] [settle MS] [idle S] [prof] | uibench state | uibench do ACTION...\n");
 	return 2;
 }
