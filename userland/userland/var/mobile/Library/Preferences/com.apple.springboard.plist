@@ -6,8 +6,6 @@
 	<true/>
 	<key>FBLaunchWatchdogScale</key>
 	<real>20</real>
-	<key>SBAutoLockTime</key>
-	<integer>-1</integer>
 	<key>SBShowBatteryPercentage</key>
 	<true/>
 </dict>

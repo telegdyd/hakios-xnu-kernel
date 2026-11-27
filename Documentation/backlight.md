@@ -47,7 +47,8 @@ values, and the slider follows the light when brightness is automatic.
 | `bl_min=`, `bl_max=` | per board | Panel values for the lowest and highest brightness |
 | `bl_bytes=1/2`, `bl_le=1` | per board | Width of the 0x51 parameter; `bl_le=1` sends the least significant byte first |
 | `bl_floor=N` | 24 | `soft` backend: share of each pixel kept at level 0, out of 256 |
-| `bl_trace=1` | 0 | The library logs every CoreBrightness key it sees (to find the keys of a newer Darwin) |
+| `bl_trace=1` | 0 | The library logs every CoreBrightness key and display mode it sees (to find the keys of a newer Darwin) |
+| `bl_idle_day=0/1` | auto | `libhakios-backlight.dylib` leaves iOS idle-timer timeouts alone when a backlight backend is active (`!= "none"`) and extends them by +24 h only when none is active; `1` forces the +24 h extension, `0` forces iOS defaults |
 | `display_sleep=0` | 1 (when `display-power` feature is present) | Keep the panel and MDSS hardware powered on when `hw.backlight.power=0` (brightness-0 blackout only) |
 
 ## sysctl `hw.backlight`

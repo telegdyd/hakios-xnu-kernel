@@ -26,17 +26,20 @@ cp -R "$US/src/board" "$O/src/"    # (the headers the libraries share with the k
 #   -[SBPolicyAggregator _allowsCapabilityPosterSwitcherWithExplanation:] (16.5's SBMainDisplayPolicyAggregator): a BOOL
 #     and the explanation through its pointer, as on 16.5; on 27.2 the switcher is offered (HAKIOS_POSTER_SWITCHER=1):
 #     with PosterBoard a launch angel again (mkimage26.py) it opens, where 16.5's is black
+#   -[SBTelephonyManager _serverConnectionDidError:]: schedules _handleTelephonyDaemonRestart after 1.0 s (same
+#     Mach retry loop resetting the idle timer when CommCenter is denied), verified on 24B119
 SB_DEFS=()
 case $BUILD in
-23G90)	SB_ACTIVATION=0x22450fdc0 SB_SETUP=0x224675b68 SB_SNAPSHOT_FORMAT='' SB_LONG_PRESS='' SB_POSTER='' ;;
-24B119)	SB_ACTIVATION=0x2274356b8 SB_SETUP=0x22757d3fc SB_SNAPSHOT_FORMAT=0x2b42c8d38 SB_LONG_PRESS=0x227922350 SB_POSTER=0x2272817c4 SB_DEFS=(-DHAKIOS_IOS27) ;;   # 27.2: the reason at +0x38 now; the hook passes 0 on
+23G90)	SB_ACTIVATION=0x22450fdc0 SB_SETUP=0x224675b68 SB_SNAPSHOT_FORMAT='' SB_LONG_PRESS='' SB_POSTER='' SB_TELEPHONY_ERROR='' ;;
+24B119)	SB_ACTIVATION=0x2274356b8 SB_SETUP=0x22757d3fc SB_SNAPSHOT_FORMAT=0x2b42c8d38 SB_LONG_PRESS=0x227922350 SB_POSTER=0x2272817c4 SB_TELEPHONY_ERROR=0x227364f44 SB_DEFS=(-DHAKIOS_IOS27) ;;   # 27.2: the reason at +0x38 now; the hook passes 0 on
 *)	echo "inj26.sh: no SpringBoard addresses for $BUILD: those hooks will be left alone" >&2
-	SB_ACTIVATION='' SB_SETUP='' SB_SNAPSHOT_FORMAT='' SB_LONG_PRESS='' SB_POSTER='' ;;
+	SB_ACTIVATION='' SB_SETUP='' SB_SNAPSHOT_FORMAT='' SB_LONG_PRESS='' SB_POSTER='' SB_TELEPHONY_ERROR='' ;;
 esac
 [ -z "$SB_ACTIVATION" ] || sed_inplace -e "s/0x1c4bc8dfcUL/${SB_ACTIVATION}UL/" -e "s/0x1c4cdd3a4UL/${SB_SETUP}UL/" "$O/src/inject_sb.c"
 [ -z "$SB_SNAPSHOT_FORMAT" ] || sed_inplace -e "s/0x1f1c91480UL/${SB_SNAPSHOT_FORMAT}UL/" "$O/src/inject_sb.c"
 [ -z "$SB_LONG_PRESS" ] || sed_inplace -e "s/0x1c4f6ab44UL/${SB_LONG_PRESS}UL/" "$O/src/inject_sb.c"
 [ -z "$SB_POSTER" ] || sed_inplace -e "s/0x1c507e0fcUL/${SB_POSTER}UL/" -e 's/"SBMainDisplayPolicyAggregator"/"SBPolicyAggregator"/' "$O/src/inject_sb.c"
+[ -z "$SB_TELEPHONY_ERROR" ] || sed_inplace -e "s/0x1c4b278dcUL/${SB_TELEPHONY_ERROR}UL/" "$O/src/inject_sb.c"
 $DYN -dynamiclib -install_name /hakios/lib/libhakios.dylib -framework CoreFoundation -framework IOKit -lobjc -o "$O/libhakios.dylib" "$O/src/inject.c"
 # the status bar's clock past the hole punch: components/statusbar/inject_statusbar.c (16.5's statusbar.c checks 16.5's addresses)
 # (what it knows of each board, user_boards.h, is made from the device packages that are there now)

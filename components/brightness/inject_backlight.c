@@ -16,10 +16,11 @@
  * would otherwise be completed first, and the stale "off" after it).
  *
  * With display modes that complete, SpringBoard's idle timer does what it does on a phone: the lock
- * screen dims and goes dark some ten seconds after the last touch. On this phone that came seconds after
- * the first frame (the user interface takes minutes to come up), and the panel cannot really dim. Every
- * timeout of -[SBBacklightIdleTimer _effectiveTimeoutForBaseTimeout:] (dim, sleep) is a day longer:
- * the screen stays lit until the side button turns it off.
+ * screen dims and goes dark some ten seconds after the last touch. Where there is no working backlight
+ * (QEMU, or early bring-up before backlight=2), the panel cannot really dim and the UI takes minutes to
+ * come up, so every timeout of -[SBBacklightIdleTimer _effectiveTimeoutForBaseTimeout:] (dim, sleep) is
+ * made a day longer until the side button turns it off. With a backlight backend present (hw.backlight.backend
+ * != "none") iOS's own dim and auto-lock timeouts are left as they are; boot-arg bl_idle_day=0/1 overrides.
  *
  * The panel follows the display mode as well, through the kernel's backlight (hw.backlight.power,
  * Documentation/backlight.md): a mode named Off makes the panel dark when its ramp is over, one with Dim in
@@ -236,9 +237,48 @@ timeout(id self, SEL selector, double base)
 	return t > 0 ? t + 24 * 60 * 60 : t;
 }
 
+static bool
+boot_arg_is_set(const char *arguments, const char *word)
+{
+	const char *at = arguments;
+	size_t len = strlen(word);
+
+	while ((at = strstr(at, word)) != NULL) {
+		if ((at == arguments || at[-1] == ' ') && (at[len] == '\0' || at[len] == ' ')) {
+			return true;
+		}
+		at += len;
+	}
+	return false;
+}
+
 static void
 idle_timer_init(void)
 {
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	char backend[32] = "";
+	size_t backend_size = sizeof(backend) - 1;
+	bool force_day = false;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		arguments[sizeof(arguments) - 1] = '\0';
+		if (boot_arg_is_set(arguments, "bl_idle_day=0")) {
+			say("hakios: SpringBoard: idle timer left at iOS defaults (bl_idle_day=0)\n");
+			return;
+		}
+		force_day = boot_arg_is_set(arguments, "bl_idle_day=1");
+	}
+	if (!force_day && sysctlbyname("hw.backlight.backend", backend, &backend_size, NULL, 0) == 0 &&
+	    backend[0] != '\0' && strcmp(backend, "none") != 0) {
+		char line[160];
+
+		snprintf(line, sizeof(line), "hakios: SpringBoard: backlight (%s) present: idle timer left at iOS defaults\n",
+		    backend);
+		say(line);
+		return;
+	}
+
 	Class timer = objc_getClass("SBBacklightIdleTimer");
 	Method m = timer ? class_getInstanceMethod(timer, sel_registerName("_effectiveTimeoutForBaseTimeout:")) : NULL;
 	char types[32] = "?", line[160];

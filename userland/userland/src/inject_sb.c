@@ -24,6 +24,8 @@
  *     SpringBoard was busy waking the display: see lock_long_press().
  *   - A long press on the lock screen's wallpaper does not open the poster switcher, which the
  *     window server here shows as a black screen (16.5; iOS 27 opens it): see poster_switcher_allowed().
+ *   - The display dims and locks when idle: the missing telephony daemon is not reconnected to
+ *     once a second, which reset the idle timer each time: see telephony_connection_error().
  *   - Darwin notifications as a remote control, for scripts (rwtouch notify NAME):
  *       com.hakios.unlock      what the lock screen does after "swipe up to open"
  *       com.hakios.layers      write down the layers SpringBoard has on the screen: see layers()
@@ -37,6 +39,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <notify.h>
 #include <objc/message.h>
@@ -510,6 +513,38 @@ lock_long_press(id self, SEL selector, id recognizer)
 		return;
 	}
 	original_lock_long_press(self, selector, recognizer);
+}
+
+/* ---- the idle timer: no telephony daemon to wait for ---------------------------------------------- */
+
+/*
+ * CommCenter is not shipped (mkjobs.py, DENY). SpringBoard's telephony manager takes the failed
+ * connection for a daemon that died: -[SBTelephonyManager _serverConnectionDidError:] schedules
+ * -[SBTelephonyManager _handleTelephonyDaemonRestart] a second later, which connects again (and
+ * fails again) and, by way of handleCallControlFailure: -> updateCalls -> updateSpringBoard, resets
+ * the idle timer. Once a second for ever: the display never dimmed or locked, on the lock screen
+ * or off it. With no CommCenter registered the retry is not scheduled; with one, it is as it was.
+ * (The argument is not an object, whatever the method's type string says.)
+ */
+extern kern_return_t bootstrap_look_up(mach_port_t bootstrap, const char *name, mach_port_t *service);
+
+static void (*original_telephony_connection_error)(id self, SEL selector, void *error);
+
+static void
+telephony_connection_error(id self, SEL selector, void *error)
+{
+	static bool said;
+	mach_port_t port = MACH_PORT_NULL;
+
+	if (bootstrap_look_up(bootstrap_port, "com.apple.commcenter.coretelephony.xpc", &port) == KERN_SUCCESS) {
+		mach_port_deallocate(mach_task_self(), port);
+		original_telephony_connection_error(self, selector, error);
+		return;
+	}
+	if (!said) {
+		said = true;
+		say("hakios: SpringBoard: no CommCenter: its connection is not retried (the retry resets the idle timer)\n");
+	}
 }
 
 /* ---- remote control ------------------------------------------------------------------------------ */
@@ -1439,6 +1474,8 @@ hakios_springboard_init(void)
 	    0x1c507e0fcUL, (IMP)poster_switcher_allowed, (IMP *)&original_poster_switcher_allowed);
 	replace_method("SBAppSwitcherPageView", "_createOrDestroyWallpaperOverlayView", 0x1c4af7860UL,
 	    (IMP)switcher_wallpaper_overlay, (IMP *)&original_switcher_wallpaper_overlay);
+	replace_method("SBTelephonyManager", "_serverConnectionDidError:", 0x1c4b278dcUL,
+	    (IMP)telephony_connection_error, (IMP *)&original_telephony_connection_error);
 	/*
 	 * Battery hooks on UIDevice: these are the methods every app and SpringBoard itself calls, so
 	 * hooking them here in the SpringBoard process covers both the status bar and any app that
@@ -1461,11 +1498,12 @@ hakios_springboard_init(void)
 	battery_lvl = (IMP)original_battery_level;
 	battery_st  = (IMP)original_battery_state;
 	say("hakios: SpringBoard: activation %s, setup assistant %s, application snapshots %s, the side button's long press %s, "
-	    "battery level %s, battery state %s, poster switcher %s\n",
+	    "battery level %s, battery state %s, poster switcher %s, telephony retry %s\n",
 	    activation ? "answered here" : "NOT replaced", original_set_setup_required_reason ? "refused" : "NOT replaced",
 	    snapshot_format ? "as JPEG" : "NOT changed", original_lock_long_press ? "checked" : "NOT checked",
 	    battery_lvl ? "from QG" : "NOT replaced", battery_st ? "from QG" : "NOT replaced",
-	    poster_switcher ? "not offered" : "NOT withheld");
+	    poster_switcher ? "not offered" : "NOT withheld",
+	    original_telephony_connection_error ? "only with CommCenter" : "NOT replaced");
 	say("hakios: battery UI: shows%% %s, set-shows%% %s, bolt %s, chargePercent %s, setChargePercent %s, lockscreen ring %s\n",
 	    original_battery_view_shows_percentage ? "ok" : "NO",
 	    original_battery_view_set_shows_percentage ? "ok" : "NO",
