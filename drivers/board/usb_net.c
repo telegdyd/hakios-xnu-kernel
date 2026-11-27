@@ -54,6 +54,7 @@
 extern uint32_t loader_log_copy(uint64_t *pos, char *out, uint32_t max);       /* loader_return.c */
 extern void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr);
 extern kern_return_t gic_v3_spi_attach(uint32_t intid, bool edge, void (*handler)(void *, uint32_t), void *context);
+extern void hakios_sleep_wake_source(uint32_t intid) __attribute__((weak));     /* psci_idle.c */
 extern void gic_v3_spi_mask(uint32_t intid);
 extern void gic_v3_spi_unmask(uint32_t intid);
 extern int hakios_mmio_try_read32(const volatile void *, unsigned *) __attribute__((weak));
@@ -856,6 +857,22 @@ usb_irq_start(void)
 	usbn_wr(GEVNTSIZ(0), rd(dwc3, GEVNTSIZ(0)) & ~GEVNTSIZ_INTMASK);
 	__asm__ volatile ("dsb sy" ::: "memory");
 	printf("usb_net: interrupts: GIC %u, recovery %u ms\n", USB_INTID, USB_RECOVERY_MS);
+	/*
+	 * And the system while it sleeps on the cable (COMMON-PORT.md "System sleep", step 3): the host's traffic, a reset
+	 * or a link change is a dark wake, its events handled once the sleep is over. Parked (no cable), the controller's
+	 * events are masked at GEVNTSIZ: nothing comes from here, the cable's coming wakes through the DSP (adsp.c).
+	 */
+	if (hakios_sleep_wake_source != NULL) {
+		hakios_sleep_wake_source(USB_INTID);
+	}
+}
+
+/* The event interrupt while it wakes the system (GenericARMPE.cpp names such a wake); 0: none. */
+uint32_t hakios_usb_wake_intid(void);
+uint32_t
+hakios_usb_wake_intid(void)
+{
+	return usb_irq.on ? USB_INTID : 0;
 }
 
 /* Arm the wait before unmasking, then recheck both the software latch and hardware count. An

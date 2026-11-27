@@ -916,7 +916,7 @@ psci_smp_cores_up(void)
  * whatever was due is done at once after it.
  */
 #define SLEEP_PET_SECONDS       5
-#define SLEEP_WAKES_MOST        4
+#define SLEEP_WAKES_MOST        8
 #define SLEEP_INTID_VTIMER      27
 #define SLEEP_INTID_NONE_MIN    1020
 #define SLEEP_INTID_NONE_MOST   1023
