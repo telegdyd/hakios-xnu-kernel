@@ -68,6 +68,10 @@ pac_strip "$OBJ/torch_test"
 $DYN -framework CoreFoundation -framework Foundation -framework AVFAudio -lobjc -o "$OBJ/record_test" "$RN/../components/audio/record_test.c"
 pac_strip "$OBJ/record_test"
 "$LDID" -S"$RN/../components/audio/record_test.entitlements" "$OBJ/record_test"
+# the speakers as a program plays to them: audio queue tones, system sounds, the route (components/audio/sound_test.c)
+$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFAudio -lobjc -o "$OBJ/sound_test" "$RN/../components/audio/sound_test.c"
+pac_strip "$OBJ/sound_test"
+"$LDID" -S "$OBJ/sound_test"
 
 # --- the tree ----------------------------------------------------------------------------------------
 rm -rf "$T"
@@ -101,6 +105,7 @@ if [ -f "$OBJ/sweetd" ] && [ "${SWEETD-1}" != 0 ]; then
 fi
 cp "$OBJ/torch_test" "$T/bin/torch_test"
 cp "$OBJ/record_test" "$T/bin/record_test"
+cp "$OBJ/sound_test" "$T/bin/sound_test"
 # the SSH server and its shell, when darwin/userland/ssh.sh has built them (rc.jobs.ssh starts the server); the keys of
 # this machine's ../ssh/ with them, unless SHARE=1 (an image for somebody else: no host key of ours in it). dropbear
 # refuses keys whose file or directory anyone but their owner may write: 600 and 700
