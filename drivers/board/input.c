@@ -23,6 +23,7 @@
 #include <sys/kauth.h>
 #include <sys/proc.h>
 #include <sys/board/input.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
 #include <pexpert/pexpert.h>
@@ -128,17 +129,17 @@ count_fingers(uint32_t type, uint32_t finger)
 	}
 }
 
+/* With touch_lock held. `when`: the sample's time (mach_absolute_time), 0 for now. */
 static void
-touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
+touch_post_locked(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver, uint64_t when)
 {
 	struct hakios_touch *t;
 
-	lck_mtx_lock(&touch_lock);
 	if (touch_tail - touch_head == TOUCH_QUEUE) {
 		touch_head++;                   /* nobody reads: drop the oldest */
 	}
 	t = &touch_queue[touch_tail++ % TOUCH_QUEUE];
-	t->time = mach_absolute_time();
+	t->time = when != 0 ? when : mach_absolute_time();
 	if (latency_lines()) {
 		uint64_t ns;
 
@@ -152,9 +153,76 @@ touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_dri
 	if (from_driver) {
 		count_fingers(type, finger);
 	}
+}
+
+static void
+touch_post(uint32_t type, uint32_t finger, uint32_t x, uint32_t y, bool from_driver)
+{
+	lck_mtx_lock(&touch_lock);
+	touch_post_locked(type, finger, x, y, from_driver, 0);
 	lck_mtx_unlock(&touch_lock);
 	wakeup(&touch_queue);
 }
+
+/*
+ * Samples written with a time (struct hakios_touch.time, mach_absolute_time; 0: at once) are posted
+ * by the kernel when that time comes, with that time as theirs: a gesture a program writes in one go
+ * (uibench) has its samples exactly as far apart as it says, however late the writer or this thread
+ * call runs -- the window server takes a touch's speed from the samples' times. They wait here, in
+ * the order written; a time earlier than the one before it is taken as that one.
+ */
+#define TOUCH_LATER     256             /* records; a power of two */
+
+static struct hakios_touch touch_later[TOUCH_LATER];
+static uint32_t later_head, later_tail;
+static thread_call_t later_call;
+
+/* With touch_lock held: the thread call set for the first sample that waits, if any. */
+static void
+later_arm(void)
+{
+	if (later_head != later_tail) {
+		thread_call_enter_delayed_with_leeway(later_call, NULL, touch_later[later_head % TOUCH_LATER].time, 0,
+		    THREAD_CALL_DELAY_LEEWAY);
+	}
+}
+
+static void
+later_due(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+{
+	uint64_t now = mach_absolute_time();
+	bool posted = false;
+
+	lck_mtx_lock(&touch_lock);
+	while (later_head != later_tail && touch_later[later_head % TOUCH_LATER].time <= now) {
+		struct hakios_touch *t = &touch_later[later_head++ % TOUCH_LATER];
+
+		touch_post_locked(t->type, t->finger, t->x, t->y, false, t->time);
+		posted = true;
+	}
+	later_arm();
+	lck_mtx_unlock(&touch_lock);
+	if (posted) {
+		wakeup(&touch_queue);
+	}
+}
+
+/* sysctl kern.hakios.touch_later: how many timed samples still wait (a writer waits for 0 before it looks) */
+SYSCTL_DECL(_kern_hakios);
+
+static int
+sysctl_touch_later SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int waiting;
+
+	lck_mtx_lock(&touch_lock);
+	waiting = (int)(later_tail - later_head);
+	lck_mtx_unlock(&touch_lock);
+	return SYSCTL_OUT(req, &waiting, sizeof(waiting));
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, touch_later, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_touch_later,
+    "I", "hakios-touch: timed samples written that wait for their time");
 
 /* when a finger last touched the screen, in absolute time */
 uint64_t hakios_touch_last;
@@ -265,7 +333,23 @@ touch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
 		if (t.type < HAKIOS_TOUCH_DOWN || t.type > HAKIOS_BUTTON_UP) {
 			return EINVAL;
 		}
-		touch_post(t.type, t.finger, t.x, t.y, false);
+		if (t.time == 0) {
+			touch_post(t.type, t.finger, t.x, t.y, false);
+			continue;
+		}
+		lck_mtx_lock(&touch_lock);
+		if (later_tail - later_head == TOUCH_LATER) {
+			lck_mtx_unlock(&touch_lock);
+			return ENOSPC;          /* (a longer gesture is written in parts, each once the one before is posted) */
+		}
+		if (later_head != later_tail && t.time < touch_later[(later_tail - 1) % TOUCH_LATER].time) {
+			t.time = touch_later[(later_tail - 1) % TOUCH_LATER].time;
+		}
+		touch_later[later_tail++ % TOUCH_LATER] = t;
+		if (later_tail - later_head == 1) {
+			later_arm();
+		}
+		lck_mtx_unlock(&touch_lock);
 	}
 	return error;
 }
@@ -285,4 +369,5 @@ hakios_input_init(void)
 		printf("hakios-touch: cannot create the device\n");
 	}
 	exit_call = thread_call_allocate(exit_hold_elapsed, NULL);
+	later_call = thread_call_allocate_with_priority(later_due, NULL, THREAD_CALL_PRIORITY_KERNEL_HIGH);
 }

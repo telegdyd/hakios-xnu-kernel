@@ -51,6 +51,9 @@ pac_strip "$OBJ/net_test"
 # touches, buttons and notifications for job lists (RC_JOBS=...; usage in its source): a swipe up unlocks, as a finger does
 $DYN -o "$OBJ/rwtouch" "$US/src/rwtouch.c"
 pac_strip "$OBJ/rwtouch"
+# the screen driven through a list of steps, each checked and measured (uibench run /hakios/share/uibench.steps)
+$DYN -o "$OBJ/uibench" "$US/src/uibench.c"
+pac_strip "$OBJ/uibench"
 # what the panel shows, as a PNG (kern.hakios.screen; sweet-sh.py /hakios/bin/screencap > screen.png)
 $DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o "$OBJ/screencap" "$US/src/screencap.c"
 pac_strip "$OBJ/screencap"
@@ -88,6 +91,8 @@ for f in ${EXTRA_BIN:-}; do
 	chmod 755 "$T/bin/$(basename "$f")"
 done
 cp "$OBJ/rwtouch" "$T/bin/rwtouch"
+cp "$OBJ/uibench" "$T/bin/uibench"
+cp "$US/uibench.steps" "$T/share/uibench.steps"
 cp "$OBJ/screencap" "$T/bin/screencap"
 # sweetd and its token: SWEETD_TOKEN=FILE, else $OBJ/sweetd.token, made here once (never in git; the client reads the
 # same file). Not with SHARE=1: an image for somebody else gets no token of ours, and sweetd then runs nothing

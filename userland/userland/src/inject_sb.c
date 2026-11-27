@@ -30,6 +30,7 @@
  *       com.hakios.unlock      what the lock screen does after "swipe up to open"
  *       com.hakios.layers      write down the layers SpringBoard has on the screen: see layers()
  *       com.hakios.switcher    open the switcher of running applications: see switcher()
+ *       com.hakios.uistate     write down what the screen is, for uibench: see ui_state()
  *     In any other program given this library (INJECT in build.sh) only the last of them is
  *     answered, with that program's layers.
  */
@@ -37,10 +38,12 @@
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <math.h>
 #include <notify.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -1097,6 +1100,256 @@ switcher(void)
 }
 
 /*
+ * What the screen is, for a program that drives it (uibench), on the notification com.hakios.uistate:
+ * written to UI_STATE_FILE as "key value" lines, then com.hakios.uistate.done is posted.
+ *   locked 0|1            the lock screen manager's isUILocked
+ *   coversheet 0|1        the cover sheet (lock screen, notifications) is up
+ *   cc 0|1                Control Center is presented
+ *   switcher 0|1          the switcher of running applications is up
+ *   front ID|-            the bundle ID of the application in front, - for none (the home screen)
+ *   page N of M           the home screen's page (the paging icon scroll view's offset)
+ *   icon ID X Y           an icon on the screen now, its centre in fractions of the screen (as rwtouch takes them)
+ *   window CLASS LEVEL    each window shown
+ *   missing WHAT          what this build's SpringBoard did not answer (the rest are still right)
+ * Everything is asked of the objects as they are, on the main queue, and only what answers with the
+ * type expected: a getter that is missing or returns something else is reported as missing.
+ */
+#define UI_STATE_FILE   "/private/var/tmp/hakios-uistate"
+
+struct ui_rect {
+	double x, y, w, h;
+};
+
+struct ui_out {
+	char text[24576];
+	size_t used;
+	unsigned icons;
+};
+
+static void __printflike(2, 3)
+ui_put(struct ui_out *out, const char *format, ...)
+{
+	va_list ap;
+	int n;
+
+	if (out->used >= sizeof(out->text) - 1) {
+		return;
+	}
+	va_start(ap, format);
+	n = vsnprintf(out->text + out->used, sizeof(out->text) - out->used, format, ap);
+	va_end(ap);
+	if (n > 0) {
+		out->used += (size_t)n < sizeof(out->text) - out->used ? (size_t)n : sizeof(out->text) - out->used - 1;
+	}
+}
+
+/* the getter `name` of `object`, if it has one returning the type encoded as `type` ('@' an object, 'B' a BOOL, 'q' an integer) */
+static bool
+ui_has(id object, const char *name, char type)
+{
+	Method method;
+	char returns[8] = "";
+	const char *r;
+
+	if (object == NULL || (method = class_getInstanceMethod(object_getClass(object), sel_registerName(name))) == NULL ||
+	    method_getNumberOfArguments(method) != 2) {
+		return false;
+	}
+	method_getReturnType(method, returns, sizeof(returns));
+	for (r = returns; *r != 0 && strchr("rnNoORV", *r) != NULL; r++) {
+		;                       /* (qualifiers: const, in, out ...) */
+	}
+	switch (type) {
+	case 'B':
+		return *r == 'B' || *r == 'c';
+	case 'q':
+		return *r != 0 && strchr("qQlLiI", *r) != NULL;
+	default:
+		return *r == type;
+	}
+}
+
+static id
+ui_object(id object, const char *name)
+{
+	return ui_has(object, name, '@') ? SEND(id, object, name) : NULL;
+}
+
+static id
+ui_shared(const char *class_name, const char *getter)
+{
+	Class cls = objc_getClass(class_name);
+
+	return cls != NULL && class_getClassMethod(cls, sel_registerName(getter)) != NULL ? SEND(id, cls, getter) : NULL;
+}
+
+/* a flag: "key 0|1", or "missing key" */
+static void
+ui_flag(struct ui_out *out, const char *key, id object, const char *name)
+{
+	if (ui_has(object, name, 'B')) {
+		ui_put(out, "%s %d\n", key, SEND(BOOL, object, name) ? 1 : 0);
+	} else {
+		ui_put(out, "missing %s (%s %s)\n", key, object ? object_getClassName(object) : "nothing", name);
+	}
+}
+
+static const char *
+ui_string(id string)
+{
+	const char *text = string != NULL && ui_has(string, "UTF8String", '*') ? SEND(const char *, string, "UTF8String") : NULL;
+
+	return text != NULL && text[0] != 0 ? text : NULL;
+}
+
+static unsigned long
+ui_count(id collection)
+{
+	return ui_has(collection, "count", 'q') ? SEND(unsigned long, collection, "count") : 0;
+}
+
+static bool
+ui_is(id object, const char *class_name)
+{
+	Class cls = objc_getClass(class_name);
+
+	return cls != NULL && object != NULL && SEND1(BOOL, object, "isKindOfClass:", Class, cls);
+}
+
+/* the bundle ID of what a layout element shows, or NULL */
+static const char *
+ui_element_app(id element)
+{
+	id entity = ui_object(element, "workspaceEntity");
+	id application = ui_object(entity, "application");
+
+	return ui_string(ui_object(application, "bundleIdentifier"));
+}
+
+#define UI_DEPTH_MAX    64
+
+static void
+ui_views(struct ui_out *out, id view, id window, struct ui_rect screen, int depth)
+{
+	id subviews;
+	unsigned long count;
+
+	if (view == NULL || depth > UI_DEPTH_MAX || SEND(BOOL, view, "isHidden") || SEND(double, view, "alpha") < 0.01) {
+		return;
+	}
+	if (ui_is(view, "SBIconView")) {
+		id icon = ui_object(view, "icon");
+		const char *name = ui_string(ui_object(icon, "applicationBundleID"));
+		struct ui_rect bounds = ((struct ui_rect (*)(id, SEL))objc_msgSend)(view, sel_registerName("bounds")), r;
+
+		if (name == NULL) {
+			name = ui_string(ui_object(icon, "displayName"));
+		}
+		r = ((struct ui_rect (*)(id, SEL, struct ui_rect, id))objc_msgSend)(view, sel_registerName("convertRect:toView:"), bounds, NULL);
+		r = ((struct ui_rect (*)(id, SEL, struct ui_rect, id))objc_msgSend)(window, sel_registerName("convertRect:toWindow:"), r, NULL);
+		if (name != NULL && screen.w > 0 && screen.h > 0) {
+			double cx = (r.x + r.w / 2 - screen.x) / screen.w, cy = (r.y + r.h / 2 - screen.y) / screen.h;
+
+			if (cx > 0 && cx < 1 && cy > 0 && cy < 1) {
+				char safe[128];
+				size_t i;
+
+				for (i = 0; name[i] != 0 && i < sizeof(safe) - 1; i++) {
+					safe[i] = name[i] == ' ' ? '_' : name[i];
+				}
+				safe[i] = 0;
+				ui_put(out, "icon %s %.4f %.4f\n", safe, cx, cy);
+				out->icons++;
+			}
+		}
+		return;
+	}
+	if (ui_is(view, "UIScrollView") && SEND(BOOL, view, "isPagingEnabled") && strstr(object_getClassName(view), "Icon") != NULL) {
+		struct ui_rect bounds = ((struct ui_rect (*)(id, SEL))objc_msgSend)(view, sel_registerName("bounds"));
+		struct { double w, h; } size = ((__typeof__(size) (*)(id, SEL))objc_msgSend)(view, sel_registerName("contentSize"));
+
+		if (bounds.w > 0 && size.w > bounds.w / 2) {
+			ui_put(out, "page %ld of %ld (%s)\n", lround(bounds.x / bounds.w), lround(size.w / bounds.w),
+			    object_getClassName(view));
+		}
+	}
+	subviews = SEND(id, view, "subviews");
+	count = ui_count(subviews);
+	for (unsigned long i = 0; i < count; i++) {
+		ui_views(out, SEND1(id, subviews, "objectAtIndex:", unsigned long, i), window, screen, depth + 1);
+	}
+}
+
+static void
+ui_state(void)
+{
+	static struct ui_out out;
+	id app = ui_shared("UIApplication", "sharedApplication");
+	id scene = ui_object(ui_object(app, "windowSceneManager"), "embeddedDisplayWindowScene");
+	id switcher = ui_object(scene, "switcherController");
+	id cc = ui_object(app, "controlCenterCoordinator");
+	id scenes, all;
+	unsigned long count;
+	const char *front = NULL;
+	char path[sizeof(UI_STATE_FILE) + 8];
+	int fd;
+
+	out.used = 0;
+	out.icons = 0;
+	ui_flag(&out, "locked", ui_shared("SBLockScreenManager", "sharedInstanceForMainDisplay"), "isUILocked");
+	ui_flag(&out, "coversheet", ui_shared("SBCoverSheetPresentationManager", "sharedInstanceForMainDisplay"), "isVisible");
+	ui_flag(&out, "cc", cc != NULL ? cc : ui_object(scene, "controlCenterController"), "isPresented");
+	ui_flag(&out, "switcher", switcher, "isMainSwitcherVisible");
+	if (switcher != NULL && ui_has(switcher, "layoutStatePrimaryElement", '@')) {
+		front = ui_element_app(SEND(id, switcher, "layoutStatePrimaryElement"));
+		ui_put(&out, "front %s\n", front != NULL ? front : "-");
+	} else {
+		id state = ui_object(ui_object(scene, "layoutStateProvider"), "layoutState");
+		id elements = ui_object(ui_object(state, "elements"), "allObjects");
+
+		if (state == NULL) {
+			ui_put(&out, "missing front\n");
+		} else {
+			for (unsigned long i = 0; i < ui_count(elements) && front == NULL; i++) {
+				front = ui_element_app(SEND1(id, elements, "objectAtIndex:", unsigned long, i));
+			}
+			ui_put(&out, "front %s\n", front != NULL ? front : "-");
+		}
+	}
+	scenes = ui_object(ui_object(app, "connectedScenes"), "allObjects");
+	count = ui_count(scenes);
+	for (unsigned long s = 0; s < count; s++) {
+		id windows = ui_object(SEND1(id, scenes, "objectAtIndex:", unsigned long, s), "windows");
+		unsigned long n = ui_count(windows);
+
+		for (unsigned long w = 0; w < n; w++) {
+			id window = SEND1(id, windows, "objectAtIndex:", unsigned long, w);
+			id screen = ui_object(window, "screen");
+			struct ui_rect bounds = { 0, 0, 0, 0 };
+
+			if (SEND(BOOL, window, "isHidden") || SEND(double, window, "alpha") < 0.01) {
+				continue;
+			}
+			if (screen != NULL) {
+				bounds = ((struct ui_rect (*)(id, SEL))objc_msgSend)(screen, sel_registerName("bounds"));
+			}
+			ui_put(&out, "window %s %.0f\n", object_getClassName(window), SEND(double, window, "windowLevel"));
+			ui_views(&out, window, window, bounds, 0);
+		}
+	}
+	ui_put(&out, "icons %u\nend\n", out.icons);
+	snprintf(path, sizeof(path), "%s.new", UI_STATE_FILE);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0 || write(fd, out.text, out.used) != (ssize_t)out.used || rename(path, UI_STATE_FILE) != 0) {
+		say("hakios: uistate: %s cannot be written (%s)\n", UI_STATE_FILE, strerror(errno));
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	notify_post("com.hakios.uistate.done");
+}
+
+/*
  * Control Center's glyphs whole from its first frames. Its modules and their parts fade in as it
  * comes down: opacity animations, mostly springs that take up to a second to settle at 1. While a
  * layer's opacity is below 1, the window server's OpenGL ES renderer draws the vibrant glyphs in it
@@ -1557,6 +1810,9 @@ hakios_springboard_init(void)
 	});
 	notify_register_dispatch("com.hakios.switcher", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		switcher();
+	});
+	notify_register_dispatch("com.hakios.uistate", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		ui_state();
 	});
 	/*
 	 * Belt-and-suspenders unlock. The user can always swipe up to open the home screen -- that

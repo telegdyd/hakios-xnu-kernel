@@ -29,7 +29,7 @@
 #define HAKIOS_BUTTON_HOME     4
 
 struct hakios_touch {
-	uint64_t time;                  /* mach_absolute_time() when the sample was posted */
+	uint64_t time;                  /* mach_absolute_time() when the sample was posted (written: when to post it, 0 at once) */
 	uint32_t type;                  /* HAKIOS_TOUCH_* or HAKIOS_BUTTON_DOWN/UP */
 	uint32_t finger;                /* which finger, from 0 (or which button) */
 	uint32_t x, y;                  /* position on the display, 0 = left/top edge, 65535 = right/bottom edge */

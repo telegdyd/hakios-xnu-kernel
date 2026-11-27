@@ -103,7 +103,6 @@ enum {
 #define kFBNotifyTypes          8
 #define kFBRefreshHz            60                      /* matches the 60 Hz hardware scanout left by DisplayDxe; overridable via fb_hz */
 
-#define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
 #define FRAME_PAUSE             90                      /* from so many on, nothing was moving: not a slow frame */
 #define SWAP_GPU_MS             500                     /* a frame the GPU has not drawn by then is shown as it is */
 #define SWAP_NEW_MS             33                      /* ... and one not yet given to the GPU at all is waited for this long (show()) */
@@ -280,6 +279,74 @@ SYSCTL_QUAD(_kern_hakios, OID_AUTO, fb_panel_phys, CTLFLAG_RD | CTLFLAG_LOCKED, 
 static uint32_t gCheckNext;
 SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_gpu_check, CTLFLAG_RW | CTLFLAG_LOCKED, &gCheckNext, 0,
     "fb_gpu: so many of the next frames checked against the processors' bilinear");
+
+/*
+ * For a program that drives the screen and measures it (uibench): how many frames have been put on the panel, when
+ * the last was (mach_absolute_time: the screen is still once none has come for a while), and the times from one frame
+ * to the next since the last look (kern.hakios.fb_step, read: "frames N under10 A under18 B under26 C under35 D
+ * longer E longest MS half MS most MS pauses P", then counted afresh). The same times as reportFrameTimes()'s, kept
+ * apart from them.
+ */
+#define FRAME_TIMES             64                      /* milliseconds told apart between two frames */
+static uint32_t gFramesShown;
+static uint64_t gFrameLast;
+static uint32_t gStepTimes[FRAME_TIMES + 1], gStepPauses, gStepLongest;
+SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &gFramesShown, 0,
+    "frames put on the panel so far");
+SYSCTL_QUAD(_kern_hakios, OID_AUTO, fb_frame_last, CTLFLAG_RD | CTLFLAG_LOCKED, &gFrameLast,
+    "when the last frame was put on the panel (mach_absolute_time)");
+
+static void
+stepFrame(uint64_t ms, bool pause)
+{
+	if (pause) {
+		__atomic_fetch_add(&gStepPauses, 1, __ATOMIC_RELAXED);
+		return;
+	}
+	__atomic_fetch_add(&gStepTimes[ms < FRAME_TIMES ? ms : FRAME_TIMES], 1, __ATOMIC_RELAXED);
+	for (uint32_t was = __atomic_load_n(&gStepLongest, __ATOMIC_RELAXED); ms > was;) {
+		if (__atomic_compare_exchange_n(&gStepLongest, &was, (uint32_t) ms, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+			break;
+		}
+	}
+}
+
+static int
+sysctl_fb_step SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	static const uint32_t limits[] = { 10, 18, 26, 35, FRAME_TIMES + 1 };
+	uint32_t times[FRAME_TIMES + 1], within[5] = { 0 }, total = 0, sum = 0, half = 0, most = 0, pauses, longest;
+	char text[192];
+	int used;
+
+	for (uint32_t ms = 0; ms <= FRAME_TIMES; ms++) {
+		times[ms] = __atomic_exchange_n(&gStepTimes[ms], 0, __ATOMIC_RELAXED);
+		total += times[ms];
+		for (uint32_t i = 0; i < 5; i++) {
+			if (ms < limits[i]) {
+				within[i] += times[ms];
+				break;
+			}
+		}
+	}
+	pauses = __atomic_exchange_n(&gStepPauses, 0, __ATOMIC_RELAXED);
+	longest = __atomic_exchange_n(&gStepLongest, 0, __ATOMIC_RELAXED);
+	for (uint32_t ms = 0; ms <= FRAME_TIMES && total != 0; ms++) {
+		sum += times[ms];
+		if (half == 0 && 2 * sum >= total) {
+			half = ms + 1;
+		}
+		if (most == 0 && 100 * sum >= 95 * total) {
+			most = ms + 1;
+		}
+	}
+	used = snprintf(text, sizeof(text), "frames %u under10 %u under18 %u under26 %u under35 %u longer %u longest %u half %u "
+	    "most %u pauses %u", total, within[0], within[1], within[2], within[3], within[4], longest, half, most, pauses);
+	return SYSCTL_OUT(req, text, (size_t) used + 1);
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, fb_step, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_fb_step, "A",
+    "the times from one frame to the next since the last read (and counted afresh)");
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" vm_offset_t ml_vtophys(vm_offset_t vaddr);
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -3052,8 +3119,11 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			fFrameTimes[nanos < FRAME_TIMES ? nanos : FRAME_TIMES]++;
 			fFrameLongest = nanos > fFrameLongest ? (uint32_t) nanos : fFrameLongest;
 		}
+		stepFrame(nanos, nanos >= FRAME_PAUSE);
 	}
 	fLastFrame = began;
+	__atomic_store_n(&gFrameLast, began, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&gFramesShown, 1, __ATOMIC_RELAXED);
 	report = fSwapsShown < 8;
 	if (report) {
 		printf("MiniIOMobileFramebuffer: swap %u (#%u): surfaces %u %u %u %u, layers set 0x%x cleared 0x%x\n",

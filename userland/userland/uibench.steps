@@ -1,0 +1,14 @@
+# uibench's default steps (uibench run uibench.steps): the home screen's pages, Control Center, Settings.
+# NAME | BEFORE | ACTION | AFTER  -- see the top of src/uibench.c. Positions are fractions of the screen.
+unlock          | ?locked=1                       | swipe 0.5 0.99 0.5 0.4 250       | locked=0
+home            | locked=0 cc=0 front=- page=0    | none                             | page=0
+page-next       | front=- cc=0                    | swipe 0.85 0.5 0.15 0.5 200      | page=+1
+page-back       | front=- cc=0                    | swipe 0.15 0.5 0.85 0.5 200      | page=-1
+page-next-again | front=- cc=0                    | swipe 0.85 0.5 0.15 0.5 200      | page=+1
+page-back-again | front=- cc=0                    | swipe 0.15 0.5 0.85 0.5 200      | page=-1
+cc-open         | front=- cc=0                    | swipe 0.92 0.003 0.92 0.55 300   | cc=1
+cc-close        | cc=1                            | swipe 0.5 0.99 0.5 0.3 250       | cc=0
+settings-open   | front=- cc=0 icon=com.apple.Preferences | tap icon:com.apple.Preferences | front=com.apple.Preferences
+settings-fling  | front=com.apple.Preferences     | swipe 0.5 0.8 0.5 0.25 120       | front=com.apple.Preferences
+settings-flingback | front=com.apple.Preferences  | swipe 0.5 0.25 0.5 0.8 120       | front=com.apple.Preferences
+settings-home   | front=com.apple.Preferences     | swipe 0.5 0.995 0.5 0.55 200     | front=-
