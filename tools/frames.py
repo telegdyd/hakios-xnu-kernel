@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-frames.py RUN.log [MORE.log ...]: how evenly the frames of a run's gestures came, and what held up the slow ones.
+frames.py [--details] RUN.log [MORE.log ...]: how evenly the frames of a run's gestures came, and what held up the slow ones.
 (More logs: the live ones of the same run, XL_FOLLOW=N XL_FOLLOW_KEEP=1, which keep what the run's log loses.)
 
 Reads the "tl:" lines a run with boot-arg touch_lat=1 writes (see tools/latency.py for what each
@@ -22,9 +22,15 @@ The thresholds are as the coordinator asked for them; 18.0 rather than 16.7 beca
 60 comes 16.6 to 16.8 ms after the one before. Beside them, the share over 8.3 ms (from 9.0: a 120 Hz frame
 missed), what a run at fb_hz=120 is measured by.
 
-A window server drawing through Metal says no "tl: g" (that is eagl.c's, the OpenGL ES road): its frames are
-counted all the same, by the swap that handed each over, and draw and idle are then unknown (0).
+For Metal, include the output of `uibench catrace BACKBOARDD_PID SECONDS` with the run log. QuartzCore's
+timer, vsync and render markers bound the time through hand-off. A Mach command-stream receipt before the
+timer splits the preceding gap into time before an observed commit and time after it. That message can
+belong to an unrelated layer tree. With no receipt in that window, the gap is reported as pre-timer.
+`--details` lists each slow interval (including 120 Hz misses), its largest stage,
+and overlapping client main-run-loop samples from waitstack=sb. More than one stage can contribute to a miss.
+Include the `uibench run ... timeline` output to use its named motion windows and omit idle wallpaper tails.
 """
+from bisect import bisect_left, bisect_right
 import os
 import sys
 
@@ -33,6 +39,79 @@ OVER_120 = 9000
 # the first cpu-id of a small core: the loader lists the boot core, then the big ones, then the small (xnuloader/loader.c);
 # on the phone with cpus=7 the Cortex-A55s are 4, 5 and 6 (FRAMES_SMALL_FROM= for another layout)
 SMALL_FROM = int(os.environ.get('FRAMES_SMALL_FROM', '4'))
+
+
+def metal_frames(swaps, events):
+    """Use each render marker at most once, including for a swap that never made the panel."""
+    events = sorted(e for e in events if e[1] in ('timer', 'vsync', 'render', 'lost'))
+    timers, ticks, result = {}, {}, {}
+    at = 0
+    for sid, swap in sorted(swaps.items(), key=lambda item: item[1]):
+        frame = None
+        while at < len(events) and events[at][0] <= swap:
+            ts, stage, thread, _ = events[at]
+            at += 1
+            if stage == 'lost':
+                timers.clear()
+                ticks.clear()
+                frame = None
+            elif stage == 'timer':
+                timers[thread] = ts
+            elif stage == 'vsync':
+                ticks[thread] = timers.pop(thread, ts)
+            else:
+                frame = (ticks.pop(thread, None), ts)
+        if frame is not None:
+            result[sid] = frame
+        timers.clear()
+        ticks.clear()
+    return result
+
+
+def metal_stages(start, frame, commits, commit_times, loss_times):
+    """Partition the interval to panel completion. Clip overlapping work at the previous present."""
+    swap, ready, shown = (max(start, frame[k]) for k in ('swap', 'ready', 'shown'))
+    stages = {}
+    commit = None
+    if frame['metal'] is None:
+        stages['untraced before swap'] = swap - start
+    else:
+        timer, render = frame['metal']
+        render = max(start, render)
+        if timer is None:
+            stages['untraced pre-render'] = render - start
+        else:
+            timer = max(start, timer)
+            i = bisect_left(commit_times, start)
+            if bisect_left(loss_times, start) < bisect_right(loss_times, timer):
+                stages['untraced pre-timer'] = timer - start
+            elif i < len(commits) and commit_times[i] <= timer:
+                ts, message = commits[i]
+                stages['before commit'] = ts - start
+                stages['commit to timer'] = timer - ts
+                commit = message
+            else:
+                stages['pre-timer'] = timer - start
+            stages['timer to render'] = render - timer
+        stages['draw to swap'] = swap - render
+    stages.update(gpu=ready - swap, **{'display wait': shown - ready}, copy=frame['done'] - shown)
+    return stages, commit
+
+
+def show_metal_details(start, end, frames, turns, commits, commit_times, loss_times):
+    began = start
+    for frame in frames:
+        elapsed = frame['done'] - began
+        if elapsed > OVER_120:
+            stages, commit = metal_stages(began, frame, commits, commit_times, loss_times)
+            parts = ', '.join(f'{stage} {us / 1000:.1f}' for stage, us in stages.items() if us)
+            message = '' if commit is None else f', Mach message {commit}'
+            print(f'    {frame["done"] / 1e6:.6f} s swap {frame["sid"]}: {elapsed / 1000:.1f} ms, '
+                  f'largest {max(stages, key=stages.get)} ({parts} ms{message})')
+        began = frame['done']
+    for woke, last, name, pid, cpu in turns:
+        if woke < end and last >= start:
+            print(f'    {name}[{pid}] {woke / 1e6:.6f}–{last / 1e6:.6f} s, {cpu / 1000:.1f} ms CPU sampled')
 
 
 def lines_of(paths):
@@ -52,11 +131,16 @@ def lines_of(paths):
 
 
 def main():
-    if len(sys.argv) < 2:
+    details = '--details' in sys.argv[1:]
+    paths = [p for p in sys.argv[1:] if p != '--details']
+    if not paths:
         sys.exit(__doc__)
     gestures, frames, swaps, shows, waits, loads = [], [], {}, {}, [], []
-    for line in lines_of(sys.argv[1:]):
+    events, turns, windows = [], [], []
+    for line in lines_of(paths):
         w = line.split()
+        if len(w) < 2:
+            continue
         try:
             if w[1] == 'p' and len(w) >= 8 and int(w[2]) in (1, 4):
                 gestures.append((int(w[7]), int(w[2]), int(w[3]), int(w[4]), int(w[5])))
@@ -71,42 +155,75 @@ def main():
                 waits.append((int(w[5]), w[2], int(w[3])))
             elif w[1] == 'u' and len(w) >= 4:
                 loads.append((int(w[3]), {int(a): int(b) for a, b in (x.split(':') for x in w[4:])}))
+            elif w[1] == 'A' and len(w) == 8:
+                events.append((int(w[5]), w[2], int(w[3]), int(w[7])))
+            elif w[1] == 'T' and len(w) == 12:
+                turns.append((int(w[5]), int(w[7]), w[2], int(w[3]), int(w[11])))
+            elif w[1] == 'B' and len(w) >= 5:
+                windows.append((int(w[2]), int(w[3]), ' '.join(w[4:])))
         except ValueError:
             pass
     gestures.sort()
     frames.sort(key=lambda f: f[1])
+    frame_ends = [f[1] for f in frames]
+    ca_frames = metal_frames(swaps, events)
+    commits = sorted((t, arg) for t, stage, _, arg in events if stage == 'receive')
+    commit_times = [t for t, _ in commits]
+    loss_times = sorted(t for t, stage, _, _ in events if stage == 'lost')
+    turns.sort()
+    windows.sort()
+    window_starts = [w[0] for w in windows]
     # every frame on the panel, with the drawing it came from
     timeline = []
     for sid in sorted(shows):
         if sid not in swaps:
             continue
         swap = swaps[sid]
-        drawn = [f for f in frames if f[1] <= swap]
-        if drawn:
-            began, ended, draws, cpu = drawn[-1]
+        drawn = bisect_right(frame_ends, swap)
+        if drawn and not events:
+            began, ended, _, cpu = frames[drawn - 1]
+        elif events:
+            began = ended = swap
+            cpu = -1
         elif not frames:
             began = ended = swap            # the Metal road: no "tl: g", the swap is where its frame ended
             cpu = -1
         else:
             continue
         ready, shown, done = shows[sid]
-        timeline.append(dict(began=began, ended=ended, swap=swap, ready=ready, shown=shown, done=done, cpu=cpu))
+        timeline.append(dict(sid=sid, began=began, ended=ended, swap=swap, ready=ready, shown=shown, done=done,
+                             cpu=cpu, metal=ca_frames.get(sid)))
     timeline.sort(key=lambda f: f['done'])
     all_counts = [0, 0, 0]
     kinds, previous = {}, ''          # the same gesture done more than once: its frames together
     print(f'frames.py: {len(gestures)} gestures, {len(timeline)} frames on the panel, {len(waits)} waits for the GPU '
           f'of 1 ms or more')
+    if events:
+        print(f'QuartzCore: {sum(f["metal"] is not None for f in timeline)}/{len(timeline)} frames with render markers, '
+              f'{len(commits)} command-stream receipts, {len(turns)} sampled client turns, '
+              f'{len(loss_times)} trace loss markers')
     for i, (start, kind, button, x, y) in enumerate(gestures):
-        end = min(gestures[i + 1][0] if i + 1 < len(gestures) else start + SEGMENT_US, start + SEGMENT_US)
-        chosen = [f for f in timeline if start <= f['done'] < end]
+        next_gesture = gestures[i + 1][0] if i + 1 < len(gestures) else sys.maxsize
+        end = min(next_gesture, start + SEGMENT_US)
         what = f'button {button}' if kind == 4 else f'touch at {x / 655.35:.0f}%,{y / 655.35:.0f}%'
-        key = f'{what} after {previous}' if kind == 4 else what
+        window = bisect_right(window_starts, start) - 1
+        named = window >= 0 and start <= windows[window][1]
+        if named:
+            _, active_end, name = windows[window]
+            end = min(next_gesture, active_end + 1)
+            key = name
+            what = f'{name} ({what})'
+        else:
+            key = f'{what} after {previous}' if kind == 4 else what
+        chosen = [f for f in timeline if start <= f['done'] < end]
         previous = what
         if len(chosen) < 3:
             print(f'{i + 1:2}. {start / 1e6:9.3f} s {what}: {len(chosen)} frames')
+            if details and events:
+                show_metal_details(start, end, chosen, turns, commits, commit_times, loss_times)
             continue
         gaps = [(b['done'] - a['done'], a, b) for a, b in zip(chosen, chosen[1:])]
-        moving = [g for g in gaps if g[0] < 100000]             # (a pause is the end of the movement, not a slow frame)
+        moving = gaps if named else [g for g in gaps if g[0] < 100000]
         span = sum(g[0] for g in moving)
         over1 = [g for g in moving if g[0] > OVER_ONE]
         over2 = [g for g in moving if g[0] > OVER_TWO]
@@ -124,18 +241,30 @@ def main():
         line = (f'{i + 1:2}. {start / 1e6:9.3f} s {what}: {len(moving)} frames at {fps:4.1f} a second; '
                 f'over 8.3 ms {100 * len(over120) / max(1, len(moving)):3.0f}%, '
                 f'over 16.7 ms {100 * len(over1) / max(1, len(moving)):3.0f}%, over 33 ms {100 * len(over2) / max(1, len(moving)):3.0f}%')
-        if over1:
+        if over1 and events:
+            totals = {}
+            for _, a, b in over1:
+                stages, _ = metal_stages(a['done'], b, commits, commit_times, loss_times)
+                for stage, us in stages.items():
+                    totals[stage] = totals.get(stage, 0) + us
+            line += '; slow frame means: ' + ', '.join(f'{stage} {us / len(over1) / 1000:.1f} ms' for stage, us in totals.items())
+        elif over1:
             # where the slow frames' time went (means over them)
             def mean(values):
                 return sum(values) / len(values) / 1000 if values else 0
-            draw = mean([b['ended'] - b['began'] for _, a, b in over1])
             gpu = mean([b['ready'] - b['swap'] for _, a, b in over1])
-            idle = mean([b['began'] - a['ready'] for _, a, b in over1])
             copy = mean([b['done'] - b['shown'] for _, a, b in over1])
-            line += f'; the slow ones: draw {draw:4.1f}, gpu {gpu:4.1f}, idle before {idle:5.1f}, copy {copy:3.1f} ms'
+            if frames:
+                draw = mean([b['ended'] - b['began'] for _, a, b in over1])
+                idle = mean([b['began'] - a['ready'] for _, a, b in over1])
+                line += f'; the slow ones: draw {draw:4.1f}, gpu {gpu:4.1f}, idle before {idle:5.1f}, copy {copy:3.1f} ms'
+            else:
+                before = mean([b['swap'] - a['ready'] for _, a, b in over1])
+                line += f'; the slow ones: untraced before swap {before:4.1f}, gpu {gpu:4.1f}, copy {copy:3.1f} ms'
             known = [b for _, a, b in over1 if b['cpu'] >= 0]
             if known:
                 line += f', {100 * sum(b["cpu"] >= SMALL_FROM for b in known) / len(known):.0f}% drawn on small cores'
+        if over1:
             stalls = [w for w in waits if start <= w[0] < end]
             if stalls:
                 line += f'; {len(stalls)} waits for the GPU ({sum(w[2] for w in stalls) / 1000:.0f} ms)'
@@ -145,6 +274,8 @@ def main():
             cores = sorted({c for l in within for c in l}, reverse=True)
             line += '; cores busy ' + ' '.join(f'{c}:{sum(l.get(c, 0) for l in within) / len(within):.0f}%' for c in cores)
         print(line)
+        if details and events:
+            show_metal_details(start, end, chosen, turns, commits, commit_times, loss_times)
     if any(k[0] > 1 for k in kinds.values()):
         print('the same gestures together:')
         for key, (times, steps, span, over1, over2) in kinds.items():
