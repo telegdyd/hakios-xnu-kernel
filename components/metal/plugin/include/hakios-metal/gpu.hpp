@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -100,6 +101,9 @@ enum : uint32_t {
     kSubmitBoRead = 0x1,
     kSubmitBoWrite = 0x2,
     kSubmitCmdBuf = 1,
+    kPrepRead = 0x1,     // MSM_PREP_READ, _WRITE, _NOSYNC: cpu-prep's op; NOSYNC asks without waiting (EBUSY: not done)
+    kPrepWrite = 0x2,
+    kPrepNoSync = 0x4,
 };
 
 // --- under it: the one part that talks to the kernel --------------------------------------------------------------------
@@ -147,6 +151,7 @@ private:
     void* cpu_;
     bool owned_ = true;   // false: another Bo owns the handle (Gpu::disown)
     bool counted_ = false;   // in Gpu::allocatedBytes: memory this driver asked for (not an IOSurface's)
+    uint32_t flags_ = 0;     // newBo's flags (its cache's key); last, so that the members before keep their places
 };
 
 struct BoUse {
@@ -185,8 +190,12 @@ public:
     // how many times the kernel has reset a hung GPU in this run (0 when it cannot say)
     uint64_t faults();
 
-    // a buffer of SIZE bytes (rounded up to a page), its GPU address and its mapping; nullptr with *error set
-    std::unique_ptr<Bo> newBo(uint64_t size, uint32_t flags, int* error);
+    // a buffer of SIZE bytes (rounded up to a page), its GPU address and its mapping; nullptr with *error set. ZEROED:
+    // its bytes 0, as the kernel's new memory is (Metal's buffers); false for a texture, whose contents Metal leaves
+    // undefined -- one taken from the cache then has what its last owner left in it
+    std::unique_ptr<Bo> newBo(uint64_t size, uint32_t flags, int* error, bool zeroed = true);
+    // the bytes of the buffers newBo made, let go of and kept for the next newBo of their size (see cache_)
+    uint64_t cachedBytes();
     // the bytes of every Bo newBo made and that is still the GPU's: MTLDevice's currentAllocatedSize, which a game
     // sizes what it keeps resident by (Resident Evil 4 asks)
     uint64_t allocatedBytes() const { return allocated_.load(std::memory_order_relaxed); }
@@ -232,8 +241,32 @@ private:
     std::condition_variable queuesGone_;
     uint32_t queues_ = 0;   // (under queuesLock_) QueueHolds alive
     std::atomic<uint64_t> allocated_{0};
-    void release(Bo& bo);
     std::unique_ptr<Transport> t_;
+    // (after t_, the members inline code of other files reads keep their places: texture.o, which the compiled-stage
+    // cache's key is made of, stays the same)
+    std::atomic<uint32_t> chip_{~0u};   // chipId()'s answer once asked (~0: not yet)
+    void release(Bo& bo);
+    // The buffers newBo made and their owner let go of: kept, mapped, by (size, flags), for the next newBo of the same,
+    // as freedreno's bo cache keeps them (fd_bo_cache.c). A window server frame makes and frees textures and buffers of
+    // the same few sizes over and over; each new one was three calls into the kernel (new, info, map), new pages faulted
+    // in, and two calls more to free it (phone, 28 November: 192 of 2631 samples of CoreAnimation's render thread a
+    // pass). A kept one is given again once the kernel says the GPU is done with it (cpu-prep without waiting).
+    struct Cached {
+        uint32_t handle, flags;
+        uint64_t size, iova;
+        void* cpu;
+        int64_t freedNs;
+    };
+    static constexpr uint64_t kCacheBytes = 48ull << 20;      // all of them together at most
+    static constexpr uint64_t kCacheLargest = 16ull << 20;    // one larger is freed at once
+    static constexpr int64_t kCacheKeepNs = 1000000000;       // one not taken again within a second is freed
+    std::mutex cacheLock_;
+    std::map<std::pair<uint64_t, uint32_t>, std::vector<Cached>> cache_;   // (each vector oldest first)
+    uint64_t cacheBytes_ = 0;
+    // (with cacheLock_ held) the cache's entries older than kCacheKeepNs, and its oldest until KEEP more bytes fit, into
+    // *GONE, closed by the caller after the lock
+    void cacheTrim(int64_t now, uint64_t keep, std::vector<Cached>* gone);
+    void closeCached(const std::vector<Cached>& gone);
 };
 
 }  // namespace hakios::metal

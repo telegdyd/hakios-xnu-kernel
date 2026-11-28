@@ -50,7 +50,10 @@ private:
     uint64_t length_;
 };
 
+// a texture's memory: what is in it is undefined, as Metal has it (a buffer the Gpu kept may be given again as it was)
 std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, uint64_t minBacking = 0);
+// a buffer's memory: all 0, as Metal's -newBufferWithLength: gives it and as the kernel's new memory is
+std::shared_ptr<Buffer> newZeroedBuffer(Gpu& gpu, uint64_t length, std::string* why, uint64_t minBacking = 0);
 // the live Buffer whose memory holds GPU address ADDRESS, and *OFFSET its offset in it; nullptr when none does. An
 // argument buffer names a buffer member by the address it was encoded with (setBuffer:offset:atIndex:, or the
 // gpuAddress an application writes itself), and this is how the draw finds the Buffer to bind and keep.

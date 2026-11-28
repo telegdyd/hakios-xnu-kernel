@@ -219,8 +219,14 @@ void refusedThere(hakios_metal_cb* cb, int r) {
 }
 }  // namespace
 
-namespace hakios::metal { extern std::atomic<uint32_t> gBuffersMade, gBuffersReused; extern std::atomic<uint64_t> gBytesMade; }
+namespace hakios::metal { extern std::atomic<uint32_t> gBuffersMade, gBuffersReused; extern std::atomic<uint64_t> gBytesMade;
+extern std::atomic<uint64_t> gBoCacheStats[4]; }
 extern "C" {
+// (looked up by name by libhakios's profile of the window server, inject.c cp_write: no header of ours there)
+__attribute__((visibility("default"))) void hakios_metal_bo_cache_stats(uint64_t out[4]) {
+    for (int i = 0; i < 4; i++) out[i] = hakios::metal::gBoCacheStats[i].load(std::memory_order_relaxed);
+}
+
 void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long long* bytes) {
     *made = hakios::metal::gBuffersMade.exchange(0);
     *reused = hakios::metal::gBuffersReused.exchange(0);
@@ -386,8 +392,8 @@ hakios_metal_buffer* hakios_metal_buffer_new(hakios_metal_device* d, uint64_t le
     if (logical > UINT64_MAX - 63) { failed("buffer length overflows its constant-load padding"); return nullptr; }
     // ir3 pushes constants in 64-byte ranges, even for a 16-byte float4 at the end of a larger buffer. Keep Metal's
     // logical length, but reserve a tail beyond it: rounding the logical length alone leaves an aligned buffer's
-    // final binding with no padding. The kernel zeroes the backing and Gpu::newBo rounds it to whole pages.
-    auto b = newBuffer(*d->gpu, logical, &why, logical + 63);
+    // final binding with no padding. The backing is all 0 (newZeroedBuffer) and Gpu::newBo rounds it to whole pages.
+    auto b = newZeroedBuffer(*d->gpu, logical, &why, logical + 63);
     if (b == nullptr) {
         failed(why);
         return nullptr;

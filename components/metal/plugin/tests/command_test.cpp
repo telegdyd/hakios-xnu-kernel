@@ -236,13 +236,86 @@ TEST(command_memory_is_used_again) {
 }
 
 TEST(buffers_are_given_back) {
+    // let go of, a buffer is kept by the Gpu for the next one of its size (Gpu::cache_), open in the kernel and no longer
+    // counted as allocated; one larger than the cache keeps any of is closed at once
     Rig r;
+    const uint32_t before = r.fake->liveBuffers();
     {
         auto a = buffer(r, 1 << 16);
         auto b = buffer(r, 1 << 16);
-        CHECK(r.fake->liveBuffers() >= 2);
+        CHECK_EQ(r.fake->liveBuffers(), before + 2);
     }
-    CHECK_EQ(r.fake->liveBuffers(), 0u);
+    CHECK_EQ(r.gpu->cachedBytes(), uint64_t(2) << 16);
+    CHECK_EQ(r.gpu->allocatedBytes(), 0u);
+    CHECK_EQ(r.fake->liveBuffers(), before + 2);
+    {
+        auto big = buffer(r, 32ull << 20);
+        CHECK_EQ(r.fake->liveBuffers(), before + 3);
+    }
+    CHECK_EQ(r.fake->liveBuffers(), before + 2);
+    CHECK_EQ(r.gpu->cachedBytes(), uint64_t(2) << 16);
+}
+
+TEST(a_buffer_let_go_of_is_given_again_zeroed_and_a_texture_as_it_was) {
+    Rig r;
+    std::string why;
+    uint64_t address = 0;
+    {
+        auto t = newBuffer(*r.gpu, 1 << 16, &why);
+        CHECK(t != nullptr);
+        memset(t->contents(), 0xab, 1 << 16);
+        address = t->gpuAddress();
+    }
+    const uint32_t live = r.fake->liveBuffers();
+    {
+        // the same memory, nothing new from the kernel; a texture's (newBuffer) as its last owner left it
+        auto t = newBuffer(*r.gpu, 1 << 16, &why);
+        CHECK(t != nullptr);
+        CHECK_EQ(t->gpuAddress(), address);
+        CHECK_EQ(r.fake->liveBuffers(), live);
+        CHECK_EQ(static_cast<const uint8_t*>(t->contents())[100], 0xab);
+        CHECK_EQ(r.gpu->cachedBytes(), 0u);
+    }
+    {
+        // a buffer's (newZeroedBuffer) all 0 again, as Metal's new buffers are
+        auto b = newZeroedBuffer(*r.gpu, 1 << 16, &why);
+        CHECK(b != nullptr);
+        CHECK_EQ(b->gpuAddress(), address);
+        bool zero = true;
+        for (uint32_t i = 0; i < (1u << 16); i++) zero = zero && static_cast<const uint8_t*>(b->contents())[i] == 0;
+        CHECK(zero);
+    }
+    {
+        // another size is new memory; the kept one stays kept
+        auto c = newZeroedBuffer(*r.gpu, 1 << 17, &why);
+        CHECK(c != nullptr);
+        CHECK(c->gpuAddress() != address);
+        CHECK_EQ(r.gpu->cachedBytes(), uint64_t(1) << 16);
+    }
+}
+
+TEST(a_kept_buffer_up_to_a_quarter_larger_is_given_for_a_smaller_one) {
+    Rig r;
+    std::string why;
+    uint64_t address = 0;
+    {
+        auto t = newBuffer(*r.gpu, 80 << 10, &why);   // (five of the driver's 16 KB pages)
+        CHECK(t != nullptr);
+        address = t->gpuAddress();
+    }
+    {
+        // 48 KB: 80 is more than a quarter larger, new memory
+        auto small = newBuffer(*r.gpu, 48 << 10, &why);
+        CHECK(small != nullptr);
+        CHECK(small->gpuAddress() != address);
+    }
+    {
+        // 64 KB: the 80 KB one, its length the one asked for
+        auto t = newBuffer(*r.gpu, 64 << 10, &why);
+        CHECK(t != nullptr);
+        CHECK_EQ(t->gpuAddress(), address);
+        CHECK_EQ(t->length(), uint64_t(64) << 10);
+    }
 }
 
 TEST(a_bad_stream_is_a_hang_the_kernel_resets_the_gpu_for) {

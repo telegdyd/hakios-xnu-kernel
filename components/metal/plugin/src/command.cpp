@@ -62,16 +62,26 @@ std::shared_ptr<Buffer> bufferAt(uint64_t address, uint64_t* offset) {
 std::atomic<uint32_t> gBuffersMade{0}, gBuffersReused{0};
 std::atomic<uint64_t> gBytesMade{0};
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, uint64_t minBacking) {
+namespace {
+std::shared_ptr<Buffer> madeBuffer(Gpu& gpu, uint64_t length, std::string* why, uint64_t minBacking, bool zeroed) {
     gBuffersMade++;
     gBytesMade += length;
     int error = 0;
-    std::unique_ptr<Bo> bo = gpu.newBo(std::max(length, minBacking), kBoWriteCombined, &error);
+    std::unique_ptr<Bo> bo = gpu.newBo(std::max(length, minBacking), kBoWriteCombined, &error, zeroed);
     if (bo == nullptr) {
         *why = "the driver gave no buffer of " + std::to_string(length) + " bytes: " + strerror(error);
         return nullptr;
     }
     return addressed(new Buffer(std::move(bo), length));
+}
+}  // namespace
+
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, uint64_t minBacking) {
+    return madeBuffer(gpu, length, why, minBacking, false);
+}
+
+std::shared_ptr<Buffer> newZeroedBuffer(Gpu& gpu, uint64_t length, std::string* why, uint64_t minBacking) {
+    return madeBuffer(gpu, length, why, minBacking, true);
 }
 
 namespace {
@@ -158,7 +168,7 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
             freeBytes_ -= size;
         }
     }
-    if (b == nullptr) return newBuffer(gpu_, size, why);
+    if (b == nullptr) return newZeroedBuffer(gpu_, size, why);
     gBuffersReused++;
     memset(b->contents(), 0, size);   // (as a new one comes from the kernel)
     return b;
@@ -199,7 +209,7 @@ std::shared_ptr<Buffer> CommandQueue::programBuffer(const Kernel& k, std::string
         resident_.clear();
         residentBytes_ = 0;
     }
-    std::shared_ptr<Buffer> b = newBuffer(gpu_, 4ull * std::max<uint32_t>(k.numWords, 1), why);
+    std::shared_ptr<Buffer> b = newZeroedBuffer(gpu_, 4ull * std::max<uint32_t>(k.numWords, 1), why);
     if (b == nullptr || b->contents() == nullptr) return nullptr;
     memcpy(b->contents(), k.words, 4ull * k.numWords);
     resident_.emplace(k.words, Resident{std::vector<uint32_t>(k.words, k.words + k.numWords), b});
@@ -362,7 +372,7 @@ void CommandBuffer::stamp(uint32_t slot) {
 
 std::shared_ptr<Buffer> CommandQueue::vscBuffer(std::string* why) {
     std::lock_guard<std::mutex> g(lock_);
-    if (vsc_ == nullptr) vsc_ = newBuffer(gpu_, render::vscBytes(), why);
+    if (vsc_ == nullptr) vsc_ = newZeroedBuffer(gpu_, render::vscBytes(), why);
     return vsc_;
 }
 
@@ -720,7 +730,7 @@ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave
             *why = "the GPU did not say which chip it is (stopped?)";
             return nullptr;
         }
-        std::shared_ptr<Buffer> b = newBuffer(gpu_, perSp * info->numCcu, why);
+        std::shared_ptr<Buffer> b = newZeroedBuffer(gpu_, perSp * info->numCcu, why);
         if (b == nullptr) return nullptr;
         private_[l].push_back(std::move(b));
         privatePerFiber_[l] = perFiber;
