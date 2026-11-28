@@ -93,6 +93,22 @@ diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
  
  	while (root) {
  		if (root->metaCast(ioblockstoragedriverClass)) {
+diff --git a/iokit/Kernel/IOMemoryDescriptor.cpp b/iokit/Kernel/IOMemoryDescriptor.cpp
+--- a/iokit/Kernel/IOMemoryDescriptor.cpp
++++ b/iokit/Kernel/IOMemoryDescriptor.cpp
+@@ -5979,9 +5979,11 @@ IOMemoryMap::copyCompatible(
+ 	_offset -= fOffset;
+ 
+-	if ((_offset + _length) > fLength) {
++	/* A reference lookup must return the existing view, including an existing submapping. */
++	if ((_offset + _length) > fLength ||
++	    ((_options & kIOMapReference) && (_offset != 0 || _length != fLength))) {
+ 		return NULL;
+ 	}
+ 
+ 	if (!taggedTryRetain(NULL)) {
+ 		return NULL;
+ 	}
 diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
 --- a/iokit/Kernel/IOUserClient.cpp
 +++ b/iokit/Kernel/IOUserClient.cpp
@@ -162,6 +178,18 @@ diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
  	if (!obj) {
  		return err;
  	}
+@@ -4932,9 +4955,10 @@ is_io_connect_unmap_memory_from_task
+ 	err = client->clientMemoryForType((UInt32) memory_type, &options, &memory );
+ 
+ 	if (memory && (kIOReturnSuccess == err)) {
++		/* Find the mapping being unmapped at the address the caller was given. */
+ 		options = (options & ~kIOMapUserOptionsMask)
+-		    | kIOMapAnywhere | kIOMapReference;
++		    | kIOMapReference | (address ? 0 : kIOMapAnywhere);
+ 
+ 		map = memory->createMappingInTask( from_task, address, options );
+ 		memory->release();
+ 		if (map) {
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
 --- a/iokit/KernelConfigTables.cpp
 +++ b/iokit/KernelConfigTables.cpp
