@@ -2377,6 +2377,57 @@ cpu_profile_start(void)
 	}
 }
 
+/*
+ * Darwin 27's QuartzCore weak-links libEDR via a single coalesced GOT slot for
+ * EDRCreateClientForDisplayWithTimeoutAndCallback(). Because CoreBrightness has no Apple display driver
+ * here and com.apple.libEDR.Notification is stripped from backboardd, libEDR retries bootstrap_look_up()
+ * every second and logs 4 syslog() calls per retry, burning ~0.35-0.43 cores in backboardd. Clearing the
+ * weak-import pointer to NULL disables CA::EDRClient via Apple's own weak-import guard.
+ */
+#define QC_EDR_CREATE_GOT 0x1e1f7f148UL
+
+static void
+disable_libedr(const char *arguments)
+{
+	void *edr;
+	uintptr_t slot_addr, got_raw = 0, got_va, sym_va;
+	vm_size_t got_read = 0;
+	vm_address_t page;
+	kern_return_t kr;
+
+	if (strstr(arguments, "edr_keep=1") != NULL) {
+		say("hakios: edr_keep=1: libEDR left enabled\n");
+		return;
+	}
+	edr = dlsym(RTLD_DEFAULT, "EDRCreateClientForDisplayWithTimeoutAndCallback");
+	if (edr == NULL) {
+		say("hakios: libEDR: EDRCreateClientForDisplayWithTimeoutAndCallback not found; left alone\n");
+		return;
+	}
+	slot_addr = QC_EDR_CREATE_GOT + slide;
+	if (vm_read_overwrite(mach_task_self(), (vm_address_t)slot_addr, sizeof(got_raw),
+	    (vm_address_t)(uintptr_t)&got_raw, &got_read) != KERN_SUCCESS || got_read != sizeof(got_raw)) {
+		say("hakios: libEDR: cannot read GOT %#lx; left alone\n", (unsigned long)QC_EDR_CREATE_GOT);
+		return;
+	}
+	got_va = (uintptr_t)ptrauth_strip((void *)got_raw, ptrauth_key_function_pointer) & 0x0000ffffffffffffUL;
+	sym_va = (uintptr_t)ptrauth_strip(edr, ptrauth_key_function_pointer) & 0x0000ffffffffffffUL;
+	if (got_va != sym_va) {
+		say("hakios: libEDR GOT %#lx holds %#lx (expected %#lx); left alone\n",
+		    (unsigned long)QC_EDR_CREATE_GOT, (unsigned long)got_va, (unsigned long)sym_va);
+		return;
+	}
+	page = (vm_address_t)slot_addr & ~(vm_address_t)(vm_page_size - 1);
+	kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	if (kr != KERN_SUCCESS) {
+		say("hakios: libEDR: vm_protect(%#lx) failed (%d); left alone\n", (unsigned long)page, kr);
+		return;
+	}
+	*(uintptr_t *)slot_addr = 0;
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
+	say("hakios: libEDR disabled (QuartzCore weak import %#lx cleared)\n", (unsigned long)QC_EDR_CREATE_GOT);
+}
+
 __attribute__((constructor))
 static void
 hakios_init(void)
@@ -2448,6 +2499,7 @@ hakios_init(void)
 				say("hakios: caenv: %s=%s for the window server\n", setting, equals + 1);
 			}
 		}
+		disable_libedr(arguments);
 		opengl_es();
 		window_server_fixes();
 		/*
