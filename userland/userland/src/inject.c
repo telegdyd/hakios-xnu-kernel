@@ -1519,6 +1519,7 @@ dc_report(void *unused)
  * frame pointer gone wrong cannot fault.
  */
 #include <mach-o/dyld_images.h>
+#include <mach-o/dyld.h>
 #include <os/log.h>
 #include <mach-o/loader.h>
 
@@ -2161,6 +2162,90 @@ static struct {
 	uint32_t samples;
 } cp_names[CP_NAMES];
 static unsigned cp_nnames, cp_lost, cp_ticks, cp_samples;
+/*
+ * ... and by the way into the Metal plug-in: each sample's innermost pc with the three innermost frames in HakiosMetal
+ * ("PROF NAME chain COUNT PC < FRAME < FRAME < FRAME"), which says which of the plug-in's paths ends in a call to the
+ * kernel, a free or a lock -- what the flat counts cannot.
+ */
+#define CP_CHAINS       4096
+#define CP_CHAIN_DEPTH  4
+static struct {
+	uintptr_t at[CP_CHAIN_DEPTH];
+	uint32_t count;
+	uint8_t name;           /* (as cp_seen's) */
+} cp_chain[CP_CHAINS];
+static uintptr_t cp_plugin_lo, cp_plugin_hi;    /* HakiosMetal's __TEXT, once it is loaded */
+/* the Metal plug-in's buffer cache at the profile's start (hakios_metal_bo_cache_stats, looked up by name): its answers
+ * meanwhile are said as "PROF bo-cache" */
+static uint64_t cp_bo_began[4];
+static bool cp_bo_known;
+
+static void
+cp_bo_stats(uint64_t out[4])
+{
+	void (*stats)(uint64_t *) = (void (*)(uint64_t *))dlsym(RTLD_DEFAULT, "hakios_metal_bo_cache_stats");
+
+	memset(out, 0, 4 * sizeof(uint64_t));
+	if (stats != NULL) {
+		stats(out);
+	}
+	cp_bo_known = stats != NULL;
+}
+
+/* where HakiosMetal's code is, looked for now and then until the window server has loaded it */
+static void
+cp_find_plugin(void)
+{
+	const uint32_t images = _dyld_image_count();
+
+	for (uint32_t i = 0; i < images; i++) {
+		const char *path = _dyld_get_image_name(i);
+		const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+		const struct load_command *lc;
+
+		if (path == NULL || h == NULL || strstr(path, "/HakiosMetal") == NULL) {
+			continue;
+		}
+		lc = (const struct load_command *)(h + 1);
+		for (uint32_t k = 0; k < h->ncmds; k++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+			const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+
+			if (lc->cmd == LC_SEGMENT_64 && strcmp(seg->segname, "__TEXT") == 0) {
+				cp_plugin_lo = (uintptr_t)h;
+				cp_plugin_hi = (uintptr_t)h + seg->vmsize;
+				return;
+			}
+		}
+	}
+}
+
+static void
+cp_count_chain(unsigned name, const uintptr_t *all, unsigned n)
+{
+	uintptr_t at[CP_CHAIN_DEPTH] = { all[0] };
+	unsigned got = 1, i, k;
+
+	for (i = 1; i < n && got < CP_CHAIN_DEPTH; i++) {
+		if (all[i] >= cp_plugin_lo && all[i] < cp_plugin_hi) {
+			at[got++] = all[i];
+		}
+	}
+	if (got == 1) {
+		return;                 /* (no frame of the plug-in's) */
+	}
+	i = (unsigned)((((at[0] ^ at[1] * 31 ^ at[2] * 961 ^ at[3] * 29791) >> 2) * 2654435761u + name * 40503u) % CP_CHAINS);
+	for (k = 0; k < CP_CHAINS; k++, i = (i + 1) % CP_CHAINS) {
+		if (cp_chain[i].name == 0) {
+			cp_chain[i].name = (uint8_t)(name + 1);
+			memcpy(cp_chain[i].at, at, sizeof(at));
+		}
+		if (cp_chain[i].name == name + 1 && memcmp(cp_chain[i].at, at, sizeof(at)) == 0) {
+			cp_chain[i].count++;
+			return;
+		}
+	}
+	cp_lost++;
+}
 
 static unsigned
 cp_name(const char *name)
@@ -2215,6 +2300,17 @@ cp_write(double seconds)
 	fprintf(f, "PROF backboardd: %u looks in %.1f s, %u running-thread samples (%.2f cores busy), %u lost; "
 	    "cache base %#lx\n", cp_ticks, seconds, cp_samples, cp_ticks != 0 ? (double)cp_samples / cp_ticks : 0,
 	    cp_lost, (unsigned long)CACHE_BASE);
+	{
+		uint64_t now[4];
+
+		cp_bo_stats(now);
+		if (cp_bo_known) {
+			fprintf(f, "PROF bo-cache: %llu given again at their size, %llu a larger one, %llu new as the cache's were "
+			    "the GPU's, %llu new with none kept\n", (unsigned long long)(now[0] - cp_bo_began[0]),
+			    (unsigned long long)(now[1] - cp_bo_began[1]), (unsigned long long)(now[2] - cp_bo_began[2]),
+			    (unsigned long long)(now[3] - cp_bo_began[3]));
+		}
+	}
 	for (unsigned k = 0; k < cp_nnames; k++) {
 		unsigned best = CP_NAMES;
 
@@ -2227,7 +2323,8 @@ cp_write(double seconds)
 		fprintf(f, "PROF thread %s %u (%.0f%%)\n", cp_names[best].name[0] != 0 ? cp_names[best].name : "-",
 		    cp_names[best].samples, cp_samples != 0 ? 100.0 * cp_names[best].samples / cp_samples : 0);
 	}
-	/* the threads with a tenth of the samples or more: their 30 hottest addresses by self time, 50 by inclusive */
+	/* the threads with a tenth of the samples or more: their 30 hottest addresses by self time, 120 by inclusive, and
+	 * their 60 commonest chains into the plug-in */
 	for (unsigned t = 0; t < cp_nnames; t++) {
 		if (cp_names[t].samples * 10 < cp_samples || cp_names[t].samples < 20) {
 			continue;
@@ -2236,7 +2333,7 @@ cp_write(double seconds)
 			static bool taken[CP_SLOTS];
 
 			memset(taken, 0, sizeof(taken));
-			for (unsigned k = 0; k < (kind == 0 ? 30u : 50u); k++) {
+			for (unsigned k = 0; k < (kind == 0 ? 30u : 120u); k++) {
 				unsigned best = CP_SLOTS;
 				char where[160] = "";
 
@@ -2255,6 +2352,33 @@ cp_write(double seconds)
 				ws_frame(where, sizeof(where), cp_seen[best].address, cache, cache_length);
 				fprintf(f, "PROF %s %s %u%s\n", cp_names[t].name[0] != 0 ? cp_names[t].name : "-",
 				    kind == 0 ? "self" : "incl", kind == 0 ? cp_seen[best].self : cp_seen[best].incl, where);
+			}
+		}
+		{
+			static bool taken[CP_CHAINS];
+
+			memset(taken, 0, sizeof(taken));
+			for (unsigned k = 0; k < 60; k++) {
+				unsigned best = CP_CHAINS;
+				char where[4 * 160] = "";
+				size_t used = 0;
+
+				for (unsigned i = 0; i < CP_CHAINS; i++) {
+					if (cp_chain[i].name == t + 1 && !taken[i] && (best == CP_CHAINS || cp_chain[i].count > cp_chain[best].count)) {
+						best = i;
+					}
+				}
+				if (best == CP_CHAINS) {
+					break;
+				}
+				taken[best] = true;
+				for (unsigned d = 0; d < CP_CHAIN_DEPTH && cp_chain[best].at[d] != 0 && used < sizeof(where); d++) {
+					char one[160];
+
+					ws_frame(one, sizeof(one), cp_chain[best].at[d], cache, cache_length);
+					used += (size_t)snprintf(where + used, sizeof(where) - used, "%s%s", d != 0 ? " <" : "", one);
+				}
+				fprintf(f, "PROF %s chain %u%s\n", cp_names[t].name[0] != 0 ? cp_names[t].name : "-", cp_chain[best].count, where);
 			}
 		}
 	}
@@ -2298,7 +2422,12 @@ cp_sampler(void *unused)
 			began = mach_absolute_time();
 			memset(cp_seen, 0, sizeof(cp_seen));
 			memset(cp_names, 0, sizeof(cp_names));
+			memset(cp_chain, 0, sizeof(cp_chain));
 			cp_nnames = cp_lost = cp_ticks = cp_samples = 0;
+			cp_bo_stats(cp_bo_began);
+		}
+		if (on && cp_plugin_hi == 0 && cp_ticks % 500 == 0) {
+			cp_find_plugin();
 		}
 		if (!on) {
 			usleep(100000);
@@ -2360,6 +2489,9 @@ cp_sampler(void *unused)
 				cp_names[name].samples++;
 				cp_samples++;
 				cp_count(name, all[0], true);
+				if (cp_plugin_hi != 0) {
+					cp_count_chain(name, all, n);
+				}
 				for (unsigned i = 0; i < n; i++) {
 					bool again = false;
 
