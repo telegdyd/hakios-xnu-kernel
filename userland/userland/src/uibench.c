@@ -1,11 +1,13 @@
 /*
  * uibench: drive the screen through a list of steps, checking each one landed, and measure it.
  *
- *   usage: uibench run STEPS [quiet MS] [settle MS] [idle S] [prof]    the steps of the file STEPS, in order
+ *   usage: uibench run STEPS [quiet MS] [settle MS] [idle S] [prof] [timeline]    run STEPS in order
  *                                                   (first waiting at most idle S, 30, for the system to be quiet;
- *                                                   prof: backboardd's CPU profile of the steps after the last line)
+ *                                                   prof: backboardd's CPU profile of the steps after the last line;
+ *                                                   timeline: active step windows in the clock used by catrace)
  *          uibench state                                what the screen is now (SpringBoard's answer)
  *          uibench do ACTION...                         one action (as in a step), then the state
+ *          uibench catrace BACKBOARDD_PID SECONDS        QuartzCore frame and transaction markers (Darwin 27.2)
  *
  * A step is a line "NAME | BEFORE | ACTION | AFTER" ('#' starts a comment):
  *   BEFORE, AFTER    conditions, all of which must hold: locked=0|1, cc=0|1, switcher=0|1, front=ID|- (the
@@ -22,14 +24,16 @@
  *   STEP NAME PASS|FAIL [why] | still after MS | screen moved D | frames N, X% within 18 ms, longest MS, 95% under MS |
  *       NAME MS ...
  * how far the picture on the panel moved (a step whose state changed fails below SCREEN_MIN: the screen did not
- * follow), the frames from the start of the action until the screen was still (kern.hakios.fb_step), and the
- * processes that took the most CPU time meanwhile. A display that a tap does not wake fails the step. The last
- * line: "UIBENCH N steps, P passed, F failed, S s".
+ * follow), the frame intervals in the motion window, and the processes that took the most CPU time meanwhile.
+ * The motion window starts at input. A sustained wallpaper cadence at the end of a Home Screen transition is
+ * left out of the frame statistics and reported alongside the settle time. A display that a tap does not wake
+ * fails the step. The last line: "UIBENCH N steps, P passed, F failed, S s".
  *
  * Gestures are written to /dev/hakios-touch in one go with each sample's time: the kernel posts them then
  * (board/input.c), with those times, so a swipe is the same swipe however busy the system is.
  */
 #include <fcntl.h>
+#include <limits.h>
 #include <mach/mach_time.h>
 #include <notify.h>
 #include <pthread.h>
@@ -62,10 +66,16 @@ extern int proc_name(int pid, void *buffer, uint32_t size);
 #define ICONS           96
 #define CONDITIONS      8
 #define PROCS           1024
+#define FRAME_HISTORY   "kern.hakios.fb_frame_history"
+#define TAP_SETTLE_MS   400             /* give the foreground animation time to begin after a tap */
+#define WALLPAPER_MIN_MS 70
+#define WALLPAPER_MAX_MS 130
+#define WALLPAPER_TICKS  4
 
 static int device = -1;
 static mach_timebase_info_data_t timebase;
 static unsigned quiet_ms = 120, settle_ms = 3000;
+static bool timeline_on;
 
 static uint64_t
 ms_to_abs(double ms)
@@ -91,6 +101,124 @@ sleep_ms(double ms)
 	if (ms > 0) {
 		usleep((useconds_t)(ms * 1000));
 	}
+}
+
+/* XNU's LP64 kdebug sysctl ABI, omitted by the iPhoneOS SDK. KERN_KDREADTR takes bytes and returns an event count. */
+struct ca_trace_event {
+	uint64_t timestamp, args[5];       /* args[4] is the kernel thread ID */
+	uint32_t debugid, cpu;
+	uint64_t unused;
+};
+
+static int
+ca_trace_ctl(int op, int value, void *data, size_t *size)
+{
+	int mib[] = { CTL_KERN, KERN_KDEBUG, op, value };
+	u_int count = (op == KERN_KDENABLE || op == KERN_KDSETBUF) ? 4 : 3;
+
+	return sysctl(mib, count, data, size, NULL, 0);
+}
+
+static int
+ca_trace(const char *pid_arg, const char *seconds_arg)
+{
+	/* 24B119 QuartzCore: IOMFB display timer and vsync, render_for_time, and Mach receive with a voucher. */
+	enum { TIMER = 0x31ca0028, VSYNC = 0x31ca0000, RENDER = 0x31ca000d,
+	    IPC_RECV = 0x01200010, TRACE_LOST = 0x07020008,
+	    KDBG_VALCHECK = 0x200000, BUFFER_EVENTS = 131072, READ_EVENTS = 16384 };
+	static struct ca_trace_event events[READ_EVENTS];
+	unsigned filter[] = { KDBG_VALCHECK, TIMER, VSYNC, RENDER & ~3u, IPC_RECV };
+	int info[5];                       /* nkdbufs, nolog, flags, nkdthreads, owning pid */
+	unsigned pid_filter[] = { 0, 0, 1, 0, 0 };
+	char build[32], name[64], *end;
+	size_t size = sizeof(build);
+	long pid = strtol(pid_arg, &end, 10);
+	if (*end != '\0' || pid <= 0 || pid > INT_MAX || !proc_name((int)pid, name, sizeof(name)) ||
+	    strcmp(name, "backboardd") != 0) {
+		fprintf(stderr, "uibench catrace: expected a live backboardd PID\n");
+		return 2;
+	}
+	long seconds = strtol(seconds_arg, &end, 10);
+	if (*end != '\0' || seconds <= 0 || seconds > 240) {
+		fprintf(stderr, "uibench catrace: expected a duration of 1–240 seconds\n");
+		return 2;
+	}
+	if (sysctlbyname("kern.osversion", build, &size, NULL, 0) != 0 || strcmp(build, "24B119") != 0) {
+		fprintf(stderr, "uibench catrace: QuartzCore markers verified for build 24B119\n");
+		return 1;
+	}
+	size = sizeof(info);
+	if (ca_trace_ctl(KERN_KDGETBUF, 0, info, &size) != 0) {
+		perror("uibench catrace: kdebug status");
+		return 1;
+	}
+	if (!info[1]) {
+		fprintf(stderr, "uibench catrace: kdebug is already recording (PID %d)\n", info[4]);
+		return 1;
+	}
+	if (ca_trace_ctl(KERN_KDSETBUF, BUFFER_EVENTS, NULL, NULL) != 0) {
+		perror("uibench catrace: kdebug buffer");
+		return 1;
+	}
+	int result = 1;
+	pid_filter[1] = (unsigned)pid;
+	size = sizeof(filter);
+	if (ca_trace_ctl(KERN_KDSETUP, 0, NULL, NULL) != 0 ||
+	    ca_trace_ctl(KERN_KDSETREG, 0, filter, &size) != 0) {
+		perror("uibench catrace: configure kdebug");
+		goto done;
+	}
+	size = sizeof(pid_filter);
+	if (ca_trace_ctl(KERN_KDPIDTR, 0, pid_filter, &size) != 0 || ca_trace_ctl(KERN_KDENABLE, 1, NULL, NULL) != 0) {
+		perror("uibench catrace: enable kdebug");
+		goto done;
+	}
+	setvbuf(stdout, NULL, _IOFBF, 64 * 1024);
+	printf("catrace: recording QuartzCore and Mach IPC markers for backboardd PID %ld\n", pid);
+	fflush(stdout);
+	const double until = now_ms() + seconds * 1000;
+	do {
+		sleep_ms(100);
+		size = sizeof(events);
+		if (ca_trace_ctl(KERN_KDREADTR, 0, events, &size) != 0) {
+			perror("uibench catrace: read kdebug");
+			goto done;
+		}
+		for (size_t i = 0; i < size; i++) {
+			const struct ca_trace_event *e = &events[i];
+			const char *stage;
+			uint64_t at = e->timestamp, arg = e->args[0];
+			switch (e->debugid) {
+			case TIMER:
+				/* The callback samples mach_absolute_time before taking its lock, then traces it in arg3. */
+				if (e->args[2] != 0 && e->args[2] <= at) at = e->args[2];
+				arg = 0;
+				stage = "timer";
+				break;
+			case VSYNC: stage = "vsync"; break;
+			case RENDER: stage = "render"; break;
+			case IPC_RECV:
+				/* On 24B119 server_thread requests MACH_RCV_VOUCHER and routes these IDs to CmdStreamMsg. */
+				arg = e->args[2];
+				if (arg < 40002 || arg > 40005) continue;
+				stage = "receive";
+				break;
+			case TRACE_LOST: stage = "lost"; break;
+			default: continue;
+			}
+			printf("tl: A %s %llu at %.0f arg %llu\n", stage, (unsigned long long)e->args[4],
+			    abs_to_ms(at) * 1000, (unsigned long long)arg);
+		}
+		if (fflush(stdout) == EOF) goto done;
+	} while (now_ms() < until);
+	puts("catrace: complete");
+	result = 0;
+done:
+	if (ca_trace_ctl(KERN_KDREMOVE, 0, NULL, NULL) != 0) {
+		perror("uibench catrace: remove kdebug");
+		result = 1;
+	}
+	return result;
 }
 
 static int
@@ -850,16 +978,108 @@ frames_summary(const char *step, char *text, size_t size)
 }
 
 static int
+compare_intervals(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return (x > y) - (x < y);
+}
+
+/* A trailing run of Mercury ticks can begin only after input ends. Keep the whole run if it overlaps input. */
+static size_t
+wallpaper_start(const uint64_t *times, size_t count, uint64_t released)
+{
+	size_t i = count - 1;
+	size_t ticks = 0;
+
+	while (i > 0) {
+		double gap = abs_to_ms(times[i] - times[i - 1]);
+		double period = gap;
+		size_t intervals = 1;
+
+		/* An extra present can split a tick into two gaps, including pairs like 15 + 90 ms. */
+		if (i > 1) {
+			double before = abs_to_ms(times[i - 1] - times[i - 2]);
+
+			if (times[i - 2] >= released && before < WALLPAPER_MIN_MS &&
+			    gap + before >= WALLPAPER_MIN_MS && gap + before <= WALLPAPER_MAX_MS) {
+				period += before;
+				intervals = 2;
+			}
+		}
+		if (period >= WALLPAPER_MIN_MS && period <= WALLPAPER_MAX_MS) {
+			ticks += gap >= WALLPAPER_MIN_MS;
+		} else if (i != count - 1 || gap >= WALLPAPER_MIN_MS) {
+			break;
+		}
+		i -= intervals;
+	}
+	return i > 0 && ticks >= WALLPAPER_TICKS && times[i] >= released ? i + 1 : count;
+}
+
+static uint64_t
+motion_summary(uint64_t *times, size_t capacity, uint64_t started, uint64_t released, uint64_t ended, bool home,
+    char *text, size_t size)
+{
+	size_t bytes = capacity * sizeof(*times);
+	size_t first = 0, count, within = 0, frames;
+	double active_ms;
+	bool wallpaper;
+
+	if (sysctlbyname(FRAME_HISTORY, times, &bytes, NULL, 0) != 0 || bytes % sizeof(*times) != 0 ||
+	    (bytes == capacity * sizeof(*times) && times[0] >= started)) {
+		snprintf(text, size, "frames unavailable (frame history incomplete)");
+		return 0;
+	}
+	count = bytes / sizeof(*times);
+	while (first < count && times[first] < started) {
+		first++;
+	}
+	while (count > first && times[count - 1] > ended) {
+		count--;
+	}
+	if (count - first < 2) {
+		snprintf(text, size, "frames 0, active %.0f ms", count == first ? 0 : abs_to_ms(times[first] - started));
+		return count == first ? 0 : times[first];
+	}
+	times += first;
+	count -= first;
+	frames = home ? wallpaper_start(times, count, released) : count;
+	wallpaper = frames < count;
+	const uint64_t active_end = times[frames - 1];
+	active_ms = abs_to_ms(active_end - started);
+	for (size_t i = 0; i + 1 < frames; i++) {
+		times[i] = times[i + 1] - times[i];
+		within += abs_to_ms(times[i]) < 18;
+	}
+	frames--;  /* both ends of each measured interval are inside the motion window */
+	qsort(times, frames, sizeof(*times), compare_intervals);
+	snprintf(text, size, "frames %zu, %zu%% within 18 ms, longest %u ms, 95%% under %u ms, active %.0f ms%s",
+	    frames, within * 100 / frames, (unsigned)abs_to_ms(times[frames - 1]),
+	    (unsigned)abs_to_ms(times[(95 * frames - 1) / 100]) + 1, active_ms, wallpaper ? " (wallpaper tail excluded)" : "");
+	return active_end;
+}
+
+static int
 run(const char *path)
 {
 	FILE *f = fopen(path, "r");
 	char line[512];
 	int steps = 0, passed = 0;
 	double began = now_ms();
+	size_t history_size = 0, history_capacity = 0;
+	uint64_t *history = NULL;
 
 	if (f == NULL) {
 		perror(path);
 		return 2;
+	}
+	if (sysctlbyname(FRAME_HISTORY, NULL, &history_size, NULL, 0) == 0 &&
+	    history_size >= 2 * sizeof(*history) && history_size % sizeof(*history) == 0) {
+		history = malloc(history_size);
+		if (history != NULL) {
+			history_capacity = history_size / sizeof(*history);
+		}
 	}
 	wait_idle();
 	if (prof_on) {
@@ -877,7 +1097,8 @@ run(const char *path)
 		char screen[64];
 		const char *changed;
 		double start, still, moved;
-		bool ok = false, was_still;
+		uint64_t started, released, ended;
+		bool ok = false, was_still, tap_action, input_action;
 
 		if (hash != NULL) {
 			*hash = 0;
@@ -941,22 +1162,35 @@ run(const char *path)
 		}
 		page_before = s.page;
 		before = s;
+		input_action = nw > 0 && strcmp(w[0], "none") != 0 && strcmp(w[0], "wait") != 0;
+		tap_action = nw > 0 && strcmp(w[0], "tap") == 0;
 		screen_grid(&grid_before);              /* (before anything is timed: a read and its sums take some 50 ms) */
-		frame_step(frames, sizeof(frames));     /* (counted afresh from here) */
 		cpu_before_n = cpu_look(cpu_before);
-		start = now_ms();
+		if (history == NULL) {
+			frame_step(frames, sizeof(frames));
+		}
+		started = mach_absolute_time();
+		start = abs_to_ms(started);
 		if (!act(w, nw, &s, why, sizeof(why))) {
 			printf("STEP %s FAIL %s\n", field[0], why);
 			fflush(stdout);
 			continue;
 		}
 		/* (a frame after the finger is up, for what moves the screen) */
-		was_still = wait_still_after(start, &still,
-		    nw > 0 && strcmp(w[0], "none") != 0 && strcmp(w[0], "wait") != 0 ? now_ms() - 10 : 0);
-		frame_step(frames, sizeof(frames));
-		cpu_after_n = cpu_look(cpu_after);
-		cpu_top(cpu, sizeof(cpu));
-		frames_summary(frames, fsum, sizeof(fsum));
+		released = mach_absolute_time();
+		if (tap_action) {
+			unsigned minimum = settle_ms < TAP_SETTLE_MS ? settle_ms : TAP_SETTLE_MS;
+
+			sleep_ms(start + minimum - now_ms());
+		}
+		was_still = wait_still_after(start, &still, input_action ? abs_to_ms(released) - 10 : 0);
+		ended = mach_absolute_time();
+		if (!tap_action) {
+			if (history == NULL) {
+				frame_step(frames, sizeof(frames));
+			}
+			cpu_after_n = cpu_look(cpu_after);
+		}
 		for (double until = now_ms() + 1000;;) {
 			if (!ask_state(&s)) {
 				snprintf(is, sizeof(is), "SpringBoard did not answer");
@@ -980,6 +1214,19 @@ run(const char *path)
 			screen_grid(&grid_after);
 			moved = grid_moved(&grid_before, &grid_after);
 		}
+		if (tap_action) {
+			/* A slow app launch can start presenting during the state or screen checks. */
+			if (was_still && frame_last() > ended) {
+				was_still = wait_still_after(start, &still, abs_to_ms(released) - 10);
+				ended = mach_absolute_time();
+				screen_grid(&grid_after);
+				moved = grid_moved(&grid_before, &grid_after);
+			}
+			if (history == NULL) {
+				frame_step(frames, sizeof(frames));
+			}
+			cpu_after_n = cpu_look(cpu_after);
+		}
 		if (moved < 0) {
 			snprintf(screen, sizeof(screen), "screen not read");
 		} else {
@@ -989,6 +1236,18 @@ run(const char *path)
 			ok = false;
 			snprintf(is, sizeof(is), "the screen did not follow (%s changed, the picture moved %.1f)", changed, moved);
 		}
+		if (history != NULL) {
+			bool home = ok && !was_still && input_action && changed[0] != 0 && s.locked == 0 && s.cc == 0 &&
+			    s.switcher == 0 && strcmp(s.front, "-") == 0;
+
+			uint64_t active_end = motion_summary(history, history_capacity, started, released, ended, home, fsum, sizeof(fsum));
+			if (timeline_on && input_action && active_end != 0) {
+				printf("tl: B %.0f %.0f %s\n", start * 1000, abs_to_ms(active_end) * 1000, field[0]);
+			}
+		} else {
+			frames_summary(frames, fsum, sizeof(fsum));
+		}
+		cpu_top(cpu, sizeof(cpu));
 		passed += ok;
 		printf("STEP %s %s%s%s | %s %.0f ms | %s | %s |%s\n", field[0], ok ? "PASS" : "FAIL", ok ? "" : " ", ok ? "" : is,
 		    was_still ? "still after" : "never still, gave up after", still - start, screen, fsum, cpu);
@@ -998,6 +1257,7 @@ run(const char *path)
 		fflush(stdout);
 	}
 	fclose(f);
+	free(history);
 	printf("UIBENCH %d steps, %d passed, %d failed, %.1f s\n", steps, passed, steps - passed, (now_ms() - began) / 1000);
 	if (prof_on) {
 		prof_finish();
@@ -1010,9 +1270,12 @@ main(int argc, char **argv)
 {
 	struct state s;
 
-	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 	mach_timebase_info(&timebase);
+	if (argc == 4 && strcmp(argv[1], "catrace") == 0) {
+		return ca_trace(argv[2], argv[3]);
+	}
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 	if (argc >= 2 && strcmp(argv[1], "state") == 0) {
 		if (!ask_state(&s)) {
 			fprintf(stderr, "uibench: SpringBoard did not answer\n");
@@ -1033,6 +1296,8 @@ main(int argc, char **argv)
 		for (int i = 3; i < argc; i++) {
 			if (strcmp(argv[i], "prof") == 0) {
 				prof_on = true;
+			} else if (strcmp(argv[i], "timeline") == 0) {
+				timeline_on = true;
 			} else if (i + 1 >= argc) {
 				break;
 			} else if (strcmp(argv[i], "quiet") == 0) {
@@ -1059,6 +1324,7 @@ main(int argc, char **argv)
 		print_state("", &s);
 		return 0;
 	}
-	fprintf(stderr, "usage: uibench run STEPS [quiet MS] [settle MS] [idle S] [prof] | uibench state | uibench do ACTION...\n");
+	fprintf(stderr, "usage: uibench run STEPS [quiet MS] [settle MS] [idle S] [prof] [timeline]\n"
+	    "       uibench state | uibench do ACTION... | uibench catrace BACKBOARDD_PID SECONDS\n");
 	return 2;
 }

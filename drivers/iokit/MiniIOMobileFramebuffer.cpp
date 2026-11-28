@@ -27,6 +27,7 @@
 #include <kern/thread_call.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
@@ -291,10 +292,44 @@ SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_gpu_check, CTLFLAG_RW | CTLFLAG_LOCKED, &
 static uint32_t gFramesShown;
 static uint64_t gFrameLast;
 static uint32_t gStepTimes[FRAME_TIMES + 1], gStepPauses, gStepLongest;
+
+/* Raw presentation times let uibench select a motion window without discarding long intervals in the driver. */
+#define FRAME_HISTORY           512
+static LCK_GRP_DECLARE(gFrameHistoryGroup, "hakios frame history");
+static LCK_SPIN_DECLARE(gFrameHistoryLock, &gFrameHistoryGroup);
+static uint64_t gFrameHistory[FRAME_HISTORY];
+static unsigned gFrameHistoryNext, gFrameHistoryCount;
+
 SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_frames, CTLFLAG_RD | CTLFLAG_LOCKED, &gFramesShown, 0,
     "frames put on the panel so far");
 SYSCTL_QUAD(_kern_hakios, OID_AUTO, fb_frame_last, CTLFLAG_RD | CTLFLAG_LOCKED, &gFrameLast,
     "when the last frame was put on the panel (mach_absolute_time)");
+
+static int
+sysctl_fb_frame_history SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	const size_t capacity = sizeof(gFrameHistory);
+	if (req->oldptr == USER_ADDR_NULL) {
+		return SYSCTL_OUT(req, NULL, capacity);
+	}
+	uint64_t *history = (uint64_t *)IOMallocData(capacity);
+	if (history == NULL) {
+		return ENOMEM;
+	}
+	lck_spin_lock(&gFrameHistoryLock);
+	unsigned count = gFrameHistoryCount;
+	unsigned first = (gFrameHistoryNext + FRAME_HISTORY - count) % FRAME_HISTORY;
+	unsigned tail = MIN(count, FRAME_HISTORY - first);
+	memcpy(history, gFrameHistory + first, tail * sizeof(*history));
+	memcpy(history + tail, gFrameHistory, (count - tail) * sizeof(*history));
+	lck_spin_unlock(&gFrameHistoryLock);
+	int error = SYSCTL_OUT(req, history, count * sizeof(*history));
+	IOFreeData(history, capacity);
+	return error;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, fb_frame_history, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0,
+    sysctl_fb_frame_history, "S", "recent presentation timestamps (mach_absolute_time, oldest first)");
 
 static void
 stepFrame(uint64_t ms, bool pause)
@@ -3122,6 +3157,13 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		stepFrame(nanos, nanos >= FRAME_PAUSE);
 	}
 	fLastFrame = began;
+	lck_spin_lock(&gFrameHistoryLock);
+	gFrameHistory[gFrameHistoryNext] = began;
+	gFrameHistoryNext = (gFrameHistoryNext + 1) % FRAME_HISTORY;
+	if (gFrameHistoryCount < FRAME_HISTORY) {
+		gFrameHistoryCount++;
+	}
+	lck_spin_unlock(&gFrameHistoryLock);
 	__atomic_store_n(&gFrameLast, began, __ATOMIC_RELAXED);
 	__atomic_fetch_add(&gFramesShown, 1, __ATOMIC_RELAXED);
 	report = fSwapsShown < 8;
