@@ -153,3 +153,16 @@ void sysmemPassBegin(pm4::Stream& stream, uint32_t W, uint32_t H) {
 }
 
 } // namespace hakios::metal::gen7
+
+namespace hakios::metal::gen7 {
+
+void tileRegisters(pm4::Stream& stream, bool gmem) {
+    raw(stream, 0x8812, gmem ? 0u : 0x000003ffu);       // RB_UNKNOWN_8812: the buffers in GMEM (0), all in sysmem (0x3ff)
+    raw(stream, 0x8e06, gmem ? 0u : 0x02080000u);       // RB_UNKNOWN_8E06: 0 in tiles, the A730's magic value in sysmem
+    raw(stream, 0x8007, 0);                             // GRAS_UNKNOWN_8007
+    raw(stream, 0x8110, 0x00000002);                    // GRAS_UNKNOWN_8110
+    raw(stream, 0x8e09, 0x00000004);                    // RB_UNKNOWN_8E09
+    raw(stream, REG_A7XX_RB_BLIT_CLEAR_MODE, gmem ? 1u : 0u);
+}
+
+} // namespace hakios::metal::gen7

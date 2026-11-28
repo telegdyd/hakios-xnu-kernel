@@ -1311,12 +1311,9 @@ namespace {
 bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                 const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
                 const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false) {
-    // The A730's first draws (section 6 step 4 of GPU-PLAN.md): sysmem, colour targets, the state freedreno writes
-    // for FD730. What has not had its own ladder step on the phone yet is refused rather than guessed at.
+    // The A730's draws: the state freedreno writes for FD730, in sysmem or in a tile (encodeGmem's A7XX branch, from
+    // freedreno's FD730 GMEM stream: device-info/2026-11-28-a730-gmem)
     const bool g7 = stream.gen7();
-    if (g7) {
-        if (gmem != nullptr) return refuse(why, "A730 GMEM passes wait for their ladder step");
-    }
     const Stage& vs = program.vs;
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
     // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
@@ -1768,9 +1765,10 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     }
     // 7. RB_RENDER_CNTL: CCUSINGLECACHELINESIZE 2 in both pipelines (tu_cmd_buffer.cc:633-693; fd6_gmem.cc:531-552), 0 in
     // r3d_dst (tu_clear_blit.cc:1408) -- renderCntlZero for the bisect. A plain type-4: has_cp_reg_write is false here.
-    if (o.renderCntl && g7) {
+    if (o.renderCntl && g7 && gmem == nullptr) {
         // A7XX: RB_RENDER_CNTL without the CCU line size or the flag mask, and GRAS_SU_RENDER_CNTL beside it, both 0 in a
-        // sysmem pass (freedreno's FD730 stream)
+        // sysmem pass (freedreno's FD730 stream). A draw for tiles leaves them to encodeGmem: replayed in the binning
+        // pass it would take BINNING away (freedreno's draws do not write them; update_render_cntl does, per pass)
         reg(stream, REG_A6XX_RB_RENDER_CNTL, 0);
         gen7::raw(stream, 0x8116, 0);   // GRAS_SU_RENDER_CNTL
     }
@@ -2328,7 +2326,10 @@ uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 uint32_t divUp(uint32_t v, uint32_t d) { return (v + d - 1) / d; }
 }  // namespace
 
-bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t likely) {
+bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t likely, uint32_t chip) {
+    const ChipInfo* c = chipInfo(chip);
+    if (c == nullptr) return refuse(why, "no GMEM facts for this chip");
+    const uint32_t colorOffset = gmemCcuColorOffset(*c);
     likely |= 1u;   // (attachment 0: every pass draws into it)
     if (pass.color0 == nullptr || pass.depth != nullptr || pass.stencil != nullptr) {
         return refuse(why, "a pass without colour attachment 0, or with depth or stencil: sysmem");
@@ -2367,6 +2368,7 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t
     // their share whatever the bins' shape), among the likely attachments; an unlikely one has none (its base 0, inside
     // the bins: a stray write there would show, not hang the colour cache above them)
     GmemPlan p;
+    p.chipId = chip;
     uint32_t before = 0;
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         const Attachment a = attachmentOf(pass, i);
@@ -2376,9 +2378,9 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t
             p.unplanned |= 1u << i;
             continue;
         }
-        p.base[i] = uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu;
+        p.base[i] = uint32_t(uint64_t(colorOffset) * before / bytes) & ~0x3fffu;
         before += p.bpp[i];
-        p.room[i] = (uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu) - p.base[i];
+        p.room[i] = (uint32_t(uint64_t(colorOffset) * before / bytes) & ~0x3fffu) - p.base[i];
     }
     const uint32_t whole[4] = {0, 0, W - 1, H - 1};
     if (!gmemTiles(&p, whole)) return refuse(why, "a bin too wide for GMEM");
@@ -2387,33 +2389,38 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t
 }
 
 bool gmemTiles(GmemPlan* plan, const uint32_t area[4]) {
+    const ChipInfo* c = chipInfo(plan->chipId);
+    if (c == nullptr) return false;
+    const uint32_t alignW = c->tileAlignW, alignH = c->tileAlignH;
     GmemPlan p = *plan;
-    p.x0 = area[0] & ~(kTileAlignW - 1);
-    p.y0 = area[1] & ~(kTileAlignH - 1);
+    p.x0 = area[0] & ~(alignW - 1);
+    p.y0 = area[1] & ~(alignH - 1);
     const uint32_t w = area[2] + 1 - p.x0, h = area[3] + 1 - p.y0;
     // The bin width is fixed once a plan has one: a framebuffer fetch's descriptor holds it as its pitch (encodeInPass,
     // written before the area was known), and a tile laid out narrower read through it as sheared rows (the screen in
     // stripes over two tile columns). Only the grid's corner, the columns, the rows and the bin height follow the area.
     if (p.binW == 0) {
-        p.cols = divUp(alignUp(w, kTileAlignW), kTileMaxW);
-        p.binW = alignUp(divUp(w, p.cols), kTileAlignW);
+        p.cols = divUp(alignUp(w, alignW), c->tileMaxW);
+        p.binW = alignUp(divUp(w, p.cols), alignW);
     } else {
         p.cols = divUp(w, p.binW);
     }
-    uint32_t fit = kTileMaxH;
+    uint32_t fit = c->tileMaxH;
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
-        if (p.bpp[i] != 0 && ((p.unplanned >> i) & 1) == 0) fit = std::min(fit, p.room[i] / (p.binW * p.bpp[i]) / kTileAlignH * kTileAlignH);
+        if (p.bpp[i] != 0 && ((p.unplanned >> i) & 1) == 0) fit = std::min(fit, p.room[i] / (p.binW * p.bpp[i]) / alignH * alignH);
     }
-    if (fit < kTileAlignH) return false;
+    if (fit < alignH) return false;
     p.rows = divUp(h, fit);
-    p.binH = alignUp(divUp(h, p.rows), kTileAlignH);
+    p.binH = alignUp(divUp(h, p.rows), alignH);
     for (uint32_t k = 0; k < 4; k++) p.area[k] = area[k];
     *plan = p;
     return true;
 }
 
 bool gmemShare(GmemPlan* plan, uint32_t touched) {
-    const uint32_t top = kGmemCcuColorOffset & ~0x3fffu;
+    const ChipInfo* c = chipInfo(plan->chipId);
+    if (c == nullptr) return false;
+    const uint32_t top = gmemCcuColorOffset(*c) & ~0x3fffu;
     bool changed = false;
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         if (plan->bpp[i] == 0) continue;
@@ -2538,9 +2545,27 @@ bool gmemDrawOk(const Program& program, const RenderPass& pass, const Draw& draw
 void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& plan, const std::vector<std::pair<uint64_t, uint32_t>>& bodies,
                 uint64_t table, const Options& o, uint32_t load, uint32_t store, bool fetch, uint32_t clear, const uint32_t (*clearWords)[4], uint64_t vsc) {
     const auto [W, H] = windowOf(pass);
-    // the colour cache out of the tiles' way (it is not pipelined: after a WFI, as the sysmem value is written)
-    stream.waitForIdle();
-    reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlGmem());
+    const bool g7 = stream.gen7();
+    if (g7) {
+        // The A730 (freedreno's FD730 stream under the drm-shim, device-info/2026-11-28-a730-gmem): what the sysmem CCU
+        // holds cleaned and dropped before the colour cache moves (tu_emit_cache_flush_ccu, sysmem to GMEM: the colour
+        // cache's old place, GMEM's middle, is a bin now), then RB_CCU_CNTL2's GMEM split -- the colour cache shrunk to
+        // an eighth at GMEM's end, 0xfc600000 -- and the A7XX's tile registers (tu7_emit_tile_render_begin_regs,
+        // fd7_emit_static_binning_regs): RB_UNKNOWN_8812 0 (the buffers in GMEM), RB_UNKNOWN_8E06 0, GRAS_UNKNOWN_8007 0,
+        // GRAS_UNKNOWN_8110 2, RB_UNKNOWN_8E09 4, RB_BLIT_CLEAR_MODE GMEM for the event blits. No WFI: RB_CCU_CNTL2 is
+        // pipelined (tu_emit_cache_flush_ccu, A7XX).
+        event(stream, PC_CCU_FLUSH_COLOR_TS);
+        event(stream, PC_CCU_FLUSH_DEPTH_TS);
+        stream.waitForIdle();
+        event(stream, PC_CCU_INVALIDATE_COLOR);
+        event(stream, PC_CCU_INVALIDATE_DEPTH);
+        gen7::raw(stream, gen7::REG_A7XX_RB_CCU_CNTL2, gen7::rbCcuCntl2(kChipA730, true));
+        gen7::tileRegisters(stream, true);
+    } else {
+        // the colour cache out of the tiles' way (it is not pipelined: after a WFI, as the sysmem value is written)
+        stream.waitForIdle();
+        reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlGmem());
+    }
     // the event blit's state common to every load and store (event_blit_setup): over the render area in granules
     // (tu6_emit_blit_scissor with align), single-sampled
     const uint32_t bx1 = std::min(alignUp(plan.area[2] + 1, kGmemAlignW), alignUp(W, kGmemAlignW)) - 1;
@@ -2573,7 +2598,10 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         reg(stream, REG_A6XX_RB_BLIT_INFO, rbBlitInfo(type, false));
         event(stream, BLIT);
     };
-    const uint32_t bin = binControlGmem(o.binControlLrzFeedback, plan.binW, plan.binH);
+    // (the A7XX's bin control has no BUFFERS_LOCATION -- RB_UNKNOWN_8812 says it -- and freedreno's FD730 tiles take
+    // LRZ feedback EARLY_LRZ_LATE_Z without FORCE_LRZ_WRITE_DIS: 0x02002a18 for 768 x 672 bins)
+    const uint32_t bin = g7 ? binControl(RENDERING_PASS, BUFFERS_IN_GMEM, LRZ_FEEDBACK_EARLY_LRZ_LATE_Z, plan.binW, plan.binH)
+                            : binControlGmem(o.binControlLrzFeedback, plan.binW, plan.binH);
     // The pipes: as fd's gmem layout groups bins (freedreno_gmem.c: tpp_y up by 2 until the rows fit the pipes, then
     // tpp_x up by 1), and each tile's place in its pipe the order the tiles are drawn in
     uint32_t tppX = 1, tppY = 1;
@@ -2593,11 +2621,19 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         command1(stream, CP_SET_MODE, 1);
         stream.waitForIdle();
         reg(stream, REG_A6XX_VFD_MODE_CNTL, A6XX_VFD_MODE_CNTL_RENDER_MODE(BINNING_PASS));
-        const uint32_t binning = binControl(BINNING_PASS, BUFFERS_IN_GMEM, o.binControlLrzFeedback ? LRZ_FEEDBACK_EARLY_LRZ_LATE_Z : LRZ_FEEDBACK_NONE,
-                                            plan.binW, plan.binH) | (o.binControlLrzFeedback ? 0u : A6XX_GRAS_BIN_CONTROL_FORCE_LRZ_WRITE_DIS);
+        // (the A7XX's: no LRZ feedback and no FORCE_LRZ_WRITE_DIS in the binning pass, 0x00042a18 for 768 x 672 bins)
+        const uint32_t binning = g7 ? binControl(BINNING_PASS, BUFFERS_IN_GMEM, LRZ_FEEDBACK_NONE, plan.binW, plan.binH)
+                                    : binControl(BINNING_PASS, BUFFERS_IN_GMEM, o.binControlLrzFeedback ? LRZ_FEEDBACK_EARLY_LRZ_LATE_Z : LRZ_FEEDBACK_NONE,
+                                                 plan.binW, plan.binH) | (o.binControlLrzFeedback ? 0u : A6XX_GRAS_BIN_CONTROL_FORCE_LRZ_WRITE_DIS);
         reg(stream, REG_A6XX_GRAS_BIN_CONTROL, binning);
         reg(stream, REG_A6XX_RB_BIN_CONTROL, binning);
         reg(stream, REG_A6XX_RB_BIN_CONTROL2, A6XX_RB_BIN_CONTROL2_BINW(plan.binW) | A6XX_RB_BIN_CONTROL2_BINH(plan.binH));
+        // The A7XX's RB_RENDER_CNTL and GRAS_SU_RENDER_CNTL say the binning pass (BINNING, 0x80 in both; update_render_cntl
+        // <A7XX> with binning); the draws, which write them 0 in sysmem, leave them to the tiles (encodeDraw)
+        if (g7) {
+            reg(stream, REG_A6XX_RB_RENDER_CNTL, gen7::kRenderCntlBinning);
+            gen7::raw(stream, gen7::REG_A7XX_GRAS_SU_RENDER_CNTL, gen7::kRenderCntlBinning);
+        }
         reg(stream, REG_A6XX_VSC_BIN_SIZE, vscBinSize(plan.binW, plan.binH));
         reg64(stream, REG_A6XX_VSC_DRAW_STRM_SIZE_ADDRESS, drawSizes);
         reg(stream, REG_A6XX_VSC_BIN_COUNT, vscBinCount(plan.cols, plan.rows));
@@ -2613,8 +2649,22 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         }
         regs(stream, REG_A6XX_VSC_PRIM_STRM_ADDRESS, {uint32_t(primStrm), uint32_t(primStrm >> 32), kVscPrimPitch, kVscPrimPitch - 64});
         regs(stream, REG_A6XX_VSC_DRAW_STRM_ADDRESS, {uint32_t(drawStrm), uint32_t(drawStrm >> 32), kVscDrawPitch, kVscDrawPitch - 64});
-        reg(stream, REG_A6XX_PC_POWER_CNTL, kMagicPcPowerCntl);
-        reg(stream, REG_A6XX_VFD_POWER_CNTL, kMagicPcPowerCntl);
+        if (g7) {
+            // The A7XX's VSC and CP_SET_BIN_DATA5_OFFSET take the streams' addresses from the command processor's pseudo
+            // registers, not from the VSC registers above (turnip's tu_emit_vsc<A7XX>: CP_SET_PSEUDO_REG DRAW_STRM_ADDRESS,
+            // DRAW_STRM_SIZE_ADDRESS, PRIM_STRM_ADDRESS). Without them every binned tile read its streams at 0: the phone's
+            // first GMEM submission, the SMMU refusing the 3D core at address 0 (run-20261128-020034).
+            const uint32_t pseudo[9] = {gen7::kPseudoDrawStrmAddress,     uint32_t(drawStrm),  uint32_t(drawStrm >> 32),
+                                        gen7::kPseudoDrawStrmSizeAddress, uint32_t(drawSizes), uint32_t(drawSizes >> 32),
+                                        gen7::kPseudoPrimStrmAddress,     uint32_t(primStrm),  uint32_t(primStrm >> 32)};
+            stream.packet(gen7::CP_SET_PSEUDO_REG, pseudo, 9);
+            // (the A7XX has no PC/VFD_POWER_CNTL to set: tu6_emit_binning_pass writes them on A6XX alone; turnip's tu_emit_vsc
+            // ends with VSC_UNKNOWN_0D08 0)
+            gen7::raw(stream, gen7::REG_A7XX_VSC_UNKNOWN_0D08, 0);
+        } else {
+            reg(stream, REG_A6XX_PC_POWER_CNTL, kMagicPcPowerCntl);
+            reg(stream, REG_A6XX_VFD_POWER_CNTL, kMagicPcPowerCntl);
+        }
         event(stream, UNK_2C);
         reg(stream, REG_A6XX_RB_WINDOW_OFFSET, regXY(0, 0));
         reg(stream, REG_A6XX_SP_TP_WINDOW_OFFSET, regXY(0, 0));
@@ -2650,6 +2700,11 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
             const uint32_t w[3] = {(0x0c38u + 0x20u * k) | 32u << CP_REG_TO_MEM_0_CNT__SHIFT, uint32_t(at), uint32_t(at >> 32)};
             stream.packet(CP_REG_TO_MEM, w, 3);
         }
+    }
+    // (the tiles render: RB_RENDER_CNTL TYPE_TILED, 0, and GRAS_SU_RENDER_CNTL 0, as freedreno's tiles have them)
+    if (g7) {
+        reg(stream, REG_A6XX_RB_RENDER_CNTL, 0);
+        gen7::raw(stream, gen7::REG_A7XX_GRAS_SU_RENDER_CNTL, 0);
     }
     for (uint32_t ry = 0; ry < plan.rows; ry++) {
         for (uint32_t rx = 0; rx < plan.cols; rx++) {
@@ -2741,7 +2796,16 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
     eventTimestamp(stream, PC_CCU_RESOLVE_TS, table + kTableBlitFlushAt, kBlitFlushValue, false);
     waitForWord(stream, table + kTableBlitFlushAt, kBlitFlushValue);
     stream.waitForIdle();
-    reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlSysmem() | (o.ccuConcurrentResolve ? A6XX_RB_CCU_CNTL_CONCURRENT_RESOLVE : 0u));
+    if (g7) {
+        // (GMEM to sysmem: the CCU's lines dropped, nothing to clean -- tu_emit_cache_flush_ccu -- then the sysmem split
+        // batchStart writes and the sysmem pass's A7XX registers back for the tail and what follows)
+        event(stream, PC_CCU_INVALIDATE_COLOR);
+        event(stream, PC_CCU_INVALIDATE_DEPTH);
+        gen7::raw(stream, gen7::REG_A7XX_RB_CCU_CNTL2, gen7::rbCcuCntl2(kChipA730, false));
+        gen7::tileRegisters(stream, false);
+    } else {
+        reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlSysmem() | (o.ccuConcurrentResolve ? A6XX_RB_CCU_CNTL_CONCURRENT_RESOLVE : 0u));
+    }
     crumb(0x999);
 }
 
@@ -2967,6 +3031,7 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
     bool forgot = false;
     using namespace a6xx;
     const std::vector<uint32_t>& w = from.words();
+    const uint32_t invalidate = registerOffset(*chipInfo(from.chipId()), Register::HLSQ_INVALIDATE_CMD);
     to.packet(pm4::kNop, nullptr, 0);
     for (size_t i = 0; i < w.size();) {
         pm4::Header h = pm4::decode(w[i]);
@@ -2974,7 +3039,6 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
             uint32_t runStart = 0, runLen = 0;
             for (uint32_t k = 0; k < h.count; k++) {
                 const uint32_t reg = h.reg + k, value = w[i + 1 + k];
-                const uint32_t invalidate = legacyRegisterOffset(*chipInfo(from.chipId()), REG_A6XX_HLSQ_INVALIDATE_CMD);
                 const bool same = regs.hold(reg, value) && reg != invalidate;
                 if (!same) {
                     if (runLen == 0) runStart = k;
@@ -3098,7 +3162,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     // GMEM is decided as a pass opens, before its first draw is encoded (a draw in a tile is encoded for the tile:
     // encodeInPass). A draw a tile cannot replay ends a GMEM pass and opens a sysmem one of its own.
     std::string gmemWhy;
-    const bool tileable = options.gmem && gmem_ && !a730 && render::gmemDrawOk(program, pass, d, *vsb, *fsb, &gmemWhy);
+    const bool tileable = options.gmem && gmem_ && render::gmemDrawOk(program, pass, d, *vsb, *fsb, &gmemWhy);
     // (a draw into an attachment the pass's like did not touch, which has no bin: the tiles end before it, as before a
     // draw they cannot replay, and the pass goes on in a pass of its own planned anew; its like's next time has a bin
     // for it -- closePass notes it as touched)
@@ -3132,8 +3196,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         gmem = open_->gmem;
         dual = open_->dual;
         plan = open_->plan;
-    } else if (options.gmem && gmem_ && !a730) {
-        gmem = render::gmemPlan(pass, &plan, &gmemWhy_) && tileable;
+    } else if (options.gmem && gmem_) {
+        gmem = render::gmemPlan(pass, &plan, &gmemWhy_, ~0u, stream_.chipId()) && tileable;
         if (!tileable) gmemWhy_ = gmemWhy;
         if (gmem && gmemMinDraws_ != 0) {
             // Both ways, unless this pass's like has had few draws for a while: then it is sysmem and recorded only so
@@ -3181,7 +3245,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             likely |= needs;
             render::GmemPlan narrow;
             std::string unused;
-            if ((attached & ~likely) != 0 && render::gmemPlan(pass, &narrow, &unused, likely)) plan = narrow;
+            if ((attached & ~likely) != 0 && render::gmemPlan(pass, &narrow, &unused, likely, stream_.chipId())) plan = narrow;
         }
     }
     Piece passTable;

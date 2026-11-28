@@ -599,6 +599,8 @@ TEST(a730_repeated_draws_keep_the_invalidate_command) {
     d.viewport = Viewport{0, 0, 64, 64, 0, 1};
     d.scissor = Scissor{0, 0, 64, 64};
     auto cb = queue->commandBuffer();
+    // (in sysmem: the draws inline in the submission, where this counts them; a GMEM pass calls them as an IB2)
+    cb->setGmem(false);
     for (int draw = 0; draw < 3; draw++) CHECK(cb->draw(flat, pass, d, {}, {}));
     finish(cb);
     unsigned invalidates = 0;
@@ -1004,4 +1006,233 @@ TEST(a730_vertex_stage_ibos_are_bindless_set_0) {
     CHECK(r.fake->stats().faults > before);
     CHECK(r.fake->stats().lastFault.find("SB6_IBO") != std::string::npos);
     CHECK_EQ(submit(w), 0);
+}
+
+TEST(a730_legacy_offset_table_matches_linear_scan) {
+    pm4::Stream a730Stream(kChipA730.id);
+    pm4::Stream a635Stream(kChipA635.id);
+    auto referenceOffset = [](uint32_t legacy) -> uint32_t {
+        uint32_t result = legacyRegisterOffset(kChipA730, legacy);
+        if (result == kRegisterAbsent) {
+            for (const auto& a : gen7::kSharedArrays) {
+                if (legacy >= a.first && legacy <= a.last) result = legacy;
+            }
+        }
+        return result;
+    };
+
+    for (uint32_t legacy = 0; legacy < gen7::kLegacyRegisterCount; ++legacy) {
+        const uint32_t expected = referenceOffset(legacy);
+        const uint16_t entry = gen7::kLegacyRegisterOffsets[legacy];
+        if (expected == kRegisterAbsent) {
+            CHECK_EQ(entry, gen7::kLegacyRegisterAbsent);
+        } else {
+            CHECK_EQ(uint32_t(entry), expected);
+            CHECK_EQ(gen7::offset(a730Stream, legacy), expected);
+        }
+        CHECK_EQ(gen7::offset(a635Stream, legacy), legacy);
+    }
+
+    // All 11 registers below 0x8000 must map identically to themselves on A730.
+    for (uint32_t reg : {0x0883u, 0x0c02u, 0x0c03u, 0x0c06u, 0x0c10u, 0x0c30u, 0x0c32u, 0x0c34u, 0x0c36u, 0x0e12u, 0x0e19u}) {
+        CHECK_EQ(gen7::offset(a730Stream, reg), reg);
+    }
+    // Moved A7xx registers.
+    CHECK_EQ(gen7::offset(a730Stream, 0xb980u), 0xa9c6u);
+    CHECK_EQ(gen7::offset(a730Stream, 0xbb08u), 0xab1fu);
+    CHECK_EQ(gen7::offset(a730Stream, 0x9980u), 0x9107u);
+    // Absent A6xx-only registers (including 0x9107 = VPC_UNKNOWN_9107).
+    for (uint32_t reg : {0xbe00u, 0xb997u, 0x9107u}) {
+        CHECK_EQ(gen7::kLegacyRegisterOffsets[reg], gen7::kLegacyRegisterAbsent);
+    }
+    // Interior elements of shared arrays.
+    for (uint32_t reg : {0x8015u, 0xa014u, 0xa990u}) {
+        CHECK_EQ(gen7::offset(a730Stream, reg), reg);
+    }
+}
+
+// A730 GMEM (UI-PERF-PLAN.md task 7), against freedreno's FD730 GMEM stream under the drm-shim
+// (device-info/2026-11-28-a730-gmem): the fake rasterizes nothing, so a target whose every pixel is its own coordinates
+// comes back unchanged only if every tile was loaded and stored at the right rows and place in GMEM (GMEM starts each tile
+// as 0xcd); the fake checks the A7XX's tile state on the way -- RB_CCU_CNTL2's GMEM split, RB_UNKNOWN_8812/8E06 0, the bin
+// control without BUFFERS_LOCATION, RB_BLIT_CLEAR_MODE GMEM, the binning pass's BINNING.
+namespace {
+void a730FillCoords(Texture& t) {
+    auto* p = static_cast<uint8_t*>(t.contents());
+    for (uint32_t y = 0; y < t.height(); y++) {
+        for (uint32_t x = 0; x < t.width(); x++) {
+            const uint32_t v = y << 16 | x;
+            std::memcpy(p + y * t.bytesPerRow() + x * 4, &v, 4);
+        }
+    }
+}
+uint32_t a730CoordsWrong(const Texture& t) {
+    const auto* p = static_cast<const uint8_t*>(t.contents());
+    uint32_t wrong = 0;
+    for (uint32_t y = 0; y < t.height(); y++) {
+        for (uint32_t x = 0; x < t.width(); x++) {
+            const uint32_t v = y << 16 | x;
+            wrong += std::memcmp(p + y * t.bytesPerRow() + x * 4, &v, 4) != 0;
+        }
+    }
+    return wrong;
+}
+std::shared_ptr<Texture> a730Target(Rig& r, uint32_t w, uint32_t h) {
+    TextureDesc desc;
+    desc.width = w;
+    desc.height = h;
+    desc.format = PixelFormat::kBGRA8Unorm;
+    desc.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+    std::string why;
+    auto t = Texture::make(r.gpu, desc, &why);
+    CHECK(t != nullptr);
+    return t;
+}
+Draw a730Whole(uint32_t w, uint32_t h) {
+    Draw d;
+    d.vertexCount = 3;
+    d.viewport = Viewport{0, 0, double(w), double(h), 0, 1};
+    return d;
+}
+}  // namespace
+
+// the A730's bins: 64 x 32 aligned, up to 1728 wide, as tall as GMEM below its colour cache (0x1f8000) holds
+TEST(a730_gmem_plan_takes_the_a730s_gmem_and_tile_alignment) {
+    Rig r;
+    auto t = a730Target(r, 1440, 3216);
+    if (!t) return;
+    RenderPass a;
+    a.color0 = t.get();
+    render::GmemPlan p;
+    std::string why;
+    CHECK(render::gmemPlan(a, &p, &why, ~0u, kChipA730.id));
+    CHECK_EQ(p.chipId, kChipA730.id);
+    CHECK_EQ(p.cols, 1u);
+    CHECK_EQ(p.binW, 1472u);   // 1440 up to 64
+    CHECK_EQ(p.binH % 32, 0u);
+    CHECK(uint64_t(p.binW) * p.binH * 4 <= gmemCcuColorOffset(kChipA730));
+    CHECK(p.rows * p.binH >= 3216u);
+    // (the A635's plan of the same pass is smaller bins in its 512 KiB)
+    render::GmemPlan q;
+    CHECK(render::gmemPlan(a, &q, &why));
+    CHECK(q.tiles() > p.tiles());
+}
+
+TEST(a730_gmem_pass_loads_and_stores_every_tile_in_place) {
+    for (const auto& [w, h] : {std::pair<uint32_t, uint32_t>{64, 64}, {1440, 3216}, {100, 37}}) {
+        Rig r;
+        auto t = a730Target(r, w, h);
+        if (!t) return;
+        a730FillCoords(*t);
+        RenderPass a;
+        a.color0 = t.get();
+        render::GmemPlan p;
+        CHECK(render::gmemPlan(a, &p, nullptr, ~0u, kChipA730.id));
+        const Program flat{kernels::a730_tri_flat_vs_air, kernels::a730_tri_flat_fs_air, Linkage{}, "flat"};
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->draw(flat, a, a730Whole(w, h), {}, {}));
+        CHECK(cb->draw(flat, a, a730Whole(w, h), {}, {}));
+        finish(cb);
+        const auto s = r.fake->stats();
+        CHECK_EQ(s.faults, 0u);
+        if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
+        CHECK_EQ(a730CoordsWrong(*t), 0u);
+        CHECK_EQ(cb->counts().gmemPasses, 1u);
+        CHECK_EQ(s.tiles, p.tiles());
+        CHECK(s.tileLoads == p.tiles() && s.tileStores == p.tiles());
+        CHECK_EQ(s.draws, 2 * p.tiles());
+        CHECK_EQ(s.storedPixels, uint64_t((w + 15) / 16 * 16) * ((h + 3) / 4 * 4));
+    }
+}
+
+// the stream's A7XX tile words as freedreno's FD730 writes them, and the sysmem state back after the tiles
+TEST(a730_gmem_pass_writes_the_a7xx_tile_registers) {
+    Rig r;
+    auto t = a730Target(r, 1440, 3216);
+    if (!t) return;
+    RenderPass a;
+    a.color0 = t.get();
+    render::GmemPlan p;
+    CHECK(render::gmemPlan(a, &p, nullptr, ~0u, kChipA730.id));
+    pm4::Stream s(kChipA730.id);
+    render::Options o;
+    render::encodeGmem(s, a, p, {{0x100000, 4}}, 0x200000, o, 1, 1, false);
+    std::map<uint32_t, std::vector<uint32_t>> writes;
+    const auto& w = s.words();
+    for (size_t i = 0; i < w.size();) {
+        const auto h = pm4::decode(w[i]);
+        if (h.kind == pm4::Header::kRegisters) {
+            for (uint32_t k = 0; k < h.count; k++) writes[h.reg + k].push_back(w[i + 1 + k]);
+        }
+        i += h.count + 1;
+    }
+    auto first = [&](uint32_t reg) { return writes[reg].empty() ? ~0u : writes[reg].front(); };
+    auto last = [&](uint32_t reg) { return writes[reg].empty() ? ~0u : writes[reg].back(); };
+    CHECK_EQ(first(gen7::REG_A7XX_RB_CCU_CNTL2), 0xfc600000u);   // the colour cache an eighth at 0x1f8000
+    CHECK_EQ(last(gen7::REG_A7XX_RB_CCU_CNTL2), 0x80000000u);    // and back where sysmem has it
+    CHECK_EQ(first(0x8812), 0u);
+    CHECK_EQ(last(0x8812), 0x3ffu);
+    CHECK_EQ(first(0x8e06), 0u);
+    CHECK_EQ(last(0x8e06), 0x02080000u);
+    CHECK_EQ(first(gen7::REG_A7XX_RB_BLIT_CLEAR_MODE), 1u);
+    CHECK_EQ(last(gen7::REG_A7XX_RB_BLIT_CLEAR_MODE), 0u);
+    // GRAS/RB_BIN_CONTROL: RENDERING_PASS, LRZ feedback EARLY_LRZ_LATE_Z, no BUFFERS_LOCATION
+    const uint32_t bin = (p.binW >> 5) | (p.binH >> 4) << 8 | 2u << 24;
+    CHECK_EQ(first(0x80a1), bin);
+    CHECK_EQ(first(0x8800), bin);
+    CHECK(writes[0x8e07].empty());   // (the A6XX's split register is not the A7XX's)
+    CHECK_EQ(first(0x8801), 0u);     // RB_RENDER_CNTL: TYPE_TILED
+}
+
+TEST(a730_clear_in_gmem_comes_out_as_the_fill_does) {
+    std::vector<uint8_t> got[2];
+    for (int gm = 0; gm < 2; gm++) {
+        Rig r;
+        auto t = a730Target(r, 100, 37);
+        if (!t) return;
+        a730FillCoords(*t);
+        RenderPass a;
+        a.color0 = t.get();
+        a.load = LoadAction::kClear;
+        const double c[4] = {0.25, 0.5, 0.75, 0.6};
+        for (int k = 0; k < 4; k++) a.clearColor[k] = c[k];
+        render::Options o;
+        o.gmem = gm != 0;
+        Draw d = a730Whole(100, 37);
+        d.viewport = Viewport{40, 10, 30, 12, 0, 1};
+        const Program flat{kernels::a730_tri_flat_vs_air, kernels::a730_tri_flat_fs_air, Linkage{}, "flat"};
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->draw(flat, a, d, {}, {}, o));
+        finish(cb);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        if (r.fake->stats().faults) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+        CHECK_EQ(r.fake->stats().tileClears, gm ? 1u : 0u);
+        const uint8_t* px = static_cast<const uint8_t*>(t->contents());
+        for (uint32_t y = 0; y < 37; y++) got[gm].insert(got[gm].end(), px + y * t->bytesPerRow(), px + y * t->bytesPerRow() + 400);
+    }
+    CHECK(got[0] == got[1]);
+}
+
+TEST(a730_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
+    Rig r;
+    auto t = a730Target(r, 1440, 3216);
+    if (!t) return;
+    a730FillCoords(*t);
+    RenderPass a;
+    a.color0 = t.get();
+    render::GmemPlan p;
+    CHECK(render::gmemPlan(a, &p, nullptr, ~0u, kChipA730.id));
+    render::Options o;
+    o.gmemBinning = true;
+    const Program flat{kernels::a730_tri_flat_vs_air, kernels::a730_tri_flat_fs_air, Linkage{}, "flat"};
+    auto cb = r.queue->commandBuffer();
+    for (int i = 0; i < 3; i++) CHECK(cb->draw(flat, a, a730Whole(1440, 3216), {}, {}, o));
+    finish(cb);
+    const auto s = r.fake->stats();
+    CHECK_EQ(s.faults, 0u);
+    if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
+    CHECK(s.binningPasses == 1 && s.binnedDraws == 3 && s.binData == p.tiles() && s.tiles == p.tiles());
+    CHECK_EQ(s.lastDraw.visCull, 1u);
+    CHECK_EQ(a730CoordsWrong(*t), 0u);
+    CHECK_EQ(cb->counts().binnedPasses, 1u);
 }

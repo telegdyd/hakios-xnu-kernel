@@ -372,12 +372,16 @@ uint64_t FakeGpu::reg64(uint32_t r) const {
 bool FakeGpu::gen7BatchReady(bool draw) {
     if (chipId_ != kChipA730.id) return true;
     if (!gen7Thread_) { fault("A730 batch has no BR thread selection"); return false; }
+    // (in a tile or the binning pass the split is GMEM's: the colour cache an eighth at GMEM's end, freedreno's FD730)
+    const uint32_t split = gen7::rbCcuCntl2(kChipA730, inTile_ || binning_);
     auto ccu = regs_.find(0x8e07), ccu2 = regs_.find(0x88e5);
     if (!written_.count(0x8e07) || !written_.count(0x88e5) || ccu == regs_.end() || ccu2 == regs_.end() ||
-        (ccu->second & ~a6xx::A6XX_RB_CCU_CNTL_GMEM_FAST_CLEAR_DISABLE) != 0 || ccu2->second != 0x80000000) {
-        fault("A730 sysmem CCU split is missing or still in the A6xx register"); return false;
+        (ccu->second & ~a6xx::A6XX_RB_CCU_CNTL_GMEM_FAST_CLEAR_DISABLE) != 0 || ccu2->second != split) {
+        fault(text("A730 CCU split (RB_CCU_CNTL2) missing, not %#llx here, or still in the A6xx register", split)); return false;
     }
     for (const auto& w : gen7::kMagic) {
+        // (RB_UNKNOWN_8E06's magic is sysmem's: a tile has it 0, gen7::tileRegisters, which gen7DrawReady checks)
+        if (w.reg == 0x8e06 && (inTile_ || binning_)) continue;
         auto value = regs_.find(w.reg);
         if (!written_.count(w.reg) || value == regs_.end() || value->second != w.value) {
             fault(text("missing or wrong A730 batch register %#llx", w.reg)); return false;
@@ -669,8 +673,14 @@ bool FakeGpu::check2d(const uint32_t* d, const char* what, uint32_t i, bool samp
             return false;
         }
         const uint32_t ccu = reg(REG_A6XX_RB_CCU_CNTL);
-        const uint64_t cache = uint64_t(fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET__SHIFT)) << A6XX_RB_CCU_CNTL_COLOR_OFFSET__SCALE |
-                               uint64_t(fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__SHIFT)) << 21;
+        uint64_t cache = uint64_t(fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET__SHIFT)) << A6XX_RB_CCU_CNTL_COLOR_OFFSET__SCALE |
+                         uint64_t(fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__SHIFT)) << 21;
+        if (chipId_ == kChipA730.id) {
+            // (the A7XX's split is RB_CCU_CNTL2's: COLOR_OFFSET at 23 in 4 KiB units, COLOR_OFFSET_HI at bit 2)
+            const auto c2 = regs_.find(gen7::REG_A7XX_RB_CCU_CNTL2);
+            const uint32_t v = c2 == regs_.end() ? 0u : c2->second;
+            cache = uint64_t(v >> 23) << 12 | uint64_t((v >> 2) & 1u) << 21;
+        }
         if (pitch != uint64_t(binW) * bpp || base + uint64_t(binW) * binH * bpp > cache ||
             fieldOf(d[2], A6XX_TEX_CONST_2_TYPE__MASK, A6XX_TEX_CONST_2_TYPE__SHIFT) != A6XX_TEX_2D ||
             fieldOf(d[5], A6XX_TEX_CONST_5_DEPTH__MASK, A6XX_TEX_CONST_5_DEPTH__SHIFT) != 1) {
@@ -794,9 +804,13 @@ bool FakeGpu::gen7DrawReady() {
         uint32_t reg, value;
         const char* name;
     };
-    static constexpr Fixed kFixed[] = {
-        {0x8812, 0x000003ff, "RB_UNKNOWN_8812"},    {0x8e06, 0x02080000, "RB_UNKNOWN_8E06"},  {0x8e09, 0x00000004, "RB_UNKNOWN_8E09"},
-        {0x8801, 0x00000000, "RB_RENDER_CNTL"},     {0x8116, 0x00000000, "GRAS_SU_RENDER_CNTL"},
+    // (in a tile or the binning pass the buffers are in GMEM -- RB_UNKNOWN_8812 and 8E06 0 -- and the binning pass's
+    // RB/GRAS_SU_RENDER_CNTL say BINNING: freedreno's FD730 GMEM stream, device-info/2026-11-28-a730-gmem)
+    const bool gmem = inTile_ || binning_;
+    const uint32_t renderCntl = binning_ ? gen7::kRenderCntlBinning : 0u;
+    const Fixed kFixed[] = {
+        {0x8812, gmem ? 0u : 0x000003ffu, "RB_UNKNOWN_8812"}, {0x8e06, gmem ? 0u : 0x02080000u, "RB_UNKNOWN_8E06"}, {0x8e09, 0x00000004, "RB_UNKNOWN_8E09"},
+        {0x8801, renderCntl, "RB_RENDER_CNTL"},     {0x8116, renderCntl, "GRAS_SU_RENDER_CNTL"},
         {0xa82d, 0x00000000, "SP_VS_VGPR_CONFIG"},  {0xaa01, 0x00000000, "SP_FS_VGPR_CONFIG"},
         {0x9885, 0x00020000, "PC_TESS_PARAM_SIZE"}, {0x9886, 0x00002000, "PC_TESS_FACTOR_SIZE"},
     };
@@ -1433,6 +1447,11 @@ bool FakeGpu::tileState(uint32_t* binW, uint32_t* binH, uint32_t win[4]) {
         fault(text("GRAS_BIN_CONTROL %#llx, RB_BIN_CONTROL %#llx, RB_BIN_CONTROL2 %#llx in a tile: the same bin in all three, in GMEM", g, r, r2));
         return false;
     }
+    // (the A7XX's bin control has no BUFFERS_LOCATION: RB_UNKNOWN_8812 0 puts the buffers in GMEM, tu7_emit_tile_render_begin_regs)
+    if (chipId_ == kChipA730.id && (!written_.count(0x8812) || regs_.at(0x8812) != 0)) {
+        fault("an A730 tile with RB_UNKNOWN_8812 not 0 in this submission: its buffers are in sysmem");
+        return false;
+    }
     const uint32_t tl = reg(REG_A6XX_GRAS_SC_WINDOW_SCISSOR_TL), br = reg(REG_A6XX_GRAS_SC_WINDOW_SCISSOR_BR);
     win[0] = tl & 0x3fff;
     win[1] = tl >> 16 & 0x3fff;
@@ -1461,6 +1480,14 @@ bool FakeGpu::eventBlit() {
     }
     uint32_t binW = 0, binH = 0, win[4] = {};
     if (!tileState(&binW, &binH, win)) return false;
+    // (an A7XX event blit between GMEM and memory: RB_BLIT_CLEAR_MODE GMEM, as every one of freedreno's FD730 blits has it)
+    if (chipId_ == kChipA730.id) {
+        const auto m = regs_.find(gen7::REG_A7XX_RB_BLIT_CLEAR_MODE);
+        if (m == regs_.end() || m->second != 1) {
+            fault("an A730 event blit without RB_BLIT_CLEAR_MODE CLEAR_MODE_GMEM");
+            return false;
+        }
+    }
     const uint32_t info = reg(REG_A6XX_RB_BLIT_INFO), type = info & A6XX_RB_BLIT_INFO_TYPE__MASK;
     if (type != BLIT_EVENT_LOAD && type != BLIT_EVENT_STORE && type != BLIT_EVENT_CLEAR) {
         fault(text("RB_BLIT_INFO %#llx: a load, a store or a clear is what this GPU model runs", info));
@@ -2305,9 +2332,14 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
                       fieldOf(ccu, A6XX_RB_CCU_CNTL_DEPTH_OFFSET__MASK, A6XX_RB_CCU_CNTL_DEPTH_OFFSET__SHIFT) == 0;
         if (inTile_) {
             // the colour cache above every target's bin, and the bins of the targets the stage writes apart
-            const uint32_t at = fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET__SHIFT) << A6XX_RB_CCU_CNTL_COLOR_OFFSET__SCALE |
-                                fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__SHIFT) << 21;
-            if (!ccuCntlWritten_ || !ccuCntlAfterWfi_) {
+            uint32_t at = fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET__SHIFT) << A6XX_RB_CCU_CNTL_COLOR_OFFSET__SCALE |
+                          fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__SHIFT) << 21;
+            // (the A730's split is RB_CCU_CNTL2's, pipelined -- no WFI -- and checked whole in gen7BatchReady)
+            if (chipId_ == kChipA730.id) {
+                const uint32_t v = regs_.count(gen7::REG_A7XX_RB_CCU_CNTL2) ? regs_.at(gen7::REG_A7XX_RB_CCU_CNTL2) : 0u;
+                at = (v >> 23) << 12 | ((v >> 2) & 1u) << 21;
+            }
+            if (chipId_ != kChipA730.id && (!ccuCntlWritten_ || !ccuCntlAfterWfi_)) {
                 fault(text("RB_CCU_CNTL (%#llx) in a tile: not written after a WFI", ccu));
                 return false;
             }
@@ -2492,10 +2524,32 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                     inTile_ = false;
                 }
                 break;
+            case gen7::CP_SET_PSEUDO_REG: {
+                // (A7XX: register, 64-bit value, as many times as the packet holds)
+                if (chipId_ != kChipA730.id || h.count == 0 || h.count % 3 != 0) {
+                    fault("CP_SET_PSEUDO_REG off the A730 or not of whole (register, address) triples");
+                    return false;
+                }
+                for (uint32_t k = 0; k < h.count; k += 3) {
+                    const uint32_t r = p[k] & 0x7ffu;
+                    if (r < 11) pseudo_[r] = p[k + 1] | uint64_t(p[k + 2]) << 32;
+                }
+                break;
+            }
             case CP_SET_BIN_DATA5_OFFSET: {
                 // a tile's streams, at offsets from VSC_DRAW_STRM_ADDRESS, VSC_DRAW_STRM_SIZE_ADDRESS and VSC_PRIM_STRM_ADDRESS
-                if (h.count != 4 || !inTile_ || at(reg64(REG_A6XX_VSC_DRAW_STRM_ADDRESS) + p[1], 4) == nullptr ||
-                    at(reg64(REG_A6XX_VSC_DRAW_STRM_SIZE_ADDRESS) + p[2], 4) == nullptr || at(reg64(REG_A6XX_VSC_PRIM_STRM_ADDRESS) + p[3], 4) == nullptr) {
+                // -- on the A7XX from the command processor's pseudo registers of those names (CP_SET_PSEUDO_REG, turnip's
+                // tu_emit_vsc<A7XX>), which the VSC registers do not set: unset, the phone read the streams at 0 and the SMMU
+                // refused it (run-20261128-020034)
+                const bool g7 = chipId_ == kChipA730.id;
+                const uint64_t drawAt = g7 ? pseudo_[gen7::kPseudoDrawStrmAddress] : reg64(REG_A6XX_VSC_DRAW_STRM_ADDRESS);
+                const uint64_t sizeAt = g7 ? pseudo_[gen7::kPseudoDrawStrmSizeAddress] : reg64(REG_A6XX_VSC_DRAW_STRM_SIZE_ADDRESS);
+                const uint64_t primAt = g7 ? pseudo_[gen7::kPseudoPrimStrmAddress] : reg64(REG_A6XX_VSC_PRIM_STRM_ADDRESS);
+                if (g7 && (drawAt == 0 || sizeAt == 0 || primAt == 0)) {
+                    fault("CP_SET_BIN_DATA5_OFFSET on the A730 without the VSC pseudo registers (CP_SET_PSEUDO_REG): its streams at 0");
+                    return false;
+                }
+                if (h.count != 4 || !inTile_ || at(drawAt + p[1], 4) == nullptr || at(sizeAt + p[2], 4) == nullptr || at(primAt + p[3], 4) == nullptr) {
                     fault("CP_SET_BIN_DATA5_OFFSET not of 4 words, outside a tile, or its streams outside every buffer");
                     return false;
                 }
@@ -2604,6 +2658,10 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                     const uint32_t ev = p[0] & 0xff;
                     if (ev == 0x07 || ev == 0x09) {
                         fault("legacy cache/CCU event in an A730 stream"); return false;
+                    }
+                    if (ev == BLIT && (write || !eventBlit())) {
+                        if (write) fault("an A730 BLIT event with a write of its own");
+                        return false;
                     }
                     if (ev == ZPASS_DONE) {
                         // the A730 (A7XX gen1) counts samples the A6XX's way, RB_SAMPLE_COUNT_ADDR, each ZPASS_DONE then
@@ -2870,6 +2928,7 @@ void FakeGpu::run(const Job& job) {
     gfxIbosFrom_ = 0;
     gfxIboUnits_ = 0;
     passBegun_ = ccuCntlWritten_ = ccuCntlAfterWfi_ = lastWasWfi_ = inTile_ = binning_ = false;
+    std::fill(std::begin(pseudo_), std::end(pseudo_), 0);   // (a submission sets its own: the kernel saves none across owners)
     drawsInSubmission_ = drawsWithoutCcuFlush_ = drawsWithoutCacheFlush_ = drawsWithoutDepthFlush_ = 0;
     written_.clear();
     gen7Thread_ = gen7ComputeDirty_ = gen7BlitDirty_ = false;

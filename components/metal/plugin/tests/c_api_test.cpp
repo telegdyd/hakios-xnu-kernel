@@ -97,7 +97,8 @@ TEST(c_api_compiles_for_each_device_and_specializes_for_the_same_chip) {
                 CHECK_EQ(hakios_metal_cb_status(cb), HAKIOS_METAL_COMPLETED);
                 unsigned passes = 99, tiles = 99;
                 hakios_metal_cb_gmem_counts(cb, &passes, &tiles);
-                if (chip == 0x07030001u) { CHECK_EQ(passes, 0u); CHECK_EQ(tiles, 0u); }
+                // the A730 tiles as the A635 does: this 64 x 64 pass is one bin in GMEM
+                if (chip == 0x07030001u) { CHECK_EQ(passes, 1u); CHECK_EQ(tiles, 1u); }
                 hakios_metal_cb_free(cb);
             }
             hakios_metal_program_free(sp);

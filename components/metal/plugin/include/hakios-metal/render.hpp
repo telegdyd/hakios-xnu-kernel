@@ -510,6 +510,9 @@ struct GmemPlan {
     // alignment) and the bins over it
     uint32_t area[4] = {}, x0 = 0, y0 = 0;
     uint32_t binW = 0, binH = 0, cols = 0, rows = 0;
+    // the chip the bins are laid out for (its GMEM, colour cache carve-out, tile alignment and limits: chip.hpp); 0 is
+    // the A635, as chipInfo answers it
+    uint32_t chipId = 0;
     uint32_t tiles() const { return cols * rows; }
 };
 // whether PASS can be drawn in GMEM and how: its colour attachments the window's size, linear, single-sampled, 4 or 8
@@ -520,7 +523,8 @@ struct GmemPlan {
 // (4 bytes a pixel), an RGBA16Float one and the path mask (8 and 4), and draws into the first two: shared among all
 // three, the first screen's bin was a quarter of GMEM and the bins 32 rows tall, 56 of them, where a third and 48 rows
 // do -- 38. False with *why otherwise (the pass then runs in sysmem, as before).
-bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t likely = ~0u);
+// CHIP: the chip ID the stream is for (0, the A635)
+bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, uint32_t likely = ~0u, uint32_t chip = 0);
 // the attachments a draw of PROGRAM writes or reads in PASS (drawnAttachments and its framebuffer fetches), as a mask
 uint32_t gmemNeeds(const Program& program, const RenderPass& pass);
 // PLAN's bins over the render area AREA (X0 Y0 X1 Y1 inclusive, inside the window): turnip's tiling of a render area

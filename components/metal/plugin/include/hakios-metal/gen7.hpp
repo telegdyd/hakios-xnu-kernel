@@ -3,6 +3,7 @@
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/registers.hpp"
 #include "hakios-metal/pm4.hpp"
+#include <array>
 #include <cassert>
 namespace hakios::metal::gen7 {
 inline constexpr uint32_t A7XX_SP_CS_CNTL_1_LINEARLOCALIDREGID__MASK = 0x000000ff; // a6xx.xml.h:9294
@@ -123,16 +124,43 @@ inline constexpr SharedArray kSharedArrays[] = {
     {0xa98e, 0xa995},   // SP_FS_OUTPUT[8]                   a6xx.xml:5039
     {0xa996, 0xa99d},   // SP_FS_MRT[8]                      a6xx.xml:5047
 };
-inline uint32_t offset(const pm4::Stream& stream, uint32_t legacy) {
-    if (!stream.gen7()) return legacy;
-    uint32_t result = legacyRegisterOffset(kChipA730, legacy);
-    if (result == kRegisterAbsent) {
-        for (const auto& a : kSharedArrays) {
-            if (legacy >= a.first && legacy <= a.last) result = legacy;
+inline constexpr uint32_t kLegacyRegisterCount = 0xc000;
+inline constexpr uint16_t kLegacyRegisterAbsent = 0xffff;
+static_assert([] {
+    for (const auto& r : kRegisters) {
+        if (r.a6xx != kRegisterAbsent && r.a6xx >= kLegacyRegisterCount) return false;
+        if (r.a7xx != kRegisterAbsent && r.a7xx >= kLegacyRegisterAbsent) return false;
+    }
+    for (const auto& a : kSharedArrays) {
+        if (a.first > a.last || a.last >= kLegacyRegisterCount) return false;
+    }
+    return true;
+}(), "A7xx legacy register table bounds or sentinel need updating");
+
+inline constexpr std::array<uint16_t, kLegacyRegisterCount> kLegacyRegisterOffsets = [] {
+    std::array<uint16_t, kLegacyRegisterCount> offsets{};
+    for (auto& entry : offsets) entry = kLegacyRegisterAbsent;
+
+    // Walk backwards so the first named entry wins if an A6xx offset is aliased.
+    for (auto i = static_cast<uint32_t>(Register::Count); i > 0; --i) {
+        const auto& r = kRegisters[i - 1];
+        if (r.a6xx == kRegisterAbsent) continue;
+        offsets[r.a6xx] = r.a7xx == kRegisterAbsent ? kLegacyRegisterAbsent : static_cast<uint16_t>(r.a7xx);
+    }
+    for (const auto& a : kSharedArrays) {
+        for (uint32_t legacy = a.first; legacy <= a.last; ++legacy) {
+            if (offsets[legacy] == kLegacyRegisterAbsent) offsets[legacy] = static_cast<uint16_t>(legacy);
         }
     }
+    return offsets;
+}();
+
+inline uint32_t offset(const pm4::Stream& stream, uint32_t legacy) {
+    if (!stream.gen7()) return legacy;
+    if (legacy >= kLegacyRegisterCount) __builtin_trap();
+    const uint16_t result = kLegacyRegisterOffsets[legacy];
     // never emitted as an address: a register the A7XX does not have is the emitter's bug
-    if (result == kRegisterAbsent) __builtin_trap();
+    if (result == kLegacyRegisterAbsent) __builtin_trap();
     return result;
 }
 inline void registers(pm4::Stream& stream, uint32_t legacy, const uint32_t* words, uint32_t count) {
@@ -154,4 +182,30 @@ void drawStatic(pm4::Stream& stream, uint64_t borderColors, uint64_t trace = 0);
 // A sysmem pass's begin over a W x H window (fd6_emit_sysmem_prep, A7XX)
 void sysmemPassBegin(pm4::Stream& stream, uint32_t W, uint32_t H);
 void event(pm4::Stream& stream, a6xx::vgt_event_type event, uint64_t address = 0, uint32_t value = 0, bool write = false);
+
+// A7XX-only registers of tiled rendering (a6xx.xml.h)
+inline constexpr uint32_t REG_A7XX_RB_CCU_CNTL2 = 0x88e5;          // a6xx.xml.h:6418
+inline constexpr uint32_t REG_A7XX_RB_BLIT_CLEAR_MODE = 0x88e4;    // a6xx.xml.h:6409  CLEAR_MODE_SYSMEM 0, CLEAR_MODE_GMEM 1
+inline constexpr uint32_t REG_A7XX_GRAS_SU_RENDER_CNTL = 0x8116;
+inline constexpr uint32_t REG_A7XX_VSC_UNKNOWN_0D08 = 0x0d08;      // a6xx.xml.h:4244
+// CP_SET_PSEUDO_REG (adreno_pm4.xml.h:291) and the pseudo registers the A7XX's VSC streams are named by (:538-540):
+// three words each, the register, then its 64-bit address
+inline constexpr uint32_t CP_SET_PSEUDO_REG = 86;
+inline constexpr uint32_t kPseudoDrawStrmAddress = 8, kPseudoDrawStrmSizeAddress = 9, kPseudoPrimStrmAddress = 10;
+// RB_RENDER_CNTL's and GRAS_SU_RENDER_CNTL's BINNING (A7XX): the binning pass; 0 in both is a tile (TYPE_TILED) or sysmem
+inline constexpr uint32_t kRenderCntlBinning = 0x80;
+// RB_CCU_CNTL2 (A7XX: the CCU split RB_CCU_CNTL held on A6XX): in sysmem the depth caches at 0 and the colour caches
+// after them, all full size (0x80000000 on the A730); for tiles the colour cache shrunk to its GMEM fraction at
+// gmemCcuColorOffset, the depth cache unmoved (emit_rb_ccu_cntl / fd6_emit_ccu_cntl<A7XX>: 0xfc600000 on the A730)
+constexpr uint32_t rbCcuCntl2(const ChipInfo& c, bool gmem) {
+    const uint32_t color = gmem ? gmemCcuColorOffset(c) : c.numCcu * c.depthCacheBytesPerCcu;
+    uint32_t fraction = 0;   // (CCU_CACHE_SIZE_FULL, _HALF, _QUARTER, _EIGHTH: the divisor's log2)
+    for (uint32_t d = gmem ? c.gmemColorCacheDivisor : 1; d > 1; d >>= 1) fraction++;
+    return ((color >> 21) & 1u) << 2 | fraction << 21 | ((color & 0x1fffff) >> 12) << 23;
+}
+static_assert(rbCcuCntl2(kChipA730, false) == 0x80000000 && rbCcuCntl2(kChipA730, true) == 0xfc600000, "freedreno's FD730 values");
+// The A7XX registers that say where the buffers are: for tiles (GMEM) tu7_emit_tile_render_begin_regs' --
+// RB_UNKNOWN_8812 0, RB_UNKNOWN_8E06 0, GRAS_UNKNOWN_8007 0, GRAS_UNKNOWN_8110 2, RB_UNKNOWN_8E09 4, RB_BLIT_CLEAR_MODE GMEM;
+// for sysmem what sysmemPassBegin writes (RB_UNKNOWN_8812 0x3ff, the A730's RB_UNKNOWN_8E06) and RB_BLIT_CLEAR_MODE SYSMEM
+void tileRegisters(pm4::Stream& stream, bool gmem);
 }

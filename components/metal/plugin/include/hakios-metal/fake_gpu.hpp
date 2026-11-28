@@ -332,6 +332,7 @@ private:
     // the copy of execBlit, into IMAGE when the destination is a UBWC one
     bool execCopy(uint32_t fmt, uint32_t bpp, uint32_t ifmt, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, uint64_t base, uint64_t pitch, bool tiled,
                   Ubwc* image);
+    uint64_t pseudo_[11] = {};   // the A7XX command processor's pseudo registers CP_SET_PSEUDO_REG set (8-10: the VSC streams)
     uint32_t binQueued_ = 0;   // tiles' streams handed over (CP_SET_BIN_DATA5*) and not yet let go by RM6_BIN_END_OF_DRAWS
     bool binning_ = false;   // between RM6_BIN_VISIBILITY and the first tile: the draws only bin
     std::vector<uint8_t> gmem_;
