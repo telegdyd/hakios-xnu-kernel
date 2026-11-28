@@ -194,10 +194,17 @@ def main():
         timeline.append(dict(sid=sid, began=began, ended=ended, swap=swap, ready=ready, shown=shown, done=done,
                              cpu=cpu, metal=ca_frames.get(sid)))
     timeline.sort(key=lambda f: f['done'])
+    # A swap held in SwapEnd (fb_queue=2): two before it not yet in the panel's memory, so the window server waits for
+    # the GPU there. The slot comes back just before tl: v's "done"; counted to it, this is an upper bound.
+    holds = []
+    for sid, at in swaps.items():
+        if sid - 2 in shows and sid - 1 in shows and shows[sid - 1][2] > at and shows[sid - 2][2] > at:
+            holds.append((at, shows[sid - 2][2] - at))
     all_counts = [0, 0, 0]
     kinds, previous = {}, ''          # the same gesture done more than once: its frames together
     print(f'frames.py: {len(gestures)} gestures, {len(timeline)} frames on the panel, {len(waits)} waits for the GPU '
-          f'of 1 ms or more')
+          f'of 1 ms or more{" (the Metal completion thread)" if events else ""}; '
+          f'{len(holds)} swaps held in SwapEnd, {sum(h for _, h in holds) / 1000:.0f} ms at most')
     if events:
         print(f'QuartzCore: {sum(f["metal"] is not None for f in timeline)}/{len(timeline)} frames with render markers, '
               f'{len(commits)} command-stream receipts, {len(turns)} sampled client turns, '
@@ -267,7 +274,12 @@ def main():
         if over1:
             stalls = [w for w in waits if start <= w[0] < end]
             if stalls:
-                line += f'; {len(stalls)} waits for the GPU ({sum(w[2] for w in stalls) / 1000:.0f} ms)'
+                # (with Metal, every tl: f is CommandQueue::waiter's, the plug-in's completion thread: nobody's drawing
+                # waits there. What holds the window server's drawing back is SwapEnd, below)
+                what_waits = 'completion-thread fence waits' if events else 'waits for the GPU'
+                line += f'; {len(stalls)} {what_waits} ({sum(w[2] for w in stalls) / 1000:.0f} ms)'
+            held = [h for t, h in holds if start <= t < end]
+            line += f'; SwapEnd held {len(held)} ({sum(held) / 1000:.0f} ms at most)'
         # the load samples that end within the movement (each covers the cpuload=MS before it)
         within = [l for t, l in loads if chosen[0]['done'] < t <= chosen[-1]['done']]
         if within:
