@@ -289,7 +289,9 @@ PY
 # Jobs that cost the phone more than they give it: ScreenTimeAgent (Screen Time) keeps a core busy all the
 # time on Darwin 27 here (ustacks=top: ~90 % of a core, touched or not) while the window server draws in
 # software. Without the job its Mach services are unknown and their clients fail at once.
-# airplayd: the audio server starts it to look for AirPlay routes, and it dies at once (SIGSEGV), every 5 s.
+# airplayd: it needs /System/Library/Audio/Plug-Ins/HAL/AirPlayHalogen.driver, which this firmware has not got;
+# its endpoint manager fails, and stopping a UGL server that never started dies of a NULL (SIGSEGV), every 5 s.
+# The feature that has it run, AirPlay/airplayd, is off below: the audio server keeps the routes itself.
 # PerfPowerServices is refused by the kernel (its busy loop does not work here). Do not leave its
 # Mach services advertised: PLClientLogger's synchronous permission request otherwise waits forever.
 for job in com.apple.ScreenTimeAgent com.apple.airplayd com.apple.PerfPowerServices; do
@@ -372,6 +374,12 @@ printf 'd\t700\t0\t0\t/private/var/keybags\nf\t600\t0\t0\t/private/var/keybags/p
 # defaults, as before. On Darwin 27: on. There the timers have no other store: with core_data off
 # -[MTTimerStorage coreDataReady] is always false, every request fails with MTTimerStorage error 4 and
 # nothing is kept; on, the store loads (seen with 24B119: a 10-second timer ran and fired).
+# AirPlay/airplayd: off. On, the audio server hands AirPlay's endpoint managers to airplayd
+# (com.apple.coremedia.endpointmanager.xpc), which has no job here (above); each change of route discovery (Control
+# Center, an application coming to the front) then retried that look-up about 1700 times a second for ~10 s: a core
+# in audiomxd and half of one in launchd (UI-PERF-PLAN.md Task 10). Off, audiomxd keeps the endpoint managers in
+# process. The table is made from these files at boot (com.apple.featureflags.shm): a change needs a restart.
+# Measured with 24B119: per warm uibench pass audiomxd 0.3-1.1 s instead of 10-13 s, launchd 0.1-0.3 s instead of 4-6 s.
 mkdir -p $T/var/preferences/FeatureFlags/Domain
 python3 - "$T/var/preferences/FeatureFlags/Domain" "$IOS/rootfs/System/Library/CoreServices/SystemVersion.plist" <<'PY'
 import plistlib, sys
@@ -381,7 +389,7 @@ try:
         major = int(plistlib.load(f)['ProductVersion'].split('.')[0])
 except (OSError, KeyError, ValueError, plistlib.InvalidFileException) as e:
     raise SystemExit(f'root26-darwin.sh: the system version is not in {sys.argv[2]}: {e}')
-flags = {'MobileTimerFlags': {'core_data': {'Enabled': major >= 27}}}
+flags = {'MobileTimerFlags': {'core_data': {'Enabled': major >= 27}}, 'AirPlay': {'airplayd': {'Enabled': False}}}
 for domain, features in flags.items():
     with open(f'{sys.argv[1]}/{domain}.plist', 'wb') as f:
         plistlib.dump(features, f)

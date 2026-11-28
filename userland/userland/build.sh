@@ -302,6 +302,8 @@ if [ -d $DARWIN_FW/rootfs/usr/lib ]; then
 		$DYN -framework CoreFoundation -framework IOKit -o obj/metal_props ../../components/metal/src/metal_props.c
 		# where every thread of a process that hangs is (src/stackof.c), with the entitlement task_for_pid wants
 		$DYN -o obj/stackof src/stackof.c
+		# where a program that dies at once crashes, when no crash report is written (src/crashof.c)
+		$DYN -o obj/crashof src/crashof.c
 		$DYN -o obj/shm_test src/shm_test.c
 		$DYN -o obj/apfs_mmap_test src/apfs_mmap_test.c
 		$DYN -o obj/vol_ls src/vol_ls.c
@@ -417,6 +419,10 @@ if [ -d $DARWIN_FW/rootfs/usr/lib ]; then
 	if [ -f obj/stackof ]; then
 		cp obj/stackof root/bin/
 		/usr/bin/codesign -f -s - --entitlements src/stackof.entitlements root/bin/stackof 2>/dev/null || true
+	fi
+	if [ -f obj/crashof ]; then
+		cp obj/crashof root/bin/
+		/usr/bin/codesign -f -s - --entitlements src/stackof.entitlements root/bin/crashof 2>/dev/null || true
 	fi
 	[ -f obj/shm_test ] && cp obj/shm_test root/bin/
 	[ -f obj/apfs_mmap_test ] && cp obj/apfs_mmap_test root/bin/
