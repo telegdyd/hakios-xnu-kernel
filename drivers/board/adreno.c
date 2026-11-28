@@ -2468,8 +2468,15 @@ step_core_power(void)
 		return false;
 	}
 	if (!quiet) {
-		printf("adreno: %u: votes: 3D core %#x %#x %#x %#x, GMU %#x %#x\n", step, perf.gpu[0].vote, perf.gpu[1].vote,
-		    perf.gpu[2].vote, perf.gpu[3].vote, perf.gmu[0].vote, perf.gmu[1].vote);
+		char gpu_votes[96];
+		int at = 0;
+
+		gpu_votes[0] = 0;
+		for (unsigned i = 0; i < perf.gpu_levels && at < (int)sizeof(gpu_votes) - 12; i++) {
+			at += snprintf(gpu_votes + at, sizeof(gpu_votes) - (size_t)at, "%s%#x", i ? " " : "", perf.gpu[i].vote);
+		}
+		printf("adreno: %u: votes: 3D core %s, GMU %#x %#x\n", step, gpu_votes,
+		    perf.gmu[0].vote, perf.gmu[1].vote);
 	}
 
 	bw.levels = 1;

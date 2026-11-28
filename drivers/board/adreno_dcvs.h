@@ -59,17 +59,18 @@ adreno_soc_cap(unsigned top, uint32_t step, uint32_t most)
 }
 
 /*
- * The speed wanted now, from `level`, the speed it runs at. With the GMU's busy counter (`busy_valid`): from 60 %
- * busy the fastest, from 20 % one below it (or the fastest, from there); without it, work still queued for the
- * fastest and a submission in the last 200 ms for one below. Otherwise one speed down every 200 ms. Never above
- * `cap`. `last_load`: when load was last seen, kept between calls.
+ * The speed wanted now, from `level`, the speed it runs at. With the GMU's busy counter (`busy_valid`): from 40 %
+ * busy the fastest (kept while at least 25 % so an active burst does not oscillate between the top two speeds),
+ * from 20 % one below it; without it, work still queued for the fastest and a submission in the last 200 ms for
+ * one below. Otherwise one speed down every 200 ms. Never above `cap`. `last_load`: when load was last seen,
+ * kept between calls.
  */
 static inline unsigned
 adreno_dcvs_target(unsigned level, unsigned top, unsigned cap, bool busy_valid, unsigned busy_pct, bool pending,
     bool recent, uint64_t now, uint64_t *last_load)
 {
 	unsigned want = level, middle = top > 1 ? top - 1 : 1;
-	bool high = busy_valid ? busy_pct >= 60 : pending;
+	bool high = busy_valid ? (busy_pct >= 40 || (level >= top && busy_pct >= 25)) : pending;
 	bool some = busy_valid ? busy_pct >= 20 : recent;
 
 	if (high) {

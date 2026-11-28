@@ -42,28 +42,47 @@ main(void)
 	assert(adreno_soc_cap(5, 1, 8) == 4);    /* (half a speed: rounded up) */
 	assert(adreno_soc_cap(5, 7, 8) == 1);
 	assert(adreno_soc_cap(5, 6, 8) == 2);
+	assert(adreno_soc_cap(5, 0, 17) == 5);
+	assert(adreno_soc_cap(5, 2, 17) == 5);
+	assert(adreno_soc_cap(5, 3, 17) == 4);
+	assert(adreno_soc_cap(5, 6, 17) == 4);
+	assert(adreno_soc_cap(5, 7, 17) == 3);
+	assert(adreno_soc_cap(5, 17, 17) == 1);
 	assert(adreno_soc_cap(1, 3, 8) == 1);
 	assert(adreno_soc_cap(0, 0, 8) == 1);
 
-	/* with the busy counter */
+	/* with the busy counter (top = 3) */
 	assert(adreno_dcvs_target(3, 3, 3, true, 0, false, false, 199999999, &last) == 3);
 	assert(adreno_dcvs_target(3, 3, 3, true, 0, false, false, 200000000, &last) == 2);
 	assert(adreno_dcvs_target(2, 3, 3, true, 0, false, false, 399999999, &last) == 2);
 	assert(adreno_dcvs_target(2, 3, 3, true, 0, false, false, 400000000, &last) == 1);
-	assert(adreno_dcvs_target(1, 3, 3, true, 60, false, false, 450000000, &last) == 3);
+	assert(adreno_dcvs_target(1, 3, 3, true, 40, false, false, 450000000, &last) == 3);
+	assert(adreno_dcvs_target(1, 3, 3, true, 39, false, false, 460000000, &last) == 2);
+	assert(adreno_dcvs_target(3, 3, 3, true, 25, false, false, 470000000, &last) == 3);   /* hysteresis at top */
+	assert(adreno_dcvs_target(3, 3, 3, true, 24, false, false, 480000000, &last) == 2);
 	assert(adreno_dcvs_target(3, 3, 3, true, 20, false, false, 500000000, &last) == 2);
 	assert(adreno_dcvs_target(1, 3, 3, true, 19, true, true, 600000000, &last) == 1);   /* (pending: the counter says) */
 	assert(adreno_dcvs_target(1, 3, 2, true, 100, false, false, 650000000, &last) == 2);
+	/* 5-speed table (220/317/492/640/818 MHz) */
+	assert(adreno_dcvs_target(1, 5, 5, true, 40, false, false, 660000000, &last) == 5);
+	assert(adreno_dcvs_target(5, 5, 5, true, 25, false, false, 670000000, &last) == 5);
+	assert(adreno_dcvs_target(5, 5, 5, true, 24, false, false, 680000000, &last) == 4);
+	assert(adreno_dcvs_target(1, 5, 5, true, 30, false, false, 690000000, &last) == 4);   /* interactive burst */
+	assert(adreno_dcvs_target(1, 5, 4, true, 100, false, false, 700000000, &last) == 4);  /* cap respected */
+	assert(adreno_dcvs_target(5, 5, 5, true, 10, false, false, 900000000, &last) == 4);   /* idle wallpaper step-down */
+	assert(adreno_dcvs_target(4, 5, 5, true, 10, false, false, 1100000000, &last) == 3);
+	assert(adreno_dcvs_target(3, 5, 5, true, 10, false, false, 1300000000, &last) == 2);
+	assert(adreno_dcvs_target(2, 5, 5, true, 10, false, false, 1500000000, &last) == 1);
 	/* without it: queued work, recent work */
-	assert(adreno_dcvs_target(1, 3, 3, false, 0, true, false, 700000000, &last) == 3);
-	assert(adreno_dcvs_target(3, 3, 3, false, 0, false, true, 750000000, &last) == 2);
-	assert(adreno_dcvs_target(2, 3, 3, false, 0, false, false, 950000000, &last) == 1);
+	assert(adreno_dcvs_target(1, 3, 3, false, 0, true, false, 1600000000, &last) == 3);
+	assert(adreno_dcvs_target(3, 3, 3, false, 0, false, true, 1650000000, &last) == 2);
+	assert(adreno_dcvs_target(2, 3, 3, false, 0, false, false, 1850000000, &last) == 1);
 	for (unsigned top = 1; top <= 5; top++) {
 		for (unsigned cap = 1; cap <= top; cap++) {
 			for (unsigned level = 1; level <= top; level++) {
 				for (unsigned busy = 0; busy <= 100; busy++) {
 					unsigned got = adreno_dcvs_target(level, top, cap, busy & 1, busy, busy & 2, busy & 4,
-					    1000000000ull + busy * 300000000ull, &last);
+					    2000000000ull + busy * 300000000ull, &last);
 					assert(got >= 1 && got <= cap);
 				}
 			}
