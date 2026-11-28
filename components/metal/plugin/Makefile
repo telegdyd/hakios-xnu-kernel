@@ -57,7 +57,7 @@ IOS_AR    ?= llvm-ar --format=darwin rcs
 endif
 
 CORE      = src/pm4.cpp src/gpu.cpp src/command.cpp src/compute.cpp src/texture.cpp src/render.cpp src/link.cpp src/compiler.cpp src/metallib.cpp src/c_api.cpp src/gen7.cpp
-HOST      = $(CORE) src/fake_gpu.cpp
+HOST      = $(CORE) src/fake_gpu.cpp src/cache_build.cpp
 TESTS     = $(wildcard tests/*_test.cpp) tests/main.cpp
 TABLES    = $(wildcard include/hakios-metal/*.inc)
 
@@ -105,20 +105,18 @@ IOS_LIBS     =
 ifneq ($(strip $(MESA)),)
 IOS_CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_IOS_MESA_CXXFLAGS)
 IOS_LIBS     += $(HAKIOS_METAL_IOS_MESA_LIBS)
-# the compiled-stage cache's key (src/compiler.cpp: kCacheBuild): what the compiler is made of -- its source, the
-# driver's headers and the Mesa archives linked in -- and not when it was built, so that a cache kept on the phone
-# across boots (var_store) outlives a rebuild of the plug-in that changed nothing of the compiler
-IOS_CACHE_BUILD := $(shell cat src/compiler.cpp include/hakios-metal/*.hpp $(wildcard $(filter %.a,$(HAKIOS_METAL_IOS_MESA_LIBS))) 2>/dev/null \
-	| (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-24)
-ifneq ($(strip $(IOS_CACHE_BUILD)),)
-IOS_CXXFLAGS += -DHAKIOS_METAL_CACHE_BUILD='"$(IOS_CACHE_BUILD)"'
-endif
+# the compiled-stage cache's key (src/cache_build.cpp): what the compiler is made of -- the objects that make a stage
+# and the Mesa archives linked in -- and not when it was built, so that a cache kept on the phone across boots
+# (var_store) and the image's seeded stages outlive a rebuild of the plug-in that changed nothing of the compiler
+IOS_CACHE_INPUTS = compiler.o link.o texture.o $(abspath $(wildcard $(filter %.a,$(HAKIOS_METAL_IOS_MESA_LIBS))))
 endif
 
-out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp) $(TABLES)
+out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp src/cache_build.cpp $(wildcard include/hakios-metal/*.hpp) $(TABLES)
 	@mkdir -p out/ios/obj
 	cd out/ios/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
 		$(IOS_CXX) $(IOS_CXXFLAGS) -I../../../include -c ../../../$$f || exit 1; done
+	cd out/ios/obj && $(IOS_CXX) $(IOS_CXXFLAGS) $(if $(strip $(MESA)),-DHAKIOS_METAL_CACHE_BUILD="\"$$(cat $(IOS_CACHE_INPUTS) \
+		| (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-24)\"") -c ../../../src/cache_build.cpp
 	rm -f $@ && $(IOS_AR) $@ out/ios/obj/*.o
 
 # (and the front end's archive, as the host tests: a probe linked before the front end changed tests the old one)

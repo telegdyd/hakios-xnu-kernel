@@ -1357,6 +1357,9 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
 // phone, every time the process starts. A stage is filed under a hash of what made it (the bitcode, the constants,
 // IBO_BASE, the known buffer) and of this build (the layout of Stage is written as it lies in memory); what comes
 // back is the CompiledStage as it was, its Kernel's pointers set to its own vectors again.
+// What the compiler is, for the key: src/cache_build.cpp, a file of its own so that this file's object does not hold
+// it -- the Makefile hashes that object.
+extern const char* const kCacheBuild;
 namespace {
 struct CacheWriter {
     std::string out;
@@ -1395,16 +1398,6 @@ struct CacheReader {
     }
 };
 constexpr uint32_t kCacheMagic = 0x53434d48;   // "HMCS"
-// What the compiler is, for the cache's key: the Makefile's hash of this file, the driver's headers and the Mesa
-// archives linked in (HAKIOS_METAL_CACHE_BUILD), so that a stage compiled before stays good across a rebuild of the
-// library that changed nothing of the compiler -- with __DATE__ and __TIME__ every rebuild of the plug-in (any file
-// of the core recompiles them all) emptied a cache that var_store had kept across boots, and the window server paid
-// its 66 to 103 first compiles again. Without the define, the old key: a build is its own.
-#ifdef HAKIOS_METAL_CACHE_BUILD
-const char* const kCacheBuild = HAKIOS_METAL_CACHE_BUILD;
-#else
-const char* const kCacheBuild = __DATE__ " " __TIME__;
-#endif
 
 // The file name of a stage in the cache (no directory), "" when no cache is configured: the writable directory
 // HAKIOS_METAL_CACHE, and the read-only ones HAKIOS_METAL_CACHE_SEED (':' between them) -- stages compiled on an

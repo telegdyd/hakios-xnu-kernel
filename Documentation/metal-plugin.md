@@ -159,7 +159,10 @@ this machine: `metal_air_dump=1`, `components/metal/plugin/tools/airdump.py`, `s
   memory while a copy writes it, so a screenshot in motion holds rows of two frames; the recording does not.)
 - **Compiled stages across boots.** `/private/var` starts empty at every boot of iOS 27 here. The stages a run
   compiled are taken off the phone over SSH (`darwin/tools/metal-cache-pull.sh`) into the next small image, where
-  the plug-in reads them after its own cache (`/hakios/share/hakios-metal-cache`).
+  the plug-in reads them after its own cache (`/hakios/share/hakios-metal-cache`). A stage is filed under a hash
+  of the objects that make it (`compiler.o`, `link.o`, `texture.o`) and the Mesa archives (`src/cache_build.cpp`):
+  a change to the encoder's headers leaves the seeded stages good; one to the compiler or to `Stage`'s layout
+  calls for a new seed.
 - **Other processes.** Only the window server is shown the device (`metal_procs=NAME,NAME` shows it to others).
   iconservicesagent draws iOS 26's icons with RenderBox, SwiftUI's renderer, and downsamples them with CoreImage.
   With `metal_procs=iconservicesagent` every pipeline it asks for now compiles: its custom effects link the visible
