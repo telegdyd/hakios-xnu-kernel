@@ -184,8 +184,8 @@ CONF
 [ -z "${INJECT_MORE:-}" ] || echo "$INJECT_MORE" >> $T/etc/inject.conf
 # LAYERS="NAME ...": these applications write down their layer tree on the notification com.hakios.layers
 [ -z "${LAYERS:-}" ] || echo "/hakios/lib/libhakios-layers.dylib $LAYERS" >> $T/etc/inject.conf
-# WAITSTACK_SB=1: libhakios.dylib in SpringBoard as well, for its thread sampler (boot-arg waitstack=sb, inject.c)
-[ -z "${WAITSTACK_SB:-}" ] || echo "/hakios/lib/libhakios.dylib SpringBoard" >> "$T/etc/inject.conf"
+# WAITSTACK_SB=1: sample UI client main run loops with boot-arg waitstack=sb (inject.c).
+[ -z "${WAITSTACK_SB:-}" ] || echo "/hakios/lib/libhakios.dylib SpringBoard Preferences WidgetRenderer WidgetRenderer_Default iconservicesagent" >> "$T/etc/inject.conf"
 # the phone's own firmware, where it was taken from that phone (firmware/BOARD/fw/: the GPU's, the Wi-Fi
 # DSP's, the network to join), uncompressed in the image: the drivers read it where it lies in memory
 PLAIN=()
